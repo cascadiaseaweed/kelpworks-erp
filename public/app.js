@@ -404,7 +404,7 @@ async function pageProduction(v) {
       el('div', { class: 'summary-line' },
         sl('Run date', run.runDate), sl('Input', fmt(run.inputKg, 1) + ' kg'),
         sl('Output', fmt(run.outputLitres, 0) + ' L'),
-        sl('Dilution', run.inputKg ? (run.outputLitres / run.inputKg).toFixed(2) + ' L/kg' : '—'),
+        sl('Conversion factor', run.inputKg ? (run.outputLitres / run.inputKg).toFixed(2) + ' L/kg' : '—'),
         sl('Target TDS', run.targetTds != null ? run.targetTds + '%' : '—'),
         sl('Citric', fmt(run.citricKg, 1) + ' kg'), sl('Sorbate', fmt(run.sorbateKg, 1) + ' kg'),
         sl('Packaged', fgList)),
@@ -564,7 +564,7 @@ async function openRun() {
     let outL = 0; for (const sz in pkgInputs) outL += (State.ref.packageSizes[sz] || 0) * (+pkgInputs[sz].value || 0);
     summary.innerHTML = '';
     summary.append(sl('Totes', chosen.length), sl('Input', fmt(inputKg, 1) + ' kg'),
-      sl('Output', fmt(outL, 0) + ' L'), sl('Dilution', inputKg ? (outL / inputKg).toFixed(2) + ' L/kg' : '—'));
+      sl('Output', fmt(outL, 0) + ' L'), sl('Conversion factor', inputKg ? (outL / inputKg).toFixed(2) + ' L/kg' : '—'));
   }
 
   const body = el('div', {},
