@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KelpWorks ERP</title>
+  <link rel="icon" href="logo.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Login -->
+  <div id="login">
+    <form class="login-card" id="loginForm">
+      <div class="brand">
+        <img class="logo" src="logo.png" alt="Cascadia Seaweed">
+        <div>
+          <h1>KelpWorks ERP</h1>
+          <div class="sub">Cascadia Seaweed &middot; Kelp Processing</div>
+        </div>
+      </div>
+      <label for="email">Email</label>
+      <input id="email" type="email" autocomplete="username" value="admin@kelp.local">
+      <label for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" value="kelp1234">
+      <button class="block" type="submit">Sign in</button>
+      <div class="error" id="loginError"></div>
+    </form>
+  </div>
+
+  <!-- App -->
+  <div id="app" class="hidden">
+    <div class="topbar">
+      <img class="logo" src="logo-white.png" alt="Cascadia Seaweed">
+      <div class="title">KelpWorks<small>CASCADIA SEAWEED ERP</small></div>
+      <nav class="tabs" id="tabs">
+        <button data-tab="dashboard" class="active">Dashboard</button>
+        <button data-tab="stabilized">Stabilized Inventory</button>
+        <button data-tab="production">Production</button>
+        <button data-tab="fg">Finished Goods</button>
+        <button data-tab="shipping">Shipping</button>
+        <button data-tab="consumables">Consumables</button>
+        <button data-tab="reports">Reports</button>
+        <button data-tab="labels">Labels</button>
+      </nav>
+      <div class="who">
+        <span id="whoName"></span>
+        <button id="logout">Sign out</button>
+      </div>
+    </div>
+    <div class="wrap" id="view"></div>
+  </div>
+
+  <div id="modalRoot"></div>
+  <script src="app.js"></script>
+</body>
+</html>

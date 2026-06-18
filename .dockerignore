@@ -1,0 +1,9 @@
+# Keep the image clean — never ship local data or caches.
+*.db
+*.db-wal
+*.db-shm
+preview_*.db
+uploads/
+__pycache__/
+*.pyc
+.git

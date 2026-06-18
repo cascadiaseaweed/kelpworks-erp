@@ -1,0 +1,31 @@
+# Render Blueprint — deploys KelpWorks ERP with automatic HTTPS.
+# In Render: New + > Blueprint, connect the repo, and Render reads this file.
+#
+# DATA PERSISTENCE:
+#   A 1 GB persistent disk is mounted at /var/data so BOTH the SQLite database
+#   AND uploaded documents survive restarts and redeploys. A disk requires a
+#   paid instance (Starter, ~$7/mo) and pins the service to a single instance.
+#   For a FREE trial instead: change "plan: starter" to "plan: free" and DELETE
+#   the "disk:" block — but the database and uploads then reset on each redeploy.
+#
+services:
+  - type: web
+    name: kelpworks-erp
+    runtime: docker
+    plan: starter
+    healthCheckPath: /
+    envVars:
+      - key: KELP_ERP_SECRET          # signs login tokens; Render generates a strong value
+        generateValue: true
+      - key: KELP_ERP_DB              # database on the persistent disk
+        value: /var/data/kelp_erp.db
+      - key: KELP_ERP_UPLOADS         # attachment files on the persistent disk
+        value: /var/data/uploads
+      - key: KELP_ERP_ADMIN_EMAIL     # admin account created on FIRST deploy only
+        sync: false
+      - key: KELP_ERP_ADMIN_PASSWORD  # set a STRONG password BEFORE the first deploy
+        sync: false
+    disk:
+      name: kelpworks-data
+      mountPath: /var/data
+      sizeGB: 1
