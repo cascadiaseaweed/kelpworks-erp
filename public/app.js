@@ -73,6 +73,7 @@ $('#loginForm').addEventListener('submit', async e => {
   } catch (err) { $('#loginError').textContent = err.message; }
 });
 $('#logout').addEventListener('click', logout);
+$('#changePw').addEventListener('click', () => changePasswordModal(false));
 $('#tabs').addEventListener('click', e => { const b = e.target.closest('button'); if (b) selectTab(b.dataset.tab); });
 function selectTab(tab) {
   State.tab = tab;
@@ -85,7 +86,10 @@ async function boot() {
     State.user = (await api('GET', '/me'));
     State.ref = await api('GET', '/refdata');
     $('#whoName').textContent = State.user.name;
+    $('#tabs [data-tab=admin]').classList.toggle('hidden', State.user.role !== 'admin');
+    if (State.tab === 'admin' && State.user.role !== 'admin') State.tab = 'dashboard';
     show('app'); selectTab(State.tab);
+    if (State.user.mustChange) changePasswordModal(true);
   } catch (err) { logout(); }
 }
 
@@ -94,7 +98,7 @@ function render() {
   const v = $('#view'); v.innerHTML = '';
   ({ dashboard: pageDashboard, stabilized: pageStabilized, production: pageProduction,
      fg: pageFG, shipping: pageShipping, consumables: pageConsumables, reports: pageReports,
-     labels: pageLabels }[State.tab])(v);
+     labels: pageLabels, admin: pageAdmin }[State.tab])(v);
 }
 
 /* ---------------- Dashboard ---------------- */
@@ -1232,13 +1236,14 @@ function editableSelect(opts, id) {
 }
 
 /* ---------------- Modal ---------------- */
-function modal(title, body, onSubmit, submitLabel = 'Save') {
+function modal(title, body, onSubmit, submitLabel = 'Save', opts = {}) {
   const errBox = el('div', { class: 'error' });
   const submitBtn = el('button', {}, submitLabel);
-  const card = el('div', { class: 'modal' }, el('h3', {}, title), body, errBox,
-    el('div', { class: 'modal-actions' },
-      el('button', { class: 'secondary', onclick: close }, 'Cancel'), submitBtn));
-  const bg = el('div', { class: 'modal-bg', onclick: e => { if (e.target === bg) close(); } }, card);
+  const actions = el('div', { class: 'modal-actions' });
+  if (!opts.noCancel) actions.append(el('button', { class: 'secondary', onclick: close }, 'Cancel'));
+  actions.append(submitBtn);
+  const card = el('div', { class: 'modal' }, el('h3', {}, title), body, errBox, actions);
+  const bg = el('div', { class: 'modal-bg', onclick: e => { if (e.target === bg && !opts.noBackdropClose) close(); } }, card);
   function close() { bg.remove(); }
   submitBtn.addEventListener('click', async () => {
     errBox.textContent = ''; submitBtn.disabled = true;
@@ -1246,6 +1251,82 @@ function modal(title, body, onSubmit, submitLabel = 'Save') {
     catch (e) { errBox.textContent = e.message; submitBtn.disabled = false; }
   });
   $('#modalRoot').append(bg);
+}
+function changePasswordModal(forced) {
+  const body = el('div', {},
+    forced ? el('div', { class: 'summary-line' }, 'For security, please set a new password before continuing.') : null,
+    field('Current password', el('input', { type: 'password', id: 'pw_cur', autocomplete: 'current-password' })),
+    el('div', { class: 'form-row' },
+      field('New password', el('input', { type: 'password', id: 'pw_new', autocomplete: 'new-password' })),
+      field('Confirm new password', el('input', { type: 'password', id: 'pw_conf', autocomplete: 'new-password' }))),
+    el('div', { class: 'help' }, 'At least 8 characters.'));
+  modal('Change password', body, async () => {
+    const cur = body.querySelector('#pw_cur').value, nw = body.querySelector('#pw_new').value, cf = body.querySelector('#pw_conf').value;
+    if (nw.length < 8) throw new Error('New password must be at least 8 characters.');
+    if (nw !== cf) throw new Error('New passwords do not match.');
+    await api('POST', '/me/password', { currentPassword: cur, newPassword: nw });
+    State.user.mustChange = false;
+    toast('Password updated');
+  }, forced ? 'Set password' : 'Update', forced ? { noCancel: true, noBackdropClose: true } : {});
+}
+
+/* ---------------- Admin ---------------- */
+async function pageAdmin(v) {
+  v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Admin — Users'),
+    el('div', { class: 'actions' }, el('button', { onclick: addUser }, '+ Add user'))));
+  const r = await api('GET', '/users');
+  v.append(table(
+    ['Name', 'Email', 'Role', 'Status', 'Actions'],
+    r.users.map(u => [
+      u.name, mono(u.email),
+      badge(u.role === 'admin' ? 'hold' : 'on_hand', u.role === 'admin' ? 'Admin' : 'User'),
+      u.active ? badge('on_hand', u.mustChange ? 'Must reset' : 'Active') : badge('disposed', 'Inactive'),
+      rowActions([
+        ['Reset password', () => resetUserPassword(u)],
+        ['Edit', () => editUser(u)],
+        u.active ? ['Deactivate', () => setUserActive(u, false), 'danger'] : ['Activate', () => setUserActive(u, true)]
+      ])
+    ]), [false, false, false, false, false]));
+  v.append(el('div', { class: 'help', style: 'margin-top:10px' },
+    'New users and password resets require the person to set a new password on next sign-in.'));
+}
+function addUser() {
+  const body = el('div', {},
+    el('div', { class: 'form-row' }, field('Name', el('input', { id: 'u_name' })),
+      field('Email', el('input', { id: 'u_email', type: 'email' }))),
+    el('div', { class: 'form-row' }, field('Temporary password', el('input', { id: 'u_pw', value: 'Cascadia123!' })),
+      field('Role', selectFrom('', [['user', 'User'], ['admin', 'Administrator']], null, 'u_role'))),
+    el('div', { class: 'help' }, 'They’ll be required to change this password on first sign-in.'));
+  modal('Add user', body, async () => {
+    await api('POST', '/users', { name: body.querySelector('#u_name').value, email: body.querySelector('#u_email').value, password: body.querySelector('#u_pw').value, role: body.querySelector('#u_role').value });
+    toast('User created'); render();
+  }, 'Create');
+}
+function editUser(u) {
+  const body = el('div', { class: 'form-row' },
+    field('Name', el('input', { id: 'ue_name', value: u.name })),
+    field('Role', selectFrom('', [['user', 'User'], ['admin', 'Administrator']], null, 'ue_role')));
+  body.querySelector('#ue_role').value = u.role;
+  modal('Edit ' + u.email, body, async () => {
+    await api('PUT', '/users/' + u.id, { name: body.querySelector('#ue_name').value, role: body.querySelector('#ue_role').value });
+    toast('Updated'); render();
+  }, 'Save');
+}
+function resetUserPassword(u) {
+  const body = el('div', {},
+    field('New password for ' + u.email, el('input', { id: 'rp_pw', value: 'Cascadia123!' })),
+    el('div', { class: 'help' }, 'They’ll be required to change it on next sign-in.'));
+  modal('Reset password', body, async () => {
+    const pw = body.querySelector('#rp_pw').value;
+    if (pw.length < 8) throw new Error('Password must be at least 8 characters.');
+    await api('POST', '/users/' + u.id + '/password', { password: pw });
+    toast('Password reset');
+  }, 'Reset');
+}
+async function setUserActive(u, active) {
+  if (!active && !confirm('Deactivate ' + u.email + '? They will no longer be able to sign in.')) return;
+  try { await api('PUT', '/users/' + u.id, { active }); toast(active ? 'Activated' : 'Deactivated'); render(); }
+  catch (e) { toast(e.message, true); }
 }
 
 /* ---------------- start ---------------- */

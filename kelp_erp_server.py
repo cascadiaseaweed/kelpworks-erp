@@ -69,6 +69,16 @@ TOKEN_TTL = 60 * 60 * 12  # 12 hours
 ADMIN_EMAIL = os.environ.get("KELP_ERP_ADMIN_EMAIL", "admin@kelp.local")
 ADMIN_PASSWORD = os.environ.get("KELP_ERP_ADMIN_PASSWORD", "kelp1234")
 
+# Initial staff roster — created (if missing) on startup with a temporary
+# password and forced to reset it on first login.
+INITIAL_USERS = [
+    "dpedde@cascadiaseaweed.com",
+    "dboire@cascadiaseaweed.com",
+    "nwrana@cascadiaseaweed.com",
+]
+INITIAL_USER_PASSWORD = os.environ.get("KELP_ERP_INITIAL_PASSWORD", "Cascadia123!")
+MIN_PASSWORD_LEN = 8
+
 PACKAGE_SIZES = {            # litres per unit of each package type
     "IBC": 1000.0,
     "4L": 4.0,
@@ -81,11 +91,14 @@ PACKAGE_SIZES = {            # litres per unit of each package type
 # --------------------------------------------------------------------------- #
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    name          TEXT NOT NULL,
-    email         TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
-    created_at    TEXT NOT NULL
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                 TEXT NOT NULL,
+    email                TEXT NOT NULL UNIQUE,
+    password_hash        TEXT NOT NULL,
+    role                 TEXT NOT NULL DEFAULT 'user',   -- 'admin' | 'user'
+    must_change_password INTEGER NOT NULL DEFAULT 0,
+    active               INTEGER NOT NULL DEFAULT 1,
+    created_at           TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS species (
@@ -343,6 +356,8 @@ def init_db():
     conn.commit()
     if conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"] == 0:
         seed(conn)
+    ensure_users(conn)
+    conn.commit()
     conn.close()
 
 
@@ -356,6 +371,28 @@ def migrate(conn):
     ccols = {r["name"] for r in conn.execute("PRAGMA table_info(consumables)")}
     if "location" not in ccols:
         conn.execute("ALTER TABLE consumables ADD COLUMN location TEXT")
+    ucols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+    if "role" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+    if "must_change_password" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
+    if "active" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+
+
+def ensure_users(conn):
+    """Idempotent: keep the configured admin an admin, and create the initial
+    staff roster (with a temporary, must-change password) if they don't exist."""
+    conn.execute("UPDATE users SET role='admin' WHERE email=?", (ADMIN_EMAIL.strip().lower(),))
+    ts = now_iso()
+    for email in INITIAL_USERS:
+        email = email.strip().lower()
+        if conn.execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone():
+            continue
+        conn.execute(
+            "INSERT INTO users (name,email,password_hash,role,must_change_password,active,created_at)"
+            " VALUES (?,?,?,?,1,1,?)",
+            (email.split("@")[0], email, hash_password(INITIAL_USER_PASSWORD), "user", ts))
 
 
 def seed(conn):
@@ -363,7 +400,7 @@ def seed(conn):
     extracted from the 202605 inventory workbook (seed.json)."""
     ts = now_iso()
     cur = conn.cursor()
-    cur.execute("INSERT INTO users (name,email,password_hash,created_at) VALUES (?,?,?,?)",
+    cur.execute("INSERT INTO users (name,email,password_hash,role,created_at) VALUES (?,?,?,'admin',?)",
                 ("Plant Admin", ADMIN_EMAIL.strip().lower(), hash_password(ADMIN_PASSWORD), ts))
     try:
         with open(SEED_FILE, encoding="utf-8") as f:
@@ -520,7 +557,13 @@ class Handler(BaseHTTPRequestHandler):
         row = conn.execute("SELECT * FROM users WHERE id=?", (payload["uid"],)).fetchone()
         if not row:
             raise ApiError(401, "User not found")
+        if not row["active"]:
+            raise ApiError(403, "This account has been deactivated")
         return row
+
+    def _require_admin(self, user):
+        if user["role"] != "admin":
+            raise ApiError(403, "Administrator access required")
 
     # ---- dispatch --------------------------------------------------------- #
     def do_OPTIONS(self):
@@ -662,7 +705,11 @@ class Handler(BaseHTTPRequestHandler):
         user = self._auth(conn)  # everything below requires auth
 
         if method == "GET" and seg == ["api", "me"]:
-            return {"id": user["id"], "name": user["name"], "email": user["email"]}
+            return self._me(user)
+        if method == "POST" and seg == ["api", "me", "password"]:
+            return self.change_my_password(conn, user)
+        if seg[:2] == ["api", "users"]:
+            return self.route_users(method, seg, conn, user)
         if method == "GET" and seg == ["api", "refdata"]:
             return self.refdata(conn)
         if method == "GET" and seg == ["api", "dashboard"]:
@@ -698,8 +745,95 @@ class Handler(BaseHTTPRequestHandler):
         row = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
         if not row or not verify_password(password, row["password_hash"]):
             raise ApiError(401, "Invalid email or password")
-        return {"token": make_token(row["id"]),
-                "user": {"id": row["id"], "name": row["name"], "email": row["email"]}}
+        if not row["active"]:
+            raise ApiError(403, "This account has been deactivated")
+        return {"token": make_token(row["id"]), "user": self._me(row)}
+
+    def _me(self, row):
+        return {"id": row["id"], "name": row["name"], "email": row["email"],
+                "role": row["role"], "mustChange": bool(row["must_change_password"])}
+
+    # ---- users / admin ---------------------------------------------------- #
+    def _user_public(self, r):
+        return {"id": r["id"], "name": r["name"], "email": r["email"], "role": r["role"],
+                "active": bool(r["active"]), "mustChange": bool(r["must_change_password"]),
+                "createdAt": r["created_at"]}
+
+    def _users(self, conn):
+        return [self._user_public(r) for r in conn.execute(
+            "SELECT * FROM users ORDER BY active DESC, role DESC, email")]
+
+    def _active_admin_count(self, conn, exclude_id=None):
+        return conn.execute(
+            "SELECT COUNT(*) c FROM users WHERE role='admin' AND active=1 AND id!=?",
+            (exclude_id or -1,)).fetchone()["c"]
+
+    def change_my_password(self, conn, user):
+        d = self._body_json()
+        if not verify_password(d.get("currentPassword") or "", user["password_hash"]):
+            raise ApiError(400, "Current password is incorrect")
+        newpw = d.get("newPassword") or ""
+        if len(newpw) < MIN_PASSWORD_LEN:
+            raise ApiError(400, "New password must be at least %d characters" % MIN_PASSWORD_LEN)
+        conn.execute("UPDATE users SET password_hash=?, must_change_password=0 WHERE id=?",
+                     (hash_password(newpw), user["id"]))
+        return {"ok": True}
+
+    def route_users(self, method, seg, conn, user):
+        self._require_admin(user)
+        if seg == ["api", "users"]:
+            if method == "GET":
+                return {"users": self._users(conn)}
+            if method == "POST":
+                d = self._body_json()
+                name = (d.get("name") or "").strip()
+                email = (d.get("email") or "").strip().lower()
+                pw = d.get("password") or ""
+                role = "admin" if d.get("role") == "admin" else "user"
+                if not name or not email:
+                    raise ApiError(400, "Name and email are required")
+                if "@" not in email:
+                    raise ApiError(400, "Enter a valid email address")
+                if len(pw) < MIN_PASSWORD_LEN:
+                    raise ApiError(400, "Password must be at least %d characters" % MIN_PASSWORD_LEN)
+                if conn.execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone():
+                    raise ApiError(409, "A user with that email already exists")
+                must_change = 0 if d.get("mustChange") is False else 1
+                conn.execute(
+                    "INSERT INTO users (name,email,password_hash,role,must_change_password,active,created_at)"
+                    " VALUES (?,?,?,?,?,1,?)",
+                    (name, email, hash_password(pw), role, must_change, now_iso()))
+                return {"users": self._users(conn)}
+        if len(seg) >= 3 and seg[2].isdigit():
+            uid = int(seg[2])
+            target = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+            if not target:
+                raise ApiError(404, "User not found")
+
+            if len(seg) == 4 and seg[3] == "password" and method == "POST":
+                d = self._body_json()
+                pw = d.get("password") or ""
+                if len(pw) < MIN_PASSWORD_LEN:
+                    raise ApiError(400, "Password must be at least %d characters" % MIN_PASSWORD_LEN)
+                must_change = 0 if d.get("mustChange") is False else 1
+                conn.execute("UPDATE users SET password_hash=?, must_change_password=? WHERE id=?",
+                             (hash_password(pw), must_change, uid))
+                return {"ok": True}
+
+            if len(seg) == 3 and method == "PUT":
+                d = self._body_json()
+                new_role = d.get("role", target["role"])
+                new_role = "admin" if new_role == "admin" else "user"
+                new_active = int(bool(d.get("active", target["active"])))
+                # Never strip the last active admin.
+                demoting = target["role"] == "admin" and (new_role != "admin" or not new_active)
+                if demoting and self._active_admin_count(conn, exclude_id=uid) == 0:
+                    raise ApiError(400, "There must be at least one active administrator")
+                conn.execute("UPDATE users SET name=?, role=?, active=? WHERE id=?",
+                             ((d["name"].strip() if d.get("name") else target["name"]),
+                              new_role, new_active, uid))
+                return {"users": self._users(conn)}
+        raise ApiError(404, "Unknown users endpoint")
 
     # ---- reference data --------------------------------------------------- #
     def refdata(self, conn):
