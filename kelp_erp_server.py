@@ -1589,6 +1589,19 @@ class Handler(BaseHTTPRequestHandler):
             "(SELECT SUM(delta) FROM consumable_txns t WHERE t.consumable_id=c.id "
             "AND substr(t.created_at,1,10)>?),0) onhand FROM consumables c ORDER BY c.name", (asof,))
 
+        # --- Inventory by location (current on hand) ---
+        loc_stab = rows(
+            "SELECT COALESCE(location,'(unspecified)') loc, COUNT(*) totes, "
+            "COALESCE(SUM(avg_weight_kg),0) kg FROM tote_lots WHERE status='in_stock' "
+            "GROUP BY location ORDER BY kg DESC")
+        loc_fg = rows(
+            "SELECT COALESCE(location,'(unspecified)') loc, COALESCE(SUM(qty),0) units, "
+            "COALESCE(SUM(qty*litres_each),0) litres FROM fg_lots "
+            "WHERE status NOT IN ('sold','disposed') AND qty>0 GROUP BY location ORDER BY litres DESC")
+        loc_cons = rows(
+            "SELECT COALESCE(location,'(unspecified)') loc, name, on_hand, unit "
+            "FROM consumables ORDER BY loc, name")
+
         return {
             "month": month, "monthStart": start, "monthEnd": end, "asOf": asof,
             "stabilized": {"created": sp_tot(created), "consumed": sp_tot(consumed),
@@ -1616,6 +1629,15 @@ class Handler(BaseHTTPRequestHandler):
                 "onHand": [{"name": r["name"], "unit": r["unit"], "onHand": round(r["onhand"] or 0, 1)}
                            for r in cons_asof]},
             "disposed": self._disposed_in_month(conn, start, end),
+            "byLocation": {
+                "stabilized": [{"location": r["loc"], "totes": r["totes"], "kg": round(r["kg"] or 0, 1)}
+                               for r in loc_stab],
+                "finishedGoods": [{"location": r["loc"], "units": r["units"],
+                                   "litres": round(r["litres"] or 0, 1)} for r in loc_fg],
+                "consumables": [{"location": r["loc"], "name": r["name"],
+                                 "onHand": round(r["on_hand"] or 0, 1), "unit": r["unit"]}
+                                for r in loc_cons],
+            },
         }
 
     def _disposed_in_month(self, conn, start, end):
@@ -1993,6 +2015,23 @@ def report_workbook(data, spname, skname):
     oh = {r["name"]: r["onHand"] for r in data["consumables"]["onHand"]}
     for r in data["consumables"]["inMonth"]:
         s.row([T(r["name"]), T(r["unit"]), N(r["received"], 5), N(r["used"], 5), N(oh.get(r["name"]), 5)])
+    sheets.append(s)
+
+    bl = data.get("byLocation") or {}
+    s = XlsxSheet("By Location"); s.set_widths([28, 14, 14])
+    s.title("Inventory by Location — current on hand", 3)
+    s.section("Stabilized totes", 3)
+    s.row([H("Location"), HR("Totes"), HR("Kg")])
+    for r in bl.get("stabilized", []):
+        s.row([T(r["location"]), N(r["totes"]), N(r["kg"], 5)])
+    s.section("Finished goods", 3)
+    s.row([H("Location"), HR("Units"), HR("Litres")])
+    for r in bl.get("finishedGoods", []):
+        s.row([T(r["location"]), N(r["units"]), N(r["litres"], 5)])
+    s.section("Consumables / packaging", 3)
+    s.row([H("Location"), H("Item"), HR("On hand")])
+    for r in bl.get("consumables", []):
+        s.row([T(r["location"]), T(r["name"]), N(r["onHand"], 5)])
     sheets.append(s)
 
     dz = data.get("disposed") or {}
