@@ -107,6 +107,8 @@ table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
 th { background: #eef3f2; color: var(--teal-dark); font-weight: 600; position: sticky; top: 0; cursor: default; }
 tbody tr:hover { background: #f6faf9; }
+tbody tr.clickable { cursor: pointer; }
+tbody tr.clickable:hover { background: #e9f4f1; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .mono { font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px; }
 

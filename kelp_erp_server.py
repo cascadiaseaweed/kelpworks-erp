@@ -603,7 +603,8 @@ class Handler(BaseHTTPRequestHandler):
                              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             self.send_header("Content-Length", str(len(content)))
             self.send_header("Content-Disposition",
-                             'attachment; filename="kelpworks-report-%s.xlsx"' % data["month"])
+                             'attachment; filename="kelpworks-report-%s_%s.xlsx"'
+                             % (data["from"], data["to"]))
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(content)
@@ -730,6 +731,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.route_shipments(method, seg, query, conn, user)
         if method == "GET" and seg == ["api", "reports"]:
             return self.route_reports(query, conn)
+        if method == "GET" and seg == ["api", "ledger"]:
+            return self.ledger(query, conn)
         if seg == ["api", "dispose"] and method == "POST":
             return self.dispose(conn, user)
         if seg == ["api", "disposals"] and method == "GET":
@@ -1023,6 +1026,17 @@ class Handler(BaseHTTPRequestHandler):
             location = (d.get("location") or "").strip() or None
             if not site or not species or count <= 0:
                 raise ApiError(400, "Site, species and a tote count > 0 are required")
+            # IBC totes consumed for this harvest come from a chosen source (empty
+            # IBC stock). Validate availability before creating any lots.
+            ibc_id = d.get("ibcConsumableId")
+            ibc_row = None
+            if ibc_id:
+                ibc_row = conn.execute("SELECT * FROM consumables WHERE id=?", (ibc_id,)).fetchone()
+                if not ibc_row:
+                    raise ApiError(400, "Unknown IBC tote source")
+                if ibc_row["on_hand"] < count:
+                    raise ApiError(400, "Not enough %s on hand (%g < %d)"
+                                   % (ibc_row["name"], ibc_row["on_hand"], count))
             if not conn.execute("SELECT 1 FROM sites WHERE code=?", (site,)).fetchone():
                 conn.execute("INSERT INTO sites (code,name) VALUES (?,?)", (site, site))
             if not conn.execute("SELECT 1 FROM species WHERE code=?", (species,)).fetchone():
@@ -1050,7 +1064,11 @@ class Handler(BaseHTTPRequestHandler):
                     (lot, site, species, int(date[:4]), date, n, 1000, ph, avg, location,
                      "Fresh Stabilized Ground %s" % common, ts))
                 created.append(lot)
-            return {"created": created, "avgWeightKg": avg, "count": len(created)}
+            if ibc_row:
+                self._consume(conn, ibc_row["id"], -count, "Harvest check-in (IBC fill)",
+                              "%s-%s-%s" % (site, species, datestr))
+            return {"created": created, "avgWeightKg": avg, "count": len(created),
+                    "ibcSource": ibc_row["name"] if ibc_row else None}
         raise ApiError(404, "Unknown harvest endpoint")
 
     # ---- consumables ------------------------------------------------------ #
@@ -1339,8 +1357,14 @@ class Handler(BaseHTTPRequestHandler):
             self._consume(conn, citric_row["id"], -citric, "Production run", lot)
         if sorbate and sorbate_row:
             self._consume(conn, sorbate_row["id"], -sorbate, "Production run", lot)
+        # Finished goods go into NEW clean IBCs (consume from the new-IBC pool).
         if ibc_used and ibc_row:
-            self._consume(conn, ibc_row["id"], -ibc_used, "Production run (IBC fill)", lot)
+            self._consume(conn, ibc_row["id"], -ibc_used, "Production run (FG into new IBCs)", lot)
+        # The IBC totes the stabilized kelp was stored in are now emptied by
+        # processing and return to the USED-IBC pool (one per tote processed).
+        used_row = self._consumable_by_name(conn, "Empty Used IBC Tote")
+        if used_row and rows:
+            self._consume(conn, used_row["id"], len(rows), "Emptied by processing", lot)
 
         # Create FG lots, one per package size.
         fg_created = []
@@ -1635,13 +1659,137 @@ class Handler(BaseHTTPRequestHandler):
             with_lines=True)}
 
     # ---- reports ---------------------------------------------------------- #
+    # ---- transaction ledger (report drill-down) --------------------------- #
+    def ledger(self, query, conn):
+        dim = query.get("dim", [""])[0]
+        key = query.get("key", [""])[0]
+        frm = query.get("from", [""])[0]
+        to = query.get("to", [""])[0]
+        if not (frm and to):
+            frm, to, _ = month_bounds(today_iso()[:7])
+        if frm > to:
+            frm, to = to, frm
+        txns = []        # each: {date, description, change, balance}
+        opening = 0.0
+        unit = ""
+        title = key
+
+        if dim == "consumable":
+            c = conn.execute("SELECT * FROM consumables WHERE name=? OR id=?",
+                             (key, key if str(key).isdigit() else -1)).fetchone()
+            if not c:
+                raise ApiError(404, "Consumable not found")
+            title, unit = c["name"], c["unit"]
+            # balance at start of period = current on hand minus everything from `frm` onward
+            after = conn.execute(
+                "SELECT COALESCE(SUM(delta),0) s FROM consumable_txns WHERE consumable_id=? "
+                "AND substr(created_at,1,10)>=?", (c["id"], frm)).fetchone()["s"]
+            opening = round((c["on_hand"] or 0) - (after or 0), 2)
+            rows = conn.execute(
+                "SELECT * FROM consumable_txns WHERE consumable_id=? AND substr(created_at,1,10)>=? "
+                "AND substr(created_at,1,10)<=? ORDER BY created_at, id", (c["id"], frm, to)).fetchall()
+            bal = opening
+            for r in rows:
+                bal = round(bal + (r["delta"] or 0), 2)
+                desc = r["reason"] or "Adjustment"
+                if r["ref"]:
+                    desc += " (" + r["ref"] + ")"
+                txns.append({"date": (r["created_at"] or "")[:10], "description": desc,
+                             "change": r["delta"], "balance": bal})
+
+        elif dim == "species":
+            sp = conn.execute("SELECT * FROM species WHERE code=?", (key,)).fetchone()
+            title = (sp["common"] or sp["name"]) if sp else key
+            unit = "kg"
+            opening = round(conn.execute(
+                "SELECT COALESCE(SUM(t.avg_weight_kg),0) k FROM tote_lots t "
+                "LEFT JOIN production_runs r ON r.id=t.run_id "
+                "WHERE t.species_code=? AND t.checkin_date<? "
+                "AND (t.run_id IS NULL OR r.run_date>=?) "
+                "AND (t.disposed_date IS NULL OR t.disposed_date>=?)",
+                (key, frm, frm, frm)).fetchone()["k"], 1)
+            evs = []
+            for r in conn.execute(
+                    "SELECT checkin_date d, lot_number, avg_weight_kg FROM tote_lots "
+                    "WHERE species_code=? AND checkin_date>=? AND checkin_date<=?",
+                    (key, frm, to)):
+                evs.append((r["d"], "Checked in " + r["lot_number"], r["avg_weight_kg"] or 0))
+            for r in conn.execute(
+                    "SELECT pr.run_date d, t.lot_number, pr.processing_lot, t.avg_weight_kg "
+                    "FROM tote_lots t JOIN production_runs pr ON pr.id=t.run_id "
+                    "WHERE t.species_code=? AND pr.run_date>=? AND pr.run_date<=?",
+                    (key, frm, to)):
+                evs.append((r["d"], "Consumed by " + r["processing_lot"] + " (" + r["lot_number"] + ")",
+                            -(r["avg_weight_kg"] or 0)))
+            for r in conn.execute(
+                    "SELECT disposed_date d, lot_number, avg_weight_kg FROM tote_lots "
+                    "WHERE species_code=? AND disposed_date>=? AND disposed_date<=?",
+                    (key, frm, to)):
+                evs.append((r["d"], "Disposed " + r["lot_number"], -(r["avg_weight_kg"] or 0)))
+            evs.sort(key=lambda e: e[0] or "")
+            bal = opening
+            for d_, desc, chg in evs:
+                bal = round(bal + chg, 1)
+                txns.append({"date": d_, "description": desc, "change": round(chg, 1), "balance": bal})
+
+        elif dim == "sku":
+            sk = conn.execute("SELECT * FROM fg_skus WHERE code=?", (key,)).fetchone()
+            title = sk["name"] if sk else key
+            unit = "L"
+            prod_b = conn.execute("SELECT COALESCE(SUM(output_litres),0) s FROM production_runs "
+                                  "WHERE sku_code=? AND run_date<?", (key, frm)).fetchone()["s"]
+            ship_b = conn.execute(
+                "SELECT COALESCE(SUM(sl.qty*sl.litres_each),0) s FROM shipment_lines sl "
+                "JOIN shipments s ON s.id=sl.shipment_id WHERE sl.sku_code=? AND s.status!='cancelled' "
+                "AND s.ship_date<?", (key, frm)).fetchone()["s"]
+            disp_b = conn.execute("SELECT COALESCE(SUM(litres),0) s FROM disposals "
+                                  "WHERE entity_type='fg' AND sku_code=? AND disposed_date<?",
+                                  (key, frm)).fetchone()["s"]
+            opening = round((prod_b or 0) - (ship_b or 0) - (disp_b or 0), 1)
+            evs = []
+            for r in conn.execute("SELECT run_date d, processing_lot, output_litres FROM production_runs "
+                                  "WHERE sku_code=? AND run_date>=? AND run_date<=?", (key, frm, to)):
+                evs.append((r["d"], "Produced " + r["processing_lot"], r["output_litres"] or 0))
+            for r in conn.execute(
+                    "SELECT s.ship_date d, s.shipment_no, COALESCE(cu.name,'') cust, "
+                    "SUM(sl.qty*sl.litres_each) litres FROM shipment_lines sl "
+                    "JOIN shipments s ON s.id=sl.shipment_id LEFT JOIN customers cu ON cu.id=s.customer_id "
+                    "WHERE sl.sku_code=? AND s.status!='cancelled' AND s.ship_date>=? AND s.ship_date<=? "
+                    "GROUP BY s.id", (key, frm, to)):
+                evs.append((r["d"], "Shipped " + r["shipment_no"] + (" → " + r["cust"] if r["cust"] else ""),
+                            -(r["litres"] or 0)))
+            for r in conn.execute("SELECT disposed_date d, ref, litres FROM disposals "
+                                  "WHERE entity_type='fg' AND sku_code=? AND disposed_date>=? "
+                                  "AND disposed_date<=?", (key, frm, to)):
+                evs.append((r["d"], "Disposed " + (r["ref"] or ""), -(r["litres"] or 0)))
+            evs.sort(key=lambda e: e[0] or "")
+            bal = opening
+            for d_, desc, chg in evs:
+                bal = round(bal + chg, 1)
+                txns.append({"date": d_, "description": desc, "change": round(chg, 1), "balance": bal})
+        else:
+            raise ApiError(400, "Unknown ledger dimension")
+
+        closing = round(opening + sum(t["change"] or 0 for t in txns), 2)
+        return {"title": title, "unit": unit, "from": frm, "to": to,
+                "opening": opening, "closing": closing, "txns": txns}
+
     def route_reports(self, query, conn):
-        month = query.get("month", [today_iso()[:7]])[0]
-        try:
-            start, end, _next = month_bounds(month)
-        except Exception:
-            raise ApiError(400, "Invalid month (expected YYYY-MM)")
-        asof = query.get("asof", [end])[0]   # point-in-time = end of month by default
+        frm = query.get("from", [""])[0]
+        to = query.get("to", [""])[0]
+        month = query.get("month", [""])[0]
+        if frm and to:
+            start, end = frm, to
+        elif month:
+            try:
+                start, end, _next = month_bounds(month)
+            except Exception:
+                raise ApiError(400, "Invalid month (expected YYYY-MM)")
+        else:
+            start, end, _next = month_bounds(today_iso()[:7])
+        if start > end:
+            start, end = end, start
+        asof = query.get("asof", [end])[0]   # point-in-time = end of the period
 
         def rows(sql, args=()):
             return conn.execute(sql, args).fetchall()
@@ -1737,7 +1885,9 @@ class Handler(BaseHTTPRequestHandler):
             "FROM consumables ORDER BY loc, name")
 
         return {
-            "month": month, "monthStart": start, "monthEnd": end, "asOf": asof,
+            "month": month or start[:7], "from": start, "to": end,
+            "period": _period_label(start, end),
+            "monthStart": start, "monthEnd": end, "asOf": asof,
             "stabilized": {"created": sp_tot(created), "consumed": sp_tot(consumed),
                            "onHand": sp_tot(onhand_stab)},
             "production": {
@@ -1895,6 +2045,25 @@ def month_bounds(month):
     start = datetime.date(y, m, 1)
     nm = datetime.date(y + (1 if m == 12 else 0), (m % 12) + 1, 1)
     return start.isoformat(), (nm - datetime.timedelta(days=1)).isoformat(), nm.isoformat()
+
+
+def _period_label(start, end):
+    """Human label for a date range, e.g. 'Jun 1 – Jun 18, 2026'."""
+    try:
+        a = datetime.date.fromisoformat(start)
+        b = datetime.date.fromisoformat(end)
+    except Exception:
+        return "%s - %s" % (start, end)
+    if a == b:
+        return a.strftime("%b %-d, %Y") if os.name != "nt" else a.strftime("%b %#d, %Y")
+    fmt_d = "%b %#d" if os.name == "nt" else "%b %-d"
+    if (a.year, a.month) == (b.year, b.month):
+        left = a.strftime(fmt_d)
+    elif a.year == b.year:
+        left = a.strftime(fmt_d)
+    else:
+        left = a.strftime(fmt_d + ", %Y")
+    return "%s – %s" % (left, b.strftime(fmt_d + ", %Y"))
 
 
 def _fmtval(v):
@@ -2071,13 +2240,11 @@ def xlsx_build(sheets):
 
 def report_workbook(data, spname, skname):
     """Build a formatted multi-sheet .xlsx from the reports payload."""
-    def mlabel(m):
-        return datetime.date(int(m[:4]), int(m[5:7]), 1).strftime("%B %Y")
     T = lambda v, s=0: ("t", v, s)
     N = lambda v, s=4: (("n", v, s) if v is not None else ("t", "—", 0))
     H = lambda v: ("t", v, 3)
     HR = lambda v: ("t", v, 9)
-    ml = mlabel(data["month"])
+    ml = data.get("period") or data.get("month", "")
     sheets = []
 
     s = XlsxSheet("Summary"); s.set_widths([38, 16, 10])

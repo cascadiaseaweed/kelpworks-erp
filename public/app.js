@@ -347,10 +347,12 @@ async function moveFG(f) {
     toast('Moved ' + fmt(qty) + ' × ' + f.packageSize + ' to ' + to); render();
   }, 'Move');
 }
-function openHarvest() {
+async function openHarvest() {
   const sites = State.ref.sites.map(s => [s.code, s.code + ' — ' + s.name]);
   const species = State.ref.species.map(s => [s.code, s.common || s.name]);
   const locs = State.ref.locations.map(l => [l, l]);
+  const ibcSources = (await api('GET', '/consumables')).consumables.filter(c => c.unit === 'tote');
+  const ibcOpts = ibcSources.map(c => [String(c.id), c.name + ' (' + fmt(c.onHand, 0) + ' on hand)']);
   const body = el('div', {},
     el('div', { class: 'form-row' },
       field('Farm site', selectFrom('', sites, null, 'h_site')),
@@ -362,7 +364,9 @@ function openHarvest() {
       field('Number of totes', el('input', { type: 'number', id: 'h_count', min: '1', value: '1' })),
       field('Total harvest (kg)', el('input', { type: 'number', id: 'h_kg', min: '0', step: '0.01', placeholder: 'averaged across totes' }))),
     el('div', { class: 'form-row' },
-      field('pH', el('input', { type: 'number', id: 'h_ph', step: '0.1', placeholder: 'e.g. 3.7' })), el('div', {})),
+      field('IBC tote source', ibcOpts.length ? selectFrom('', ibcOpts, null, 'h_ibc') : el('input', { id: 'h_ibc', disabled: 'disabled', placeholder: 'no IBC stock' })),
+      field('pH', el('input', { type: 'number', id: 'h_ph', step: '0.1', placeholder: 'e.g. 3.7' }))),
+    el('div', { class: 'help' }, 'The selected empty-IBC stock is reduced by the number of totes checked in.'),
     el('div', { class: 'help', id: 'h_preview' }));
   const c_count = body.querySelector('#h_count'), c_kg = body.querySelector('#h_kg');
   const upd = () => {
@@ -371,15 +375,17 @@ function openHarvest() {
   };
   c_count.addEventListener('input', upd); c_kg.addEventListener('input', upd); upd();
   modal('Check in a harvest batch', body, async () => {
+    const ibcSel = body.querySelector('#h_ibc');
+    const ibcId = ibcSel && ibcSel.value && !ibcSel.disabled ? +ibcSel.value : null;
     const payload = {
       site: body.querySelector('#h_site').value, species: body.querySelector('#h_species').value,
       checkinDate: body.querySelector('#h_date').value, location: body.querySelector('#h_loc').value,
       toteCount: +body.querySelector('#h_count').value, totalKg: +body.querySelector('#h_kg').value,
-      ph: body.querySelector('#h_ph').value || null
+      ph: body.querySelector('#h_ph').value || null, ibcConsumableId: ibcId
     };
     const r = await api('POST', '/harvest', payload);
     State.ref = await api('GET', '/refdata');
-    toast(`Created ${r.count} totes · ${r.avgWeightKg} kg each`);
+    toast(`Created ${r.count} totes · ${r.avgWeightKg} kg each` + (r.ibcSource ? ` · ${r.count} from ${r.ibcSource}` : ''));
     render();
   }, 'Check in');
 }
@@ -407,6 +413,7 @@ async function pageProduction(v) {
         sl('Conversion factor', run.inputKg ? (run.outputLitres / run.inputKg).toFixed(2) + ' L/kg' : '—'),
         sl('Target TDS', run.targetTds != null ? run.targetTds + '%' : '—'),
         sl('Citric', fmt(run.citricKg, 1) + ' kg'), sl('Sorbate', fmt(run.sorbateKg, 1) + ' kg'),
+        sl('New IBCs filled', fmt(run.ibcUsed)), sl('Used IBCs freed', fmt(run.inputTotes.length)),
         sl('Packaged', fgList)),
       el('div', { class: 'muted', style: 'margin-top:8px;font-size:12px' },
         `Consumed ${run.inputTotes.length} tote(s): `, el('span', { class: 'mono' }, run.inputTotes.join(', '))),
@@ -960,31 +967,41 @@ function monthLabel(m) {
 }
 async function pageReports(v) {
   const now = new Date();
-  const defMonth = State.reportMonth || (now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0'));
-  const monthInput = el('input', { type: 'month', id: 'rp_month', value: defMonth, style: 'width:auto', onchange: gen });
+  const iso = dt => `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+  const def = State.reportRange || { from: iso(new Date(now.getFullYear(), now.getMonth(), 1)), to: iso(now) };
+  const fromInput = el('input', { type: 'date', id: 'rp_from', value: def.from, style: 'width:auto', onchange: gen });
+  const toInput = el('input', { type: 'date', id: 'rp_to', value: def.to, style: 'width:auto', onchange: gen });
+  const preset = (f, t) => { fromInput.value = f; toInput.value = t; gen(); };
   v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Reports'),
     el('div', { class: 'actions' },
-      el('label', { style: 'margin:0 6px 0 0' }, 'Month'), monthInput,
       el('button', { class: 'secondary', onclick: () => printReport(State.reportData) }, '🖨 Print / PDF'),
       el('button', { onclick: downloadReportXlsx }, '⬇ Export Excel'),
       el('button', { class: 'secondary', onclick: () => exportReportCsv(State.reportData) }, 'CSV'))));
+  v.append(el('div', { class: 'toolbar' },
+    el('label', { style: 'margin:0 4px 0 0' }, 'From'), fromInput,
+    el('label', { style: 'margin:0 4px 0 10px' }, 'To'), toInput,
+    el('span', { style: 'margin-left:10px' },
+      el('button', { class: 'secondary', onclick: () => preset(iso(new Date(now.getFullYear(), now.getMonth(), 1)), iso(now)) }, 'This month'),
+      el('button', { class: 'secondary', onclick: () => preset(iso(new Date(now.getFullYear(), now.getMonth() - 1, 1)), iso(new Date(now.getFullYear(), now.getMonth(), 0))) }, 'Last month'),
+      el('button', { class: 'secondary', onclick: () => preset(iso(new Date(now.getFullYear(), 0, 1)), iso(now)) }, 'Year to date'))));
   const host = el('div', {});
   v.append(host);
   async function gen() {
-    State.reportMonth = monthInput.value;
-    host.innerHTML = '';
-    host.append(el('div', { class: 'muted' }, 'Loading…'));
-    const d = await api('GET', '/reports?month=' + encodeURIComponent(monthInput.value));
-    State.reportData = d;
-    host.innerHTML = '';
-    renderReport(host, d);
+    if (fromInput.value && toInput.value && fromInput.value > toInput.value) {
+      const t = fromInput.value; fromInput.value = toInput.value; toInput.value = t;
+    }
+    State.reportRange = { from: fromInput.value, to: toInput.value };
+    host.innerHTML = ''; host.append(el('div', { class: 'muted' }, 'Loading…'));
+    const d = await api('GET', '/reports?from=' + encodeURIComponent(fromInput.value) + '&to=' + encodeURIComponent(toInput.value));
+    State.reportData = d; host.innerHTML = ''; renderReport(host, d);
   }
   gen();
 }
 function renderReport(host, d) {
   host.append(el('div', { class: 'muted', style: 'margin-bottom:10px' },
-    'Activity during ', el('b', {}, monthLabel(d.month)),
-    ' · on-hand balances as of ', el('b', {}, d.asOf)));
+    'Activity ', el('b', {}, d.period),
+    ' · on-hand balances as of ', el('b', {}, d.asOf),
+    ' · ', el('span', { class: 'help', style: 'display:inline' }, 'click any species / SKU / item row for its transaction ledger')));
   host.append(el('div', { class: 'tiles' },
     tile('Stabilized created', fmt(d.stabilized.created.kg, 0), 'kg · ' + fmt(d.stabilized.created.totes) + ' totes', true),
     tile('Stabilized consumed', fmt(d.stabilized.consumed.kg, 0), 'kg · ' + fmt(d.stabilized.consumed.totes) + ' totes'),
@@ -994,14 +1011,13 @@ function renderReport(host, d) {
     tile('Finished goods on hand', fmt(d.finishedGoods.onHandLitres, 0), 'L at ' + d.asOf),
     tile('Written off', fmt(d.disposed ? d.disposed.fgLitres : 0, 0), 'L FG · ' + fmt(d.disposed ? d.disposed.toteKg : 0, 0) + ' kg totes')));
 
-  const spRows = src => src.bySpecies.map(r => [speciesName(r.species), fmt(r.totes), num(fmt(r.kg, 0))]);
+  const spTable = block => table(['Species', 'Totes', 'Kg'],
+    block.bySpecies.map(r => [speciesName(r.species), fmt(r.totes), num(fmt(r.kg, 0))]),
+    [false, true, true], i => openLedger('species', block.bySpecies[i].species));
   host.append(el('div', { class: 'grid2' },
-    el('div', { class: 'card' }, el('h3', {}, 'Stabilized inventory — created (' + monthLabel(d.month) + ')'),
-      table(['Species', 'Totes', 'Kg'], spRows(d.stabilized.created), [false, true, true])),
-    el('div', { class: 'card' }, el('h3', {}, 'Stabilized inventory — consumed into production'),
-      table(['Species', 'Totes', 'Kg'], spRows(d.stabilized.consumed), [false, true, true]))));
-  host.append(el('div', { class: 'card' }, el('h3', {}, 'Stabilized inventory on hand — ' + d.asOf),
-    table(['Species', 'Totes', 'Kg'], spRows(d.stabilized.onHand), [false, true, true])));
+    el('div', { class: 'card' }, el('h3', {}, 'Stabilized inventory — created (' + d.period + ')'), spTable(d.stabilized.created)),
+    el('div', { class: 'card' }, el('h3', {}, 'Stabilized inventory — consumed into production'), spTable(d.stabilized.consumed))));
+  host.append(el('div', { class: 'card' }, el('h3', {}, 'Stabilized inventory on hand — ' + d.asOf), spTable(d.stabilized.onHand)));
 
   const pr = d.production;
   host.append(el('div', { class: 'card' }, el('h3', {}, 'Production summary'),
@@ -1011,20 +1027,24 @@ function renderReport(host, d) {
       sl('Yield', pr.yield != null ? pr.yield.toFixed(2) + ' L/kg' : '—'),
       sl('Citric', fmt(pr.citricKg, 1) + ' kg'), sl('Sorbate', fmt(pr.sorbateKg, 1) + ' kg')),
     pr.bySku.length ? table(['SKU', 'Runs', 'Litres produced'],
-      pr.bySku.map(r => [skuName(r.sku), fmt(r.runs), num(fmt(r.litres, 0))]), [false, true, true]) : null));
+      pr.bySku.map(r => [skuName(r.sku), fmt(r.runs), num(fmt(r.litres, 0))]), [false, true, true],
+      i => openLedger('sku', pr.bySku[i].sku)) : null));
 
   const fg = d.finishedGoods;
   host.append(el('div', { class: 'grid2' },
     el('div', { class: 'card' }, el('h3', {}, 'Finished goods shipped — by customer'),
       table(['Customer', 'Units', 'Litres'], fg.shippedByCustomer.map(r => [r.customer, fmt(r.units), num(fmt(r.litres, 0))]), [false, true, true])),
     el('div', { class: 'card' }, el('h3', {}, 'Finished goods on hand — ' + d.asOf),
-      table(['SKU', 'Litres'], fg.onHand.map(r => [skuName(r.sku), num(fmt(r.litres, 0))]), [false, true]))));
+      table(['SKU', 'Litres'], fg.onHand.map(r => [skuName(r.sku), num(fmt(r.litres, 0))]), [false, true],
+        i => openLedger('sku', fg.onHand[i].sku)))));
 
   host.append(el('div', { class: 'grid2' },
-    el('div', { class: 'card' }, el('h3', {}, 'Consumables — received / used (' + monthLabel(d.month) + ')'),
-      table(['Item', 'Received', 'Used'], d.consumables.inMonth.map(r => [r.name + ' (' + r.unit + ')', num(fmt(r.received, 1)), num(fmt(r.used, 1))]), [false, true, true])),
+    el('div', { class: 'card' }, el('h3', {}, 'Consumables — received / used (' + d.period + ')'),
+      table(['Item', 'Received', 'Used'], d.consumables.inMonth.map(r => [r.name + ' (' + r.unit + ')', num(fmt(r.received, 1)), num(fmt(r.used, 1))]), [false, true, true],
+        i => openLedger('consumable', d.consumables.inMonth[i].name))),
     el('div', { class: 'card' }, el('h3', {}, 'Consumables on hand — ' + d.asOf),
-      table(['Item', 'On hand'], d.consumables.onHand.map(r => [r.name, fmt(r.onHand, 1) + ' ' + r.unit]), [false, true]))));
+      table(['Item', 'On hand'], d.consumables.onHand.map(r => [r.name, fmt(r.onHand, 1) + ' ' + r.unit]), [false, true],
+        i => openLedger('consumable', d.consumables.onHand[i].name)))));
 
   const bl = d.byLocation;
   if (bl) {
@@ -1036,12 +1056,13 @@ function renderReport(host, d) {
     host.append(el('div', { class: 'card' },
       el('h3', {}, 'Consumables / packaging by location'),
       el('div', { class: 'help', style: 'margin:-6px 0 8px' }, 'Current on-hand location of inventory.'),
-      table(['Location', 'Item', 'On hand'], bl.consumables.map(r => [r.location, r.name, fmt(r.onHand, 1) + ' ' + r.unit]), [false, false, true])));
+      table(['Location', 'Item', 'On hand'], bl.consumables.map(r => [r.location, r.name, fmt(r.onHand, 1) + ' ' + r.unit]), [false, false, true],
+        i => openLedger('consumable', bl.consumables[i].name))));
   }
 
   const dz = d.disposed;
   if (dz) {
-    host.append(el('div', { class: 'card' }, el('h3', {}, 'Disposed / written off — ' + monthLabel(d.month)),
+    host.append(el('div', { class: 'card' }, el('h3', {}, 'Disposed / written off — ' + d.period),
       el('div', { class: 'summary-line' },
         sl('Totes', fmt(dz.totes) + ' (' + fmt(dz.toteKg, 0) + ' kg)'),
         sl('FG lots', fmt(dz.fgLots) + ' (' + fmt(dz.fgLitres, 0) + ' L)'),
@@ -1066,7 +1087,7 @@ function printReport(d) {
     .tiles{display:flex;gap:18px;margin:10px 0;flex-wrap:wrap;} .ti{font-size:11px;color:#666;} .ti b{display:block;font-size:18px;color:#15564F;}
     .co{display:flex;align-items:center;gap:10px;} .hd img{height:46px;width:auto;}`;
   w.document.write(`<!doctype html><html><head><title>Manufacturing Report ${d.month}</title><style>${css}</style></head><body>
-    <div class="hd"><div class="co"><img src="${location.origin}/logo.png" alt="">CASCADIA SEAWEED</div><div style="text-align:right"><h1 style="margin:0">MANUFACTURING REPORT</h1>${monthLabel(d.month)} · on hand as of ${d.asOf}</div></div>
+    <div class="hd"><div class="co"><img src="${location.origin}/logo.png" alt="">CASCADIA SEAWEED</div><div style="text-align:right"><h1 style="margin:0">MANUFACTURING REPORT</h1>${d.period} · on hand as of ${d.asOf}</div></div>
     <div class="tiles">
       <div class="ti">Stabilized created<b>${fmt(d.stabilized.created.kg, 0)} kg</b></div>
       <div class="ti">Stabilized consumed<b>${fmt(d.stabilized.consumed.kg, 0)} kg</b></div>
@@ -1092,17 +1113,31 @@ function printReport(d) {
   w.document.close();
 }
 function downloadReportXlsx() {
-  const m = (document.querySelector('#rp_month') || {}).value || State.reportMonth;
-  if (!m) return toast('Pick a month first.', true);
-  const url = '/api/reports/xlsx?month=' + encodeURIComponent(m) + '&token=' + encodeURIComponent(State.token);
-  const a = el('a', { href: url, download: 'kelpworks-report-' + m + '.xlsx' });
+  const r = State.reportRange;
+  if (!r || !r.from || !r.to) return toast('Pick a date range first.', true);
+  const url = '/api/reports/xlsx?from=' + encodeURIComponent(r.from) + '&to=' + encodeURIComponent(r.to) + '&token=' + encodeURIComponent(State.token);
+  const a = el('a', { href: url, download: 'kelpworks-report-' + r.from + '_' + r.to + '.xlsx' });
   document.body.append(a); a.click(); a.remove();
+}
+function signed(n) { if (n == null) return '—'; const s = Number(n); return (s > 0 ? '+' : '') + fmt(s, 1); }
+async function openLedger(dim, key) {
+  const r = State.reportData; if (!r) return;
+  const data = await api('GET', '/ledger?dim=' + dim + '&key=' + encodeURIComponent(key) + '&from=' + r.from + '&to=' + r.to);
+  const u = data.unit ? ' ' + data.unit : '';
+  const body = el('div', {},
+    el('div', { class: 'summary-line' }, sl('Item', data.title), sl('Period', r.period),
+      sl('Opening', fmt(data.opening, 1) + u), sl('Closing', fmt(data.closing, 1) + u)),
+    data.txns.length
+      ? table(['Date', 'Transaction', 'Change', 'Balance'],
+        data.txns.map(t => [t.date, t.description, signed(t.change), fmt(t.balance, 1) + u]), [false, false, true, true])
+      : el('div', { class: 'help' }, 'No transactions in this period.'));
+  modal('Transactions — ' + data.title, body, async () => {}, 'Done');
 }
 function exportReportCsv(d) {
   if (!d) return toast('Nothing to export yet.', true);
   const lines = [];
   const add = (...cols) => lines.push(cols.map(c => '"' + String(c == null ? '' : c).replace(/"/g, '""') + '"').join(','));
-  add('Cascadia Seaweed — Manufacturing Report', monthLabel(d.month), 'On hand as of', d.asOf);
+  add('Cascadia Seaweed — Manufacturing Report', d.period, 'On hand as of', d.asOf);
   add('');
   add('STABILIZED INVENTORY'); add('Metric', 'Species', 'Totes', 'Kg');
   const sp = (label, s) => s.bySpecies.forEach(r => add(label, speciesName(r.species), r.totes, r.kg));
@@ -1210,11 +1245,14 @@ function printLabels(labels) {
 }
 
 /* ---------------- shared UI bits ---------------- */
-function table(headers, rows, numCols = []) {
+function table(headers, rows, numCols = [], rowClick = null) {
   const thead = el('thead', {}, el('tr', {}, ...headers.map((h, i) => el('th', { class: numCols[i] ? 'num' : '' }, h))));
   const tb = el('tbody', {});
   if (!rows.length) tb.append(el('tr', {}, el('td', { colspan: headers.length, class: 'empty' }, 'Nothing here yet.')));
-  for (const r of rows) tb.append(el('tr', {}, ...r.map((c, i) => el('td', { class: numCols[i] ? 'num' : '' }, c == null ? '—' : (c.nodeType ? c : String(c))))));
+  rows.forEach((r, ri) => {
+    const cells = r.map((c, i) => el('td', { class: numCols[i] ? 'num' : '' }, c == null ? '—' : (c.nodeType ? c : String(c))));
+    tb.append(el('tr', rowClick ? { class: 'clickable', onclick: () => rowClick(ri) } : {}, ...cells));
+  });
   return el('div', { class: 'tablewrap' }, el('table', {}, thead, tb));
 }
 function mono(s) { return el('span', { class: 'mono' }, s); }
