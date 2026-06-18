@@ -1243,7 +1243,9 @@ function modal(title, body, onSubmit, submitLabel = 'Save', opts = {}) {
   if (!opts.noCancel) actions.append(el('button', { class: 'secondary', onclick: close }, 'Cancel'));
   actions.append(submitBtn);
   const card = el('div', { class: 'modal' }, el('h3', {}, title), body, errBox, actions);
-  const bg = el('div', { class: 'modal-bg', onclick: e => { if (e.target === bg && !opts.noBackdropClose) close(); } }, card);
+  // Backdrop clicks do NOT close the dialog — only Cancel or completing the
+  // action does, so a stray click off the popup can't discard your input.
+  const bg = el('div', { class: 'modal-bg' }, card);
   function close() { bg.remove(); }
   submitBtn.addEventListener('click', async () => {
     errBox.textContent = ''; submitBtn.disabled = true;
