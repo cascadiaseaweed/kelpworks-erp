@@ -113,6 +113,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .badge { display:inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
 .badge.in_stock, .badge.on_hand { background: #e2f3ef; color: var(--teal-dark); }
 .badge.consumed, .badge.sold { background: #eceff0; color: var(--muted); }
+.badge.disposed { background: #f1e0e0; color: #9a4040; text-decoration: line-through; }
 .badge.hold { background: #fcefd6; color: var(--warn); }
 .badge.low { background: #fbe3df; color: var(--danger); }
 .pill { display:inline-block; padding:1px 7px; border-radius:6px; background:#eef3f2; color:var(--teal-dark); font-weight:600; font-size:11px; }

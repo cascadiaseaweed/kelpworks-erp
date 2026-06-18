@@ -133,7 +133,7 @@ async function pageStabilized(v) {
   stabCache = r.totes;
   const search = el('input', { placeholder: 'Search lot / location…', oninput: drawStab });
   const spcF = selectFrom('Species', [['', 'All species'], ...(State.ref.species.map(s => [s.code, s.common || s.name]))], drawStab);
-  const stF = selectFrom('Status', [['', 'All'], ['in_stock', 'In stock'], ['consumed', 'Consumed']], drawStab);
+  const stF = selectFrom('Status', [['', 'All'], ['in_stock', 'In stock'], ['consumed', 'Consumed'], ['disposed', 'Disposed']], drawStab);
   const bar = el('div', { class: 'toolbar' }, search, spcF, stF, el('span', { class: 'muted', id: 'stabCount' }));
   const bulkBar = el('div', { class: 'bulkbar hidden' });
   const host = el('div', {});
@@ -149,6 +149,7 @@ async function pageStabilized(v) {
     bulkBar.append(
       el('span', {}, el('b', {}, n), ' tote' + (n === 1 ? '' : 's') + ' selected'),
       el('button', { onclick: () => bulkMoveTotes([...selected]) }, 'Move selected'),
+      el('button', { class: 'danger', onclick: () => disposeSimple('tote', [...selected], 'tote') }, 'Dispose / write off'),
       el('button', { class: 'secondary', onclick: () => { selected.clear(); drawStab(); } }, 'Clear'));
   }
   function drawStab() {
@@ -172,7 +173,7 @@ async function pageStabilized(v) {
         rowCheck(t, selected, updateBulk),
         mono(t.lot), t.site, speciesName(t.species), t.checkinDate || '—',
         num(fmt(t.avgWeightKg, 1)), phCell(t), t.location || '—',
-        badge(t.status, t.status === 'in_stock' ? 'In stock' : 'Consumed'),
+        badge(t.status, t.status === 'in_stock' ? 'In stock' : t.status === 'disposed' ? 'Disposed' : 'Consumed'),
         rowActions([
           t.status === 'in_stock' ? ['Move', () => moveTote(t)] : null,
           t.status === 'in_stock' ? ['Update pH', () => updatePh(t)] : null,
@@ -186,12 +187,48 @@ async function pageStabilized(v) {
   drawStab();
 }
 function rowCheck(item, selected, onChange) {
-  if (item.status === 'consumed' || item.status === 'sold') return '';
+  if (item.status === 'consumed' || item.status === 'sold' || item.status === 'disposed') return '';
   const cb = el('input', { type: 'checkbox', class: 'rowcheck', onchange: () => {
     cb.checked ? selected.add(item.id) : selected.delete(item.id); onChange();
   } });
   cb.checked = selected.has(item.id);
   return cb;
+}
+function disposeSimple(type, ids, noun) {
+  const body = el('div', {},
+    el('div', { class: 'summary-line' }, sl('Writing off', ids.length + ' ' + noun + (ids.length === 1 ? '' : 's'))),
+    field('Reason / description (required)', el('textarea', { id: 'dz_reason', rows: '2', placeholder: 'e.g. spoilage, failed QA, contamination, expired' })),
+    field('Date', el('input', { type: 'date', id: 'dz_date', value: todayStr() })),
+    el('div', { class: 'help' }, 'Permanently writes the selected ' + noun + (ids.length === 1 ? '' : 's') + ' off inventory. The reason is logged with your name.'));
+  modal('Dispose / write off ' + ids.length + ' ' + noun + (ids.length === 1 ? '' : 's'), body, async () => {
+    const reason = body.querySelector('#dz_reason').value.trim();
+    if (!reason) throw new Error('A reason / description is required.');
+    const r = await api('POST', '/dispose', { type, itemIds: ids, reason, date: body.querySelector('#dz_date').value });
+    State.ref = await api('GET', '/refdata');
+    toast('Wrote off ' + r.disposed + ' ' + noun + (r.disposed === 1 ? '' : 's')); render();
+  }, 'Dispose');
+}
+function disposeConsumables(items) {
+  const qty = {};
+  const grid = el('div', {}, ...items.map(c => {
+    const inp = el('input', { type: 'number', min: '0', max: c.onHand, step: '0.1', value: '0', style: 'width:90px' });
+    qty[c.id] = inp;
+    return el('div', { class: 'form-row', style: 'align-items:center' },
+      field('', el('span', {}, el('b', {}, c.name), ' ', el('span', { class: 'muted' }, '(' + fmt(c.onHand, 1) + ' ' + c.unit + ' on hand)'))),
+      field('Qty to write off', inp));
+  }));
+  const body = el('div', {},
+    field('Reason / description (required)', el('textarea', { id: 'dz_reason', rows: '2', placeholder: 'e.g. expired, spilled, contaminated' })),
+    field('Date', el('input', { type: 'date', id: 'dz_date', value: todayStr() })),
+    el('h3', { style: 'margin:14px 0 6px;font-size:14px' }, 'Quantities to write off'), grid);
+  modal('Dispose / write off consumables', body, async () => {
+    const reason = body.querySelector('#dz_reason').value.trim();
+    if (!reason) throw new Error('A reason / description is required.');
+    const lines = items.map(c => ({ id: c.id, qty: +qty[c.id].value || 0 })).filter(l => l.qty > 0);
+    if (!lines.length) throw new Error('Enter a quantity for at least one item.');
+    const r = await api('POST', '/dispose', { type: 'consumable', items: lines, reason, date: body.querySelector('#dz_date').value });
+    toast('Wrote off ' + r.disposed + ' item' + (r.disposed === 1 ? '' : 's')); render();
+  }, 'Dispose');
 }
 function bulkMoveTotes(ids) {
   const locs = State.ref.locations.map(l => [l, l]);
@@ -573,6 +610,7 @@ async function pageFG(v) {
     bulkBar.append(
       el('span', {}, el('b', {}, n), ' lot' + (n === 1 ? '' : 's') + ' selected'),
       el('button', { onclick: () => bulkMoveFG([...selected]) }, 'Move selected'),
+      el('button', { class: 'danger', onclick: () => disposeSimple('fg', [...selected], 'lot') }, 'Dispose / write off'),
       el('button', { class: 'secondary', onclick: () => { selected.clear(); draw(); } }, 'Clear'));
   }
   function draw() {
@@ -837,13 +875,38 @@ async function pageConsumables(v) {
   v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Consumables & Packaging'),
     el('div', { class: 'actions' }, el('button', { onclick: addConsumable }, '+ Add item'))));
   const r = await api('GET', '/consumables');
-  v.append(table(
-    ['Item', 'On hand', 'Reorder at', 'Cost/unit', '', 'Actions'],
-    r.consumables.map(c => [
-      c.name, fmt(c.onHand, 1) + ' ' + c.unit, fmt(c.reorderLevel, 1), c.costPerUnit != null ? '$' + fmt(c.costPerUnit, 2) : '—',
-      badge(c.low ? 'low' : 'ok', c.low ? 'LOW' : 'OK'),
-      rowActions([['Receive', () => adjustC(c, 1)], ['Use', () => adjustC(c, -1)], ['Edit', () => editC(c)]])
-    ]), [false, true, true, true, false, false]));
+  const bulkBar = el('div', { class: 'bulkbar hidden' });
+  const host = el('div', {});
+  v.append(bulkBar, host);
+  const selected = new Set();
+  function updateBulk() {
+    const n = selected.size;
+    bulkBar.classList.toggle('hidden', n === 0);
+    bulkBar.innerHTML = '';
+    if (!n) return;
+    bulkBar.append(
+      el('span', {}, el('b', {}, n), ' item' + (n === 1 ? '' : 's') + ' selected'),
+      el('button', { class: 'danger', onclick: () => disposeConsumables(r.consumables.filter(c => selected.has(c.id))) }, 'Dispose / write off'),
+      el('button', { class: 'secondary', onclick: () => { selected.clear(); draw(); } }, 'Clear'));
+  }
+  function draw() {
+    host.innerHTML = '';
+    const allCb = el('input', { type: 'checkbox', title: 'Select all', onchange: () => {
+      r.consumables.forEach(c => allCb.checked ? selected.add(c.id) : selected.delete(c.id)); draw();
+    } });
+    allCb.checked = r.consumables.length > 0 && r.consumables.every(c => selected.has(c.id));
+    host.append(table(
+      [allCb, 'Item', 'Location', 'On hand', 'Reorder at', 'Cost/unit', '', 'Actions'],
+      r.consumables.map(c => [
+        rowCheck(c, selected, updateBulk),
+        c.name, c.location || '—', fmt(c.onHand, 1) + ' ' + c.unit, fmt(c.reorderLevel, 1), c.costPerUnit != null ? '$' + fmt(c.costPerUnit, 2) : '—',
+        badge(c.low ? 'low' : 'ok', c.low ? 'LOW' : 'OK'),
+        rowActions([['Receive', () => adjustC(c, 1)], ['Use', () => adjustC(c, -1)],
+          ['Dispose', () => disposeConsumables([c]), 'danger'], ['Edit', () => editC(c)]])
+      ]), [false, false, false, true, true, true, false, false]));
+    updateBulk();
+  }
+  draw();
 }
 function adjustC(c, sign) {
   const body = el('div', {},
@@ -858,22 +921,30 @@ function adjustC(c, sign) {
   }, sign > 0 ? 'Receive' : 'Use');
 }
 function editC(c) {
-  const body = el('div', { class: 'form-row' },
-    field('Reorder level', el('input', { type: 'number', id: 'c_re', value: c.reorderLevel, step: '0.1' })),
-    field('Cost per unit', el('input', { type: 'number', id: 'c_cost', value: c.costPerUnit ?? '', step: '0.01' })));
+  const locs = State.ref.locations.map(l => [l, l]);
+  const body = el('div', {},
+    el('div', { class: 'form-row' },
+      field('Reorder level', el('input', { type: 'number', id: 'c_re', value: c.reorderLevel, step: '0.1' })),
+      field('Cost per unit', el('input', { type: 'number', id: 'c_cost', value: c.costPerUnit ?? '', step: '0.01' }))),
+    field('Warehouse location', editableSelect(locs, 'c_loc')));
+  body.querySelector('#c_loc').value = c.location || '';
   modal('Edit ' + c.name, body, async () => {
-    await api('PUT', '/consumables/' + c.id, { reorderLevel: +body.querySelector('#c_re').value, costPerUnit: body.querySelector('#c_cost').value || null });
+    await api('PUT', '/consumables/' + c.id, { reorderLevel: +body.querySelector('#c_re').value, costPerUnit: body.querySelector('#c_cost').value || null, location: body.querySelector('#c_loc').value });
+    State.ref = await api('GET', '/refdata');
     toast('Updated'); render();
   }, 'Save');
 }
 function addConsumable() {
+  const locs = State.ref.locations.map(l => [l, l]);
   const body = el('div', {},
     el('div', { class: 'form-row' }, field('Name', el('input', { id: 'n_name' })), field('Unit', el('input', { id: 'n_unit', value: 'kg' }))),
     el('div', { class: 'form-row' }, field('On hand', el('input', { type: 'number', id: 'n_oh', value: '0' })),
       field('Reorder level', el('input', { type: 'number', id: 'n_re', value: '0' }))),
-    field('Cost per unit', el('input', { type: 'number', id: 'n_cost', step: '0.01' })));
-  modal('Add consumable', body, async () => {
-    await api('POST', '/consumables', { name: body.querySelector('#n_name').value, unit: body.querySelector('#n_unit').value, onHand: +body.querySelector('#n_oh').value, reorderLevel: +body.querySelector('#n_re').value, costPerUnit: body.querySelector('#n_cost').value || null });
+    el('div', { class: 'form-row' }, field('Cost per unit', el('input', { type: 'number', id: 'n_cost', step: '0.01' })),
+      field('Warehouse location', editableSelect(locs, 'n_loc'))));
+  modal('Add consumable / packaging', body, async () => {
+    await api('POST', '/consumables', { name: body.querySelector('#n_name').value, unit: body.querySelector('#n_unit').value, onHand: +body.querySelector('#n_oh').value, reorderLevel: +body.querySelector('#n_re').value, costPerUnit: body.querySelector('#n_cost').value || null, location: body.querySelector('#n_loc').value });
+    State.ref = await api('GET', '/refdata');
     toast('Added'); render();
   }, 'Add');
 }
@@ -916,7 +987,8 @@ function renderReport(host, d) {
     tile('LKE produced', fmt(d.production.outputLitres, 0), 'L · ' + fmt(d.production.runs) + ' runs'),
     tile('LKE shipped', fmt(d.finishedGoods.shippedLitres, 0), 'L'),
     tile('Stabilized on hand', fmt(d.stabilized.onHand.kg, 0), 'kg at ' + d.asOf),
-    tile('Finished goods on hand', fmt(d.finishedGoods.onHandLitres, 0), 'L at ' + d.asOf)));
+    tile('Finished goods on hand', fmt(d.finishedGoods.onHandLitres, 0), 'L at ' + d.asOf),
+    tile('Written off', fmt(d.disposed ? d.disposed.fgLitres : 0, 0), 'L FG · ' + fmt(d.disposed ? d.disposed.toteKg : 0, 0) + ' kg totes')));
 
   const spRows = src => src.bySpecies.map(r => [speciesName(r.species), fmt(r.totes), num(fmt(r.kg, 0))]);
   host.append(el('div', { class: 'grid2' },
@@ -949,6 +1021,20 @@ function renderReport(host, d) {
       table(['Item', 'Received', 'Used'], d.consumables.inMonth.map(r => [r.name + ' (' + r.unit + ')', num(fmt(r.received, 1)), num(fmt(r.used, 1))]), [false, true, true])),
     el('div', { class: 'card' }, el('h3', {}, 'Consumables on hand — ' + d.asOf),
       table(['Item', 'On hand'], d.consumables.onHand.map(r => [r.name, fmt(r.onHand, 1) + ' ' + r.unit]), [false, true]))));
+
+  const dz = d.disposed;
+  if (dz) {
+    host.append(el('div', { class: 'card' }, el('h3', {}, 'Disposed / written off — ' + monthLabel(d.month)),
+      el('div', { class: 'summary-line' },
+        sl('Totes', fmt(dz.totes) + ' (' + fmt(dz.toteKg, 0) + ' kg)'),
+        sl('FG lots', fmt(dz.fgLots) + ' (' + fmt(dz.fgLitres, 0) + ' L)'),
+        sl('Consumable write-offs', fmt(dz.consumableEvents))),
+      (dz.lines && dz.lines.length)
+        ? table(['Date', 'Type', 'Item', 'Qty', 'Reason', 'By'],
+          dz.lines.map(l => [l.date, l.type, mono(l.ref), fmt(l.qty, 1) + ' ' + (l.unit || ''), l.reason, l.by || '—']),
+          [false, false, false, true, false, false])
+        : el('div', { class: 'help' }, 'No write-offs this month.')));
+  }
 }
 function printReport(d) {
   if (!d) return toast('Nothing to print yet.', true);
@@ -980,6 +1066,7 @@ function printReport(d) {
     ${sec('Finished goods on hand (' + d.asOf + ')', ['SKU', 'Litres'], d.finishedGoods.onHand.map(r => [skuName(r.sku), fmt(r.litres, 0)]), [0, 1])}
     ${sec('Consumables received / used', ['Item', 'Received', 'Used'], d.consumables.inMonth.map(r => [r.name + ' (' + r.unit + ')', fmt(r.received, 1), fmt(r.used, 1)]), [0, 1, 1])}
     ${sec('Consumables on hand (' + d.asOf + ')', ['Item', 'On hand'], d.consumables.onHand.map(r => [r.name, fmt(r.onHand, 1) + ' ' + r.unit]), [0, 0])}
+    ${sec('Disposed / written off', ['Date', 'Type', 'Item', 'Qty', 'Reason', 'By'], (d.disposed && d.disposed.lines || []).map(l => [l.date, l.type, l.ref, fmt(l.qty, 1) + ' ' + (l.unit || ''), l.reason, l.by || '']), [0, 0, 0, 1, 0, 0])}
     <p style="margin-top:14px;font-size:10px;color:#999">Generated by KelpWorks ERP · ${d.month}</p>
     <script>window.onload=()=>window.print()<\/script></body></html>`);
   w.document.close();
@@ -1010,6 +1097,9 @@ function exportReportCsv(d) {
   add('CONSUMABLES'); add('Item', 'Unit', 'Received', 'Used', 'On hand (' + d.asOf + ')');
   const oh = {}; d.consumables.onHand.forEach(r => oh[r.name] = r.onHand);
   d.consumables.inMonth.forEach(r => add(r.name, r.unit, r.received, r.used, oh[r.name] ?? ''));
+  add('');
+  add('DISPOSED / WRITTEN OFF'); add('Date', 'Type', 'Item', 'Qty', 'Unit', 'Reason', 'By');
+  (d.disposed && d.disposed.lines || []).forEach(l => add(l.date, l.type, l.ref, l.qty, l.unit, l.reason, l.by));
   const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
   const a = el('a', { href: URL.createObjectURL(blob), download: 'kelpworks-report-' + d.month + '.csv' });
   document.body.append(a); a.click(); a.remove();

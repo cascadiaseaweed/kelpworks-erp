@@ -118,8 +118,9 @@ CREATE TABLE IF NOT EXISTS tote_lots (
     avg_weight_kg REAL,                   -- batch total kg / tote count
     location      TEXT,
     description   TEXT,
-    status        TEXT NOT NULL DEFAULT 'in_stock',  -- in_stock | consumed
+    status        TEXT NOT NULL DEFAULT 'in_stock',  -- in_stock | consumed | disposed
     run_id        INTEGER REFERENCES production_runs(id),
+    disposed_date TEXT,                   -- date written off (NULL unless disposed)
     created_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tote_status ON tote_lots(status);
@@ -215,6 +216,25 @@ CREATE TABLE IF NOT EXISTS shipment_lines (
 );
 CREATE INDEX IF NOT EXISTS idx_shipline_ship ON shipment_lines(shipment_id);
 
+-- Inventory write-offs / disposals (reason is required). Covers stabilized
+-- totes, finished-goods lots, and consumables.
+CREATE TABLE IF NOT EXISTS disposals (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_type   TEXT NOT NULL,          -- 'tote' | 'fg' | 'consumable'
+    entity_id     INTEGER,
+    ref           TEXT,                   -- lot number / consumable name snapshot
+    species_code  TEXT,                   -- totes
+    sku_code      TEXT,                   -- finished goods
+    qty           REAL,                   -- kg (tote) | units (fg) | amount (consumable)
+    unit          TEXT,
+    litres        REAL,                   -- finished-goods litres (else NULL)
+    reason        TEXT NOT NULL,
+    disposed_by   TEXT,
+    disposed_date TEXT NOT NULL,          -- YYYY-MM-DD
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_disposals_date ON disposals(disposed_date);
+
 -- Consumables & packaging (citric acid, potassium sorbate, empty IBCs ...).
 CREATE TABLE IF NOT EXISTS consumables (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -222,7 +242,8 @@ CREATE TABLE IF NOT EXISTS consumables (
     unit          TEXT NOT NULL,
     on_hand       REAL NOT NULL DEFAULT 0,
     reorder_level REAL NOT NULL DEFAULT 0,
-    cost_per_unit REAL
+    cost_per_unit REAL,
+    location      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS consumable_txns (
@@ -330,6 +351,11 @@ def migrate(conn):
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(tote_lots)")}
     if "ph_updated" not in cols:
         conn.execute("ALTER TABLE tote_lots ADD COLUMN ph_updated TEXT")
+    if "disposed_date" not in cols:
+        conn.execute("ALTER TABLE tote_lots ADD COLUMN disposed_date TEXT")
+    ccols = {r["name"] for r in conn.execute("PRAGMA table_info(consumables)")}
+    if "location" not in ccols:
+        conn.execute("ALTER TABLE consumables ADD COLUMN location TEXT")
 
 
 def seed(conn):
@@ -416,7 +442,7 @@ def tote_public(r):
             "volumeL": r["volume_l"], "ph": r["ph"], "phUpdated": r["ph_updated"],
             "avgWeightKg": r["avg_weight_kg"],
             "location": r["location"], "description": r["description"],
-            "status": r["status"], "runId": r["run_id"]}
+            "status": r["status"], "runId": r["run_id"], "disposedDate": r["disposed_date"]}
 
 
 def fg_public(r):
@@ -657,6 +683,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.route_shipments(method, seg, query, conn, user)
         if method == "GET" and seg == ["api", "reports"]:
             return self.route_reports(query, conn)
+        if seg == ["api", "dispose"] and method == "POST":
+            return self.dispose(conn, user)
+        if seg == ["api", "disposals"] and method == "GET":
+            return self.list_disposals(query, conn)
 
         raise ApiError(404, "Unknown endpoint")
 
@@ -699,10 +729,10 @@ class Handler(BaseHTTPRequestHandler):
                "qty": r["qty"], "litres": round(r["litres"] or 0, 1)}
               for r in conn.execute(
                   "SELECT sku_code, package_size, SUM(qty) qty, SUM(qty*litres_each) litres "
-                  "FROM fg_lots WHERE status!='sold' GROUP BY sku_code, package_size "
+                  "FROM fg_lots WHERE status NOT IN ('sold','disposed') GROUP BY sku_code, package_size "
                   "ORDER BY sku_code, litres DESC")]
         fg_litres = conn.execute(
-            "SELECT COALESCE(SUM(qty*litres_each),0) l FROM fg_lots WHERE status!='sold'").fetchone()["l"]
+            "SELECT COALESCE(SUM(qty*litres_each),0) l FROM fg_lots WHERE status NOT IN ('sold','disposed')").fetchone()["l"]
         consum = [dict(id=r["id"], name=r["name"], unit=r["unit"], onHand=r["on_hand"],
                        reorderLevel=r["reorder_level"], low=(r["on_hand"] <= r["reorder_level"]))
                   for r in conn.execute("SELECT * FROM consumables ORDER BY name")]
@@ -897,7 +927,8 @@ class Handler(BaseHTTPRequestHandler):
                 return {"consumables": [
                     dict(id=r["id"], name=r["name"], unit=r["unit"], onHand=r["on_hand"],
                          reorderLevel=r["reorder_level"], costPerUnit=r["cost_per_unit"],
-                         low=(r["on_hand"] <= r["reorder_level"])) for r in rows]}
+                         location=r["location"], low=(r["on_hand"] <= r["reorder_level"]))
+                    for r in rows]}
             if method == "POST":
                 d = self._body_json()
                 name = (d.get("name") or "").strip()
@@ -905,10 +936,11 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(400, "Name is required")
                 if conn.execute("SELECT 1 FROM consumables WHERE name=?", (name,)).fetchone():
                     raise ApiError(409, "That consumable already exists")
-                conn.execute("INSERT INTO consumables (name,unit,on_hand,reorder_level,cost_per_unit)"
-                             " VALUES (?,?,?,?,?)",
+                location = self._ensure_location(conn, d.get("location"))
+                conn.execute("INSERT INTO consumables (name,unit,on_hand,reorder_level,cost_per_unit,location)"
+                             " VALUES (?,?,?,?,?,?)",
                              (name, (d.get("unit") or "unit").strip(), num(d.get("onHand")),
-                              num(d.get("reorderLevel")), numn(d.get("costPerUnit"))))
+                              num(d.get("reorderLevel")), numn(d.get("costPerUnit")), location))
                 return {"ok": True}
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "adjust" and method == "POST":
             cid = int(seg[2])
@@ -928,9 +960,11 @@ class Handler(BaseHTTPRequestHandler):
             if not c:
                 raise ApiError(404, "Consumable not found")
             d = self._body_json()
-            conn.execute("UPDATE consumables SET reorder_level=?, cost_per_unit=? WHERE id=?",
+            location = self._ensure_location(conn, d["location"]) if "location" in d else c["location"]
+            conn.execute("UPDATE consumables SET reorder_level=?, cost_per_unit=?, location=? WHERE id=?",
                          (num(d["reorderLevel"]) if "reorderLevel" in d else c["reorder_level"],
-                          numn(d["costPerUnit"]) if "costPerUnit" in d else c["cost_per_unit"], cid))
+                          numn(d["costPerUnit"]) if "costPerUnit" in d else c["cost_per_unit"],
+                          location, cid))
             return {"ok": True}
         raise ApiError(404, "Unknown consumables endpoint")
 
@@ -1491,7 +1525,8 @@ class Handler(BaseHTTPRequestHandler):
             "SELECT t.species_code sp, COUNT(*) totes, COALESCE(SUM(t.avg_weight_kg),0) kg "
             "FROM tote_lots t LEFT JOIN production_runs r ON r.id=t.run_id "
             "WHERE t.checkin_date<=? AND (t.run_id IS NULL OR r.run_date>?) "
-            "GROUP BY t.species_code", (asof, asof))
+            "AND (t.disposed_date IS NULL OR t.disposed_date>?) "
+            "GROUP BY t.species_code", (asof, asof, asof))
 
         def sp_list(rs):
             return [{"species": r["sp"], "totes": r["totes"], "kg": round(r["kg"] or 0, 1)} for r in rs]
@@ -1532,9 +1567,13 @@ class Handler(BaseHTTPRequestHandler):
             "SELECT sl.sku_code sku, COALESCE(SUM(sl.qty*sl.litres_each),0) litres "
             "FROM shipment_lines sl JOIN shipments s ON s.id=sl.shipment_id "
             "WHERE s.status!='cancelled' AND s.ship_date<=? GROUP BY sl.sku_code", (asof,))}
+        disp_asof = {r["sku"]: r["litres"] for r in rows(
+            "SELECT sku_code sku, COALESCE(SUM(litres),0) litres FROM disposals "
+            "WHERE entity_type='fg' AND disposed_date<=? GROUP BY sku_code", (asof,))}
         fg_onhand = []
-        for sku in sorted(set(prod_asof) | set(ship_asof)):
-            litres = round((prod_asof.get(sku, 0) or 0) - (ship_asof.get(sku, 0) or 0), 1)
+        for sku in sorted(set(prod_asof) | set(ship_asof) | set(disp_asof)):
+            litres = round((prod_asof.get(sku, 0) or 0) - (ship_asof.get(sku, 0) or 0)
+                           - (disp_asof.get(sku, 0) or 0), 1)
             fg_onhand.append({"sku": sku, "litres": litres})
 
         # --- Consumables: in-month receipts/usage + on-hand as-of ---
@@ -1576,7 +1615,106 @@ class Handler(BaseHTTPRequestHandler):
                              "used": round(r["used"] or 0, 1)} for r in cons_month],
                 "onHand": [{"name": r["name"], "unit": r["unit"], "onHand": round(r["onhand"] or 0, 1)}
                            for r in cons_asof]},
+            "disposed": self._disposed_in_month(conn, start, end),
         }
+
+    def _disposed_in_month(self, conn, start, end):
+        rows = conn.execute(
+            "SELECT entity_type, COUNT(*) n, COALESCE(SUM(qty),0) qty, COALESCE(SUM(litres),0) litres "
+            "FROM disposals WHERE disposed_date>=? AND disposed_date<=? GROUP BY entity_type",
+            (start, end)).fetchall()
+        out = {"totes": 0, "toteKg": 0.0, "fgLots": 0, "fgLitres": 0.0, "consumableEvents": 0}
+        for r in rows:
+            if r["entity_type"] == "tote":
+                out["totes"], out["toteKg"] = r["n"], round(r["qty"] or 0, 1)
+            elif r["entity_type"] == "fg":
+                out["fgLots"], out["fgLitres"] = r["n"], round(r["litres"] or 0, 1)
+            elif r["entity_type"] == "consumable":
+                out["consumableEvents"] = r["n"]
+        out["lines"] = [{"type": r["entity_type"], "ref": r["ref"], "qty": r["qty"], "unit": r["unit"],
+                         "reason": r["reason"], "by": r["disposed_by"], "date": r["disposed_date"]}
+                        for r in conn.execute(
+                            "SELECT * FROM disposals WHERE disposed_date>=? AND disposed_date<=? "
+                            "ORDER BY disposed_date DESC, id DESC", (start, end))]
+        return out
+
+    # ---- disposal / write-off -------------------------------------------- #
+    def dispose(self, conn, user):
+        d = self._body_json()
+        typ = d.get("type")
+        reason = (d.get("reason") or "").strip()
+        date = (d.get("date") or today_iso()).strip()
+        if not reason:
+            raise ApiError(400, "A reason / description is required to write off inventory")
+        who = user["name"] if user else None
+        ts = now_iso()
+        disposed = 0
+
+        def log(entity_type, eid, ref, qty, unit, litres=None, species=None, sku=None):
+            conn.execute(
+                "INSERT INTO disposals (entity_type,entity_id,ref,species_code,sku_code,qty,unit,"
+                "litres,reason,disposed_by,disposed_date,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (entity_type, eid, ref, species, sku, qty, unit, litres, reason, who, date, ts))
+
+        if typ == "tote":
+            ids = [int(x) for x in (d.get("itemIds") or [])]
+            if not ids:
+                raise ApiError(400, "Select at least one tote to dispose")
+            for tid in ids:
+                t = conn.execute("SELECT * FROM tote_lots WHERE id=?", (tid,)).fetchone()
+                if not t or t["status"] != "in_stock":
+                    continue
+                conn.execute("UPDATE tote_lots SET status='disposed', disposed_date=? WHERE id=?", (date, tid))
+                log("tote", tid, t["lot_number"], t["avg_weight_kg"], "kg", species=t["species_code"])
+                disposed += 1
+
+        elif typ == "fg":
+            ids = [int(x) for x in (d.get("itemIds") or [])]
+            if not ids:
+                raise ApiError(400, "Select at least one finished-goods lot to dispose")
+            for fid in ids:
+                f = conn.execute("SELECT * FROM fg_lots WHERE id=?", (fid,)).fetchone()
+                if not f or f["status"] == "disposed" or (f["qty"] or 0) <= 0:
+                    continue
+                litres = round((f["qty"] or 0) * (f["litres_each"] or 0), 2)
+                log("fg", fid, f["fg_lot_number"], f["qty"], "units", litres=litres, sku=f["sku_code"])
+                conn.execute("UPDATE fg_lots SET qty=0, status='disposed' WHERE id=?", (fid,))
+                disposed += 1
+
+        elif typ == "consumable":
+            items = d.get("items") or []   # [{id, qty}]
+            any_qty = False
+            for it in items:
+                c = conn.execute("SELECT * FROM consumables WHERE id=?", (it.get("id"),)).fetchone()
+                qty = num(it.get("qty"))
+                if not c or qty <= 0:
+                    continue
+                any_qty = True
+                if qty > c["on_hand"]:
+                    raise ApiError(400, "Cannot dispose %g %s of %s — only %g on hand"
+                                   % (qty, c["unit"], c["name"], c["on_hand"]))
+                self._consume(conn, c["id"], -qty, "Disposal: " + reason, None)
+                log("consumable", c["id"], c["name"], qty, c["unit"])
+                disposed += 1
+            if not any_qty:
+                raise ApiError(400, "Enter a quantity to write off for at least one consumable")
+        else:
+            raise ApiError(400, "Unknown disposal type")
+
+        return {"disposed": disposed, "reason": reason, "date": date}
+
+    def list_disposals(self, query, conn):
+        typ = query.get("type", [""])[0]
+        sql = "SELECT * FROM disposals"
+        args = ()
+        if typ:
+            sql += " WHERE entity_type=?"
+            args = (typ,)
+        sql += " ORDER BY disposed_date DESC, id DESC LIMIT 500"
+        return {"disposals": [
+            {"id": r["id"], "type": r["entity_type"], "ref": r["ref"], "qty": r["qty"], "unit": r["unit"],
+             "litres": r["litres"], "reason": r["reason"], "by": r["disposed_by"], "date": r["disposed_date"]}
+            for r in conn.execute(sql, args)]}
 
 
 def num(v, default=0):
@@ -1855,6 +1993,20 @@ def report_workbook(data, spname, skname):
     oh = {r["name"]: r["onHand"] for r in data["consumables"]["onHand"]}
     for r in data["consumables"]["inMonth"]:
         s.row([T(r["name"]), T(r["unit"]), N(r["received"], 5), N(r["used"], 5), N(oh.get(r["name"]), 5)])
+    sheets.append(s)
+
+    dz = data.get("disposed") or {}
+    s = XlsxSheet("Disposals"); s.set_widths([12, 12, 26, 10, 8, 40, 16])
+    s.title("Disposed / Written Off — " + ml, 7)
+    s.section("Summary", 7)
+    s.row([T("Totes", 7), N(dz.get("totes", 0)), T("kg", 8), N(dz.get("toteKg", 0), 5)])
+    s.row([T("FG lots", 7), N(dz.get("fgLots", 0)), T("litres", 8), N(dz.get("fgLitres", 0), 5)])
+    s.row([T("Consumable write-offs", 7), N(dz.get("consumableEvents", 0))])
+    s.section("Detail", 7)
+    s.row([H("Date"), H("Type"), H("Item"), HR("Qty"), H("Unit"), H("Reason"), H("By")])
+    for l in dz.get("lines", []):
+        s.row([T(l["date"]), T(l["type"]), T(l["ref"]), N(l["qty"], 5),
+               T(l["unit"] or ""), T(l["reason"]), T(l["by"] or "")])
     sheets.append(s)
 
     return xlsx_build(sheets)
