@@ -526,6 +526,10 @@ async function openAttachments(run) {
   const status = el('div', { class: 'help' });
   const fileInput = el('input', { type: 'file', multiple: 'multiple',
     accept: '.pdf,image/*,.doc,.docx,.xls,.xlsx,.txt,.csv,.heic' });
+  // capture="environment" hands off straight to the rear camera on phones/tablets
+  // instead of the general photo/file picker; desktop browsers just ignore it.
+  const cameraInput = el('input', { type: 'file', accept: 'image/*', capture: 'environment', style: 'display:none' });
+  const cameraBtn = el('button', { class: 'secondary', type: 'button', onclick: () => cameraInput.click() }, '📷 Take photo');
   async function refresh() { drawList((await api('GET', '/production/' + run.id + '/attachments')).attachments); }
   function drawList(atts) {
     listHost.innerHTML = '';
@@ -540,19 +544,24 @@ async function openAttachments(run) {
       ])
     ]), [false, true, false, false, false]));
   }
-  fileInput.addEventListener('change', async () => {
-    const files = [...fileInput.files]; if (!files.length) return;
+  async function handleFiles(fileList) {
+    const files = [...fileList]; if (!files.length) return;
     status.textContent = 'Uploading ' + files.length + ' file(s)…';
     try {
       for (const f of files) await uploadAtt(run.id, f);
-      fileInput.value = ''; status.textContent = ''; await refresh(); toast('Uploaded'); State.attachmentsChanged = true;
+      status.textContent = ''; await refresh(); toast('Uploaded'); State.attachmentsChanged = true;
     } catch (e) { status.textContent = ''; toast(e.message, true); await refresh(); }
-  });
+  }
+  fileInput.addEventListener('change', async () => { await handleFiles(fileInput.files); fileInput.value = ''; });
+  cameraInput.addEventListener('change', async () => { await handleFiles(cameraInput.files); cameraInput.value = ''; });
   const body = el('div', {},
     el('div', { class: 'summary-line' }, sl('Run', run.processingLot),
       el('span', { class: 'muted' }, 'lab results, paper logs, images — PDF, images, Office docs (max 25 MB each)')),
     el('label', {}, 'Attached documents'), listHost,
-    el('div', { style: 'margin-top:16px' }, el('label', {}, 'Add documents'), fileInput, status));
+    el('div', { style: 'margin-top:16px' },
+      el('label', {}, 'Add documents'),
+      el('div', { style: 'display:flex;gap:10px;align-items:center;flex-wrap:wrap' }, fileInput, cameraBtn, cameraInput),
+      status));
   await refresh();
   modal('Documents — ' + run.processingLot, body, async () => { if (State.attachmentsChanged) { State.attachmentsChanged = false; render(); } }, 'Done');
 }
