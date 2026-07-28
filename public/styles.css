@@ -80,6 +80,16 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .topbar .who { font-size: 12px; opacity: .9; }
 .topbar .who button { background: rgba(255,255,255,.15); padding: 6px 10px; font-size: 12px; }
 
+/* Below this width, logo + title + account menu leave no room for the tabs
+   on a shared row (flex squeezes .tabs to 0) — give the nav its own
+   full-width row instead so every link stays visible and tappable. */
+@media (max-width: 900px) {
+  .topbar { flex-wrap: wrap; padding: 10px 14px; }
+  .topbar .who { margin-left: auto; }
+  .tabs { order: 3; flex: 1 1 100%; margin: 6px 0 0; }
+  .tabs button { padding: 12px 12px; }
+}
+
 .wrap { max-width: 1180px; margin: 0 auto; padding: 20px 18px 60px; }
 .page-head { display:flex; align-items:center; justify-content:space-between; margin-bottom: 16px; gap: 12px; flex-wrap: wrap; }
 .page-head h2 { margin: 0; font-size: 20px; color: var(--teal-dark); }
