@@ -890,7 +890,7 @@ class Handler(BaseHTTPRequestHandler):
                        reorderLevel=r["reorder_level"], low=(r["on_hand"] <= r["reorder_level"]))
                   for r in conn.execute("SELECT * FROM consumables ORDER BY name")]
         runs = [run_public(r) for r in conn.execute(
-            "SELECT * FROM production_runs ORDER BY run_date DESC, id DESC LIMIT 5")]
+            "SELECT * FROM production_runs WHERE status='completed' ORDER BY run_date DESC, id DESC LIMIT 5")]
         return {
             "stabilized": {"totes": stab["totes"], "kg": round(stab["kg"] or 0, 1),
                            "bySpecies": by_species},
@@ -1870,7 +1870,7 @@ class Handler(BaseHTTPRequestHandler):
             title = sk["name"] if sk else key
             unit = "L"
             prod_b = conn.execute("SELECT COALESCE(SUM(output_litres),0) s FROM production_runs "
-                                  "WHERE sku_code=? AND run_date<?", (key, frm)).fetchone()["s"]
+                                  "WHERE status='completed' AND sku_code=? AND run_date<?", (key, frm)).fetchone()["s"]
             ship_b = conn.execute(
                 "SELECT COALESCE(SUM(sl.qty*sl.litres_each),0) s FROM shipment_lines sl "
                 "JOIN shipments s ON s.id=sl.shipment_id WHERE sl.sku_code=? AND s.status!='cancelled' "
@@ -1881,7 +1881,8 @@ class Handler(BaseHTTPRequestHandler):
             opening = round((prod_b or 0) - (ship_b or 0) - (disp_b or 0), 1)
             evs = []
             for r in conn.execute("SELECT run_date d, processing_lot, output_litres FROM production_runs "
-                                  "WHERE sku_code=? AND run_date>=? AND run_date<=?", (key, frm, to)):
+                                  "WHERE status='completed' AND sku_code=? AND run_date>=? AND run_date<=?",
+                                  (key, frm, to)):
                 evs.append((r["d"], "Produced " + r["processing_lot"], r["output_litres"] or 0))
             for r in conn.execute(
                     "SELECT s.ship_date d, s.shipment_no, COALESCE(cu.name,'') cust, "
@@ -1954,10 +1955,11 @@ class Handler(BaseHTTPRequestHandler):
         p = conn.execute(
             "SELECT COUNT(*) runs, COALESCE(SUM(input_kg),0) ik, COALESCE(SUM(output_litres),0) ol, "
             "COALESCE(SUM(citric_kg),0) ck, COALESCE(SUM(sorbate_kg),0) sk "
-            "FROM production_runs WHERE run_date>=? AND run_date<=?", (start, end)).fetchone()
+            "FROM production_runs WHERE status='completed' AND run_date>=? AND run_date<=?", (start, end)).fetchone()
         prod_by_sku = rows(
             "SELECT sku_code sku, COUNT(*) runs, COALESCE(SUM(output_litres),0) litres "
-            "FROM production_runs WHERE run_date>=? AND run_date<=? GROUP BY sku_code", (start, end))
+            "FROM production_runs WHERE status='completed' AND run_date>=? AND run_date<=? GROUP BY sku_code",
+            (start, end))
 
         # --- Finished goods produced (by run output) & shipped (dated) ---
         produced_sku = {r["sku"]: r["litres"] for r in prod_by_sku}
@@ -1977,7 +1979,7 @@ class Handler(BaseHTTPRequestHandler):
         # FG on hand as-of = produced(run_date<=asof) - shipped(ship_date<=asof)
         prod_asof = {r["sku"]: r["litres"] for r in rows(
             "SELECT sku_code sku, COALESCE(SUM(output_litres),0) litres FROM production_runs "
-            "WHERE run_date<=? GROUP BY sku_code", (asof,))}
+            "WHERE status='completed' AND run_date<=? GROUP BY sku_code", (asof,))}
         ship_asof = {r["sku"]: r["litres"] for r in rows(
             "SELECT sl.sku_code sku, COALESCE(SUM(sl.qty*sl.litres_each),0) litres "
             "FROM shipment_lines sl JOIN shipments s ON s.id=sl.shipment_id "
