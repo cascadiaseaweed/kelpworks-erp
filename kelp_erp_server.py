@@ -289,6 +289,8 @@ CREATE TABLE IF NOT EXISTS production_runs (
     ibc_used       INTEGER DEFAULT 0,
     location       TEXT,
     notes          TEXT,
+    status         TEXT NOT NULL DEFAULT 'completed',  -- draft | completed
+    draft_data     TEXT,  -- JSON {toteIds, packages} while status='draft'
     created_at     TEXT NOT NULL
 );
 
@@ -378,6 +380,11 @@ def migrate(conn):
         conn.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
     if "active" not in ucols:
         conn.execute("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+    prcols = {r["name"] for r in conn.execute("PRAGMA table_info(production_runs)")}
+    if "status" not in prcols:
+        conn.execute("ALTER TABLE production_runs ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'")
+    if "draft_data" not in prcols:
+        conn.execute("ALTER TABLE production_runs ADD COLUMN draft_data TEXT")
 
 
 def ensure_users(conn):
@@ -491,11 +498,20 @@ def fg_public(r):
 
 
 def run_public(r):
-    return {"id": r["id"], "processingLot": r["processing_lot"], "runDate": r["run_date"],
-            "species": r["species_code"], "sku": r["sku_code"], "inputKg": r["input_kg"],
-            "targetTds": r["target_tds"], "outputLitres": r["output_litres"],
-            "citricKg": r["citric_kg"], "sorbateKg": r["sorbate_kg"], "ibcUsed": r["ibc_used"],
-            "location": r["location"], "notes": r["notes"]}
+    d = {"id": r["id"], "processingLot": r["processing_lot"], "runDate": r["run_date"],
+         "species": r["species_code"], "sku": r["sku_code"], "inputKg": r["input_kg"],
+         "targetTds": r["target_tds"], "outputLitres": r["output_litres"],
+         "citricKg": r["citric_kg"], "sorbateKg": r["sorbate_kg"], "ibcUsed": r["ibc_used"],
+         "location": r["location"], "notes": r["notes"], "status": r["status"],
+         "createdAt": r["created_at"]}
+    if r["status"] == "draft":
+        try:
+            dd = json.loads(r["draft_data"]) if r["draft_data"] else {}
+        except ValueError:
+            dd = {}
+        d["toteIds"] = dd.get("toteIds") or []
+        d["packages"] = dd.get("packages") or []
+    return d
 
 
 # --------------------------------------------------------------------------- #
@@ -1142,7 +1158,8 @@ class Handler(BaseHTTPRequestHandler):
     def route_production(self, method, seg, conn, user):
         if seg == ["api", "production"] and method == "GET":
             runs = []
-            for r in conn.execute("SELECT * FROM production_runs ORDER BY run_date DESC, id DESC"):
+            for r in conn.execute(
+                    "SELECT * FROM production_runs WHERE status='completed' ORDER BY run_date DESC, id DESC"):
                 d = run_public(r)
                 d["inputTotes"] = [row["lot_number"] for row in conn.execute(
                     "SELECT t.lot_number FROM run_inputs ri JOIN tote_lots t ON t.id=ri.tote_lot_id "
@@ -1155,6 +1172,20 @@ class Handler(BaseHTTPRequestHandler):
             return {"runs": runs}
         if seg == ["api", "production"] and method == "POST":
             return self.create_run(conn)
+        if seg == ["api", "production", "drafts"] and method == "GET":
+            return self.list_drafts(conn)
+        if seg == ["api", "production", "drafts"] and method == "POST":
+            return self.save_draft(conn, None)
+        if len(seg) == 4 and seg[2] == "drafts" and seg[3].isdigit():
+            rid = int(seg[3])
+            if method == "GET":
+                return self.get_draft(conn, rid)
+            if method == "PUT":
+                return self.save_draft(conn, rid)
+            if method == "DELETE":
+                return self.delete_draft(conn, rid)
+        if len(seg) == 5 and seg[2] == "drafts" and seg[3].isdigit() and seg[4] == "finalize" and method == "POST":
+            return self.finalize_draft(conn, int(seg[3]))
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "edits" and method == "GET":
             return {"edits": self._run_edits(conn, int(seg[2]))}
         if len(seg) == 3 and seg[2].isdigit() and method == "PUT":
@@ -1274,7 +1305,13 @@ class Handler(BaseHTTPRequestHandler):
             "edits": self._run_edits(conn, rid), "changed": len(changes)}
 
     def create_run(self, conn):
-        d = self._body_json()
+        return self._finalize_run(conn, self._body_json())
+
+    def _finalize_run(self, conn, d, existing=None):
+        """Validate a run's inputs/outputs and apply the tote-consumption,
+        consumable-deduction and FG-lot side effects. With `existing` (a draft
+        row), converts it to status='completed' in place; otherwise inserts a
+        brand-new completed run."""
         tote_ids = [int(x) for x in (d.get("toteIds") or [])]
         if not tote_ids:
             raise ApiError(400, "Select at least one stabilized tote to process")
@@ -1329,23 +1366,36 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "Not enough empty IBC totes on hand (%d < %d)"
                            % (int(ibc_row["on_hand"]), ibc_used))
 
-        # Processing lot number: PR-YYYYMMDD-NNN (NNN = next overall sequence).
+        # Processing lot number: PR-YYYYMMDD-NNN (NNN = next completed sequence).
         lot = (d.get("processingLot") or "").strip()
         if not lot:
-            seq = conn.execute("SELECT COUNT(*) c FROM production_runs").fetchone()["c"] + 1
+            seq = conn.execute(
+                "SELECT COUNT(*) c FROM production_runs WHERE status='completed'").fetchone()["c"] + 1
             lot = "PR-%s-%03d" % (run_date.replace("-", ""), seq)
-        if conn.execute("SELECT 1 FROM production_runs WHERE processing_lot=?", (lot,)).fetchone():
+        dupe = conn.execute(
+            "SELECT 1 FROM production_runs WHERE processing_lot=? AND id!=?",
+            (lot, existing["id"] if existing else -1)).fetchone()
+        if dupe:
             raise ApiError(409, "Processing lot %s already exists" % lot)
 
         ts = now_iso()
         cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO production_runs (processing_lot,run_date,species_code,sku_code,input_kg,"
-            "target_tds,output_litres,citric_kg,sorbate_kg,ibc_used,location,notes,created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (lot, run_date, species, sku, input_kg, target_tds, output_litres,
-             citric, sorbate, ibc_used, location, notes, ts))
-        run_id = cur.lastrowid
+        if existing:
+            run_id = existing["id"]
+            cur.execute(
+                "UPDATE production_runs SET processing_lot=?, run_date=?, species_code=?, sku_code=?,"
+                " input_kg=?, target_tds=?, output_litres=?, citric_kg=?, sorbate_kg=?, ibc_used=?,"
+                " location=?, notes=?, status='completed', draft_data=NULL WHERE id=?",
+                (lot, run_date, species, sku, input_kg, target_tds, output_litres,
+                 citric, sorbate, ibc_used, location, notes, run_id))
+        else:
+            cur.execute(
+                "INSERT INTO production_runs (processing_lot,run_date,species_code,sku_code,input_kg,"
+                "target_tds,output_litres,citric_kg,sorbate_kg,ibc_used,location,notes,status,created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'completed', ?)",
+                (lot, run_date, species, sku, input_kg, target_tds, output_litres,
+                 citric, sorbate, ibc_used, location, notes, ts))
+            run_id = cur.lastrowid
 
         # Consume totes.
         for r in rows:
@@ -1384,6 +1434,89 @@ class Handler(BaseHTTPRequestHandler):
 
         return {"processingLot": lot, "runId": run_id, "inputKg": input_kg,
                 "outputLitres": output_litres, "fgLots": fg_created}
+
+    # ---- production run drafts (save progress, resume, discard) ---------- #
+    def list_drafts(self, conn):
+        drafts = []
+        for r in conn.execute("SELECT * FROM production_runs WHERE status='draft' ORDER BY id DESC"):
+            dd = run_public(r)
+            dd["toteLots"] = self._tote_lot_numbers(conn, dd["toteIds"])
+            drafts.append(dd)
+        return {"drafts": drafts}
+
+    def _tote_lot_numbers(self, conn, ids):
+        if not ids:
+            return []
+        rows = conn.execute(
+            "SELECT lot_number FROM tote_lots WHERE id IN (%s)" % ",".join("?" * len(ids)), ids).fetchall()
+        return [r["lot_number"] for r in rows]
+
+    def get_draft(self, conn, rid):
+        r = conn.execute("SELECT * FROM production_runs WHERE id=? AND status='draft'", (rid,)).fetchone()
+        if not r:
+            raise ApiError(404, "Draft not found")
+        return {"run": run_public(r)}
+
+    def save_draft(self, conn, rid):
+        """Create (rid=None) or update (rid given) a run in progress. No
+        validation beyond what's needed to store the snapshot — totes aren't
+        consumed and consumables aren't deducted until finalize."""
+        d = self._body_json()
+        sku = (d.get("sku") or "").strip() or None
+        species = None
+        if sku:
+            sku_row = conn.execute("SELECT * FROM fg_skus WHERE code=?", (sku,)).fetchone()
+            species = sku_row["species_code"] if sku_row else None
+        target_tds = numn(d.get("targetTds"))
+        citric = num(d.get("citricKg"))
+        sorbate = num(d.get("sorbateKg"))
+        location = (d.get("location") or "").strip() or None
+        run_date = (d.get("runDate") or today_iso()).strip()
+        notes = d.get("notes")
+        tote_ids = [int(x) for x in (d.get("toteIds") or [])]
+        packages = [p for p in (d.get("packages") or []) if p.get("size") in PACKAGE_SIZES]
+        draft_data = json.dumps({"toteIds": tote_ids, "packages": packages})
+
+        if rid is None:
+            cur = conn.cursor()
+            placeholder = "DRAFT-" + secrets.token_hex(6)
+            cur.execute(
+                "INSERT INTO production_runs (processing_lot,run_date,species_code,sku_code,"
+                "target_tds,citric_kg,sorbate_kg,location,notes,status,draft_data,created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?, 'draft', ?, ?)",
+                (placeholder, run_date, species, sku, target_tds, citric, sorbate,
+                 location, notes, draft_data, now_iso()))
+            rid = cur.lastrowid
+            conn.execute("UPDATE production_runs SET processing_lot=? WHERE id=?",
+                         ("DRAFT-%d" % rid, rid))
+        else:
+            run = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
+            if not run:
+                raise ApiError(404, "Draft not found")
+            if run["status"] != "draft":
+                raise ApiError(409, "This run has already been finalized")
+            conn.execute(
+                "UPDATE production_runs SET run_date=?, species_code=?, sku_code=?, target_tds=?,"
+                " citric_kg=?, sorbate_kg=?, location=?, notes=?, draft_data=? WHERE id=?",
+                (run_date, species, sku, target_tds, citric, sorbate,
+                 location, notes, draft_data, rid))
+        return {"run": run_public(conn.execute(
+            "SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone())}
+
+    def delete_draft(self, conn, rid):
+        r = conn.execute("SELECT * FROM production_runs WHERE id=? AND status='draft'", (rid,)).fetchone()
+        if not r:
+            raise ApiError(404, "Draft not found")
+        conn.execute("DELETE FROM production_runs WHERE id=?", (rid,))
+        return {"ok": True}
+
+    def finalize_draft(self, conn, rid):
+        existing = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
+        if not existing:
+            raise ApiError(404, "Draft not found")
+        if existing["status"] != "draft":
+            raise ApiError(409, "This run has already been finalized")
+        return self._finalize_run(conn, self._body_json(), existing=existing)
 
     # ---- finished goods --------------------------------------------------- #
     def route_fg(self, method, seg, query, conn):

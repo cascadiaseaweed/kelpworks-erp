@@ -394,9 +394,14 @@ async function openHarvest() {
 async function pageProduction(v) {
   v.append(el('div', { class: 'page-head' },
     el('h2', {}, 'Production Runs'),
-    el('div', { class: 'actions' }, el('button', { onclick: openRun }, '+ New production run'))));
-  const r = await api('GET', '/production');
-  if (!r.runs.length) { v.append(el('div', { class: 'empty card' }, 'No production runs yet. Click “New production run” to process stabilized totes into finished goods.')); return; }
+    el('div', { class: 'actions' }, el('button', { onclick: () => openRun() }, '+ New production run'))));
+  const [r, dr] = await Promise.all([api('GET', '/production'), api('GET', '/production/drafts')]);
+  if (dr.drafts.length) {
+    v.append(el('h3', { style: 'margin:0 0 8px' }, 'In progress'));
+    for (const d of dr.drafts) v.append(draftCard(d));
+  }
+  if (!r.runs.length && !dr.drafts.length) { v.append(el('div', { class: 'empty card' }, 'No production runs yet. Click “New production run” to process stabilized totes into finished goods.')); return; }
+  if (!r.runs.length) return;
   for (const run of r.runs) {
     const fgList = run.fgLots.map(f => `${fmt(f.qty)} × ${f.packageSize}`).join(', ') || '—';
     const card = el('div', { class: 'card' },
@@ -421,6 +426,26 @@ async function pageProduction(v) {
       run.edits && run.edits.length ? editHistoryBlock(run.edits) : null);
     v.append(card);
   }
+}
+function draftCard(d) {
+  const pkgSummary = (d.packages || []).filter(p => p.qty > 0).map(p => `${fmt(p.qty)} × ${p.size}`).join(', ') || '—';
+  return el('div', { class: 'card' },
+    el('div', { class: 'page-head', style: 'margin:0 0 8px' },
+      el('h3', { style: 'margin:0' }, 'In-progress run', '  ', el('span', { class: 'badge hold' }, 'Not yet submitted')),
+      el('div', { class: 'actions' },
+        el('button', { onclick: () => openRun(d) }, 'Resume'),
+        el('button', { class: 'danger', onclick: () => discardDraft(d) }, 'Discard'))),
+    el('div', { class: 'summary-line' },
+      sl('Run date', d.runDate), sl('SKU', d.sku ? skuName(d.sku) : '—'),
+      sl('Totes selected', d.toteLots.length ? d.toteLots.join(', ') : '—'),
+      sl('Packaging', pkgSummary)),
+    d.notes ? el('div', { class: 'muted', style: 'margin-top:4px;font-size:12px' }, '“' + d.notes + '”') : null);
+}
+async function discardDraft(d) {
+  if (!confirm('Discard this in-progress run? This cannot be undone.')) return;
+  await api('DELETE', '/production/drafts/' + d.id);
+  toast('Draft discarded');
+  render();
 }
 function editHistoryBlock(edits) {
   const wrap = el('details', { class: 'edit-history' },
@@ -533,21 +558,25 @@ async function openAttachments(run) {
 }
 function sl(k, val) { return el('span', {}, k + ': ', el('b', {}, val)); }
 
-async function openRun() {
+async function openRun(draft) {
   const totes = (await api('GET', '/totes?status=in_stock')).totes;
   const skus = State.ref.skus;
   const locs = State.ref.locations.map(l => [l, l]);
   const skuSel = selectFrom('', skus.map(s => [s.code, s.name]), () => filterTotes(), 'r_sku');
+  if (draft && draft.sku) skuSel.value = draft.sku;
   const search = el('input', { placeholder: 'Filter totes…', oninput: () => filterTotes() });
   const pickHost = el('div', { class: 'tote-pick' });
   const summary = el('div', { class: 'summary-line' });
   const pkgInputs = {};
+  const draftQty = {};
+  (draft?.packages || []).forEach(p => { draftQty[p.size] = p.qty; });
   const pkgGrid = el('div', { class: 'pkg-grid' }, ...Object.keys(State.ref.packageSizes).map(sz => {
-    const inp = el('input', { type: 'number', min: '0', value: '0', oninput: recompute });
+    const inp = el('input', { type: 'number', min: '0', value: String(draftQty[sz] || 0), oninput: recompute });
     pkgInputs[sz] = inp;
     return field(sz + ' units', inp);
   }));
-  let selected = new Set();
+  let selected = new Set(draft?.toteIds || []);
+  let draftId = draft ? draft.id : null;
 
   function speciesOfSku() { const s = skus.find(x => x.code === skuSel.value); return s ? s.species : null; }
   function filterTotes() {
@@ -576,30 +605,49 @@ async function openRun() {
 
   const body = el('div', {},
     el('div', { class: 'form-row' }, field('Finished-good SKU', skuSel),
-      field('Target TDS (%)', el('input', { type: 'number', step: '0.1', id: 'r_tds', placeholder: 'e.g. 4.0' }))),
+      field('Target TDS (%)', el('input', { type: 'number', step: '0.1', id: 'r_tds', placeholder: 'e.g. 4.0', value: draft?.targetTds ?? '' }))),
     field('Select stabilized totes to process', search), pickHost, summary,
     el('h3', { style: 'margin:16px 0 8px;font-size:14px' }, 'Bottling / packaging output'), pkgGrid,
     el('div', { class: 'form-row' },
-      field('Citric acid (kg)', el('input', { type: 'number', step: '0.1', min: '0', id: 'r_citric', value: '0' })),
-      field('Potassium sorbate (kg)', el('input', { type: 'number', step: '0.1', min: '0', id: 'r_sorbate', value: '0' }))),
+      field('Citric acid (kg)', el('input', { type: 'number', step: '0.1', min: '0', id: 'r_citric', value: draft?.citricKg ?? 0 })),
+      field('Potassium sorbate (kg)', el('input', { type: 'number', step: '0.1', min: '0', id: 'r_sorbate', value: draft?.sorbateKg ?? 0 }))),
     el('div', { class: 'form-row' },
-      field('Run date', el('input', { type: 'date', id: 'r_date', value: new Date().toISOString().slice(0, 10) })),
+      field('Run date', el('input', { type: 'date', id: 'r_date', value: draft?.runDate || new Date().toISOString().slice(0, 10) })),
       field('Location', editableSelect(locs, 'r_loc'))),
-    field('Notes', el('textarea', { id: 'r_notes', rows: '2', placeholder: 'Optional batch notes' })));
+    field('Notes', el('textarea', { id: 'r_notes', rows: '2', placeholder: 'Optional batch notes' }, draft?.notes || '')));
+  body.querySelector('#r_loc').value = draft?.location || '';
   filterTotes();
-  modal('New production run', body, async () => {
+
+  function buildPayload() {
     const packages = Object.keys(pkgInputs).map(sz => ({ size: sz, qty: +pkgInputs[sz].value || 0 })).filter(p => p.qty > 0);
-    if (!selected.size) throw new Error('Select at least one tote.');
-    if (!packages.length) throw new Error('Enter at least one packaged output quantity.');
-    const r = await api('POST', '/production', {
+    return {
       sku: skuSel.value, toteIds: [...selected], targetTds: body.querySelector('#r_tds').value || null,
       citricKg: +body.querySelector('#r_citric').value || 0, sorbateKg: +body.querySelector('#r_sorbate').value || 0,
       runDate: body.querySelector('#r_date').value, location: body.querySelector('#r_loc').value,
       notes: body.querySelector('#r_notes').value, packages
-    });
+    };
+  }
+  async function saveDraft() {
+    const payload = buildPayload();
+    const r = draftId
+      ? await api('PUT', '/production/drafts/' + draftId, payload)
+      : await api('POST', '/production/drafts', payload);
+    draftId = r.run.id;
+    toast('Progress saved — resume it anytime from “In progress”.');
+    render();
+  }
+  async function finalizeRun() {
+    const payload = buildPayload();
+    if (!payload.toteIds.length) throw new Error('Select at least one tote.');
+    if (!payload.packages.length) throw new Error('Enter at least one packaged output quantity.');
+    const r = draftId
+      ? await api('POST', '/production/drafts/' + draftId + '/finalize', payload)
+      : await api('POST', '/production', payload);
     toast(`Run ${r.processingLot}: ${fmt(r.inputKg, 0)} kg → ${fmt(r.outputLitres, 0)} L`);
     render();
-  }, 'Create run');
+  }
+  modal(draft ? 'Resume production run' : 'New production run', body, finalizeRun, 'Create run',
+    { extraLabel: 'Save & close', onExtra: saveDraft });
 }
 
 /* ---------------- Finished goods ---------------- */
@@ -1279,16 +1327,28 @@ function modal(title, body, onSubmit, submitLabel = 'Save', opts = {}) {
   const submitBtn = el('button', {}, submitLabel);
   const actions = el('div', { class: 'modal-actions' });
   if (!opts.noCancel) actions.append(el('button', { class: 'secondary', onclick: close }, 'Cancel'));
+  // Optional secondary action (e.g. "Save & close") that runs its own handler
+  // and closes the modal on success, same as submit but without finalizing.
+  let extraBtn = null;
+  if (opts.extraLabel && opts.onExtra) {
+    extraBtn = el('button', { class: 'secondary', onclick: runExtra }, opts.extraLabel);
+    actions.append(extraBtn);
+  }
   actions.append(submitBtn);
   const card = el('div', { class: 'modal' }, el('h3', {}, title), body, errBox, actions);
   // Backdrop clicks do NOT close the dialog — only Cancel or completing the
   // action does, so a stray click off the popup can't discard your input.
   const bg = el('div', { class: 'modal-bg' }, card);
   function close() { bg.remove(); }
+  async function runExtra() {
+    errBox.textContent = ''; submitBtn.disabled = true; extraBtn.disabled = true;
+    try { await opts.onExtra(); close(); }
+    catch (e) { errBox.textContent = e.message; submitBtn.disabled = false; extraBtn.disabled = false; }
+  }
   submitBtn.addEventListener('click', async () => {
-    errBox.textContent = ''; submitBtn.disabled = true;
+    errBox.textContent = ''; submitBtn.disabled = true; if (extraBtn) extraBtn.disabled = true;
     try { await onSubmit(); close(); }
-    catch (e) { errBox.textContent = e.message; submitBtn.disabled = false; }
+    catch (e) { errBox.textContent = e.message; submitBtn.disabled = false; if (extraBtn) extraBtn.disabled = false; }
   });
   $('#modalRoot').append(bg);
 }
