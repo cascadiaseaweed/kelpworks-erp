@@ -120,6 +120,8 @@ table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
 th { background: #eef3f2; color: var(--teal-dark); font-weight: 600; position: sticky; top: 0; cursor: default; }
 tbody tr:hover { background: #f6faf9; }
+/* QC log entries: show ~5 rows before scrolling (sticky header stays visible). */
+.qc-results-scroll .tablewrap { max-height: 264px; overflow-y: auto; }
 tbody tr.clickable { cursor: pointer; }
 tbody tr.clickable:hover { background: #e9f4f1; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }

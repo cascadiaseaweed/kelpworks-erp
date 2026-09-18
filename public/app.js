@@ -764,7 +764,7 @@ async function openQcModal() {
 }
 
 async function openQcForRun(run) {
-  const listHost = el('div', {});
+  const listHost = el('div', { class: 'qc-results-scroll' });
   const qf = buildQcFields();
   const notesInput = el('input', { placeholder: 'Optional notes' });
   const errBox = el('div', { class: 'help' });
@@ -803,12 +803,12 @@ async function openQcForRun(run) {
   const addBtn = el('button', { class: 'secondary', type: 'button', onclick: addEntry }, '+ Add');
   const body = el('div', {},
     el('div', { class: 'summary-line' }, sl('Run', run.processingLot), sl('SKU', skuName(run.sku))),
-    el('label', {}, 'Logged results'), listHost,
-    el('div', { style: 'margin-top:16px' },
+    el('div', {},
       el('label', {}, 'Add a result'),
       ...qcFormRows(qf),
       field('Notes', notesInput),
-      addBtn, errBox));
+      addBtn, errBox),
+    el('label', { style: 'margin-top:16px' }, 'Logged results'), listHost);
   await refresh();
   modal('Quality control — ' + run.processingLot, body, async () => { if (State.qcChanged) { State.qcChanged = false; render(); } }, 'Done');
 }
