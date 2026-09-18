@@ -97,7 +97,7 @@ async function boot() {
 function render() {
   const v = $('#view'); v.innerHTML = '';
   ({ dashboard: pageDashboard, stabilized: pageStabilized, production: pageProduction,
-     fg: pageFG, shipping: pageShipping, consumables: pageConsumables, reports: pageReports,
+     qc: pageQC, fg: pageFG, shipping: pageShipping, consumables: pageConsumables, reports: pageReports,
      labels: pageLabels, admin: pageAdmin }[State.tab])(v);
 }
 
@@ -409,6 +409,8 @@ async function pageProduction(v) {
         el('h3', { style: 'margin:0' }, mono(run.processingLot) , '  ', el('span', { class: 'pill' }, skuName(run.sku))),
         el('div', { class: 'actions' },
           el('button', { class: 'secondary', onclick: () => editRun(run) }, 'Edit'),
+          el('button', { class: 'secondary', onclick: () => openQcForRun(run) },
+            '🧪 QC' + (run.qc && run.qc.length ? ' (' + run.qc.length + ')' : '')),
           el('button', { class: 'secondary', onclick: () => openAttachments(run) },
             '📎 Documents' + (run.attachments && run.attachments.length ? ' (' + run.attachments.length + ')' : '')),
           el('button', { class: 'secondary', onclick: () => printLabels(run.fgLots.map(f => fgLabel(f, run))) }, 'Print FG labels'))),
@@ -566,6 +568,116 @@ async function openAttachments(run) {
   modal('Documents — ' + run.processingLot, body, async () => { if (State.attachmentsChanged) { State.attachmentsChanged = false; render(); } }, 'Done');
 }
 function sl(k, val) { return el('span', {}, k + ': ', el('b', {}, val)); }
+
+/* ---------------- Quality control log ---------------- */
+const QC_METRICS = ['pH', 'TDS %', 'Brix %', 'Moisture %', 'Density (g/mL)', 'Viscosity (cP)',
+  'Microbial count (CFU/mL)', 'Color', 'Clarity', 'Heavy metals'];
+
+async function pageQC(v) {
+  v.append(el('div', { class: 'page-head' },
+    el('h2', {}, 'Quality Control Log'),
+    el('div', { class: 'actions' }, el('button', { onclick: () => openQcModal() }, '+ Add QC entry'))));
+  const search = el('input', { placeholder: 'Filter by lot or metric…', style: 'max-width:320px;margin-bottom:14px' });
+  const listHost = el('div', {});
+  v.append(search, listHost);
+  const r = await api('GET', '/production/qc');
+  function draw() {
+    const q = search.value.trim().toLowerCase();
+    const rows = r.qc.filter(e => !q || (e.processingLot + ' ' + e.metric).toLowerCase().includes(q));
+    listHost.innerHTML = '';
+    if (!rows.length) {
+      listHost.append(el('div', { class: 'empty card' },
+        r.qc.length ? 'No QC entries match that filter.'
+          : 'No QC results logged yet. Click “+ Add QC entry” to log a lot-specific measurement, traceable back to its production run.'));
+      return;
+    }
+    listHost.append(table(['Lot', 'Date', 'SKU', 'Metric', 'Value', 'Notes', 'Recorded by', 'When', ''],
+      rows.map(e => [
+        el('span', { class: 'mono', style: 'cursor:pointer;text-decoration:underline', title: 'View production run',
+          onclick: () => selectTab('production') }, e.processingLot),
+        e.runDate, skuName(e.sku), e.metric, e.value + (e.unit ? ' ' + e.unit : ''),
+        e.notes || '—', e.recordedBy || '—', fmtWhen(e.recordedAt),
+        rowActions([['Delete', async () => {
+          if (!confirm('Remove this QC entry?')) return;
+          await api('DELETE', '/production/' + e.runId + '/qc/' + e.id);
+          toast('Removed'); render();
+        }, 'danger']])
+      ]), [false, false, false, false, false, false, false, false, false]));
+  }
+  search.addEventListener('input', draw);
+  draw();
+}
+
+async function openQcModal() {
+  const runs = (await api('GET', '/production')).runs;
+  if (!runs.length) { toast('No finalized production runs to log QC against yet.', true); return; }
+  const runSel = selectFrom('', runs.map(r => [String(r.id), r.processingLot + ' — ' + skuName(r.sku) + ' (' + r.runDate + ')']), null, 'qc_run');
+  const metricInput = editableSelect(QC_METRICS.map(m => [m, m]), 'qc_metric');
+  const valueInput = el('input', { placeholder: 'e.g. 4.2' });
+  const unitInput = el('input', { placeholder: 'e.g. %' });
+  const notesInput = el('textarea', { rows: '2', placeholder: 'Optional notes' });
+  const body = el('div', {},
+    field('Production lot', runSel),
+    el('div', { class: 'form-row' }, field('Metric', metricInput), field('Value', valueInput)),
+    field('Unit (optional)', unitInput),
+    field('Notes', notesInput));
+  modal('Add QC entry', body, async () => {
+    const metric = metricInput.querySelector('input').value.trim();
+    const value = valueInput.value.trim();
+    if (!metric) throw new Error('Enter a metric name.');
+    if (!value) throw new Error('Enter a value.');
+    await api('POST', '/production/' + runSel.value + '/qc',
+      { metric, value, unit: unitInput.value.trim(), notes: notesInput.value.trim() });
+    toast('QC entry added');
+    render();
+  }, 'Add entry');
+}
+
+async function openQcForRun(run) {
+  const listHost = el('div', {});
+  const metricInput = editableSelect(QC_METRICS.map(m => [m, m]), 'qc_metric_run');
+  const valueInput = el('input', { placeholder: 'e.g. 4.2' });
+  const unitInput = el('input', { placeholder: 'e.g. %', style: 'width:90px' });
+  const notesInput = el('input', { placeholder: 'Optional notes', style: 'flex:1' });
+  const errBox = el('div', { class: 'help' });
+  async function refresh() { drawList((await api('GET', '/production/' + run.id + '/qc')).qc); }
+  function drawList(entries) {
+    listHost.innerHTML = '';
+    if (!entries.length) { listHost.append(el('div', { class: 'help' }, 'No QC results logged yet.')); return; }
+    listHost.append(table(['Metric', 'Value', 'Notes', 'Recorded by', 'When', ''], entries.map(q => [
+      q.metric, q.value + (q.unit ? ' ' + q.unit : ''), q.notes || '—', q.recordedBy || '—', fmtWhen(q.recordedAt),
+      rowActions([['Delete', async () => {
+        if (!confirm('Remove this QC entry?')) return;
+        await api('DELETE', '/production/' + run.id + '/qc/' + q.id);
+        toast('Removed'); refresh(); State.qcChanged = true;
+      }, 'danger']])
+    ]), [false, false, false, false, false, false]));
+  }
+  async function addEntry() {
+    errBox.textContent = '';
+    const metric = metricInput.querySelector('input').value.trim();
+    const value = valueInput.value.trim();
+    if (!metric) { errBox.textContent = 'Enter a metric name.'; return; }
+    if (!value) { errBox.textContent = 'Enter a value.'; return; }
+    try {
+      await api('POST', '/production/' + run.id + '/qc',
+        { metric, value, unit: unitInput.value.trim(), notes: notesInput.value.trim() });
+      metricInput.querySelector('input').value = ''; valueInput.value = ''; unitInput.value = ''; notesInput.value = '';
+      await refresh(); toast('QC entry added'); State.qcChanged = true;
+    } catch (e) { errBox.textContent = e.message; }
+  }
+  const addBtn = el('button', { class: 'secondary', type: 'button', onclick: addEntry }, '+ Add');
+  const body = el('div', {},
+    el('div', { class: 'summary-line' }, sl('Run', run.processingLot), sl('SKU', skuName(run.sku))),
+    el('label', {}, 'Logged results'), listHost,
+    el('div', { style: 'margin-top:16px' },
+      el('label', {}, 'Add a result'),
+      el('div', { style: 'display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap' },
+        metricInput, valueInput, unitInput, notesInput, addBtn),
+      errBox));
+  await refresh();
+  modal('Quality control — ' + run.processingLot, body, async () => { if (State.qcChanged) { State.qcChanged = false; render(); } }, 'Done');
+}
 
 async function openRun(draft) {
   const totes = (await api('GET', '/totes?status=in_stock')).totes;
