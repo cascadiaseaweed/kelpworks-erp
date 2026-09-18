@@ -192,14 +192,16 @@ CREATE INDEX IF NOT EXISTS idx_attach_run ON run_attachments(run_id);
 -- Lot-specific quality control measurements, traced back to the production
 -- run (processing lot) they were taken on.
 CREATE TABLE IF NOT EXISTS qc_logs (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id       INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
-    metric       TEXT NOT NULL,
-    value        TEXT NOT NULL,
-    unit         TEXT,
-    notes        TEXT,
-    recorded_by  TEXT,
-    recorded_at  TEXT NOT NULL
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id          INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+    sample_location TEXT,
+    sample_type     TEXT,
+    metric          TEXT NOT NULL,
+    value           TEXT NOT NULL,
+    unit            TEXT,
+    notes           TEXT,
+    recorded_by     TEXT,
+    recorded_at     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_qc_run ON qc_logs(run_id);
 
@@ -399,6 +401,11 @@ def migrate(conn):
         conn.execute("ALTER TABLE production_runs ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'")
     if "draft_data" not in prcols:
         conn.execute("ALTER TABLE production_runs ADD COLUMN draft_data TEXT")
+    qccols = {r["name"] for r in conn.execute("PRAGMA table_info(qc_logs)")}
+    if "sample_location" not in qccols:
+        conn.execute("ALTER TABLE qc_logs ADD COLUMN sample_location TEXT")
+    if "sample_type" not in qccols:
+        conn.execute("ALTER TABLE qc_logs ADD COLUMN sample_type TEXT")
 
 
 def ensure_users(conn):
@@ -1278,7 +1285,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- quality control log ----------------------------------------------- #
     def _qc_public(self, r):
-        return {"id": r["id"], "runId": r["run_id"], "metric": r["metric"], "value": r["value"],
+        return {"id": r["id"], "runId": r["run_id"], "sampleLocation": r["sample_location"],
+                "sampleType": r["sample_type"], "metric": r["metric"], "value": r["value"],
                 "unit": r["unit"], "notes": r["notes"], "recordedBy": r["recorded_by"],
                 "recordedAt": r["recorded_at"]}
 
@@ -1299,37 +1307,41 @@ class Handler(BaseHTTPRequestHandler):
             out.append(d)
         return {"qc": out}
 
-    def add_qc(self, conn, run_id, user):
-        d = self._body_json()
+    def _qc_fields(self, d):
+        sample_location = (d.get("sampleLocation") or "").strip()
+        sample_type = (d.get("sampleType") or "").strip()
         metric = (d.get("metric") or "").strip()
         value = (d.get("value") or "").strip()
+        if not sample_location:
+            raise ApiError(400, "Choose a sample location")
+        if not sample_type:
+            raise ApiError(400, "Choose a sample type")
         if not metric:
-            raise ApiError(400, "Enter a metric name")
+            raise ApiError(400, "Choose or enter a measurement")
         if not value:
             raise ApiError(400, "Enter a value")
         unit = (d.get("unit") or "").strip() or None
         notes = (d.get("notes") or "").strip() or None
+        return sample_location, sample_type, metric, value, unit, notes
+
+    def add_qc(self, conn, run_id, user):
+        sample_location, sample_type, metric, value, unit, notes = self._qc_fields(self._body_json())
         conn.execute(
-            "INSERT INTO qc_logs (run_id,metric,value,unit,notes,recorded_by,recorded_at)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (run_id, metric, value, unit, notes, user["name"] if user else None, now_iso()))
+            "INSERT INTO qc_logs (run_id,sample_location,sample_type,metric,value,unit,notes,"
+            "recorded_by,recorded_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (run_id, sample_location, sample_type, metric, value, unit, notes,
+             user["name"] if user else None, now_iso()))
         return {"qc": self._qc_entries(conn, run_id)}
 
     def edit_qc(self, conn, run_id, qid):
         r = conn.execute("SELECT * FROM qc_logs WHERE id=? AND run_id=?", (qid, run_id)).fetchone()
         if not r:
             raise ApiError(404, "QC entry not found")
-        d = self._body_json()
-        metric = (d.get("metric") or "").strip()
-        value = (d.get("value") or "").strip()
-        if not metric:
-            raise ApiError(400, "Enter a metric name")
-        if not value:
-            raise ApiError(400, "Enter a value")
-        unit = (d.get("unit") or "").strip() or None
-        notes = (d.get("notes") or "").strip() or None
-        conn.execute("UPDATE qc_logs SET metric=?, value=?, unit=?, notes=? WHERE id=?",
-                     (metric, value, unit, notes, qid))
+        sample_location, sample_type, metric, value, unit, notes = self._qc_fields(self._body_json())
+        conn.execute(
+            "UPDATE qc_logs SET sample_location=?, sample_type=?, metric=?, value=?, unit=?, notes=?"
+            " WHERE id=?",
+            (sample_location, sample_type, metric, value, unit, notes, qid))
         return {"qc": self._qc_entries(conn, run_id)}
 
     def delete_qc(self, conn, run_id, qid):

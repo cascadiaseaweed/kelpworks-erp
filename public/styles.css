@@ -50,6 +50,9 @@ input, select, textarea {
   font-size: 14px; background: #fff; color: var(--ink); font-family: inherit;
 }
 input:focus, select:focus, textarea:focus { outline: 2px solid var(--teal); border-color: var(--teal); }
+/* Unit hints (e.g. "kg", "%") shown as placeholder guidance in QC value fields —
+   grey + italic, and native placeholder behavior already clears it on input. */
+input::placeholder, textarea::placeholder { font-style: italic; color: var(--muted); }
 button {
   cursor: pointer; border: none; border-radius: 9px; font-weight: 600; font-size: 14px;
   padding: 9px 16px; background: var(--teal); color: #fff; font-family: inherit;
