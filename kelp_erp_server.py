@@ -1211,6 +1211,8 @@ class Handler(BaseHTTPRequestHandler):
                 return {"qc": self._qc_entries(conn, rid)}
             if len(seg) == 4 and method == "POST":
                 return self.add_qc(conn, rid, user)
+            if len(seg) == 5 and seg[4].isdigit() and method == "PUT":
+                return self.edit_qc(conn, rid, int(seg[4]))
             if len(seg) == 5 and seg[4].isdigit() and method == "DELETE":
                 return self.delete_qc(conn, rid, int(seg[4]))
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "edits" and method == "GET":
@@ -1311,6 +1313,23 @@ class Handler(BaseHTTPRequestHandler):
             "INSERT INTO qc_logs (run_id,metric,value,unit,notes,recorded_by,recorded_at)"
             " VALUES (?,?,?,?,?,?,?)",
             (run_id, metric, value, unit, notes, user["name"] if user else None, now_iso()))
+        return {"qc": self._qc_entries(conn, run_id)}
+
+    def edit_qc(self, conn, run_id, qid):
+        r = conn.execute("SELECT * FROM qc_logs WHERE id=? AND run_id=?", (qid, run_id)).fetchone()
+        if not r:
+            raise ApiError(404, "QC entry not found")
+        d = self._body_json()
+        metric = (d.get("metric") or "").strip()
+        value = (d.get("value") or "").strip()
+        if not metric:
+            raise ApiError(400, "Enter a metric name")
+        if not value:
+            raise ApiError(400, "Enter a value")
+        unit = (d.get("unit") or "").strip() or None
+        notes = (d.get("notes") or "").strip() or None
+        conn.execute("UPDATE qc_logs SET metric=?, value=?, unit=?, notes=? WHERE id=?",
+                     (metric, value, unit, notes, qid))
         return {"qc": self._qc_entries(conn, run_id)}
 
     def delete_qc(self, conn, run_id, qid):

@@ -597,11 +597,14 @@ async function pageQC(v) {
           onclick: () => selectTab('production') }, e.processingLot),
         e.runDate, skuName(e.sku), e.metric, e.value + (e.unit ? ' ' + e.unit : ''),
         e.notes || '—', e.recordedBy || '—', fmtWhen(e.recordedAt),
-        rowActions([['Delete', async () => {
-          if (!confirm('Remove this QC entry?')) return;
-          await api('DELETE', '/production/' + e.runId + '/qc/' + e.id);
-          toast('Removed'); render();
-        }, 'danger']])
+        rowActions([
+          ['Edit', () => editQcEntry(e, render)],
+          ['Delete', async () => {
+            if (!confirm('Remove this QC entry?')) return;
+            await api('DELETE', '/production/' + e.runId + '/qc/' + e.id);
+            toast('Removed'); render();
+          }, 'danger']
+        ])
       ]), [false, false, false, false, false, false, false, false, false]));
   }
   search.addEventListener('input', draw);
@@ -646,11 +649,14 @@ async function openQcForRun(run) {
     if (!entries.length) { listHost.append(el('div', { class: 'help' }, 'No QC results logged yet.')); return; }
     listHost.append(table(['Metric', 'Value', 'Notes', 'Recorded by', 'When', ''], entries.map(q => [
       q.metric, q.value + (q.unit ? ' ' + q.unit : ''), q.notes || '—', q.recordedBy || '—', fmtWhen(q.recordedAt),
-      rowActions([['Delete', async () => {
-        if (!confirm('Remove this QC entry?')) return;
-        await api('DELETE', '/production/' + run.id + '/qc/' + q.id);
-        toast('Removed'); refresh(); State.qcChanged = true;
-      }, 'danger']])
+      rowActions([
+        ['Edit', () => editQcEntry(q, () => { refresh(); State.qcChanged = true; })],
+        ['Delete', async () => {
+          if (!confirm('Remove this QC entry?')) return;
+          await api('DELETE', '/production/' + run.id + '/qc/' + q.id);
+          toast('Removed'); refresh(); State.qcChanged = true;
+        }, 'danger']
+      ])
     ]), [false, false, false, false, false, false]));
   }
   async function addEntry() {
@@ -677,6 +683,28 @@ async function openQcForRun(run) {
       errBox));
   await refresh();
   modal('Quality control — ' + run.processingLot, body, async () => { if (State.qcChanged) { State.qcChanged = false; render(); } }, 'Done');
+}
+
+function editQcEntry(entry, onDone) {
+  const metricInput = editableSelect(QC_METRICS.map(m => [m, m]), 'qc_edit_metric');
+  metricInput.querySelector('input').value = entry.metric;
+  const valueInput = el('input', { value: entry.value });
+  const unitInput = el('input', { value: entry.unit || '' });
+  const notesInput = el('textarea', { rows: '2' }, entry.notes || '');
+  const body = el('div', {},
+    el('div', { class: 'form-row' }, field('Metric', metricInput), field('Value', valueInput)),
+    field('Unit (optional)', unitInput),
+    field('Notes', notesInput));
+  modal('Edit QC entry', body, async () => {
+    const metric = metricInput.querySelector('input').value.trim();
+    const value = valueInput.value.trim();
+    if (!metric) throw new Error('Enter a metric name.');
+    if (!value) throw new Error('Enter a value.');
+    await api('PUT', '/production/' + entry.runId + '/qc/' + entry.id,
+      { metric, value, unit: unitInput.value.trim(), notes: notesInput.value.trim() });
+    toast('QC entry updated');
+    onDone();
+  }, 'Save changes');
 }
 
 async function openRun(draft) {
