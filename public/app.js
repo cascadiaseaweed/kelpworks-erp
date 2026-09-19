@@ -647,15 +647,66 @@ function qcLocationParts(loc) {
   const m = /^(.*?)\s*\(([^)]+)\)\s*$/.exec(loc);
   return m ? { name: m[1], note: m[2] } : { name: loc, note: null };
 }
-function qcLocationOptionText(loc) {
+function qcLocationLabel(loc, variant) {
   const { name, note } = qcLocationParts(loc);
-  return note ? name + ' — ' + note : name;
-}
-function qcLocationLabel(loc) {
-  const { name, note } = qcLocationParts(loc);
-  return el('span', { class: 'qc-loc' },
+  return el('span', { class: 'qc-loc qc-loc-' + (variant || 'secondary') },
     el('span', { class: 'qc-loc-name' }, name),
     note ? el('span', { class: 'qc-loc-note' }, note) : null);
+}
+// Custom dropdown (native <select> can't render multi-line option text) that
+// shows every location as its stacked two-line label, both for the closed
+// button and the open list of choices.
+function buildQcLocationSelect(initialValue, onChange) {
+  let value = QC_LOCATIONS.includes(initialValue) ? initialValue : QC_LOCATIONS[0];
+  const btn = el('button', { type: 'button', class: 'qc-loc-select-btn' });
+  const panel = el('div', { class: 'qc-loc-panel hidden' });
+  const wrap = el('div', { class: 'qc-loc-select' }, btn, panel);
+  function onDocClick(e) { if (!wrap.contains(e.target)) close(); }
+  function open() {
+    panel.innerHTML = '';
+    QC_LOCATIONS.forEach(l => panel.append(el('div', {
+      class: 'qc-loc-option' + (l === value ? ' selected' : ''),
+      onclick: () => { value = l; renderBtn(); close(); onChange(value); }
+    }, qcLocationLabel(l, 'primary'))));
+    panel.classList.remove('hidden');
+    document.addEventListener('click', onDocClick, true);
+  }
+  function close() {
+    panel.classList.add('hidden');
+    document.removeEventListener('click', onDocClick, true);
+  }
+  function renderBtn() {
+    btn.innerHTML = '';
+    btn.append(qcLocationLabel(value, 'primary'), el('span', { class: 'qc-loc-caret' }, '▾'));
+  }
+  btn.addEventListener('click', () => { panel.classList.contains('hidden') ? open() : close(); });
+  renderBtn();
+  return { el: wrap, get value() { return value; } };
+}
+// Restricts a Value input to digits and one decimal point, groups the integer
+// part with commas as the user types, and caps decimal digits at maxDecimals
+// (a number, or a function returning one — density measurements get 3, every
+// other measurement 2, per QC policy).
+function attachNumericMask(input, maxDecimals) {
+  const getMax = typeof maxDecimals === 'function' ? maxDecimals : () => maxDecimals;
+  input.addEventListener('input', () => {
+    const caretFromEnd = input.value.length - input.selectionStart;
+    let raw = input.value.replace(/[^0-9.]/g, '');
+    const firstDot = raw.indexOf('.');
+    if (firstDot !== -1) raw = raw.slice(0, firstDot + 1) + raw.slice(firstDot + 1).replace(/\./g, '');
+    let [intPart, fracPart] = raw.split('.');
+    if (fracPart !== undefined) fracPart = fracPart.slice(0, getMax());
+    const intGrouped = intPart ? Number(intPart).toLocaleString('en-US') : '';
+    input.value = intGrouped + (fracPart !== undefined ? '.' + fracPart : '');
+    const newCaret = Math.max(0, input.value.length - caretFromEnd);
+    input.setSelectionRange(newCaret, newCaret);
+  });
+}
+function qcMaxDecimals(unit) { return unit === 'g/mL' ? 3 : 2; }   // density (ρ) gets 3 places, everything else 2
+function qcParseValue(s) { return parseFloat(String(s).replace(/,/g, '')); }
+function formatQcValue(n, maxDecimals) {
+  const num = Number(n);
+  return Number.isNaN(num) ? '' : num.toLocaleString('en-US', { maximumFractionDigits: maxDecimals });
 }
 
 // Renders the three ways to work through a QC log: by Sample location (all
@@ -691,11 +742,9 @@ function renderQcBulkEntry(host, run, existingEntries, state, onSaved) {
   function buildPicker() {
     pickerHost.innerHTML = '';
     if (state.mode === 'location') {
-      const sel = el('select', {}, ...QC_LOCATIONS.map(l => el('option', { value: l }, qcLocationOptionText(l))));
-      sel.value = QC_LOCATIONS.includes(state.location) ? state.location : QC_LOCATIONS[0];
-      state.location = sel.value;
-      sel.addEventListener('change', () => { state.location = sel.value; rebuildRows(); });
-      pickerHost.append(field('Sample location', sel));
+      const picker = buildQcLocationSelect(state.location, v => { state.location = v; rebuildRows(); });
+      state.location = picker.value;
+      pickerHost.append(field('Sample location', picker.el));
     } else if (state.mode === 'measurement') {
       const sel = el('select', {}, ...QC_MEASUREMENTS.map(m => el('option', { value: m }, m)));
       sel.value = QC_MEASUREMENTS.includes(state.measurement) ? state.measurement : QC_MEASUREMENTS[0];
@@ -707,10 +756,15 @@ function renderQcBulkEntry(host, run, existingEntries, state, onSaved) {
   }
   function buildRow(r, showLocation) {
     const existing = existingFor(r.location, r.measurement);
-    const valueInput = el('input', { placeholder: r.unit || '', value: existing ? existing.value : '' });
+    const maxDecimals = qcMaxDecimals(r.unit);
+    const valueInput = el('input', {
+      inputmode: 'decimal', placeholder: r.unit || '',
+      value: existing ? formatQcValue(existing.value, maxDecimals) : ''
+    });
+    attachNumericMask(valueInput, maxDecimals);
     const check = el('span', { class: 'qc-check' + (existing ? '' : ' hidden'), title: 'Already logged' }, '✓ Logged');
     valueInput.addEventListener('input', () => {
-      check.classList.toggle('hidden', !(existing && valueInput.value === existing.value));
+      check.classList.toggle('hidden', !(existing && qcParseValue(valueInput.value) === existing.value));
     });
     rowsHost.append(el('div', { class: 'qc-row ' + qcTypeClass(r.type) },
       el('span', { class: 'qc-row-label' },
@@ -724,7 +778,8 @@ function renderQcBulkEntry(host, run, existingEntries, state, onSaved) {
     rowCtls = [];
     if (state.mode === 'location' && state.location === 'Other') {
       const measureInput = el('input', { placeholder: 'Measurement name' });
-      const valueInput = el('input', {});
+      const valueInput = el('input', { inputmode: 'decimal' });
+      attachNumericMask(valueInput, 2);
       rowsHost.append(el('div', { class: 'form-row' },
         field('Measurement', measureInput), field('Value', valueInput)));
       rowCtls.push({ other: true, measureInput, valueInput });
@@ -759,15 +814,19 @@ function renderQcBulkEntry(host, run, existingEntries, state, onSaved) {
     try {
       if (state.mode === 'location' && state.location === 'Other') {
         const { measureInput, valueInput } = rowCtls[0];
-        const metric = measureInput.value.trim(), value = valueInput.value.trim();
+        const metric = measureInput.value.trim();
+        const value = qcParseValue(valueInput.value);
         if (!metric) throw new Error('Enter a measurement name.');
-        if (!value) throw new Error('Enter a value.');
+        if (!valueInput.value.trim() || Number.isNaN(value)) throw new Error('Enter a numeric value.');
         await api('POST', '/production/' + run.id + '/qc', { sampleLocation: 'Other', metric, value, unit: '' });
       } else {
         let saved = 0;
         for (const r of rowCtls) {
-          const value = r.valueInput.value.trim();
-          if (!value || (r.existing && r.existing.value === value)) continue;   // blank or unchanged
+          const raw = r.valueInput.value.trim();
+          if (!raw) continue;
+          const value = qcParseValue(raw);
+          if (Number.isNaN(value)) throw new Error('Enter a numeric value for ' + r.measurement + '.');
+          if (r.existing && r.existing.value === value) continue;   // unchanged
           await api('POST', '/production/' + run.id + '/qc',
             { sampleLocation: r.location, metric: r.measurement, value, unit: r.unit || '' });
           saved++;
@@ -807,7 +866,8 @@ async function pageQC(v) {
         el('span', { class: 'mono', style: 'cursor:pointer;text-decoration:underline', title: 'View production run',
           onclick: () => selectTab('production') }, e.processingLot),
         e.runDate, skuName(e.sku), e.sampleLocation || '—', e.metric,
-        e.value + (e.unit ? ' ' + e.unit : ''), e.notes || '—', e.recordedBy || '—', fmtWhen(e.recordedAt),
+        formatQcValue(e.value, qcMaxDecimals(e.unit)) + (e.unit ? ' ' + e.unit : ''),
+        e.notes || '—', e.recordedBy || '—', fmtWhen(e.recordedAt),
         rowActions([
           ['Edit', () => editQcEntry(e, render)],
           ['Delete', async () => {
@@ -853,7 +913,7 @@ async function openQcForRun(run) {
     listHost.innerHTML = '';
     if (!entries.length) { listHost.append(el('div', { class: 'help' }, 'No QC results logged yet.')); return; }
     listHost.append(table(['Sample location', 'Measurement', 'Value', 'Notes', 'Recorded by', 'When', ''], entries.map(q => [
-      q.sampleLocation || '—', q.metric, q.value + (q.unit ? ' ' + q.unit : ''),
+      q.sampleLocation || '—', q.metric, formatQcValue(q.value, qcMaxDecimals(q.unit)) + (q.unit ? ' ' + q.unit : ''),
       q.notes || '—', q.recordedBy || '—', fmtWhen(q.recordedAt),
       rowActions([
         ['Edit', () => editQcEntry(q, () => { refresh(); State.qcChanged = true; })],
@@ -874,25 +934,24 @@ async function openQcForRun(run) {
 }
 
 function editQcEntry(entry, onDone) {
-  const locSel = el('select', {}, ...QC_LOCATIONS.map(l => el('option', { value: l }, qcLocationOptionText(l))));
-  locSel.value = QC_LOCATIONS.includes(entry.sampleLocation) ? entry.sampleLocation : QC_LOCATIONS[0];
   const measureHost = el('div', {});
-  const valueInput = el('input', { placeholder: entry.unit || '', value: entry.value ?? '' });
+  const valueInput = el('input', { inputmode: 'decimal', placeholder: entry.unit || '' });
   let measureCtl = null;
+  const locPicker = buildQcLocationSelect(entry.sampleLocation, () => rebuildMeasure());
   function currentUnit() {
-    if (locSel.value === 'Other' || !measureCtl || measureCtl.tagName !== 'SELECT') return '';
-    const found = measurementsForLocation(locSel.value).find(o => o.measurement === measureCtl.value);
+    if (locPicker.value === 'Other' || !measureCtl || measureCtl.tagName !== 'SELECT') return '';
+    const found = measurementsForLocation(locPicker.value).find(o => o.measurement === measureCtl.value);
     return (found && found.unit) || '';
   }
   function rebuildMeasure(selMetric) {
     measureHost.innerHTML = '';
-    if (locSel.value === 'Other') {
+    if (locPicker.value === 'Other') {
       measureCtl = el('input', { placeholder: 'Enter a measurement name', value: selMetric || '' });
       measureHost.append(measureCtl);
       valueInput.placeholder = '';
       return;
     }
-    const opts = measurementsForLocation(locSel.value);
+    const opts = measurementsForLocation(locPicker.value);
     measureCtl = el('select', {}, ...opts.map(o =>
       el('option', { value: o.measurement }, o.measurement + (o.unit ? ' (' + o.unit + ')' : ''))));
     if (opts.some(o => o.measurement === selMetric)) measureCtl.value = selMetric;
@@ -900,19 +959,20 @@ function editQcEntry(entry, onDone) {
     measureHost.append(measureCtl);
     valueInput.placeholder = currentUnit();
   }
-  locSel.addEventListener('change', () => rebuildMeasure());
   rebuildMeasure(entry.metric);
+  valueInput.value = formatQcValue(entry.value, qcMaxDecimals(entry.unit));
+  attachNumericMask(valueInput, () => qcMaxDecimals(currentUnit()));
   const notesInput = el('textarea', { rows: '2' }, entry.notes || '');
   const body = el('div', {},
-    el('div', { class: 'form-row' }, field('Sample location', locSel), field('Measurement', measureHost)),
+    el('div', { class: 'form-row' }, field('Sample location', locPicker.el), field('Measurement', measureHost)),
     field('Value', valueInput), field('Notes', notesInput));
   modal('Edit QC entry', body, async () => {
     const metric = measureCtl ? measureCtl.value.trim() : '';
-    const value = valueInput.value.trim();
+    const value = qcParseValue(valueInput.value);
     if (!metric) throw new Error('Choose or enter a measurement.');
-    if (!value) throw new Error('Enter a value.');
+    if (!valueInput.value.trim() || Number.isNaN(value)) throw new Error('Enter a numeric value.');
     await api('PUT', '/production/' + entry.runId + '/qc/' + entry.id, {
-      sampleLocation: locSel.value, metric, value, unit: currentUnit(), notes: notesInput.value.trim()
+      sampleLocation: locPicker.value, metric, value, unit: currentUnit(), notes: notesInput.value.trim()
     });
     toast('QC entry updated');
     onDone();

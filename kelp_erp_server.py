@@ -197,7 +197,7 @@ CREATE TABLE IF NOT EXISTS qc_logs (
     sample_location TEXT,
     sample_type     TEXT,
     metric          TEXT NOT NULL,
-    value           TEXT NOT NULL,
+    value           REAL NOT NULL,
     unit            TEXT,
     notes           TEXT,
     recorded_by     TEXT,
@@ -401,11 +401,36 @@ def migrate(conn):
         conn.execute("ALTER TABLE production_runs ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'")
     if "draft_data" not in prcols:
         conn.execute("ALTER TABLE production_runs ADD COLUMN draft_data TEXT")
-    qccols = {r["name"] for r in conn.execute("PRAGMA table_info(qc_logs)")}
+    qc_info = list(conn.execute("PRAGMA table_info(qc_logs)"))
+    qccols = {r["name"] for r in qc_info}
     if "sample_location" not in qccols:
         conn.execute("ALTER TABLE qc_logs ADD COLUMN sample_location TEXT")
     if "sample_type" not in qccols:
         conn.execute("ALTER TABLE qc_logs ADD COLUMN sample_type TEXT")
+    value_col = next((r for r in qc_info if r["name"] == "value"), None)
+    if value_col and value_col["type"].upper() != "REAL":
+        # SQLite can't ALTER a column's type in place — rebuild the table.
+        conn.execute("""
+            CREATE TABLE qc_logs_new (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id          INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+                sample_location TEXT,
+                sample_type     TEXT,
+                metric          TEXT NOT NULL,
+                value           REAL NOT NULL,
+                unit            TEXT,
+                notes           TEXT,
+                recorded_by     TEXT,
+                recorded_at     TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "INSERT INTO qc_logs_new (id,run_id,sample_location,sample_type,metric,value,unit,notes,"
+            "recorded_by,recorded_at) SELECT id,run_id,sample_location,sample_type,metric,"
+            "CAST(value AS REAL),unit,notes,recorded_by,recorded_at FROM qc_logs")
+        conn.execute("DROP TABLE qc_logs")
+        conn.execute("ALTER TABLE qc_logs_new RENAME TO qc_logs")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_qc_run ON qc_logs(run_id)")
 
 
 def ensure_users(conn):
@@ -1311,13 +1336,17 @@ class Handler(BaseHTTPRequestHandler):
         sample_location = (d.get("sampleLocation") or "").strip()
         sample_type = (d.get("sampleType") or "").strip() or None  # retained for old rows; no longer collected
         metric = (d.get("metric") or "").strip()
-        value = (d.get("value") or "").strip()
         if not sample_location:
             raise ApiError(400, "Choose a sample location")
         if not metric:
             raise ApiError(400, "Choose or enter a measurement")
-        if not value:
+        raw_value = d.get("value")
+        if raw_value in (None, ""):
             raise ApiError(400, "Enter a value")
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            raise ApiError(400, "Enter a numeric value")
         unit = (d.get("unit") or "").strip() or None
         notes = (d.get("notes") or "").strip() or None
         return sample_location, sample_type, metric, value, unit, notes
