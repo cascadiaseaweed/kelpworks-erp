@@ -869,7 +869,6 @@ async function pageQC(v) {
         formatQcValue(e.value, qcMaxDecimals(e.unit)) + (e.unit ? ' ' + e.unit : ''),
         e.notes || '—', e.recordedBy || '—', fmtWhen(e.recordedAt),
         rowActions([
-          ['Edit', () => editQcEntry(e, render)],
           ['Delete', async () => {
             if (!confirm('Remove this QC entry?')) return;
             await api('DELETE', '/production/' + e.runId + '/qc/' + e.id);
@@ -916,7 +915,6 @@ async function openQcForRun(run) {
       q.sampleLocation || '—', q.metric, formatQcValue(q.value, qcMaxDecimals(q.unit)) + (q.unit ? ' ' + q.unit : ''),
       q.notes || '—', q.recordedBy || '—', fmtWhen(q.recordedAt),
       rowActions([
-        ['Edit', () => editQcEntry(q, () => { refresh(); State.qcChanged = true; })],
         ['Delete', async () => {
           if (!confirm('Remove this QC entry?')) return;
           await api('DELETE', '/production/' + run.id + '/qc/' + q.id);
@@ -930,53 +928,7 @@ async function openQcForRun(run) {
     el('div', {}, el('label', {}, 'Add / update results'), bulkHost),
     el('label', { style: 'margin-top:16px' }, 'Logged results'), listHost);
   await refresh();
-  modal('Quality control — ' + run.processingLot, body, async () => { if (State.qcChanged) { State.qcChanged = false; render(); } }, 'Done');
-}
-
-function editQcEntry(entry, onDone) {
-  const measureHost = el('div', {});
-  const valueInput = el('input', { inputmode: 'decimal', placeholder: entry.unit || '' });
-  let measureCtl = null;
-  const locPicker = buildQcLocationSelect(entry.sampleLocation, () => rebuildMeasure());
-  function currentUnit() {
-    if (locPicker.value === 'Other' || !measureCtl || measureCtl.tagName !== 'SELECT') return '';
-    const found = measurementsForLocation(locPicker.value).find(o => o.measurement === measureCtl.value);
-    return (found && found.unit) || '';
-  }
-  function rebuildMeasure(selMetric) {
-    measureHost.innerHTML = '';
-    if (locPicker.value === 'Other') {
-      measureCtl = el('input', { placeholder: 'Enter a measurement name', value: selMetric || '' });
-      measureHost.append(measureCtl);
-      valueInput.placeholder = '';
-      return;
-    }
-    const opts = measurementsForLocation(locPicker.value);
-    measureCtl = el('select', {}, ...opts.map(o =>
-      el('option', { value: o.measurement }, o.measurement + (o.unit ? ' (' + o.unit + ')' : ''))));
-    if (opts.some(o => o.measurement === selMetric)) measureCtl.value = selMetric;
-    measureCtl.addEventListener('change', () => { valueInput.placeholder = currentUnit(); });
-    measureHost.append(measureCtl);
-    valueInput.placeholder = currentUnit();
-  }
-  rebuildMeasure(entry.metric);
-  valueInput.value = formatQcValue(entry.value, qcMaxDecimals(entry.unit));
-  attachNumericMask(valueInput, () => qcMaxDecimals(currentUnit()));
-  const notesInput = el('textarea', { rows: '2' }, entry.notes || '');
-  const body = el('div', {},
-    el('div', { class: 'form-row' }, field('Sample location', locPicker.el), field('Measurement', measureHost)),
-    field('Value', valueInput), field('Notes', notesInput));
-  modal('Edit QC entry', body, async () => {
-    const metric = measureCtl ? measureCtl.value.trim() : '';
-    const value = qcParseValue(valueInput.value);
-    if (!metric) throw new Error('Choose or enter a measurement.');
-    if (!valueInput.value.trim() || Number.isNaN(value)) throw new Error('Enter a numeric value.');
-    await api('PUT', '/production/' + entry.runId + '/qc/' + entry.id, {
-      sampleLocation: locPicker.value, metric, value, unit: currentUnit(), notes: notesInput.value.trim()
-    });
-    toast('QC entry updated');
-    onDone();
-  }, 'Save changes');
+  modal('Quality Control Log — ' + run.processingLot, body, async () => { if (State.qcChanged) { State.qcChanged = false; render(); } }, 'Done');
 }
 
 async function openRun(draft) {
