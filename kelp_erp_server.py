@@ -189,6 +189,22 @@ CREATE TABLE IF NOT EXISTS run_attachments (
 );
 CREATE INDEX IF NOT EXISTS idx_attach_run ON run_attachments(run_id);
 
+-- Lot-specific quality control measurements, traced back to the production
+-- run (processing lot) they were taken on.
+CREATE TABLE IF NOT EXISTS qc_logs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id          INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+    sample_location TEXT,
+    sample_type     TEXT,
+    metric          TEXT NOT NULL,
+    value           REAL NOT NULL,
+    unit            TEXT,
+    notes           TEXT,
+    recorded_by     TEXT,
+    recorded_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_qc_run ON qc_logs(run_id);
+
 CREATE TABLE IF NOT EXISTS customers (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     name       TEXT NOT NULL UNIQUE,
@@ -385,6 +401,36 @@ def migrate(conn):
         conn.execute("ALTER TABLE production_runs ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'")
     if "draft_data" not in prcols:
         conn.execute("ALTER TABLE production_runs ADD COLUMN draft_data TEXT")
+    qc_info = list(conn.execute("PRAGMA table_info(qc_logs)"))
+    qccols = {r["name"] for r in qc_info}
+    if "sample_location" not in qccols:
+        conn.execute("ALTER TABLE qc_logs ADD COLUMN sample_location TEXT")
+    if "sample_type" not in qccols:
+        conn.execute("ALTER TABLE qc_logs ADD COLUMN sample_type TEXT")
+    value_col = next((r for r in qc_info if r["name"] == "value"), None)
+    if value_col and value_col["type"].upper() != "REAL":
+        # SQLite can't ALTER a column's type in place — rebuild the table.
+        conn.execute("""
+            CREATE TABLE qc_logs_new (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id          INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+                sample_location TEXT,
+                sample_type     TEXT,
+                metric          TEXT NOT NULL,
+                value           REAL NOT NULL,
+                unit            TEXT,
+                notes           TEXT,
+                recorded_by     TEXT,
+                recorded_at     TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "INSERT INTO qc_logs_new (id,run_id,sample_location,sample_type,metric,value,unit,notes,"
+            "recorded_by,recorded_at) SELECT id,run_id,sample_location,sample_type,metric,"
+            "CAST(value AS REAL),unit,notes,recorded_by,recorded_at FROM qc_logs")
+        conn.execute("DROP TABLE qc_logs")
+        conn.execute("ALTER TABLE qc_logs_new RENAME TO qc_logs")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_qc_run ON qc_logs(run_id)")
 
 
 def ensure_users(conn):
@@ -1168,6 +1214,7 @@ class Handler(BaseHTTPRequestHandler):
                     "SELECT * FROM fg_lots WHERE run_id=? ORDER BY package_size", (r["id"],))]
                 d["edits"] = self._run_edits(conn, r["id"])
                 d["attachments"] = self._attachments(conn, r["id"])
+                d["qc"] = self._qc_entries(conn, r["id"])
                 runs.append(d)
             return {"runs": runs}
         if seg == ["api", "production"] and method == "POST":
@@ -1186,6 +1233,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self.delete_draft(conn, rid)
         if len(seg) == 5 and seg[2] == "drafts" and seg[3].isdigit() and seg[4] == "finalize" and method == "POST":
             return self.finalize_draft(conn, int(seg[3]))
+        if seg == ["api", "production", "qc"] and method == "GET":
+            return self.list_qc_all(conn)
+        if len(seg) >= 4 and seg[2].isdigit() and seg[3] == "qc":
+            rid = int(seg[2])
+            if not conn.execute("SELECT 1 FROM production_runs WHERE id=?", (rid,)).fetchone():
+                raise ApiError(404, "Production run not found")
+            if len(seg) == 4 and method == "GET":
+                return {"qc": self._qc_entries(conn, rid)}
+            if len(seg) == 4 and method == "POST":
+                return self.add_qc(conn, rid, user)
+            if len(seg) == 5 and seg[4].isdigit() and method == "DELETE":
+                return self.delete_qc(conn, rid, int(seg[4]), user)
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "edits" and method == "GET":
             return {"edits": self._run_edits(conn, int(seg[2]))}
         if len(seg) == 3 and seg[2].isdigit() and method == "PUT":
@@ -1246,6 +1305,66 @@ class Handler(BaseHTTPRequestHandler):
             pass
         conn.execute("DELETE FROM run_attachments WHERE id=?", (aid,))
         return {"attachments": self._attachments(conn, run_id)}
+
+    # ---- quality control log ----------------------------------------------- #
+    def _qc_public(self, r):
+        return {"id": r["id"], "runId": r["run_id"], "sampleLocation": r["sample_location"],
+                "sampleType": r["sample_type"], "metric": r["metric"], "value": r["value"],
+                "unit": r["unit"], "notes": r["notes"], "recordedBy": r["recorded_by"],
+                "recordedAt": r["recorded_at"]}
+
+    def _qc_entries(self, conn, run_id):
+        return [self._qc_public(r) for r in conn.execute(
+            "SELECT * FROM qc_logs WHERE run_id=? ORDER BY recorded_at DESC, id DESC", (run_id,))]
+
+    def list_qc_all(self, conn):
+        out = []
+        for r in conn.execute(
+                "SELECT q.*, r.processing_lot, r.run_date, r.sku_code FROM qc_logs q "
+                "JOIN production_runs r ON r.id=q.run_id "
+                "WHERE r.status='completed' ORDER BY q.recorded_at DESC, q.id DESC"):
+            d = self._qc_public(r)
+            d["processingLot"] = r["processing_lot"]
+            d["runDate"] = r["run_date"]
+            d["sku"] = r["sku_code"]
+            out.append(d)
+        return {"qc": out}
+
+    def _qc_fields(self, d):
+        sample_location = (d.get("sampleLocation") or "").strip()
+        sample_type = (d.get("sampleType") or "").strip() or None  # retained for old rows; no longer collected
+        metric = (d.get("metric") or "").strip()
+        if not sample_location:
+            raise ApiError(400, "Choose a sample location")
+        if not metric:
+            raise ApiError(400, "Choose or enter a measurement")
+        raw_value = d.get("value")
+        if raw_value in (None, ""):
+            raise ApiError(400, "Enter a value")
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            raise ApiError(400, "Enter a numeric value")
+        unit = (d.get("unit") or "").strip() or None
+        notes = (d.get("notes") or "").strip() or None
+        return sample_location, sample_type, metric, value, unit, notes
+
+    def add_qc(self, conn, run_id, user):
+        sample_location, sample_type, metric, value, unit, notes = self._qc_fields(self._body_json())
+        conn.execute(
+            "INSERT INTO qc_logs (run_id,sample_location,sample_type,metric,value,unit,notes,"
+            "recorded_by,recorded_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (run_id, sample_location, sample_type, metric, value, unit, notes,
+             user["name"] if user else None, now_iso()))
+        return {"qc": self._qc_entries(conn, run_id)}
+
+    def delete_qc(self, conn, run_id, qid, user):
+        self._require_admin(user)
+        r = conn.execute("SELECT * FROM qc_logs WHERE id=? AND run_id=?", (qid, run_id)).fetchone()
+        if not r:
+            raise ApiError(404, "QC entry not found")
+        conn.execute("DELETE FROM qc_logs WHERE id=?", (qid,))
+        return {"qc": self._qc_entries(conn, run_id)}
 
     def _run_edits(self, conn, run_id):
         return [{"user": r["user_name"], "field": r["field"], "old": r["old_value"],

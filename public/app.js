@@ -97,7 +97,7 @@ async function boot() {
 function render() {
   const v = $('#view'); v.innerHTML = '';
   ({ dashboard: pageDashboard, stabilized: pageStabilized, production: pageProduction,
-     fg: pageFG, shipping: pageShipping, consumables: pageConsumables, reports: pageReports,
+     qc: pageQC, fg: pageFG, shipping: pageShipping, consumables: pageConsumables, reports: pageReports,
      labels: pageLabels, admin: pageAdmin }[State.tab])(v);
 }
 
@@ -409,6 +409,8 @@ async function pageProduction(v) {
         el('h3', { style: 'margin:0' }, mono(run.processingLot) , '  ', el('span', { class: 'pill' }, skuName(run.sku))),
         el('div', { class: 'actions' },
           el('button', { class: 'secondary', onclick: () => editRun(run) }, 'Edit'),
+          el('button', { class: 'secondary', onclick: () => openQcForRun(run) },
+            '🧪 QC' + (run.qc && run.qc.length ? ' (' + run.qc.length + ')' : '')),
           el('button', { class: 'secondary', onclick: () => openAttachments(run) },
             '📎 Documents' + (run.attachments && run.attachments.length ? ' (' + run.attachments.length + ')' : '')),
           el('button', { class: 'secondary', onclick: () => printLabels(run.fgLots.map(f => fgLabel(f, run))) }, 'Print FG labels'))),
@@ -566,6 +568,368 @@ async function openAttachments(run) {
   modal('Documents — ' + run.processingLot, body, async () => { if (State.attachmentsChanged) { State.attachmentsChanged = false; render(); } }, 'Done');
 }
 function sl(k, val) { return el('span', {}, k + ': ', el('b', {}, val)); }
+
+/* ---------------- Quality control log ---------------- */
+// [Sample Location, Sample Type, Measurement, Unit] — transcribed from the QAQC
+// sample plan (Claude_sample_fields.xlsx). Sample Type isn't a user-facing field
+// (removed per feedback) but is kept here to color-code line items by it.
+const QC_TABLE = [
+  ['Homogenization (Feedstock Characterization)', 'Process', 'Total IBC weight', 'kg'],
+  ['Homogenization (Feedstock Characterization)', 'Process', 'Total IBC volume', 'L'],
+  ['Homogenization (Feedstock Characterization)', 'Process', 'Total rinse water', 'L'],
+  ['Homogenization (Feedstock Characterization)', 'Product', 'Fraction wet solid', '%'],
+  ['Homogenization (Feedstock Characterization)', 'Product', 'TSslurry', '%'],
+  ['Homogenization (Feedstock Characterization)', 'Product', 'TSliquid', '%'],
+  ['Homogenization (Feedstock Characterization)', 'Product', 'TSsolids', '%'],
+  ['Homogenization (Feedstock Characterization)', 'Product', 'ρliquid', 'g/mL'],
+  ['Homogenization (Feedstock Characterization)', 'Product', 'ρslurry', 'g/mL'],
+
+  ['Pre-Extraction (Lot Characterization)', 'Process', 'Total dilution water', 'L'],
+  ['Pre-Extraction (Lot Characterization)', 'Process', 'Total slurry level (2A/B)', 'L'],
+  ['Pre-Extraction (Lot Characterization)', 'Quality', 'pH', ''],
+  ['Pre-Extraction (Lot Characterization)', 'Quality', 'TDS', '%'],
+  ['Pre-Extraction (Lot Characterization)', 'Quality', 'Brix', '%'],
+  ['Pre-Extraction (Lot Characterization)', 'Quality', 'Mannitol', '%'],
+  ['Pre-Extraction (Lot Characterization)', 'Product', 'Fraction wet solid', '%'],
+  ['Pre-Extraction (Lot Characterization)', 'Product', 'TSslurry', '%'],
+  ['Pre-Extraction (Lot Characterization)', 'Product', 'TSliquid', '%'],
+  ['Pre-Extraction (Lot Characterization)', 'Product', 'TSsolids', '%'],
+  ['Pre-Extraction (Lot Characterization)', 'Product', 'ρliquid', 'g/mL'],
+  ['Pre-Extraction (Lot Characterization)', 'Product', 'ρslurry', 'g/mL'],
+
+  ['Post-Extraction (Extraction Performance)', 'Process', 'Total slurry level (3)', 'L'],
+  ['Post-Extraction (Extraction Performance)', 'Quality', 'pH', ''],
+  ['Post-Extraction (Extraction Performance)', 'Quality', 'TDS', '%'],
+  ['Post-Extraction (Extraction Performance)', 'Quality', 'Brix', '%'],
+  ['Post-Extraction (Extraction Performance)', 'Quality', 'Mannitol', '%'],
+  ['Post-Extraction (Extraction Performance)', 'Product', 'Fraction wet solid', '%'],
+  ['Post-Extraction (Extraction Performance)', 'Product', 'TSslurry', '%'],
+  ['Post-Extraction (Extraction Performance)', 'Product', 'TSliquid', '%'],
+  ['Post-Extraction (Extraction Performance)', 'Product', 'TSsolids', '%'],
+  ['Post-Extraction (Extraction Performance)', 'Product', 'ρliquid', 'g/mL'],
+  ['Post-Extraction (Extraction Performance)', 'Product', 'ρslurry', 'g/mL'],
+
+  ['Solids Characterization', 'Process', 'Total solids weight', 'kg'],
+  ['Solids Characterization', 'Product', 'Moisture', '%'],
+
+  ['Post-Pasteurization (Reagent & Dilution Requirements)', 'Process', 'Total tank level (5A/B)', 'L'],
+  ['Post-Pasteurization (Reagent & Dilution Requirements)', 'Quality', 'pH', ''],
+  ['Post-Pasteurization (Reagent & Dilution Requirements)', 'Quality', 'TDS', '%'],
+  ['Post-Pasteurization (Reagent & Dilution Requirements)', 'Product', 'TSliquid', '%'],
+  ['Post-Pasteurization (Reagent & Dilution Requirements)', 'Product', 'ρliquid', 'g/mL'],
+
+  ['Final Product (LKE Characterization)', 'Process', 'Total citric', 'kg'],
+  ['Final Product (LKE Characterization)', 'Process', 'Total ksorbate', 'kg'],
+  ['Final Product (LKE Characterization)', 'Process', 'Total dilution water', 'L'],
+  ['Final Product (LKE Characterization)', 'Process', 'Total tank level (6A/B)', 'L'],
+  ['Final Product (LKE Characterization)', 'Process', 'IBC count', ''],
+  ['Final Product (LKE Characterization)', 'Quality', 'pH', ''],
+  ['Final Product (LKE Characterization)', 'Quality', 'TDS', '%'],
+  ['Final Product (LKE Characterization)', 'Quality', 'Brix', '%'],
+  ['Final Product (LKE Characterization)', 'Quality', 'Mannitol', '%'],
+  ['Final Product (LKE Characterization)', 'Product', 'TSliquid', '%'],
+  ['Final Product (LKE Characterization)', 'Product', 'ρliquid', 'g/mL'],
+  ['Final Product (LKE Characterization)', 'Product', 'Settling rate', 'mL/h'],
+  ['Final Product (LKE Characterization)', 'Product', 'TSSliquid', '%']
+];
+const QC_LOCATIONS = [...new Set(QC_TABLE.map(r => r[0])), 'Other'];
+const QC_MEASUREMENTS = [...new Set(QC_TABLE.map(r => r[2]))].sort();
+function qcRow(r) { return { location: r[0], type: r[1], measurement: r[2], unit: r[3] }; }
+function measurementsForLocation(loc) { return QC_TABLE.filter(r => r[0] === loc).map(qcRow); }
+function locationsForMeasurement(name) { return QC_TABLE.filter(r => r[2] === name).map(qcRow); }
+function qcTypeClass(type) {
+  return type === 'Process' ? 'qc-type-process' : type === 'Quality' ? 'qc-type-quality' : 'qc-type-product';
+}
+// Most location names carry a parenthetical sub-category, e.g.
+// "Homogenization (Feedstock Characterization)" — split that out so it can be
+// shown as secondary detail instead of cluttering the main name with brackets.
+function qcLocationParts(loc) {
+  const m = /^(.*?)\s*\(([^)]+)\)\s*$/.exec(loc);
+  return m ? { name: m[1], note: m[2] } : { name: loc, note: null };
+}
+function qcLocationLabel(loc, variant) {
+  const { name, note } = qcLocationParts(loc);
+  return el('span', { class: 'qc-loc qc-loc-' + (variant || 'secondary') },
+    el('span', { class: 'qc-loc-name' }, name),
+    note ? el('span', { class: 'qc-loc-note' }, note) : null);
+}
+// Custom dropdown (native <select> can't render multi-line option text) that
+// shows every location as its stacked two-line label, both for the closed
+// button and the open list of choices.
+function buildQcLocationSelect(initialValue, onChange) {
+  let value = QC_LOCATIONS.includes(initialValue) ? initialValue : QC_LOCATIONS[0];
+  const btn = el('button', { type: 'button', class: 'qc-loc-select-btn' });
+  const panel = el('div', { class: 'qc-loc-panel hidden' });
+  const wrap = el('div', { class: 'qc-loc-select' }, btn, panel);
+  function onDocClick(e) { if (!wrap.contains(e.target)) close(); }
+  function open() {
+    panel.innerHTML = '';
+    QC_LOCATIONS.forEach(l => panel.append(el('div', {
+      class: 'qc-loc-option' + (l === value ? ' selected' : ''),
+      onclick: () => { value = l; renderBtn(); close(); onChange(value); }
+    }, qcLocationLabel(l, 'primary'))));
+    panel.classList.remove('hidden');
+    document.addEventListener('click', onDocClick, true);
+  }
+  function close() {
+    panel.classList.add('hidden');
+    document.removeEventListener('click', onDocClick, true);
+  }
+  function renderBtn() {
+    btn.innerHTML = '';
+    btn.append(qcLocationLabel(value, 'primary'), el('span', { class: 'qc-loc-caret' }, '▾'));
+  }
+  btn.addEventListener('click', () => { panel.classList.contains('hidden') ? open() : close(); });
+  renderBtn();
+  return { el: wrap, get value() { return value; } };
+}
+// Restricts a Value input to digits and one decimal point, groups the integer
+// part with commas as the user types, and caps decimal digits at maxDecimals
+// (a number, or a function returning one — density measurements get 3, every
+// other measurement 2, per QC policy).
+function attachNumericMask(input, maxDecimals) {
+  const getMax = typeof maxDecimals === 'function' ? maxDecimals : () => maxDecimals;
+  input.addEventListener('input', () => {
+    const caretFromEnd = input.value.length - input.selectionStart;
+    let raw = input.value.replace(/[^0-9.]/g, '');
+    const firstDot = raw.indexOf('.');
+    if (firstDot !== -1) raw = raw.slice(0, firstDot + 1) + raw.slice(firstDot + 1).replace(/\./g, '');
+    let [intPart, fracPart] = raw.split('.');
+    if (fracPart !== undefined) fracPart = fracPart.slice(0, getMax());
+    const intGrouped = intPart ? Number(intPart).toLocaleString('en-US') : '';
+    input.value = intGrouped + (fracPart !== undefined ? '.' + fracPart : '');
+    const newCaret = Math.max(0, input.value.length - caretFromEnd);
+    input.setSelectionRange(newCaret, newCaret);
+  });
+}
+function qcMaxDecimals(unit) { return unit === 'g/mL' ? 3 : 2; }   // density (ρ) gets 3 places, everything else 2
+function qcParseValue(s) { return parseFloat(String(s).replace(/,/g, '')); }
+function formatQcValue(n, maxDecimals) {
+  const num = Number(n);
+  return Number.isNaN(num) ? '' : num.toLocaleString('en-US', { maximumFractionDigits: maxDecimals });
+}
+
+// Renders the three ways to work through a QC log: by Sample location (all
+// measurements at one location), by Measurement (that measurement across every
+// location it applies to), or Not yet logged (everything with no value yet for
+// this run). Each line item pre-fills with the run's most recent value for that
+// (location, measurement) pair, if any, marked with a green check, and is
+// color-coded by its original Process/Quality/Product grouping. "Other" (only
+// reachable via Sample location) falls back to a single free-text measurement +
+// value. `existingEntries` is the run's QC log, newest first. `state` is a
+// plain object {mode, location, measurement} the caller owns and this mutates
+// in place, so the caller's next render can pick up where the user left off.
+function renderQcBulkEntry(host, run, existingEntries, state, onSaved) {
+  host.innerHTML = '';
+  const modeSel = el('select', {},
+    el('option', { value: 'location' }, 'Sample location'),
+    el('option', { value: 'measurement' }, 'Measurement'),
+    el('option', { value: 'unlogged' }, 'Not yet logged'));
+  modeSel.value = state.mode;
+  const pickerHost = el('div', {});
+  const legend = el('div', { class: 'qc-legend' },
+    el('span', { class: 'qc-legend-item qc-type-process' }, 'Process'),
+    el('span', { class: 'qc-legend-item qc-type-quality' }, 'Quality'),
+    el('span', { class: 'qc-legend-item qc-type-product' }, 'Product'));
+  const rowsHost = el('div', { class: 'qc-rows-scroll' });
+  const errBox = el('div', { class: 'help' });
+  const saveBtn = el('button', { type: 'button', onclick: save }, 'Save values');
+  let rowCtls = [];
+
+  function existingFor(loc, metric) {
+    return existingEntries.find(e => e.sampleLocation === loc && e.metric === metric);
+  }
+  function buildPicker() {
+    pickerHost.innerHTML = '';
+    if (state.mode === 'location') {
+      const picker = buildQcLocationSelect(state.location, v => { state.location = v; rebuildRows(); });
+      state.location = picker.value;
+      pickerHost.append(field('Sample location', picker.el));
+    } else if (state.mode === 'measurement') {
+      const sel = el('select', {}, ...QC_MEASUREMENTS.map(m => el('option', { value: m }, m)));
+      sel.value = QC_MEASUREMENTS.includes(state.measurement) ? state.measurement : QC_MEASUREMENTS[0];
+      state.measurement = sel.value;
+      sel.addEventListener('change', () => { state.measurement = sel.value; rebuildRows(); });
+      pickerHost.append(field('Measurement', sel));
+    }
+    rebuildRows();
+  }
+  function buildRow(r, showLocation) {
+    const existing = existingFor(r.location, r.measurement);
+    const maxDecimals = qcMaxDecimals(r.unit);
+    const valueInput = el('input', {
+      inputmode: 'decimal', placeholder: r.unit || '',
+      value: existing ? formatQcValue(existing.value, maxDecimals) : ''
+    });
+    attachNumericMask(valueInput, maxDecimals);
+    const check = el('span', { class: 'qc-check' + (existing ? '' : ' hidden'), title: 'Already logged' }, '✓ Logged');
+    valueInput.addEventListener('input', () => {
+      check.classList.toggle('hidden', !(existing && qcParseValue(valueInput.value) === existing.value));
+    });
+    rowsHost.append(el('div', { class: 'qc-row ' + qcTypeClass(r.type) },
+      el('span', { class: 'qc-row-label' },
+        el('b', {}, r.measurement + (r.unit ? ' (' + r.unit + ')' : '')),
+        showLocation ? qcLocationLabel(r.location) : null),
+      valueInput, check));
+    rowCtls.push({ location: r.location, measurement: r.measurement, unit: r.unit, valueInput, existing });
+  }
+  function rebuildRows() {
+    rowsHost.innerHTML = '';
+    rowCtls = [];
+    if (state.mode === 'location' && state.location === 'Other') {
+      const measureInput = el('input', { placeholder: 'Measurement name' });
+      const valueInput = el('input', { inputmode: 'decimal' });
+      attachNumericMask(valueInput, 2);
+      rowsHost.append(el('div', { class: 'form-row' },
+        field('Measurement', measureInput), field('Value', valueInput)));
+      rowCtls.push({ other: true, measureInput, valueInput });
+      saveBtn.textContent = 'Add entry';
+      return;
+    }
+    saveBtn.textContent = 'Save values';
+    let list;
+    if (state.mode === 'location') list = measurementsForLocation(state.location);
+    else if (state.mode === 'measurement') list = locationsForMeasurement(state.measurement);
+    else {
+      // Alphabetical by measurement, then by location in its natural (not
+      // alphabetical) order — i.e. the order locations are listed elsewhere.
+      const locOrder = new Map(QC_LOCATIONS.map((l, i) => [l, i]));
+      list = QC_TABLE.map(qcRow).filter(r => !existingFor(r.location, r.measurement))
+        .sort((a, b) => a.measurement.localeCompare(b.measurement) || locOrder.get(a.location) - locOrder.get(b.location));
+    }
+    if (!list.length) {
+      rowsHost.append(el('div', { class: 'help' },
+        state.mode === 'unlogged' ? 'Everything has a logged value.' : 'No standard measurements here.'));
+      return;
+    }
+    const showLocation = state.mode !== 'location';
+    list.forEach(r => buildRow(r, showLocation));
+  }
+  modeSel.addEventListener('change', () => { state.mode = modeSel.value; buildPicker(); });
+  buildPicker();
+
+  async function save() {
+    errBox.textContent = '';
+    saveBtn.disabled = true;
+    try {
+      if (state.mode === 'location' && state.location === 'Other') {
+        const { measureInput, valueInput } = rowCtls[0];
+        const metric = measureInput.value.trim();
+        const value = qcParseValue(valueInput.value);
+        if (!metric) throw new Error('Enter a measurement name.');
+        if (!valueInput.value.trim() || Number.isNaN(value)) throw new Error('Enter a numeric value.');
+        await api('POST', '/production/' + run.id + '/qc', { sampleLocation: 'Other', metric, value, unit: '' });
+      } else {
+        let saved = 0;
+        for (const r of rowCtls) {
+          const raw = r.valueInput.value.trim();
+          if (!raw) continue;
+          const value = qcParseValue(raw);
+          if (Number.isNaN(value)) throw new Error('Enter a numeric value for ' + r.measurement + '.');
+          if (r.existing && r.existing.value === value) continue;   // unchanged
+          await api('POST', '/production/' + run.id + '/qc',
+            { sampleLocation: r.location, metric: r.measurement, value, unit: r.unit || '' });
+          saved++;
+        }
+        if (!saved) { errBox.textContent = 'No new or changed values to save.'; saveBtn.disabled = false; return; }
+      }
+      await onSaved();
+    } catch (e) {
+      errBox.textContent = e.message;
+      saveBtn.disabled = false;
+    }
+  }
+  host.append(field('View by', modeSel), pickerHost, legend, rowsHost, saveBtn, errBox);
+}
+
+async function pageQC(v) {
+  v.append(el('div', { class: 'page-head' },
+    el('h2', {}, 'Quality Control Log'),
+    el('div', { class: 'actions' }, el('button', { onclick: () => openQcModal() }, '+ Add QC entry'))));
+  const search = el('input', { placeholder: 'Filter by lot, location or measurement…', style: 'max-width:320px;margin-bottom:14px' });
+  const listHost = el('div', {});
+  v.append(search, listHost);
+  const r = await api('GET', '/production/qc');
+  function draw() {
+    const q = search.value.trim().toLowerCase();
+    const rows = r.qc.filter(e => !q ||
+      (e.processingLot + ' ' + e.metric + ' ' + (e.sampleLocation || '')).toLowerCase().includes(q));
+    listHost.innerHTML = '';
+    if (!rows.length) {
+      listHost.append(el('div', { class: 'empty card' },
+        r.qc.length ? 'No QC entries match that filter.'
+          : 'No QC results logged yet. Click “+ Add QC entry” to log a lot-specific measurement, traceable back to its production run.'));
+      return;
+    }
+    listHost.append(table(['Lot', 'Date', 'SKU', 'Sample location', 'Measurement', 'Value', 'Notes', 'Recorded by', 'When', ''],
+      rows.map(e => [
+        el('span', { class: 'mono', style: 'cursor:pointer;text-decoration:underline', title: 'View production run',
+          onclick: () => selectTab('production') }, e.processingLot),
+        e.runDate, skuName(e.sku), e.sampleLocation || '—', e.metric,
+        formatQcValue(e.value, qcMaxDecimals(e.unit)) + (e.unit ? ' ' + e.unit : ''),
+        e.notes || '—', e.recordedBy || '—', fmtWhen(e.recordedAt),
+        rowActions([
+          State.user.role === 'admin' ? ['Delete', async () => {
+            if (!confirm('Remove this QC entry?')) return;
+            await api('DELETE', '/production/' + e.runId + '/qc/' + e.id);
+            toast('Removed'); render();
+          }, 'danger'] : null
+        ])
+      ]), [false, false, false, false, false, false, false, false, false, false]));
+  }
+  search.addEventListener('input', draw);
+  draw();
+}
+
+async function openQcModal() {
+  const runs = (await api('GET', '/production')).runs;
+  if (!runs.length) { toast('No finalized production runs to log QC against yet.', true); return; }
+  const runSel = selectFrom('', runs.map(r => [String(r.id), r.processingLot + ' — ' + skuName(r.sku) + ' (' + r.runDate + ')']),
+    () => loadForRun(), 'qc_run');
+  const bulkHost = el('div', { style: 'margin-top:10px' });
+  const state = { mode: 'location', location: QC_LOCATIONS[0], measurement: QC_MEASUREMENTS[0] };
+  async function loadForRun() {
+    const entries = (await api('GET', '/production/' + runSel.value + '/qc')).qc;
+    renderQcBulkEntry(bulkHost, { id: runSel.value }, entries, state,
+      async () => { toast('Saved'); await loadForRun(); render(); });
+  }
+  const body = el('div', {}, field('Production lot', runSel), bulkHost);
+  await loadForRun();
+  modal('Add QC entry', body, async () => { render(); }, 'Done');
+}
+
+async function openQcForRun(run) {
+  const listHost = el('div', { class: 'qc-results-scroll' });
+  const bulkHost = el('div', {});
+  const state = { mode: 'location', location: QC_LOCATIONS[0], measurement: QC_MEASUREMENTS[0] };
+  async function refresh() {
+    const entries = (await api('GET', '/production/' + run.id + '/qc')).qc;
+    drawList(entries);
+    renderQcBulkEntry(bulkHost, run, entries, state,
+      async () => { toast('Saved'); State.qcChanged = true; await refresh(); });
+  }
+  function drawList(entries) {
+    listHost.innerHTML = '';
+    if (!entries.length) { listHost.append(el('div', { class: 'help' }, 'No QC results logged yet.')); return; }
+    listHost.append(table(['Sample location', 'Measurement', 'Value', 'Notes', 'Recorded by', 'When', ''], entries.map(q => [
+      q.sampleLocation || '—', q.metric, formatQcValue(q.value, qcMaxDecimals(q.unit)) + (q.unit ? ' ' + q.unit : ''),
+      q.notes || '—', q.recordedBy || '—', fmtWhen(q.recordedAt),
+      rowActions([
+        State.user.role === 'admin' ? ['Delete', async () => {
+          if (!confirm('Remove this QC entry?')) return;
+          await api('DELETE', '/production/' + run.id + '/qc/' + q.id);
+          toast('Removed'); refresh(); State.qcChanged = true;
+        }, 'danger'] : null
+      ])
+    ]), [false, false, false, false, false, false, false]));
+  }
+  const body = el('div', {},
+    el('div', { class: 'summary-line' }, sl('Run', run.processingLot), sl('SKU', skuName(run.sku))),
+    el('div', {}, el('label', {}, 'Add / update results'), bulkHost),
+    el('label', { style: 'margin-top:16px' }, 'Logged results'), listHost);
+  await refresh();
+  modal('Quality Control Log — ' + run.processingLot, body, async () => { if (State.qcChanged) { State.qcChanged = false; render(); } }, 'Done');
+}
 
 async function openRun(draft) {
   const totes = (await api('GET', '/totes?status=in_stock')).totes;
