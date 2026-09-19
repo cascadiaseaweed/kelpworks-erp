@@ -172,6 +172,11 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .qc-row-label { flex: 1 1 auto; font-size: 13px; }
 .qc-row input { flex: 0 0 130px; }
+/* Stacked location label (used when a row lists several locations) — the main
+   name reads clearly, the sub-category rides underneath as quieter detail. */
+.qc-loc { display: block; margin-top: 1px; }
+.qc-loc-name { display: block; font-size: 11px; color: var(--muted); font-weight: 600; }
+.qc-loc-note { display: block; font-size: 10px; color: var(--muted); font-style: italic; }
 .qc-check { flex: 0 0 auto; color: #1e8e3e; font-weight: 600; font-size: 12px; white-space: nowrap; }
 .qc-type-process { background: #eaf1fd; border-left-color: #3b6fd6; }
 .qc-type-quality { background: #fdf3e3; border-left-color: var(--warn); }

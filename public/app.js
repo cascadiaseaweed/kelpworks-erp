@@ -640,6 +640,23 @@ function locationsForMeasurement(name) { return QC_TABLE.filter(r => r[2] === na
 function qcTypeClass(type) {
   return type === 'Process' ? 'qc-type-process' : type === 'Quality' ? 'qc-type-quality' : 'qc-type-product';
 }
+// Most location names carry a parenthetical sub-category, e.g.
+// "Homogenization (Feedstock Characterization)" — split that out so it can be
+// shown as secondary detail instead of cluttering the main name with brackets.
+function qcLocationParts(loc) {
+  const m = /^(.*?)\s*\(([^)]+)\)\s*$/.exec(loc);
+  return m ? { name: m[1], note: m[2] } : { name: loc, note: null };
+}
+function qcLocationOptionText(loc) {
+  const { name, note } = qcLocationParts(loc);
+  return note ? name + ' — ' + note : name;
+}
+function qcLocationLabel(loc) {
+  const { name, note } = qcLocationParts(loc);
+  return el('span', { class: 'qc-loc' },
+    el('span', { class: 'qc-loc-name' }, name),
+    note ? el('span', { class: 'qc-loc-note' }, note) : null);
+}
 
 // Renders the three ways to work through a QC log: by Sample location (all
 // measurements at one location), by Measurement (that measurement across every
@@ -674,7 +691,7 @@ function renderQcBulkEntry(host, run, existingEntries, state, onSaved) {
   function buildPicker() {
     pickerHost.innerHTML = '';
     if (state.mode === 'location') {
-      const sel = el('select', {}, ...QC_LOCATIONS.map(l => el('option', { value: l }, l)));
+      const sel = el('select', {}, ...QC_LOCATIONS.map(l => el('option', { value: l }, qcLocationOptionText(l))));
       sel.value = QC_LOCATIONS.includes(state.location) ? state.location : QC_LOCATIONS[0];
       state.location = sel.value;
       sel.addEventListener('change', () => { state.location = sel.value; rebuildRows(); });
@@ -698,7 +715,7 @@ function renderQcBulkEntry(host, run, existingEntries, state, onSaved) {
     rowsHost.append(el('div', { class: 'qc-row ' + qcTypeClass(r.type) },
       el('span', { class: 'qc-row-label' },
         el('b', {}, r.measurement + (r.unit ? ' (' + r.unit + ')' : '')),
-        showLocation ? el('span', { class: 'muted' }, ' — ' + r.location) : null),
+        showLocation ? qcLocationLabel(r.location) : null),
       valueInput, check));
     rowCtls.push({ location: r.location, measurement: r.measurement, unit: r.unit, valueInput, existing });
   }
@@ -718,7 +735,13 @@ function renderQcBulkEntry(host, run, existingEntries, state, onSaved) {
     let list;
     if (state.mode === 'location') list = measurementsForLocation(state.location);
     else if (state.mode === 'measurement') list = locationsForMeasurement(state.measurement);
-    else list = QC_TABLE.map(qcRow).filter(r => !existingFor(r.location, r.measurement));
+    else {
+      // Alphabetical by measurement, then by location in its natural (not
+      // alphabetical) order — i.e. the order locations are listed elsewhere.
+      const locOrder = new Map(QC_LOCATIONS.map((l, i) => [l, i]));
+      list = QC_TABLE.map(qcRow).filter(r => !existingFor(r.location, r.measurement))
+        .sort((a, b) => a.measurement.localeCompare(b.measurement) || locOrder.get(a.location) - locOrder.get(b.location));
+    }
     if (!list.length) {
       rowsHost.append(el('div', { class: 'help' },
         state.mode === 'unlogged' ? 'Everything has a logged value.' : 'No standard measurements here.'));
@@ -851,7 +874,7 @@ async function openQcForRun(run) {
 }
 
 function editQcEntry(entry, onDone) {
-  const locSel = el('select', {}, ...QC_LOCATIONS.map(l => el('option', { value: l }, l)));
+  const locSel = el('select', {}, ...QC_LOCATIONS.map(l => el('option', { value: l }, qcLocationOptionText(l))));
   locSel.value = QC_LOCATIONS.includes(entry.sampleLocation) ? entry.sampleLocation : QC_LOCATIONS[0];
   const measureHost = el('div', {});
   const valueInput = el('input', { placeholder: entry.unit || '', value: entry.value ?? '' });
