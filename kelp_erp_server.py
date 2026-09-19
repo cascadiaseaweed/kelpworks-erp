@@ -1309,13 +1309,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _qc_fields(self, d):
         sample_location = (d.get("sampleLocation") or "").strip()
-        sample_type = (d.get("sampleType") or "").strip()
+        sample_type = (d.get("sampleType") or "").strip() or None  # retained for old rows; no longer collected
         metric = (d.get("metric") or "").strip()
         value = (d.get("value") or "").strip()
         if not sample_location:
             raise ApiError(400, "Choose a sample location")
-        if not sample_type:
-            raise ApiError(400, "Choose a sample type")
         if not metric:
             raise ApiError(400, "Choose or enter a measurement")
         if not value:
