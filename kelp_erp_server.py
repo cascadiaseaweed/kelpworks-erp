@@ -1244,7 +1244,7 @@ class Handler(BaseHTTPRequestHandler):
             if len(seg) == 4 and method == "POST":
                 return self.add_qc(conn, rid, user)
             if len(seg) == 5 and seg[4].isdigit() and method == "DELETE":
-                return self.delete_qc(conn, rid, int(seg[4]))
+                return self.delete_qc(conn, rid, int(seg[4]), user)
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "edits" and method == "GET":
             return {"edits": self._run_edits(conn, int(seg[2]))}
         if len(seg) == 3 and seg[2].isdigit() and method == "PUT":
@@ -1358,7 +1358,8 @@ class Handler(BaseHTTPRequestHandler):
              user["name"] if user else None, now_iso()))
         return {"qc": self._qc_entries(conn, run_id)}
 
-    def delete_qc(self, conn, run_id, qid):
+    def delete_qc(self, conn, run_id, qid, user):
+        self._require_admin(user)
         r = conn.execute("SELECT * FROM qc_logs WHERE id=? AND run_id=?", (qid, run_id)).fetchone()
         if not r:
             raise ApiError(404, "QC entry not found")

@@ -869,11 +869,11 @@ async function pageQC(v) {
         formatQcValue(e.value, qcMaxDecimals(e.unit)) + (e.unit ? ' ' + e.unit : ''),
         e.notes || '—', e.recordedBy || '—', fmtWhen(e.recordedAt),
         rowActions([
-          ['Delete', async () => {
+          State.user.role === 'admin' ? ['Delete', async () => {
             if (!confirm('Remove this QC entry?')) return;
             await api('DELETE', '/production/' + e.runId + '/qc/' + e.id);
             toast('Removed'); render();
-          }, 'danger']
+          }, 'danger'] : null
         ])
       ]), [false, false, false, false, false, false, false, false, false, false]));
   }
@@ -915,11 +915,11 @@ async function openQcForRun(run) {
       q.sampleLocation || '—', q.metric, formatQcValue(q.value, qcMaxDecimals(q.unit)) + (q.unit ? ' ' + q.unit : ''),
       q.notes || '—', q.recordedBy || '—', fmtWhen(q.recordedAt),
       rowActions([
-        ['Delete', async () => {
+        State.user.role === 'admin' ? ['Delete', async () => {
           if (!confirm('Remove this QC entry?')) return;
           await api('DELETE', '/production/' + run.id + '/qc/' + q.id);
           toast('Removed'); refresh(); State.qcChanged = true;
-        }, 'danger']
+        }, 'danger'] : null
       ])
     ]), [false, false, false, false, false, false, false]));
   }
