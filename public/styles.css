@@ -163,11 +163,25 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .field { margin-bottom: 6px; }
 .help { font-size: 11px; color: var(--muted); margin-top: 2px; }
 
-/* QC bulk-entry line items: one row per measurement for the chosen location. */
-.qc-row { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+/* QC bulk-entry line items: one row per measurement, color-coded by its
+   original Process/Quality/Product grouping (Sample Type isn't a form field
+   anymore, but the color still helps a technician read the list at a glance). */
+.qc-row {
+  display:flex; align-items:center; gap:10px; margin-bottom:6px;
+  padding: 6px 10px; border-radius: 8px; border-left: 4px solid transparent;
+}
 .qc-row-label { flex: 1 1 auto; font-size: 13px; }
 .qc-row input { flex: 0 0 130px; }
 .qc-check { flex: 0 0 auto; color: #1e8e3e; font-weight: 600; font-size: 12px; white-space: nowrap; }
+.qc-type-process { background: #eaf1fd; border-left-color: #3b6fd6; }
+.qc-type-quality { background: #fdf3e3; border-left-color: var(--warn); }
+.qc-type-product { background: #e6f5f3; border-left-color: var(--ok); }
+.qc-legend { display:flex; gap:8px; margin: 8px 0; flex-wrap: wrap; }
+.qc-legend-item { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; }
+.qc-legend-item.qc-type-process { color: #3b6fd6; border-left: none; }
+.qc-legend-item.qc-type-quality { color: var(--warn); border-left: none; }
+.qc-legend-item.qc-type-product { color: var(--ok); border-left: none; }
+.qc-rows-scroll { max-height: 320px; overflow-y: auto; padding-right: 2px; }
 @media (max-width: 480px) {
   .qc-row { flex-wrap: wrap; }
   .qc-row-label { flex-basis: 100%; }

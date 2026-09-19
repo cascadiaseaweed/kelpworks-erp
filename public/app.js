@@ -570,95 +570,142 @@ async function openAttachments(run) {
 function sl(k, val) { return el('span', {}, k + ': ', el('b', {}, val)); }
 
 /* ---------------- Quality control log ---------------- */
-// [Sample Location, Measurement, Unit] — transcribed from the QAQC sample plan
-// (Claude_sample_fields.xlsx), flattened across the sheet's old Sample Type
-// grouping since every measurement name is unique within a location.
+// [Sample Location, Sample Type, Measurement, Unit] — transcribed from the QAQC
+// sample plan (Claude_sample_fields.xlsx). Sample Type isn't a user-facing field
+// (removed per feedback) but is kept here to color-code line items by it.
 const QC_TABLE = [
-  ['Homogenization (Feedstock Characterization)', 'Total IBC weight', 'kg'],
-  ['Homogenization (Feedstock Characterization)', 'Total IBC volume', 'L'],
-  ['Homogenization (Feedstock Characterization)', 'Total rinse water', 'L'],
-  ['Homogenization (Feedstock Characterization)', 'Fraction wet solid', '%'],
-  ['Homogenization (Feedstock Characterization)', 'TSslurry', '%'],
-  ['Homogenization (Feedstock Characterization)', 'TSliquid', '%'],
-  ['Homogenization (Feedstock Characterization)', 'TSsolids', '%'],
-  ['Homogenization (Feedstock Characterization)', 'ρliquid', 'g/mL'],
-  ['Homogenization (Feedstock Characterization)', 'ρslurry', 'g/mL'],
+  ['Homogenization (Feedstock Characterization)', 'Process', 'Total IBC weight', 'kg'],
+  ['Homogenization (Feedstock Characterization)', 'Process', 'Total IBC volume', 'L'],
+  ['Homogenization (Feedstock Characterization)', 'Process', 'Total rinse water', 'L'],
+  ['Homogenization (Feedstock Characterization)', 'Product', 'Fraction wet solid', '%'],
+  ['Homogenization (Feedstock Characterization)', 'Product', 'TSslurry', '%'],
+  ['Homogenization (Feedstock Characterization)', 'Product', 'TSliquid', '%'],
+  ['Homogenization (Feedstock Characterization)', 'Product', 'TSsolids', '%'],
+  ['Homogenization (Feedstock Characterization)', 'Product', 'ρliquid', 'g/mL'],
+  ['Homogenization (Feedstock Characterization)', 'Product', 'ρslurry', 'g/mL'],
 
-  ['Pre-Extraction (Lot Characterization)', 'Total dilution water', 'L'],
-  ['Pre-Extraction (Lot Characterization)', 'Total slurry level (2A/B)', 'L'],
-  ['Pre-Extraction (Lot Characterization)', 'pH', ''],
-  ['Pre-Extraction (Lot Characterization)', 'TDS', '%'],
-  ['Pre-Extraction (Lot Characterization)', 'Brix', '%'],
-  ['Pre-Extraction (Lot Characterization)', 'Mannitol', '%'],
-  ['Pre-Extraction (Lot Characterization)', 'Fraction wet solid', '%'],
-  ['Pre-Extraction (Lot Characterization)', 'TSslurry', '%'],
-  ['Pre-Extraction (Lot Characterization)', 'TSliquid', '%'],
-  ['Pre-Extraction (Lot Characterization)', 'TSsolids', '%'],
-  ['Pre-Extraction (Lot Characterization)', 'ρliquid', 'g/mL'],
-  ['Pre-Extraction (Lot Characterization)', 'ρslurry', 'g/mL'],
+  ['Pre-Extraction (Lot Characterization)', 'Process', 'Total dilution water', 'L'],
+  ['Pre-Extraction (Lot Characterization)', 'Process', 'Total slurry level (2A/B)', 'L'],
+  ['Pre-Extraction (Lot Characterization)', 'Quality', 'pH', ''],
+  ['Pre-Extraction (Lot Characterization)', 'Quality', 'TDS', '%'],
+  ['Pre-Extraction (Lot Characterization)', 'Quality', 'Brix', '%'],
+  ['Pre-Extraction (Lot Characterization)', 'Quality', 'Mannitol', '%'],
+  ['Pre-Extraction (Lot Characterization)', 'Product', 'Fraction wet solid', '%'],
+  ['Pre-Extraction (Lot Characterization)', 'Product', 'TSslurry', '%'],
+  ['Pre-Extraction (Lot Characterization)', 'Product', 'TSliquid', '%'],
+  ['Pre-Extraction (Lot Characterization)', 'Product', 'TSsolids', '%'],
+  ['Pre-Extraction (Lot Characterization)', 'Product', 'ρliquid', 'g/mL'],
+  ['Pre-Extraction (Lot Characterization)', 'Product', 'ρslurry', 'g/mL'],
 
-  ['Post-Extraction (Extraction Performance)', 'Total slurry level (3)', 'L'],
-  ['Post-Extraction (Extraction Performance)', 'pH', ''],
-  ['Post-Extraction (Extraction Performance)', 'TDS', '%'],
-  ['Post-Extraction (Extraction Performance)', 'Brix', '%'],
-  ['Post-Extraction (Extraction Performance)', 'Mannitol', '%'],
-  ['Post-Extraction (Extraction Performance)', 'Fraction wet solid', '%'],
-  ['Post-Extraction (Extraction Performance)', 'TSslurry', '%'],
-  ['Post-Extraction (Extraction Performance)', 'TSliquid', '%'],
-  ['Post-Extraction (Extraction Performance)', 'TSsolids', '%'],
-  ['Post-Extraction (Extraction Performance)', 'ρliquid', 'g/mL'],
-  ['Post-Extraction (Extraction Performance)', 'ρslurry', 'g/mL'],
+  ['Post-Extraction (Extraction Performance)', 'Process', 'Total slurry level (3)', 'L'],
+  ['Post-Extraction (Extraction Performance)', 'Quality', 'pH', ''],
+  ['Post-Extraction (Extraction Performance)', 'Quality', 'TDS', '%'],
+  ['Post-Extraction (Extraction Performance)', 'Quality', 'Brix', '%'],
+  ['Post-Extraction (Extraction Performance)', 'Quality', 'Mannitol', '%'],
+  ['Post-Extraction (Extraction Performance)', 'Product', 'Fraction wet solid', '%'],
+  ['Post-Extraction (Extraction Performance)', 'Product', 'TSslurry', '%'],
+  ['Post-Extraction (Extraction Performance)', 'Product', 'TSliquid', '%'],
+  ['Post-Extraction (Extraction Performance)', 'Product', 'TSsolids', '%'],
+  ['Post-Extraction (Extraction Performance)', 'Product', 'ρliquid', 'g/mL'],
+  ['Post-Extraction (Extraction Performance)', 'Product', 'ρslurry', 'g/mL'],
 
-  ['Solids Characterization', 'Total solids weight', 'kg'],
-  ['Solids Characterization', 'Moisture', '%'],
+  ['Solids Characterization', 'Process', 'Total solids weight', 'kg'],
+  ['Solids Characterization', 'Product', 'Moisture', '%'],
 
-  ['Post-Pasteurization (Reagent & Dilution Requirements)', 'Total tank level (5A/B)', 'L'],
-  ['Post-Pasteurization (Reagent & Dilution Requirements)', 'pH', ''],
-  ['Post-Pasteurization (Reagent & Dilution Requirements)', 'TDS', '%'],
-  ['Post-Pasteurization (Reagent & Dilution Requirements)', 'TSliquid', '%'],
-  ['Post-Pasteurization (Reagent & Dilution Requirements)', 'ρliquid', 'g/mL'],
+  ['Post-Pasteurization (Reagent & Dilution Requirements)', 'Process', 'Total tank level (5A/B)', 'L'],
+  ['Post-Pasteurization (Reagent & Dilution Requirements)', 'Quality', 'pH', ''],
+  ['Post-Pasteurization (Reagent & Dilution Requirements)', 'Quality', 'TDS', '%'],
+  ['Post-Pasteurization (Reagent & Dilution Requirements)', 'Product', 'TSliquid', '%'],
+  ['Post-Pasteurization (Reagent & Dilution Requirements)', 'Product', 'ρliquid', 'g/mL'],
 
-  ['Final Product (LKE Characterization)', 'Total citric', 'kg'],
-  ['Final Product (LKE Characterization)', 'Total ksorbate', 'kg'],
-  ['Final Product (LKE Characterization)', 'Total dilution water', 'L'],
-  ['Final Product (LKE Characterization)', 'Total tank level (6A/B)', 'L'],
-  ['Final Product (LKE Characterization)', 'IBC count', ''],
-  ['Final Product (LKE Characterization)', 'pH', ''],
-  ['Final Product (LKE Characterization)', 'TDS', '%'],
-  ['Final Product (LKE Characterization)', 'Brix', '%'],
-  ['Final Product (LKE Characterization)', 'Mannitol', '%'],
-  ['Final Product (LKE Characterization)', 'TSliquid', '%'],
-  ['Final Product (LKE Characterization)', 'ρliquid', 'g/mL'],
-  ['Final Product (LKE Characterization)', 'Settling rate', 'mL/h'],
-  ['Final Product (LKE Characterization)', 'TSSliquid', '%']
+  ['Final Product (LKE Characterization)', 'Process', 'Total citric', 'kg'],
+  ['Final Product (LKE Characterization)', 'Process', 'Total ksorbate', 'kg'],
+  ['Final Product (LKE Characterization)', 'Process', 'Total dilution water', 'L'],
+  ['Final Product (LKE Characterization)', 'Process', 'Total tank level (6A/B)', 'L'],
+  ['Final Product (LKE Characterization)', 'Process', 'IBC count', ''],
+  ['Final Product (LKE Characterization)', 'Quality', 'pH', ''],
+  ['Final Product (LKE Characterization)', 'Quality', 'TDS', '%'],
+  ['Final Product (LKE Characterization)', 'Quality', 'Brix', '%'],
+  ['Final Product (LKE Characterization)', 'Quality', 'Mannitol', '%'],
+  ['Final Product (LKE Characterization)', 'Product', 'TSliquid', '%'],
+  ['Final Product (LKE Characterization)', 'Product', 'ρliquid', 'g/mL'],
+  ['Final Product (LKE Characterization)', 'Product', 'Settling rate', 'mL/h'],
+  ['Final Product (LKE Characterization)', 'Product', 'TSSliquid', '%']
 ];
 const QC_LOCATIONS = [...new Set(QC_TABLE.map(r => r[0])), 'Other'];
-function measurementsForLocation(loc) {
-  return QC_TABLE.filter(r => r[0] === loc).map(r => ({ measurement: r[1], unit: r[2] }));
+const QC_MEASUREMENTS = [...new Set(QC_TABLE.map(r => r[2]))].sort();
+function qcRow(r) { return { location: r[0], type: r[1], measurement: r[2], unit: r[3] }; }
+function measurementsForLocation(loc) { return QC_TABLE.filter(r => r[0] === loc).map(qcRow); }
+function locationsForMeasurement(name) { return QC_TABLE.filter(r => r[2] === name).map(qcRow); }
+function qcTypeClass(type) {
+  return type === 'Process' ? 'qc-type-process' : type === 'Quality' ? 'qc-type-quality' : 'qc-type-product';
 }
 
-// Renders a Sample location picker plus one line item per Measurement defined
-// for that location. Each line item is pre-filled with the run's most recent
-// value for that (location, measurement) pair, if any, marked with a green
-// check. "Other" falls back to a single free-text measurement + value.
-// `existingEntries` is the run's QC log, newest first (so the first match per
-// measurement is the most recent one). Calls `onSaved` after a successful save.
-function renderQcBulkEntry(host, run, existingEntries, initialLoc, onLocChange, onSaved) {
+// Renders the three ways to work through a QC log: by Sample location (all
+// measurements at one location), by Measurement (that measurement across every
+// location it applies to), or Not yet logged (everything with no value yet for
+// this run). Each line item pre-fills with the run's most recent value for that
+// (location, measurement) pair, if any, marked with a green check, and is
+// color-coded by its original Process/Quality/Product grouping. "Other" (only
+// reachable via Sample location) falls back to a single free-text measurement +
+// value. `existingEntries` is the run's QC log, newest first. `state` is a
+// plain object {mode, location, measurement} the caller owns and this mutates
+// in place, so the caller's next render can pick up where the user left off.
+function renderQcBulkEntry(host, run, existingEntries, state, onSaved) {
   host.innerHTML = '';
-  const locSel = el('select', {}, ...QC_LOCATIONS.map(l => el('option', { value: l }, l)));
-  locSel.value = QC_LOCATIONS.includes(initialLoc) ? initialLoc : QC_LOCATIONS[0];
-  const rowsHost = el('div', { style: 'margin-top:10px' });
+  const modeSel = el('select', {},
+    el('option', { value: 'location' }, 'Sample location'),
+    el('option', { value: 'measurement' }, 'Measurement'),
+    el('option', { value: 'unlogged' }, 'Not yet logged'));
+  modeSel.value = state.mode;
+  const pickerHost = el('div', {});
+  const legend = el('div', { class: 'qc-legend' },
+    el('span', { class: 'qc-legend-item qc-type-process' }, 'Process'),
+    el('span', { class: 'qc-legend-item qc-type-quality' }, 'Quality'),
+    el('span', { class: 'qc-legend-item qc-type-product' }, 'Product'));
+  const rowsHost = el('div', { class: 'qc-rows-scroll' });
   const errBox = el('div', { class: 'help' });
   const saveBtn = el('button', { type: 'button', onclick: save }, 'Save values');
   let rowCtls = [];
 
-  function latestFor(loc, metric) {
+  function existingFor(loc, metric) {
     return existingEntries.find(e => e.sampleLocation === loc && e.metric === metric);
+  }
+  function buildPicker() {
+    pickerHost.innerHTML = '';
+    if (state.mode === 'location') {
+      const sel = el('select', {}, ...QC_LOCATIONS.map(l => el('option', { value: l }, l)));
+      sel.value = QC_LOCATIONS.includes(state.location) ? state.location : QC_LOCATIONS[0];
+      state.location = sel.value;
+      sel.addEventListener('change', () => { state.location = sel.value; rebuildRows(); });
+      pickerHost.append(field('Sample location', sel));
+    } else if (state.mode === 'measurement') {
+      const sel = el('select', {}, ...QC_MEASUREMENTS.map(m => el('option', { value: m }, m)));
+      sel.value = QC_MEASUREMENTS.includes(state.measurement) ? state.measurement : QC_MEASUREMENTS[0];
+      state.measurement = sel.value;
+      sel.addEventListener('change', () => { state.measurement = sel.value; rebuildRows(); });
+      pickerHost.append(field('Measurement', sel));
+    }
+    rebuildRows();
+  }
+  function buildRow(r, showLocation) {
+    const existing = existingFor(r.location, r.measurement);
+    const valueInput = el('input', { placeholder: r.unit || '', value: existing ? existing.value : '' });
+    const check = el('span', { class: 'qc-check' + (existing ? '' : ' hidden'), title: 'Already logged' }, '✓ Logged');
+    valueInput.addEventListener('input', () => {
+      check.classList.toggle('hidden', !(existing && valueInput.value === existing.value));
+    });
+    rowsHost.append(el('div', { class: 'qc-row ' + qcTypeClass(r.type) },
+      el('span', { class: 'qc-row-label' },
+        el('b', {}, r.measurement + (r.unit ? ' (' + r.unit + ')' : '')),
+        showLocation ? el('span', { class: 'muted' }, ' — ' + r.location) : null),
+      valueInput, check));
+    rowCtls.push({ location: r.location, measurement: r.measurement, unit: r.unit, valueInput, existing });
   }
   function rebuildRows() {
     rowsHost.innerHTML = '';
     rowCtls = [];
-    if (locSel.value === 'Other') {
+    if (state.mode === 'location' && state.location === 'Other') {
       const measureInput = el('input', { placeholder: 'Measurement name' });
       const valueInput = el('input', {});
       rowsHost.append(el('div', { class: 'form-row' },
@@ -668,27 +715,26 @@ function renderQcBulkEntry(host, run, existingEntries, initialLoc, onLocChange, 
       return;
     }
     saveBtn.textContent = 'Save values';
-    for (const o of measurementsForLocation(locSel.value)) {
-      const existing = latestFor(locSel.value, o.measurement);
-      const valueInput = el('input', { placeholder: o.unit || '', value: existing ? existing.value : '' });
-      const check = el('span', { class: 'qc-check' + (existing ? '' : ' hidden'), title: 'Already logged' }, '✓ Logged');
-      valueInput.addEventListener('input', () => {
-        check.classList.toggle('hidden', !(existing && valueInput.value === existing.value));
-      });
-      rowsHost.append(el('div', { class: 'qc-row' },
-        el('span', { class: 'qc-row-label' }, o.measurement + (o.unit ? ' (' + o.unit + ')' : '')),
-        valueInput, check));
-      rowCtls.push({ measurement: o.measurement, unit: o.unit, valueInput, existing });
+    let list;
+    if (state.mode === 'location') list = measurementsForLocation(state.location);
+    else if (state.mode === 'measurement') list = locationsForMeasurement(state.measurement);
+    else list = QC_TABLE.map(qcRow).filter(r => !existingFor(r.location, r.measurement));
+    if (!list.length) {
+      rowsHost.append(el('div', { class: 'help' },
+        state.mode === 'unlogged' ? 'Everything has a logged value.' : 'No standard measurements here.'));
+      return;
     }
+    const showLocation = state.mode !== 'location';
+    list.forEach(r => buildRow(r, showLocation));
   }
-  locSel.addEventListener('change', () => { onLocChange(locSel.value); rebuildRows(); });
-  rebuildRows();
+  modeSel.addEventListener('change', () => { state.mode = modeSel.value; buildPicker(); });
+  buildPicker();
 
   async function save() {
     errBox.textContent = '';
     saveBtn.disabled = true;
     try {
-      if (locSel.value === 'Other') {
+      if (state.mode === 'location' && state.location === 'Other') {
         const { measureInput, valueInput } = rowCtls[0];
         const metric = measureInput.value.trim(), value = valueInput.value.trim();
         if (!metric) throw new Error('Enter a measurement name.');
@@ -700,7 +746,7 @@ function renderQcBulkEntry(host, run, existingEntries, initialLoc, onLocChange, 
           const value = r.valueInput.value.trim();
           if (!value || (r.existing && r.existing.value === value)) continue;   // blank or unchanged
           await api('POST', '/production/' + run.id + '/qc',
-            { sampleLocation: locSel.value, metric: r.measurement, value, unit: r.unit || '' });
+            { sampleLocation: r.location, metric: r.measurement, value, unit: r.unit || '' });
           saved++;
         }
         if (!saved) { errBox.textContent = 'No new or changed values to save.'; saveBtn.disabled = false; return; }
@@ -711,7 +757,7 @@ function renderQcBulkEntry(host, run, existingEntries, initialLoc, onLocChange, 
       saveBtn.disabled = false;
     }
   }
-  host.append(field('Sample location', locSel), rowsHost, saveBtn, errBox);
+  host.append(field('View by', modeSel), pickerHost, legend, rowsHost, saveBtn, errBox);
 }
 
 async function pageQC(v) {
@@ -759,10 +805,10 @@ async function openQcModal() {
   const runSel = selectFrom('', runs.map(r => [String(r.id), r.processingLot + ' — ' + skuName(r.sku) + ' (' + r.runDate + ')']),
     () => loadForRun(), 'qc_run');
   const bulkHost = el('div', { style: 'margin-top:10px' });
-  let selectedLoc = QC_LOCATIONS[0];
+  const state = { mode: 'location', location: QC_LOCATIONS[0], measurement: QC_MEASUREMENTS[0] };
   async function loadForRun() {
     const entries = (await api('GET', '/production/' + runSel.value + '/qc')).qc;
-    renderQcBulkEntry(bulkHost, { id: runSel.value }, entries, selectedLoc, loc => { selectedLoc = loc; },
+    renderQcBulkEntry(bulkHost, { id: runSel.value }, entries, state,
       async () => { toast('Saved'); await loadForRun(); render(); });
   }
   const body = el('div', {}, field('Production lot', runSel), bulkHost);
@@ -773,11 +819,11 @@ async function openQcModal() {
 async function openQcForRun(run) {
   const listHost = el('div', { class: 'qc-results-scroll' });
   const bulkHost = el('div', {});
-  let selectedLoc = QC_LOCATIONS[0];
+  const state = { mode: 'location', location: QC_LOCATIONS[0], measurement: QC_MEASUREMENTS[0] };
   async function refresh() {
     const entries = (await api('GET', '/production/' + run.id + '/qc')).qc;
     drawList(entries);
-    renderQcBulkEntry(bulkHost, run, entries, selectedLoc, loc => { selectedLoc = loc; },
+    renderQcBulkEntry(bulkHost, run, entries, state,
       async () => { toast('Saved'); State.qcChanged = true; await refresh(); });
   }
   function drawList(entries) {
