@@ -306,15 +306,87 @@ CREATE TABLE IF NOT EXISTS production_runs (
     location       TEXT,
     notes          TEXT,
     status         TEXT NOT NULL DEFAULT 'completed',  -- draft | completed
-    draft_data     TEXT,  -- JSON {toteIds, packages} while status='draft'
+    draft_data     TEXT,  -- JSON {toteIds, packages, feedstockDetails} while status='draft'
+    operators      TEXT,  -- free text, e.g. "DP, AL, NW"
+    -- Homogenization stage (singular per run)
+    homog_rinsing_water_l    REAL,
+    homog_slurry_l           REAL,
+    homog_dilution_water_l   REAL,
+    homog_citric_kg          REAL,
+    homog_output_l           REAL,
+    homog_started_at         TEXT,
+    -- Extraction stage (singular per run)
+    extraction_amplitude_pct     REAL,
+    extraction_flowrate_lpm      REAL,
+    extraction_pressure_psi      REAL,
+    extraction_starting_power_w  REAL,
+    extraction_started_at        TEXT,
+    -- Separation stage parameters (repeatable solids collections live in run_separation_solids)
+    separation_flowrate_lpm      REAL,
+    separation_mesh_micron       REAL,
+    separation_water_addition_l  REAL,
+    separation_started_at        TEXT,
+    -- Pasteurization stage (singular per run)
+    pasteurization_product_setpoint_c  REAL,
+    pasteurization_boiler_setpoint_c   REAL,
+    pasteurization_total_volume_l      REAL,
+    pasteurization_started_at          TEXT,
+    -- Packaging stage
+    packaging_started_at          TEXT,
+    rejected_feedstock_json       TEXT,  -- JSON [{toteLot, reason, at}] for inspected-but-rejected totes
     created_at     TEXT NOT NULL
 );
 
+-- Feedstock characterization: one row per tote fed into a run (receiving inspection).
 CREATE TABLE IF NOT EXISTS run_inputs (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id      INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
-    tote_lot_id INTEGER NOT NULL REFERENCES tote_lots(id)
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id           INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+    tote_lot_id      INTEGER NOT NULL REFERENCES tote_lots(id),
+    loaded_at        TEXT,
+    surface_photo    TEXT,      -- stored filename (run_attachments-style, on disk in UPLOAD_DIR)
+    striation_photo  TEXT,
+    ph               REAL,
+    ph_measured_at   TEXT,      -- client-stamped moment the pH reading was entered
+    orp              REAL,      -- mV
+    orp_range        TEXT,      -- ORP classification, calculated from REF_ORP_classification
+    odour            TEXT,
+    odour_other      TEXT,
+    odour_intensity  TEXT,      -- Mild | Medium | Strong
+    decision         TEXT NOT NULL DEFAULT 'accepted',  -- accepted | rejected
+    rejection_reason TEXT,
+    notes            TEXT
 );
+
+-- Repeatable Separation solids collections (a run may have several).
+CREATE TABLE IF NOT EXISTS run_separation_solids (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id    INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+    weight_kg REAL,
+    photo     TEXT,
+    notes     TEXT,
+    logged_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sepsolids_run ON run_separation_solids(run_id);
+
+-- Repeatable Dilution & Preservation entries (a run may split output across tanks).
+CREATE TABLE IF NOT EXISTS run_dilutions (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id                 INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+    tank                   TEXT,
+    volume_initial_l       REAL,
+    water_required_l       REAL,
+    volume_final_l         REAL,
+    sorbate_required_kg    REAL,
+    benzoate_required_kg   REAL,
+    preservatives_added    INTEGER NOT NULL DEFAULT 0,
+    preservatives_added_at TEXT,
+    citric_kg              REAL,
+    samples_taken          INTEGER NOT NULL DEFAULT 0,
+    samples_taken_at       TEXT,
+    notes                  TEXT,
+    created_at             TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dilutions_run ON run_dilutions(run_id);
 
 -- Finished goods on hand: one row per (run, package size).
 CREATE TABLE IF NOT EXISTS fg_lots (
@@ -401,6 +473,32 @@ def migrate(conn):
         conn.execute("ALTER TABLE production_runs ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'")
     if "draft_data" not in prcols:
         conn.execute("ALTER TABLE production_runs ADD COLUMN draft_data TEXT")
+    for col, decl in [
+        ("operators", "TEXT"),
+        ("homog_rinsing_water_l", "REAL"), ("homog_slurry_l", "REAL"),
+        ("homog_dilution_water_l", "REAL"), ("homog_citric_kg", "REAL"),
+        ("homog_output_l", "REAL"), ("homog_started_at", "TEXT"),
+        ("extraction_amplitude_pct", "REAL"), ("extraction_flowrate_lpm", "REAL"),
+        ("extraction_pressure_psi", "REAL"), ("extraction_starting_power_w", "REAL"),
+        ("extraction_started_at", "TEXT"),
+        ("separation_flowrate_lpm", "REAL"), ("separation_mesh_micron", "REAL"),
+        ("separation_water_addition_l", "REAL"), ("separation_started_at", "TEXT"),
+        ("pasteurization_product_setpoint_c", "REAL"), ("pasteurization_boiler_setpoint_c", "REAL"),
+        ("pasteurization_total_volume_l", "REAL"), ("pasteurization_started_at", "TEXT"),
+        ("packaging_started_at", "TEXT"), ("rejected_feedstock_json", "TEXT"),
+    ]:
+        if col not in prcols:
+            conn.execute("ALTER TABLE production_runs ADD COLUMN %s %s" % (col, decl))
+    ricols = {r["name"] for r in conn.execute("PRAGMA table_info(run_inputs)")}
+    for col, decl in [
+        ("loaded_at", "TEXT"), ("surface_photo", "TEXT"), ("striation_photo", "TEXT"),
+        ("ph", "REAL"), ("ph_measured_at", "TEXT"), ("orp", "REAL"), ("orp_range", "TEXT"),
+        ("odour", "TEXT"), ("odour_other", "TEXT"), ("odour_intensity", "TEXT"),
+        ("decision", "TEXT NOT NULL DEFAULT 'accepted'"), ("rejection_reason", "TEXT"),
+        ("notes", "TEXT"),
+    ]:
+        if col not in ricols:
+            conn.execute("ALTER TABLE run_inputs ADD COLUMN %s %s" % (col, decl))
     qc_info = list(conn.execute("PRAGMA table_info(qc_logs)"))
     qccols = {r["name"] for r in qc_info}
     if "sample_location" not in qccols:
@@ -549,7 +647,30 @@ def run_public(r):
          "targetTds": r["target_tds"], "outputLitres": r["output_litres"],
          "citricKg": r["citric_kg"], "sorbateKg": r["sorbate_kg"], "ibcUsed": r["ibc_used"],
          "location": r["location"], "notes": r["notes"], "status": r["status"],
-         "createdAt": r["created_at"]}
+         "operators": r["operators"], "createdAt": r["created_at"]}
+    try:
+        d["rejectedFeedstock"] = json.loads(r["rejected_feedstock_json"]) if r["rejected_feedstock_json"] else []
+    except ValueError:
+        d["rejectedFeedstock"] = []
+    d["stages"] = {
+        "homogenization": {
+            "startedAt": r["homog_started_at"], "rinsingWaterL": r["homog_rinsing_water_l"],
+            "slurryL": r["homog_slurry_l"], "dilutionWaterL": r["homog_dilution_water_l"],
+            "citricKg": r["homog_citric_kg"], "outputL": r["homog_output_l"]},
+        "extraction": {
+            "startedAt": r["extraction_started_at"], "amplitudePct": r["extraction_amplitude_pct"],
+            "flowrateLpm": r["extraction_flowrate_lpm"], "pressurePsi": r["extraction_pressure_psi"],
+            "startingPowerW": r["extraction_starting_power_w"]},
+        "separation": {
+            "startedAt": r["separation_started_at"], "flowrateLpm": r["separation_flowrate_lpm"],
+            "meshMicron": r["separation_mesh_micron"], "waterAdditionL": r["separation_water_addition_l"]},
+        "pasteurization": {
+            "startedAt": r["pasteurization_started_at"],
+            "productSetpointC": r["pasteurization_product_setpoint_c"],
+            "boilerSetpointC": r["pasteurization_boiler_setpoint_c"],
+            "totalVolumeL": r["pasteurization_total_volume_l"]},
+        "packaging": {"startedAt": r["packaging_started_at"]},
+    }
     if r["status"] == "draft":
         try:
             dd = json.loads(r["draft_data"]) if r["draft_data"] else {}
@@ -557,6 +678,7 @@ def run_public(r):
             dd = {}
         d["toteIds"] = dd.get("toteIds") or []
         d["packages"] = dd.get("packages") or []
+        d["feedstockDetails"] = dd.get("feedstockDetails") or {}
     return d
 
 
@@ -1199,6 +1321,72 @@ class Handler(BaseHTTPRequestHandler):
         ("sorbate_kg", "sorbateKg", "Potassium sorbate (kg)", "num"),
         ("location", "location", "Location", "text"),
         ("notes", "notes", "Notes", "text"),
+        ("operators", "operators", "Operators", "text"),
+    ]
+
+    # Process-stage columns a stage save may touch: (db column, json key, kind)
+    STAGE_FIELDS = {
+        "homogenization": [
+            ("homog_started_at", "startedAt", "text"),
+            ("homog_rinsing_water_l", "rinsingWaterL", "num"),
+            ("homog_slurry_l", "slurryL", "num"),
+            ("homog_dilution_water_l", "dilutionWaterL", "num"),
+            ("homog_citric_kg", "citricKg", "num"),
+            ("homog_output_l", "outputL", "num"),
+        ],
+        "extraction": [
+            ("extraction_started_at", "startedAt", "text"),
+            ("extraction_amplitude_pct", "amplitudePct", "num"),
+            ("extraction_flowrate_lpm", "flowrateLpm", "num"),
+            ("extraction_pressure_psi", "pressurePsi", "num"),
+            ("extraction_starting_power_w", "startingPowerW", "num"),
+        ],
+        "separation": [
+            ("separation_started_at", "startedAt", "text"),
+            ("separation_flowrate_lpm", "flowrateLpm", "num"),
+            ("separation_mesh_micron", "meshMicron", "num"),
+            ("separation_water_addition_l", "waterAdditionL", "num"),
+        ],
+        "pasteurization": [
+            ("pasteurization_started_at", "startedAt", "text"),
+            ("pasteurization_product_setpoint_c", "productSetpointC", "num"),
+            ("pasteurization_boiler_setpoint_c", "boilerSetpointC", "num"),
+            ("pasteurization_total_volume_l", "totalVolumeL", "num"),
+        ],
+        "packaging": [
+            ("packaging_started_at", "startedAt", "text"),
+        ],
+    }
+
+    # Feedstock (run_inputs) characterization fields: (db column, json key, kind)
+    INPUT_FIELDS = [
+        ("loaded_at", "loadedAt", "text"),
+        ("ph", "ph", "num"),
+        ("ph_measured_at", "phMeasuredAt", "text"),
+        ("orp", "orp", "num"),
+        ("orp_range", "orpRange", "text"),
+        ("odour", "odour", "text"),
+        ("odour_other", "odourOther", "text"),
+        ("odour_intensity", "odourIntensity", "text"),
+        ("decision", "decision", "text"),
+        ("rejection_reason", "rejectionReason", "text"),
+        ("notes", "notes", "text"),
+    ]
+
+    # Dilution & Preservation fields: (db column, json key, kind)
+    DILUTION_FIELDS = [
+        ("tank", "tank", "text"),
+        ("volume_initial_l", "volumeInitialL", "num"),
+        ("water_required_l", "waterRequiredL", "num"),
+        ("volume_final_l", "volumeFinalL", "num"),
+        ("sorbate_required_kg", "sorbateRequiredKg", "num"),
+        ("benzoate_required_kg", "benzoateRequiredKg", "num"),
+        ("preservatives_added", "preservativesAdded", "bool"),
+        ("preservatives_added_at", "preservativesAddedAt", "text"),
+        ("citric_kg", "citricKg", "num"),
+        ("samples_taken", "samplesTaken", "bool"),
+        ("samples_taken_at", "samplesTakenAt", "text"),
+        ("notes", "notes", "text"),
     ]
 
     def route_production(self, method, seg, conn, user):
@@ -1215,6 +1403,9 @@ class Handler(BaseHTTPRequestHandler):
                 d["edits"] = self._run_edits(conn, r["id"])
                 d["attachments"] = self._attachments(conn, r["id"])
                 d["qc"] = self._qc_entries(conn, r["id"])
+                d["inputs"] = self._run_inputs_public(conn, r["id"])
+                d["separationSolids"] = self._sep_solids_public(conn, r["id"])
+                d["dilutions"] = self._dilutions_public(conn, r["id"])
                 runs.append(d)
             return {"runs": runs}
         if seg == ["api", "production"] and method == "POST":
@@ -1259,6 +1450,48 @@ class Handler(BaseHTTPRequestHandler):
                 return self.add_attachment(conn, rid, user)
             if len(seg) == 5 and seg[4].isdigit() and method == "DELETE":
                 return self.delete_attachment(conn, rid, int(seg[4]))
+        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "feedstock-photo" and method == "POST":
+            return self.feedstock_photo_draft(conn, int(seg[2]), user)
+        if len(seg) == 5 and seg[2].isdigit() and seg[3] == "inputs" and seg[4].isdigit() and method == "PUT":
+            return self.update_run_input(conn, int(seg[2]), int(seg[4]), user)
+        if (len(seg) == 6 and seg[2].isdigit() and seg[3] == "inputs" and seg[4].isdigit()
+                and seg[5] == "photo" and method == "POST"):
+            return self.upload_input_photo(conn, int(seg[2]), int(seg[4]), user)
+        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "rejected-feedstock" and method == "PUT":
+            return self.rejected_feedstock(conn, int(seg[2]), user)
+        if len(seg) == 5 and seg[2].isdigit() and seg[3] == "stages" and method == "PUT":
+            return self.save_stage(conn, int(seg[2]), seg[4], user)
+        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "separation-solids":
+            rid = int(seg[2])
+            if not conn.execute("SELECT 1 FROM production_runs WHERE id=?", (rid,)).fetchone():
+                raise ApiError(404, "Production run not found")
+            if method == "GET":
+                return {"separationSolids": self._sep_solids_public(conn, rid)}
+            if method == "POST":
+                return self.add_sep_solids(conn, rid, user)
+        if len(seg) == 5 and seg[2].isdigit() and seg[3] == "separation-solids" and seg[4].isdigit():
+            rid, sid = int(seg[2]), int(seg[4])
+            if method == "PUT":
+                return self.update_sep_solids(conn, rid, sid, user)
+            if method == "DELETE":
+                return self.delete_sep_solids(conn, rid, sid)
+        if (len(seg) == 6 and seg[2].isdigit() and seg[3] == "separation-solids" and seg[4].isdigit()
+                and seg[5] == "photo" and method == "POST"):
+            return self.upload_sep_solids_photo(conn, int(seg[2]), int(seg[4]), user)
+        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "dilutions":
+            rid = int(seg[2])
+            if not conn.execute("SELECT 1 FROM production_runs WHERE id=?", (rid,)).fetchone():
+                raise ApiError(404, "Production run not found")
+            if method == "GET":
+                return {"dilutions": self._dilutions_public(conn, rid)}
+            if method == "POST":
+                return self.add_dilution(conn, rid, user)
+        if len(seg) == 5 and seg[2].isdigit() and seg[3] == "dilutions" and seg[4].isdigit():
+            rid, did = int(seg[2]), int(seg[4])
+            if method == "PUT":
+                return self.update_dilution(conn, rid, did, user)
+            if method == "DELETE":
+                return self.delete_dilution(conn, rid, did)
         raise ApiError(404, "Unknown production endpoint")
 
     def _attachments(self, conn, run_id):
@@ -1268,10 +1501,11 @@ class Handler(BaseHTTPRequestHandler):
                     "SELECT * FROM run_attachments WHERE run_id=? ORDER BY uploaded_at DESC, id DESC",
                     (run_id,))]
 
-    def add_attachment(self, conn, run_id, user):
-        d = self._body_json()
-        filename = (d.get("filename") or "document").strip().replace("\\", "/").split("/")[-1] or "document"
-        data_b64 = d.get("dataB64") or ""
+    def _store_attachment(self, conn, run_id, filename, content_type, data_b64, uploaded_by):
+        """Decode+store one base64 file and insert its run_attachments row.
+        Shared by generic document uploads and every stage/tote photo slot."""
+        filename = (filename or "document").strip().replace("\\", "/").split("/")[-1] or "document"
+        data_b64 = data_b64 or ""
         if data_b64.startswith("data:") and "," in data_b64:
             data_b64 = data_b64.split(",", 1)[1]
         try:
@@ -1287,12 +1521,31 @@ class Handler(BaseHTTPRequestHandler):
         stored = secrets.token_hex(8) + ext
         with open(os.path.join(UPLOAD_DIR, stored), "wb") as f:
             f.write(raw)
-        conn.execute(
+        cur = conn.cursor()
+        cur.execute(
             "INSERT INTO run_attachments (run_id,filename,content_type,size,stored_name,"
             "uploaded_by,uploaded_at) VALUES (?,?,?,?,?,?,?)",
-            (run_id, filename, d.get("contentType") or "application/octet-stream", len(raw),
-             stored, user["name"] if user else None, now_iso()))
+            (run_id, filename, content_type or "application/octet-stream", len(raw),
+             stored, uploaded_by, now_iso()))
+        return cur.lastrowid
+
+    def add_attachment(self, conn, run_id, user):
+        d = self._body_json()
+        self._store_attachment(conn, run_id, d.get("filename"), d.get("contentType"),
+                                d.get("dataB64") or "", user["name"] if user else None)
         return {"attachments": self._attachments(conn, run_id)}
+
+    def _delete_attachment_row(self, conn, aid):
+        """Remove an attachment's file+row by id, if it exists. Silent no-op
+        if it doesn't (used when replacing a stage/tote photo)."""
+        row = conn.execute("SELECT * FROM run_attachments WHERE id=?", (aid,)).fetchone()
+        if not row:
+            return
+        try:
+            os.remove(os.path.join(UPLOAD_DIR, row["stored_name"]))
+        except OSError:
+            pass
+        conn.execute("DELETE FROM run_attachments WHERE id=?", (aid,))
 
     def delete_attachment(self, conn, run_id, aid):
         r = conn.execute("SELECT * FROM run_attachments WHERE id=? AND run_id=?",
@@ -1305,6 +1558,243 @@ class Handler(BaseHTTPRequestHandler):
             pass
         conn.execute("DELETE FROM run_attachments WHERE id=?", (aid,))
         return {"attachments": self._attachments(conn, run_id)}
+
+    # ---- feedstock characterization (run_inputs) --------------------------- #
+    def _run_inputs_public(self, conn, run_id):
+        out = []
+        for r in conn.execute(
+                "SELECT ri.*, t.lot_number, t.site_code, t.species_code FROM run_inputs ri "
+                "JOIN tote_lots t ON t.id=ri.tote_lot_id WHERE ri.run_id=? ORDER BY t.lot_number",
+                (run_id,)):
+            out.append({
+                "id": r["id"], "toteLotId": r["tote_lot_id"], "toteLot": r["lot_number"],
+                "site": r["site_code"], "species": r["species_code"],
+                "loadedAt": r["loaded_at"], "surfacePhoto": r["surface_photo"],
+                "striationPhoto": r["striation_photo"], "ph": r["ph"],
+                "phMeasuredAt": r["ph_measured_at"], "orp": r["orp"],
+                "orpRange": r["orp_range"], "odour": r["odour"], "odourOther": r["odour_other"],
+                "odourIntensity": r["odour_intensity"], "decision": r["decision"],
+                "rejectionReason": r["rejection_reason"], "notes": r["notes"],
+            })
+        return out
+
+    def _apply_feedstock_detail(self, conn, input_id, fd):
+        """Apply staged draft characterization (+ already-uploaded photo attachment
+        ids) onto a freshly-created run_inputs row at finalize time."""
+        if not fd:
+            return
+        updates = {}
+        for col, key, kind in self.INPUT_FIELDS:
+            if key not in fd:
+                continue
+            updates[col] = numn(fd[key]) if kind == "num" else ((fd[key] or "").strip() or None)
+        if fd.get("surfacePhotoId"):
+            updates["surface_photo"] = fd["surfacePhotoId"]
+        if fd.get("striationPhotoId"):
+            updates["striation_photo"] = fd["striationPhotoId"]
+        if updates:
+            sets = ", ".join("%s=?" % c for c in updates)
+            conn.execute("UPDATE run_inputs SET %s WHERE id=?" % sets, (*updates.values(), input_id))
+
+    def update_run_input(self, conn, run_id, input_id, user):
+        row = conn.execute("SELECT * FROM run_inputs WHERE id=? AND run_id=?",
+                           (input_id, run_id)).fetchone()
+        if not row:
+            raise ApiError(404, "Feedstock input not found")
+        d = self._body_json()
+        if "decision" in d and d["decision"] not in ("accepted", "rejected"):
+            raise ApiError(400, "Invalid decision")
+        self._apply_feedstock_detail(conn, input_id, d)
+        return {"inputs": self._run_inputs_public(conn, run_id)}
+
+    def upload_input_photo(self, conn, run_id, input_id, user):
+        row = conn.execute("SELECT * FROM run_inputs WHERE id=? AND run_id=?",
+                           (input_id, run_id)).fetchone()
+        if not row:
+            raise ApiError(404, "Feedstock input not found")
+        d = self._body_json()
+        slot = d.get("slot")
+        if slot not in ("surface", "striation"):
+            raise ApiError(400, "Invalid photo slot")
+        col = "surface_photo" if slot == "surface" else "striation_photo"
+        tote = conn.execute("SELECT lot_number FROM tote_lots WHERE id=?", (row["tote_lot_id"],)).fetchone()
+        label = "Surface" if slot == "surface" else "Settling-Striation"
+        filename = d.get("filename") or ("%s %s.jpg" % (tote["lot_number"] if tote else "tote", label))
+        new_id = self._store_attachment(conn, run_id, filename, d.get("contentType"),
+                                        d.get("dataB64") or "", user["name"] if user else None)
+        old_id = row[col]
+        conn.execute("UPDATE run_inputs SET %s=? WHERE id=?" % col, (new_id, input_id))
+        if old_id:
+            self._delete_attachment_row(conn, old_id)
+        return {"inputs": self._run_inputs_public(conn, run_id)}
+
+    def feedstock_photo_draft(self, conn, run_id, user):
+        """Upload a feedstock photo for a tote before it has a run_inputs row
+        (still a draft) — stored as an ordinary attachment; the client stashes
+        the returned id in feedstockDetails and it's copied in at finalize."""
+        run = conn.execute("SELECT * FROM production_runs WHERE id=? AND status='draft'",
+                           (run_id,)).fetchone()
+        if not run:
+            raise ApiError(404, "Draft not found")
+        d = self._body_json()
+        slot = d.get("slot")
+        if slot not in ("surface", "striation"):
+            raise ApiError(400, "Invalid photo slot")
+        new_id = self._store_attachment(conn, run_id, d.get("filename") or "feedstock.jpg",
+                                        d.get("contentType"), d.get("dataB64") or "",
+                                        user["name"] if user else None)
+        return {"attachmentId": new_id}
+
+    def rejected_feedstock(self, conn, rid, user):
+        run = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
+        if not run:
+            raise ApiError(404, "Production run not found")
+        d = self._body_json()
+        clean = []
+        for it in (d.get("items") or []):
+            tote_lot = (it.get("toteLot") or "").strip()
+            reason = (it.get("reason") or "").strip()
+            if not tote_lot or not reason:
+                continue
+            clean.append({"toteLot": tote_lot, "reason": reason, "at": it.get("at") or now_iso()})
+        conn.execute("UPDATE production_runs SET rejected_feedstock_json=? WHERE id=?",
+                     (json.dumps(clean), rid))
+        return {"run": run_public(conn.execute(
+            "SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone())}
+
+    # ---- process stages (Homogenization / Extraction / Separation / ------- #
+    # ---- Pasteurization / Packaging) ---------------------------------------#
+    def save_stage(self, conn, rid, stage, user):
+        if stage not in self.STAGE_FIELDS:
+            raise ApiError(404, "Unknown stage")
+        run = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
+        if not run:
+            raise ApiError(404, "Production run not found")
+        d = self._body_json()
+        updates = {}
+        for col, key, kind in self.STAGE_FIELDS[stage]:
+            if key not in d:
+                continue
+            updates[col] = numn(d[key]) if kind == "num" else ((d[key] or "").strip() or None)
+        if updates:
+            sets = ", ".join("%s=?" % c for c in updates)
+            conn.execute("UPDATE production_runs SET %s WHERE id=?" % sets, (*updates.values(), rid))
+        return {"run": run_public(conn.execute(
+            "SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone())}
+
+    # ---- Separation: repeatable solids collections -------------------------#
+    def _sep_solids_public(self, conn, run_id):
+        return [{"id": r["id"], "weightKg": r["weight_kg"], "photo": r["photo"],
+                 "notes": r["notes"], "loggedAt": r["logged_at"]}
+                for r in conn.execute(
+                    "SELECT * FROM run_separation_solids WHERE run_id=? ORDER BY logged_at, id",
+                    (run_id,))]
+
+    def add_sep_solids(self, conn, run_id, user):
+        d = self._body_json()
+        conn.execute(
+            "INSERT INTO run_separation_solids (run_id,weight_kg,photo,notes,logged_at)"
+            " VALUES (?,?,?,?,?)",
+            (run_id, numn(d.get("weightKg")), None, (d.get("notes") or "").strip() or None,
+             (d.get("loggedAt") or "").strip() or now_iso()))
+        return {"separationSolids": self._sep_solids_public(conn, run_id)}
+
+    def update_sep_solids(self, conn, run_id, sid, user):
+        row = conn.execute("SELECT * FROM run_separation_solids WHERE id=? AND run_id=?",
+                           (sid, run_id)).fetchone()
+        if not row:
+            raise ApiError(404, "Separation solids entry not found")
+        d = self._body_json()
+        updates = {}
+        if "weightKg" in d:
+            updates["weight_kg"] = numn(d["weightKg"])
+        if "notes" in d:
+            updates["notes"] = (d["notes"] or "").strip() or None
+        if "loggedAt" in d:
+            updates["logged_at"] = (d["loggedAt"] or "").strip() or row["logged_at"]
+        if updates:
+            sets = ", ".join("%s=?" % c for c in updates)
+            conn.execute("UPDATE run_separation_solids SET %s WHERE id=?" % sets,
+                         (*updates.values(), sid))
+        return {"separationSolids": self._sep_solids_public(conn, run_id)}
+
+    def delete_sep_solids(self, conn, run_id, sid):
+        row = conn.execute("SELECT * FROM run_separation_solids WHERE id=? AND run_id=?",
+                           (sid, run_id)).fetchone()
+        if not row:
+            raise ApiError(404, "Separation solids entry not found")
+        if row["photo"]:
+            self._delete_attachment_row(conn, row["photo"])
+        conn.execute("DELETE FROM run_separation_solids WHERE id=?", (sid,))
+        return {"separationSolids": self._sep_solids_public(conn, run_id)}
+
+    def upload_sep_solids_photo(self, conn, run_id, sid, user):
+        row = conn.execute("SELECT * FROM run_separation_solids WHERE id=? AND run_id=?",
+                           (sid, run_id)).fetchone()
+        if not row:
+            raise ApiError(404, "Separation solids entry not found")
+        d = self._body_json()
+        new_id = self._store_attachment(conn, run_id, d.get("filename") or "solids.jpg",
+                                        d.get("contentType"), d.get("dataB64") or "",
+                                        user["name"] if user else None)
+        if row["photo"]:
+            self._delete_attachment_row(conn, row["photo"])
+        conn.execute("UPDATE run_separation_solids SET photo=? WHERE id=?", (new_id, sid))
+        return {"separationSolids": self._sep_solids_public(conn, run_id)}
+
+    # ---- Dilution & Preservation: repeatable tank entries ------------------#
+    def _dilutions_public(self, conn, run_id):
+        out = []
+        for r in conn.execute(
+                "SELECT * FROM run_dilutions WHERE run_id=? ORDER BY created_at, id", (run_id,)):
+            out.append({
+                "id": r["id"], "tank": r["tank"], "volumeInitialL": r["volume_initial_l"],
+                "waterRequiredL": r["water_required_l"], "volumeFinalL": r["volume_final_l"],
+                "sorbateRequiredKg": r["sorbate_required_kg"],
+                "benzoateRequiredKg": r["benzoate_required_kg"],
+                "preservativesAdded": bool(r["preservatives_added"]),
+                "preservativesAddedAt": r["preservatives_added_at"], "citricKg": r["citric_kg"],
+                "samplesTaken": bool(r["samples_taken"]), "samplesTakenAt": r["samples_taken_at"],
+                "notes": r["notes"], "createdAt": r["created_at"]})
+        return out
+
+    def _apply_dilution_fields(self, conn, did, d):
+        updates = {}
+        for col, key, kind in self.DILUTION_FIELDS:
+            if key not in d:
+                continue
+            if kind == "num":
+                updates[col] = numn(d[key])
+            elif kind == "bool":
+                updates[col] = 1 if d[key] else 0
+            else:
+                updates[col] = (d[key] or "").strip() or None
+        if updates:
+            sets = ", ".join("%s=?" % c for c in updates)
+            conn.execute("UPDATE run_dilutions SET %s WHERE id=?" % sets, (*updates.values(), did))
+
+    def add_dilution(self, conn, run_id, user):
+        cur = conn.cursor()
+        cur.execute("INSERT INTO run_dilutions (run_id,created_at) VALUES (?,?)", (run_id, now_iso()))
+        did = cur.lastrowid
+        self._apply_dilution_fields(conn, did, self._body_json())
+        return {"dilutions": self._dilutions_public(conn, run_id)}
+
+    def update_dilution(self, conn, run_id, did, user):
+        row = conn.execute("SELECT * FROM run_dilutions WHERE id=? AND run_id=?",
+                           (did, run_id)).fetchone()
+        if not row:
+            raise ApiError(404, "Dilution entry not found")
+        self._apply_dilution_fields(conn, did, self._body_json())
+        return {"dilutions": self._dilutions_public(conn, run_id)}
+
+    def delete_dilution(self, conn, run_id, did):
+        row = conn.execute("SELECT * FROM run_dilutions WHERE id=? AND run_id=?",
+                           (did, run_id)).fetchone()
+        if not row:
+            raise ApiError(404, "Dilution entry not found")
+        conn.execute("DELETE FROM run_dilutions WHERE id=?", (did,))
+        return {"dilutions": self._dilutions_public(conn, run_id)}
 
     # ---- quality control log ----------------------------------------------- #
     def _qc_public(self, r):
@@ -1446,6 +1936,8 @@ class Handler(BaseHTTPRequestHandler):
         location = (d.get("location") or "").strip() or None
         run_date = (d.get("runDate") or today_iso()).strip()
         notes = d.get("notes")
+        operators = (d.get("operators") or "").strip() or None
+        feedstock_details = d.get("feedstockDetails") or {}
 
         # Validate totes are all in stock.
         rows = conn.execute(
@@ -1504,22 +1996,27 @@ class Handler(BaseHTTPRequestHandler):
             cur.execute(
                 "UPDATE production_runs SET processing_lot=?, run_date=?, species_code=?, sku_code=?,"
                 " input_kg=?, target_tds=?, output_litres=?, citric_kg=?, sorbate_kg=?, ibc_used=?,"
-                " location=?, notes=?, status='completed', draft_data=NULL WHERE id=?",
+                " location=?, notes=?, operators=?, status='completed', draft_data=NULL WHERE id=?",
                 (lot, run_date, species, sku, input_kg, target_tds, output_litres,
-                 citric, sorbate, ibc_used, location, notes, run_id))
+                 citric, sorbate, ibc_used, location, notes, operators, run_id))
         else:
             cur.execute(
                 "INSERT INTO production_runs (processing_lot,run_date,species_code,sku_code,input_kg,"
-                "target_tds,output_litres,citric_kg,sorbate_kg,ibc_used,location,notes,status,created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'completed', ?)",
+                "target_tds,output_litres,citric_kg,sorbate_kg,ibc_used,location,notes,operators,"
+                "status,created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'completed', ?)",
                 (lot, run_date, species, sku, input_kg, target_tds, output_litres,
-                 citric, sorbate, ibc_used, location, notes, ts))
+                 citric, sorbate, ibc_used, location, notes, operators, ts))
             run_id = cur.lastrowid
 
-        # Consume totes.
+        # Consume totes, carrying over any feedstock characterization staged
+        # while this was still a draft (photos already uploaded as attachments).
         for r in rows:
             cur.execute("UPDATE tote_lots SET status='consumed', run_id=? WHERE id=?", (run_id, r["id"]))
             cur.execute("INSERT INTO run_inputs (run_id,tote_lot_id) VALUES (?,?)", (run_id, r["id"]))
+            input_id = cur.lastrowid
+            fd = feedstock_details.get(str(r["id"])) or feedstock_details.get(r["id"])
+            self._apply_feedstock_detail(conn, input_id, fd)
 
         # Deduct consumables.
         if citric and citric_row:
@@ -1560,6 +2057,8 @@ class Handler(BaseHTTPRequestHandler):
         for r in conn.execute("SELECT * FROM production_runs WHERE status='draft' ORDER BY id DESC"):
             dd = run_public(r)
             dd["toteLots"] = self._tote_lot_numbers(conn, dd["toteIds"])
+            dd["separationSolids"] = self._sep_solids_public(conn, r["id"])
+            dd["dilutions"] = self._dilutions_public(conn, r["id"])
             drafts.append(dd)
         return {"drafts": drafts}
 
@@ -1574,7 +2073,10 @@ class Handler(BaseHTTPRequestHandler):
         r = conn.execute("SELECT * FROM production_runs WHERE id=? AND status='draft'", (rid,)).fetchone()
         if not r:
             raise ApiError(404, "Draft not found")
-        return {"run": run_public(r)}
+        d = run_public(r)
+        d["separationSolids"] = self._sep_solids_public(conn, rid)
+        d["dilutions"] = self._dilutions_public(conn, rid)
+        return {"run": d}
 
     def save_draft(self, conn, rid):
         """Create (rid=None) or update (rid given) a run in progress. No
@@ -1592,19 +2094,22 @@ class Handler(BaseHTTPRequestHandler):
         location = (d.get("location") or "").strip() or None
         run_date = (d.get("runDate") or today_iso()).strip()
         notes = d.get("notes")
+        operators = (d.get("operators") or "").strip() or None
         tote_ids = [int(x) for x in (d.get("toteIds") or [])]
         packages = [p for p in (d.get("packages") or []) if p.get("size") in PACKAGE_SIZES]
-        draft_data = json.dumps({"toteIds": tote_ids, "packages": packages})
+        feedstock_details = d.get("feedstockDetails") or {}
+        draft_data = json.dumps({"toteIds": tote_ids, "packages": packages,
+                                  "feedstockDetails": feedstock_details})
 
         if rid is None:
             cur = conn.cursor()
             placeholder = "DRAFT-" + secrets.token_hex(6)
             cur.execute(
                 "INSERT INTO production_runs (processing_lot,run_date,species_code,sku_code,"
-                "target_tds,citric_kg,sorbate_kg,location,notes,status,draft_data,created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?, 'draft', ?, ?)",
+                "target_tds,citric_kg,sorbate_kg,location,notes,operators,status,draft_data,created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?, 'draft', ?, ?)",
                 (placeholder, run_date, species, sku, target_tds, citric, sorbate,
-                 location, notes, draft_data, now_iso()))
+                 location, notes, operators, draft_data, now_iso()))
             rid = cur.lastrowid
             conn.execute("UPDATE production_runs SET processing_lot=? WHERE id=?",
                          ("DRAFT-%d" % rid, rid))
@@ -1616,9 +2121,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(409, "This run has already been finalized")
             conn.execute(
                 "UPDATE production_runs SET run_date=?, species_code=?, sku_code=?, target_tds=?,"
-                " citric_kg=?, sorbate_kg=?, location=?, notes=?, draft_data=? WHERE id=?",
+                " citric_kg=?, sorbate_kg=?, location=?, notes=?, operators=?, draft_data=? WHERE id=?",
                 (run_date, species, sku, target_tds, citric, sorbate,
-                 location, notes, draft_data, rid))
+                 location, notes, operators, draft_data, rid))
         return {"run": run_public(conn.execute(
             "SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone())}
 

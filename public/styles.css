@@ -157,6 +157,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 /* ---------- Modal ---------- */
 .modal-bg { position: fixed; inset: 0; background: rgba(12,43,39,.5); display:flex; align-items:flex-start; justify-content:center; padding: 40px 16px; z-index: 50; overflow:auto; }
 .modal { background: var(--card); border-radius: 16px; padding: 22px; width: 100%; max-width: 620px; box-shadow: 0 24px 60px rgba(0,0,0,.3); }
+.modal.wide { max-width: 960px; }
 .modal h3 { margin: 0 0 14px; color: var(--teal-dark); }
 .modal .form-row { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .modal .modal-actions { display:flex; justify-content:flex-end; gap: 8px; margin-top: 18px; }
@@ -226,6 +227,31 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 
 .pkg-grid { display:grid; grid-template-columns: repeat(4,1fr); gap:10px; }
 @media (max-width:600px){ .pkg-grid{ grid-template-columns: repeat(2,1fr);} .modal .form-row{grid-template-columns:1fr;} }
+
+/* ---------- Production run: process-stage accordion ---------- */
+.accordion { border-top: 1px solid var(--line); margin-top: 4px; }
+.accordion:first-of-type { border-top: none; margin-top: 0; }
+.accordion > summary {
+  cursor: pointer; font-weight: 700; color: var(--teal-dark); padding: 12px 2px;
+  list-style: none; display: flex; align-items: center; gap: 8px;
+}
+.accordion > summary::-webkit-details-marker { display: none; }
+.accordion > summary::before { content: '▸'; font-size: 11px; color: var(--muted); }
+.accordion[open] > summary::before { content: '▾'; }
+.accordion-body { padding: 2px 2px 16px; }
+.accordion-body .form-row { margin-bottom: 8px; }
+
+.feedstock-tote { border: 1px solid var(--line); border-radius: 10px; margin: 8px 0; background: #fafcfc; }
+.feedstock-tote > summary { padding: 9px 12px; font-size: 13px; }
+.feedstock-tote .accordion-body { padding: 0 12px 14px; }
+
+.repeat-item { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-bottom: 10px; background: #fafcfc; }
+
+.photo-slot img { display: block; width: 100%; max-width: 160px; border-radius: 8px; margin-top: 6px; object-fit: cover; }
+
+.stage-progress { display: flex; gap: 4px; margin-top: 8px; }
+.stage-dot { font-size: 13px; color: var(--line); }
+.stage-dot.done { color: var(--teal); }
 
 /* ---------- Labels ---------- */
 .label-controls { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; margin-bottom:16px; }
