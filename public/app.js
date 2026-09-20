@@ -409,6 +409,7 @@ async function pageProduction(v) {
         el('h3', { style: 'margin:0' }, mono(run.processingLot) , '  ', el('span', { class: 'pill' }, skuName(run.sku))),
         el('div', { class: 'actions' },
           el('button', { class: 'secondary', onclick: () => editRun(run) }, 'Edit'),
+          el('button', { class: 'secondary', onclick: () => openProcessLog(run) }, '📋 Process log'),
           el('button', { class: 'secondary', onclick: () => openQcForRun(run) },
             '🧪 QC' + (run.qc && run.qc.length ? ' (' + run.qc.length + ')' : '')),
           el('button', { class: 'secondary', onclick: () => openAttachments(run) },
@@ -421,13 +422,29 @@ async function pageProduction(v) {
         sl('Target TDS', run.targetTds != null ? run.targetTds + '%' : '—'),
         sl('Citric', fmt(run.citricKg, 1) + ' kg'), sl('Sorbate', fmt(run.sorbateKg, 1) + ' kg'),
         sl('New IBCs filled', fmt(run.ibcUsed)), sl('Used IBCs freed', fmt(run.inputTotes.length)),
-        sl('Packaged', fgList)),
+        sl('Packaged', fgList), run.operators ? sl('Operators', run.operators) : null),
+      stageProgress(run),
       el('div', { class: 'muted', style: 'margin-top:8px;font-size:12px' },
         `Consumed ${run.inputTotes.length} tote(s): `, el('span', { class: 'mono' }, run.inputTotes.join(', '))),
       run.notes ? el('div', { class: 'muted', style: 'margin-top:4px;font-size:12px' }, '“' + run.notes + '”') : null,
       run.edits && run.edits.length ? editHistoryBlock(run.edits) : null);
     v.append(card);
   }
+}
+// Small at-a-glance progress dots for the 7 process-log sections a run can carry.
+function stageProgress(run) {
+  const stages = run.stages || {};
+  const items = [
+    ['Feedstock', (run.inputs || []).some(i => i.ph != null || i.surfacePhoto || i.striationPhoto || i.decision === 'rejected')],
+    ['Homogenization', !!(stages.homogenization && stages.homogenization.startedAt)],
+    ['Extraction', !!(stages.extraction && stages.extraction.startedAt)],
+    ['Separation', !!(stages.separation && stages.separation.startedAt) || (run.separationSolids || []).length > 0],
+    ['Pasteurization', !!(stages.pasteurization && stages.pasteurization.startedAt)],
+    ['Dilution & Preservation', (run.dilutions || []).length > 0],
+    ['Packaging', !!(stages.packaging && stages.packaging.startedAt)],
+  ];
+  return el('div', { class: 'stage-progress' }, ...items.map(([label, done]) =>
+    el('span', { class: 'stage-dot' + (done ? ' done' : ''), title: label + (done ? ' — logged' : ' — not yet logged') }, done ? '●' : '○')));
 }
 function draftCard(d) {
   const pkgSummary = (d.packages || []).filter(p => p.qty > 0).map(p => `${fmt(p.qty)} × ${p.size}`).join(', ') || '—';
@@ -440,7 +457,8 @@ function draftCard(d) {
     el('div', { class: 'summary-line' },
       sl('Run date', d.runDate), sl('SKU', d.sku ? skuName(d.sku) : '—'),
       sl('Totes selected', d.toteLots.length ? d.toteLots.join(', ') : '—'),
-      sl('Packaging', pkgSummary)),
+      sl('Packaging', pkgSummary), d.operators ? sl('Operators', d.operators) : null),
+    stageProgress(d),
     d.notes ? el('div', { class: 'muted', style: 'margin-top:4px;font-size:12px' }, '“' + d.notes + '”') : null);
 }
 async function discardDraft(d) {
@@ -462,6 +480,7 @@ function editHistoryBlock(edits) {
 function fmtWhen(iso) { if (!iso) return '—'; return iso.replace('T', ' ').replace('Z', '').slice(0, 16); }
 async function editRun(run) {
   const locs = State.ref.locations.map(l => [l, l]);
+  const operatorsSelect = buildOperatorsSelect(run.operators || '');
   const body = el('div', {},
     el('div', { class: 'summary-line' }, sl('Processing lot', run.processingLot), sl('SKU', skuName(run.sku)),
       el('span', { class: 'muted' }, 'Totes consumed & packaged output are fixed; correct the run details below.')),
@@ -471,7 +490,9 @@ async function editRun(run) {
     el('div', { class: 'form-row' },
       field('Citric acid (kg)', el('input', { type: 'number', step: '0.1', id: 'e_citric', value: run.citricKg ?? 0 })),
       field('Potassium sorbate (kg)', el('input', { type: 'number', step: '0.1', id: 'e_sorbate', value: run.sorbateKg ?? 0 }))),
-    field('Location', editableSelect(locs, 'e_loc')),
+    el('div', { class: 'form-row' },
+      field('Location', editableSelect(locs, 'e_loc')),
+      field('Operators', operatorsSelect.el)),
     field('Notes', el('textarea', { id: 'e_notes', rows: '2' }, run.notes || '')),
     el('div', { class: 'help' }, 'Changing citric / sorbate adjusts consumable stock by the difference. Every change is logged with your name.'));
   body.querySelector('#e_loc').value = run.location || '';
@@ -482,6 +503,7 @@ async function editRun(run) {
       citricKg: body.querySelector('#e_citric').value || 0,
       sorbateKg: body.querySelector('#e_sorbate').value || 0,
       location: body.querySelector('#e_loc').value,
+      operators: operatorsSelect.value,
       notes: body.querySelector('#e_notes').value
     });
     State.ref = await api('GET', '/refdata');
@@ -686,18 +708,21 @@ function buildQcLocationSelect(initialValue, onChange) {
 // Restricts a Value input to digits and one decimal point, groups the integer
 // part with commas as the user types, and caps decimal digits at maxDecimals
 // (a number, or a function returning one — density measurements get 3, every
-// other measurement 2, per QC policy).
-function attachNumericMask(input, maxDecimals) {
+// other measurement 2, per QC policy). `allowNegative` (off by default, so
+// every existing QC call site is unaffected) permits a leading "-", needed
+// for signed readings like ORP (mV).
+function attachNumericMask(input, maxDecimals, allowNegative) {
   const getMax = typeof maxDecimals === 'function' ? maxDecimals : () => maxDecimals;
   input.addEventListener('input', () => {
     const caretFromEnd = input.value.length - input.selectionStart;
+    const neg = allowNegative && input.value.trim().startsWith('-');
     let raw = input.value.replace(/[^0-9.]/g, '');
     const firstDot = raw.indexOf('.');
     if (firstDot !== -1) raw = raw.slice(0, firstDot + 1) + raw.slice(firstDot + 1).replace(/\./g, '');
     let [intPart, fracPart] = raw.split('.');
     if (fracPart !== undefined) fracPart = fracPart.slice(0, getMax());
     const intGrouped = intPart ? Number(intPart).toLocaleString('en-US') : '';
-    input.value = intGrouped + (fracPart !== undefined ? '.' + fracPart : '');
+    input.value = (neg ? '-' : '') + intGrouped + (fracPart !== undefined ? '.' + fracPart : '');
     const newCaret = Math.max(0, input.value.length - caretFromEnd);
     input.setSelectionRange(newCaret, newCaret);
   });
@@ -931,7 +956,450 @@ async function openQcForRun(run) {
   modal('Quality Control Log — ' + run.processingLot, body, async () => { if (State.qcChanged) { State.qcChanged = false; render(); } }, 'Done');
 }
 
-async function openRun(draft) {
+/* ---- Process-stage building blocks, shared by openRun (pre-finalize) and
+   openProcessLog (post-finalize) ---- */
+const STAGE_DEFS = {
+  homogenization: { key: 'homogenization', title: 'Homogenization', fields: [
+    ['startedAt', 'Started at', 'dt'], ['rinsingWaterL', 'Rinsing water (L)', 'num'],
+    ['slurryL', 'Slurry (L)', 'num'], ['dilutionWaterL', 'Dilution water (L)', 'num'],
+    ['citricKg', 'Citric acid added (kg)', 'num'], ['outputL', 'Output (L)', 'num']] },
+  extraction: { key: 'extraction', title: 'Extraction', fields: [
+    ['startedAt', 'Started at', 'dt'], ['amplitudePct', 'Amplitude (%)', 'num'],
+    ['flowrateLpm', 'Flow rate (L/min)', 'num'], ['pressurePsi', 'Pressure (psi)', 'num'],
+    ['startingPowerW', 'Starting power (W)', 'num']] },
+  separation: { key: 'separation', title: 'Separation parameters', fields: [
+    ['startedAt', 'Started at', 'dt'], ['flowrateLpm', 'Flow rate (L/min)', 'num'],
+    ['meshMicron', 'Mesh size (micron)', 'num'], ['waterAdditionL', 'Water addition (L)', 'num']] },
+  pasteurization: { key: 'pasteurization', title: 'Pasteurization', fields: [
+    ['startedAt', 'Started at', 'dt'], ['productSetpointC', 'Product set-point (°C)', 'num'],
+    ['boilerSetpointC', 'Boiler set-point (°C)', 'num'], ['totalVolumeL', 'Total volume (L)', 'num']] },
+};
+// A stage section is self-saving (its own small "Save" button, nothing required)
+// so it never blocks finalizing a run and can be revisited at any time.
+// `bare` skips the outer <details> wrapper, for stages folded into a bigger section.
+function buildStageSection(getRunId, def, values, bare) {
+  const inputs = {};
+  const rows = def.fields.map(([key, label, kind]) => {
+    let inp;
+    if (kind === 'dt') { inp = el('input', { type: 'datetime-local', value: values?.[key] || '' }); }
+    else {
+      inp = el('input', { inputmode: 'decimal', placeholder: label });
+      attachNumericMask(inp, 2);
+      if (values && values[key] != null) inp.value = formatQcValue(values[key], 2);
+    }
+    inputs[key] = { inp, kind };
+    return field(label, inp);
+  });
+  const status = el('span', { class: 'help' });
+  const saveBtn = el('button', { type: 'button', class: 'secondary', onclick: save }, 'Save');
+  async function save() {
+    status.textContent = ''; saveBtn.disabled = true;
+    try {
+      const rid = await getRunId();
+      const payload = {};
+      for (const key in inputs) {
+        const { inp, kind } = inputs[key];
+        payload[key] = kind === 'num' ? (inp.value.trim() === '' ? null : qcParseValue(inp.value)) : (inp.value || null);
+      }
+      await api('PUT', '/production/' + rid + '/stages/' + def.key, payload);
+      status.textContent = 'Saved.';
+    } catch (e) { status.textContent = e.message; }
+    saveBtn.disabled = false;
+  }
+  const content = el('div', {}, el('div', { class: 'form-row' }, ...rows),
+    el('div', { style: 'margin-top:6px' }, saveBtn, status));
+  if (bare) return content;
+  return el('details', { class: 'accordion' }, el('summary', {}, def.title),
+    el('div', { class: 'accordion-body' }, content));
+}
+
+const ODOUR_INTENSITIES = ['', 'Mild', 'Medium', 'Strong'];
+// REF_odour.pdf — the standard odour vocabulary offered in the Feedstock
+// dropdown; "Other" reveals a free-text field for anything not on this list.
+const REF_ODOURS = ['Marine', 'Sweet (Apple Juice)', 'Sulfuric (Rotten Eggs)', 'Butyric (Sour Milk, Parmesan Cheese)', 'Other'];
+// REF_ORP_classification.pdf — ORP (mV) is classified into one of these bands;
+// the "ORP meter range" field is calculated from this, never typed by hand.
+const REF_ORP_RANGES = [
+  { min: -400, max: -201, label: 'Spoiled' },
+  { min: -200, max: -51, label: 'Spoilage underway' },
+  { min: -50, max: -1, label: 'Watch closely' },
+  { min: 0, max: 400, label: 'Stable / safe zone' },
+];
+function classifyOrp(mv) {
+  if (mv == null || Number.isNaN(mv)) return null;
+  const band = REF_ORP_RANGES.find(r => mv >= r.min && mv <= r.max);
+  return band ? band.label : 'Out of range';
+}
+// REF_operators.pdf — the plant's operator roster, used for the Initiation
+// "Operators" field and any other operator picker.
+const REF_OPERATORS = [
+  { last: 'Pedde', first: 'Dan', initials: 'DP' },
+  { last: 'Llewellyn', first: 'Andrew', initials: 'AL' },
+  { last: 'Wrana', first: 'Nathan', initials: 'NW' },
+  { last: 'Boire', first: 'Dalton', initials: 'DB' },
+  { last: 'Kinsman', first: 'Cam', initials: 'CK' },
+  { last: 'Obee', first: 'Matt', initials: 'MO' },
+  { last: 'Martin', first: 'Sean', initials: 'SM' },
+  { last: 'Claxton', first: 'Adam', initials: 'AC' },
+  { last: 'Ismael', first: 'Imronn', initials: 'II' },
+];
+// Multi-select operator picker (a run usually has more than one) built on the
+// same floating-panel pattern as the QC sample-location dropdown. Stores/reads
+// a comma-separated string of initials (+ any free-text "Other" names) so it
+// round-trips through the existing `operators` text column unchanged.
+function buildOperatorsSelect(initialValue) {
+  const known = new Set();
+  let otherText = '';
+  (initialValue || '').split(',').map(s => s.trim()).filter(Boolean).forEach(tok => {
+    const match = REF_OPERATORS.find(o => o.initials.toLowerCase() === tok.toLowerCase()
+      || (o.first + ' ' + o.last).toLowerCase() === tok.toLowerCase() || o.last.toLowerCase() === tok.toLowerCase());
+    if (match) known.add(match.initials); else otherText = otherText ? otherText + ', ' + tok : tok;
+  });
+  const btn = el('button', { type: 'button', class: 'qc-loc-select-btn' });
+  const panel = el('div', { class: 'qc-loc-panel hidden' });
+  const wrap = el('div', { class: 'qc-loc-select' }, btn, panel);
+  const otherInput = el('input', { placeholder: 'Other operator name(s)', value: otherText });
+  function currentValue() {
+    const parts = REF_OPERATORS.filter(o => known.has(o.initials)).map(o => o.initials);
+    if (otherInput.value.trim()) parts.push(otherInput.value.trim());
+    return parts.join(', ');
+  }
+  function renderBtn() {
+    btn.innerHTML = '';
+    btn.append(el('span', {}, currentValue() || 'Select operators…'), el('span', { class: 'qc-loc-caret' }, '▾'));
+  }
+  function onDocClick(e) { if (!wrap.contains(e.target)) close(); }
+  function open() {
+    panel.innerHTML = '';
+    REF_OPERATORS.forEach(o => {
+      const cb = el('input', { type: 'checkbox', style: 'width:auto;flex:none' });
+      cb.checked = known.has(o.initials);
+      cb.addEventListener('change', () => { cb.checked ? known.add(o.initials) : known.delete(o.initials); renderBtn(); });
+      panel.append(el('label', { class: 'qc-loc-option', style: 'display:flex;align-items:center;gap:8px;cursor:pointer' },
+        cb, o.first + ' ' + o.last + ' (' + o.initials + ')'));
+    });
+    panel.append(el('div', { class: 'qc-loc-option' }, field('Other', otherInput)));
+    panel.classList.remove('hidden');
+    document.addEventListener('click', onDocClick, true);
+  }
+  function close() { panel.classList.add('hidden'); document.removeEventListener('click', onDocClick, true); }
+  btn.addEventListener('click', () => { panel.classList.contains('hidden') ? open() : close(); });
+  otherInput.addEventListener('input', renderBtn);
+  renderBtn();
+  return { el: wrap, get value() { return currentValue(); } };
+}
+
+// One tote's receiving-inspection card: photos, pH/ORP/odour readings and an
+// accept/reject decision. `mode: 'draft'` keeps edits in memory (bundled into
+// the outer save/finalize payload); `mode: 'completed'` saves immediately via
+// its own Save button, since the run may already be finalized.
+function buildFeedstockCard(opts) {
+  const v = Object.assign({ loadedAt: '', ph: null, phMeasuredAt: null, orp: null, orpRange: '', odour: '', odourOther: '',
+    odourIntensity: '', decision: 'accepted', rejectionReason: '', notes: '',
+    surfacePhotoId: null, striationPhotoId: null }, opts.initial || {});
+
+  const loadedAt = el('input', { type: 'datetime-local', value: v.loadedAt ? v.loadedAt.replace('Z', '').slice(0, 16) : '' });
+  const phInp = el('input', { inputmode: 'decimal', placeholder: 'pH' }); attachNumericMask(phInp, 2);
+  if (v.ph != null) phInp.value = formatQcValue(v.ph, 2);
+  // Automated, not operator-entered: stamped the instant the pH value changes,
+  // so it always reflects when the reading was actually last taken.
+  const phMeasuredNote = el('span', { class: 'help' }, v.phMeasuredAt ? 'Last measured: ' + fmtWhen(v.phMeasuredAt) : 'Not yet measured');
+  const orpInp = el('input', { inputmode: 'decimal', placeholder: 'mV (can be negative)' }); attachNumericMask(orpInp, 0, true);
+  if (v.orp != null) orpInp.value = formatQcValue(v.orp, 0);
+  // Calculated from REF_ORP_classification.pdf — never typed by hand.
+  const orpRangeNote = el('span', { class: 'help' }, v.orpRange || classifyOrp(v.orp) || 'Enter ORP to classify');
+  const odourSel = el('select', {}, ...REF_ODOURS.map(o => el('option', { value: o }, o)));
+  odourSel.value = REF_ODOURS.includes(v.odour) ? v.odour : (v.odour ? 'Other' : REF_ODOURS[0]);
+  const odourOtherInp = el('input', { placeholder: 'Odour (other)', value: v.odourOther || (odourSel.value === 'Other' && v.odour && !REF_ODOURS.includes(v.odour) ? v.odour : '') });
+  const odourOtherField = field('Odour (other)', odourOtherInp);
+  odourOtherField.classList.toggle('hidden', odourSel.value !== 'Other');
+  const intensitySel = el('select', {}, ...ODOUR_INTENSITIES.map(i => el('option', { value: i }, i || '—')));
+  intensitySel.value = v.odourIntensity || '';
+  const decisionSel = el('select', {}, el('option', { value: 'accepted' }, 'Accepted'), el('option', { value: 'rejected' }, 'Rejected'));
+  decisionSel.value = v.decision || 'accepted';
+  const reasonInp = el('input', { placeholder: 'Reason for rejection', value: v.rejectionReason || '' });
+  const reasonField = field('Rejection reason', reasonInp);
+  reasonField.classList.toggle('hidden', decisionSel.value !== 'rejected');
+  const notesInp = el('textarea', { rows: '2', placeholder: 'Notes' }, v.notes || '');
+
+  function currentValues() {
+    return {
+      loadedAt: loadedAt.value || null,
+      ph: phInp.value.trim() === '' ? null : qcParseValue(phInp.value),
+      phMeasuredAt: v.phMeasuredAt,
+      orp: orpInp.value.trim() === '' ? null : qcParseValue(orpInp.value),
+      orpRange: classifyOrp(orpInp.value.trim() === '' ? null : qcParseValue(orpInp.value)),
+      odour: odourSel.value,
+      odourOther: odourSel.value === 'Other' ? (odourOtherInp.value.trim() || null) : null,
+      odourIntensity: intensitySel.value || null,
+      decision: decisionSel.value,
+      rejectionReason: reasonInp.value.trim() || null,
+      notes: notesInp.value.trim() || null,
+      surfacePhotoId: v.surfacePhotoId, striationPhotoId: v.striationPhotoId
+    };
+  }
+  function notifyChange() { if (opts.onChange) opts.onChange(currentValues()); }
+  phInp.addEventListener('change', () => {
+    v.phMeasuredAt = phInp.value.trim() === '' ? null : new Date().toISOString();
+    phMeasuredNote.textContent = v.phMeasuredAt ? 'Last measured: ' + fmtWhen(v.phMeasuredAt) : 'Not yet measured';
+    notifyChange();
+  });
+  orpInp.addEventListener('input', () => {
+    orpRangeNote.textContent = classifyOrp(orpInp.value.trim() === '' ? null : qcParseValue(orpInp.value)) || 'Enter ORP to classify';
+  });
+  orpInp.addEventListener('change', notifyChange);
+  odourSel.addEventListener('change', () => { odourOtherField.classList.toggle('hidden', odourSel.value !== 'Other'); notifyChange(); });
+  decisionSel.addEventListener('change', () => { reasonField.classList.toggle('hidden', decisionSel.value !== 'rejected'); notifyChange(); });
+  [loadedAt, odourOtherInp, intensitySel, notesInp]
+    .forEach(inp => inp.addEventListener('change', notifyChange));
+
+  function photoSlot(slotKey, label) {
+    const img = el('img', {});
+    if (v[slotKey] && opts.photoUrl) img.src = opts.photoUrl(v[slotKey]); else img.style.display = 'none';
+    const fileInput = el('input', { type: 'file', accept: 'image/*', style: 'display:none' });
+    // capture="environment" hands off to the rear camera on phones/tablets.
+    const cameraInput = el('input', { type: 'file', accept: 'image/*', capture: 'environment', style: 'display:none' });
+    const status = el('span', { class: 'help' });
+    async function handle(file) {
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = async () => {
+        img.src = String(reader.result); img.style.display = '';
+        status.textContent = 'Uploading…';
+        try {
+          const b64 = String(reader.result).split(',')[1];
+          v[slotKey] = await opts.uploadPhoto(slotKey === 'surfacePhotoId' ? 'surface' : 'striation', file, b64);
+          status.textContent = '';
+          notifyChange();
+        } catch (e) { status.textContent = e.message; }
+      };
+      reader.readAsDataURL(file);
+    }
+    fileInput.addEventListener('change', () => { handle(fileInput.files[0]); fileInput.value = ''; });
+    cameraInput.addEventListener('change', () => { handle(cameraInput.files[0]); cameraInput.value = ''; });
+    return el('div', { class: 'photo-slot', style: 'flex:1 1 160px' },
+      el('div', { class: 'help' }, label), img, fileInput, cameraInput,
+      el('div', { style: 'display:flex;gap:6px;margin-top:4px' },
+        el('button', { type: 'button', class: 'secondary', onclick: () => fileInput.click() }, 'Upload'),
+        el('button', { type: 'button', class: 'secondary', onclick: () => cameraInput.click() }, '📷 Photo')),
+      status);
+  }
+
+  const fieldsRow = el('div', { class: 'form-row' },
+    field('Loaded at', loadedAt), field('pH', el('div', {}, phInp, phMeasuredNote)),
+    field('ORP (mV)', orpInp), field('ORP meter range (calculated)', orpRangeNote),
+    field('Odour', odourSel), odourOtherField,
+    field('Odour intensity', intensitySel), field('Decision', decisionSel));
+  const bodyEls = [fieldsRow, reasonField, field('Notes', notesInp),
+    el('div', { style: 'display:flex;gap:14px;flex-wrap:wrap;margin-top:8px' },
+      photoSlot('surfacePhotoId', 'Surface photo'), photoSlot('striationPhotoId', 'Settling / striation photo'))];
+
+  if (opts.mode === 'completed') {
+    const status = el('span', { class: 'help' });
+    const saveBtn = el('button', {
+      type: 'button', class: 'secondary', onclick: async () => {
+        status.textContent = ''; saveBtn.disabled = true;
+        try { await opts.onSave(currentValues()); status.textContent = 'Saved.'; }
+        catch (e) { status.textContent = e.message; }
+        saveBtn.disabled = false;
+      }
+    }, 'Save');
+    bodyEls.push(el('div', { style: 'margin-top:10px' }, saveBtn, status));
+  }
+  return el('details', { class: 'accordion feedstock-tote' },
+    el('summary', {}, opts.label + (v.decision === 'rejected' ? '  ⚠ Rejected' : '')),
+    el('div', { class: 'accordion-body' }, ...bodyEls));
+}
+
+// Totes inspected but never selected for the run (e.g. "rejected and discarded
+// due to smell") — a small audit list, independent of tote_lots inventory.
+function buildRejectedFeedstockSection(initialItems, getRunId) {
+  let items = (initialItems || []).slice();
+  const listHost = el('div', {});
+  const toteInp = el('input', { placeholder: 'Tote lot #' });
+  const reasonInp = el('input', { placeholder: 'Reason (e.g. smell)' });
+  const status = el('div', { class: 'help' });
+  function draw() {
+    listHost.innerHTML = '';
+    if (!items.length) { listHost.append(el('div', { class: 'help' }, 'None recorded.')); return; }
+    listHost.append(table(['Tote lot', 'Reason', 'When', ''], items.map((it, i) => [
+      el('span', { class: 'mono' }, it.toteLot), it.reason, fmtWhen(it.at),
+      rowActions([['Remove', () => remove(i), 'danger']])
+    ]), [false, false, false, false]));
+  }
+  async function persist() {
+    status.textContent = 'Saving…';
+    try {
+      const rid = await getRunId();
+      const r = await api('PUT', '/production/' + rid + '/rejected-feedstock', { items });
+      items = r.run.rejectedFeedstock || [];
+      status.textContent = '';
+    } catch (e) { status.textContent = e.message; }
+    draw();
+  }
+  async function add() {
+    const toteLot = toteInp.value.trim(), reason = reasonInp.value.trim();
+    if (!toteLot || !reason) { status.textContent = 'Enter both a tote lot and a reason.'; return; }
+    items.push({ toteLot, reason, at: new Date().toISOString() });
+    toteInp.value = ''; reasonInp.value = '';
+    await persist();
+  }
+  async function remove(i) { items.splice(i, 1); await persist(); }
+  draw();
+  return el('div', {}, listHost,
+    el('div', { class: 'form-row', style: 'margin-top:8px' }, field('Tote lot #', toteInp), field('Reason', reasonInp)),
+    el('button', { type: 'button', class: 'secondary', onclick: add }, '+ Add'), status);
+}
+
+// Separation solids: a run may have several collections (e.g. multiple passes).
+function buildSepSolidsSection(initial, getRunId, photoUrlFn) {
+  let items = (initial || []).slice();
+  const listHost = el('div', {});
+  const status = el('div', { class: 'help' });
+  function draw() {
+    listHost.innerHTML = '';
+    if (!items.length) { listHost.append(el('div', { class: 'help' }, 'No collections logged yet.')); return; }
+    items.forEach(it => {
+      const weightInp = el('input', { inputmode: 'decimal', placeholder: 'kg' }); attachNumericMask(weightInp, 2);
+      if (it.weightKg != null) weightInp.value = formatQcValue(it.weightKg, 2);
+      const whenInp = el('input', { type: 'datetime-local', value: it.loggedAt ? it.loggedAt.replace('Z', '').slice(0, 16) : '' });
+      const notesInp = el('input', { placeholder: 'Notes', value: it.notes || '' });
+      const img = el('img', { style: 'width:60px;height:60px;object-fit:cover;border-radius:6px' });
+      if (it.photo && photoUrlFn) img.src = photoUrlFn(it.photo); else img.style.display = 'none';
+      const fileInput = el('input', { type: 'file', accept: 'image/*', style: 'display:none' });
+      const rowStatus = el('span', { class: 'help' });
+      fileInput.addEventListener('change', async () => {
+        const f = fileInput.files[0]; fileInput.value = ''; if (!f) return;
+        const reader = new FileReader();
+        reader.onload = async () => {
+          img.src = String(reader.result); img.style.display = '';
+          try {
+            const b64 = String(reader.result).split(',')[1];
+            const rid = await getRunId();
+            const r = await api('POST', '/production/' + rid + '/separation-solids/' + it.id + '/photo',
+              { filename: f.name, contentType: f.type || 'image/jpeg', dataB64: b64 });
+            items = r.separationSolids;
+          } catch (e) { rowStatus.textContent = e.message; }
+        };
+        reader.readAsDataURL(f);
+      });
+      const saveBtn = el('button', {
+        type: 'button', class: 'secondary', onclick: async () => {
+          try {
+            const rid = await getRunId();
+            const r = await api('PUT', '/production/' + rid + '/separation-solids/' + it.id, {
+              weightKg: weightInp.value.trim() === '' ? null : qcParseValue(weightInp.value),
+              loggedAt: whenInp.value || null, notes: notesInp.value.trim() || null
+            });
+            items = r.separationSolids; rowStatus.textContent = 'Saved.';
+          } catch (e) { rowStatus.textContent = e.message; }
+        }
+      }, 'Save');
+      const delBtn = el('button', {
+        type: 'button', class: 'danger', onclick: async () => {
+          if (!confirm('Remove this collection?')) return;
+          const rid = await getRunId();
+          const r = await api('DELETE', '/production/' + rid + '/separation-solids/' + it.id);
+          items = r.separationSolids; draw();
+        }
+      }, 'Remove');
+      listHost.append(el('div', { class: 'repeat-item' },
+        el('div', { class: 'form-row' }, field('Weight (kg)', weightInp), field('Logged at', whenInp)),
+        field('Notes', notesInp),
+        el('div', { style: 'display:flex;gap:10px;align-items:center;margin-top:6px' },
+          img, el('button', { type: 'button', class: 'secondary', onclick: () => fileInput.click() }, '📷 Photo'),
+          fileInput, saveBtn, delBtn, rowStatus)));
+    });
+  }
+  draw();
+  const addBtn = el('button', {
+    type: 'button', class: 'secondary', onclick: async () => {
+      try { const rid = await getRunId(); const r = await api('POST', '/production/' + rid + '/separation-solids', {}); items = r.separationSolids; draw(); }
+      catch (e) { status.textContent = e.message; }
+    }
+  }, '+ Add collection');
+  return el('div', {}, listHost, addBtn, status);
+}
+
+// Dilution & Preservation: a run may split its output across several tanks.
+function buildDilutionsSection(initial, getRunId) {
+  let items = (initial || []).slice();
+  const listHost = el('div', {});
+  const status = el('div', { class: 'help' });
+  function numField(val, ph) { const i = el('input', { inputmode: 'decimal', placeholder: ph }); attachNumericMask(i, 2); if (val != null) i.value = formatQcValue(val, 2); return i; }
+  function draw() {
+    listHost.innerHTML = '';
+    if (!items.length) { listHost.append(el('div', { class: 'help' }, 'No dilution / preservation entries yet.')); return; }
+    items.forEach(it => {
+      const tankInp = el('input', { placeholder: 'Tank', value: it.tank || '' });
+      const volInitInp = numField(it.volumeInitialL, 'L');
+      const waterInp = numField(it.waterRequiredL, 'L');
+      const volFinalInp = numField(it.volumeFinalL, 'L');
+      const sorbInp = numField(it.sorbateRequiredKg, 'kg');
+      const benzInp = numField(it.benzoateRequiredKg, 'kg');
+      const citricInp = numField(it.citricKg, 'kg');
+      const presAddedChk = el('input', { type: 'checkbox', style: 'width:auto;flex:none' }); presAddedChk.checked = !!it.preservativesAdded;
+      const presAtInp = el('input', { type: 'datetime-local', value: it.preservativesAddedAt ? it.preservativesAddedAt.replace('Z', '').slice(0, 16) : '' });
+      const sampleChk = el('input', { type: 'checkbox', style: 'width:auto;flex:none' }); sampleChk.checked = !!it.samplesTaken;
+      const sampleAtInp = el('input', { type: 'datetime-local', value: it.samplesTakenAt ? it.samplesTakenAt.replace('Z', '').slice(0, 16) : '' });
+      const notesInp = el('input', { placeholder: 'Notes', value: it.notes || '' });
+      const rowStatus = el('span', { class: 'help' });
+      const saveBtn = el('button', {
+        type: 'button', class: 'secondary', onclick: async () => {
+          try {
+            const rid = await getRunId();
+            const r = await api('PUT', '/production/' + rid + '/dilutions/' + it.id, {
+              tank: tankInp.value.trim() || null,
+              volumeInitialL: volInitInp.value.trim() === '' ? null : qcParseValue(volInitInp.value),
+              waterRequiredL: waterInp.value.trim() === '' ? null : qcParseValue(waterInp.value),
+              volumeFinalL: volFinalInp.value.trim() === '' ? null : qcParseValue(volFinalInp.value),
+              sorbateRequiredKg: sorbInp.value.trim() === '' ? null : qcParseValue(sorbInp.value),
+              benzoateRequiredKg: benzInp.value.trim() === '' ? null : qcParseValue(benzInp.value),
+              citricKg: citricInp.value.trim() === '' ? null : qcParseValue(citricInp.value),
+              preservativesAdded: presAddedChk.checked, preservativesAddedAt: presAtInp.value || null,
+              samplesTaken: sampleChk.checked, samplesTakenAt: sampleAtInp.value || null,
+              notes: notesInp.value.trim() || null
+            });
+            items = r.dilutions; rowStatus.textContent = 'Saved.';
+          } catch (e) { rowStatus.textContent = e.message; }
+        }
+      }, 'Save');
+      const delBtn = el('button', {
+        type: 'button', class: 'danger', onclick: async () => {
+          if (!confirm('Remove this tank entry?')) return;
+          const rid = await getRunId();
+          const r = await api('DELETE', '/production/' + rid + '/dilutions/' + it.id);
+          items = r.dilutions; draw();
+        }
+      }, 'Remove');
+      listHost.append(el('div', { class: 'repeat-item' },
+        el('div', { class: 'form-row' }, field('Tank', tankInp), field('Volume initial (L)', volInitInp)),
+        el('div', { class: 'form-row' }, field('Water required (L)', waterInp), field('Volume final (L)', volFinalInp)),
+        el('div', { class: 'form-row' }, field('Sorbate required (kg)', sorbInp), field('Benzoate required (kg)', benzInp)),
+        field('Citric acid (kg)', citricInp),
+        el('div', { class: 'form-row' },
+          field('Preservatives added', el('label', { style: 'display:flex;align-items:center;gap:6px' }, presAddedChk, 'Yes')),
+          field('Added at', presAtInp)),
+        el('div', { class: 'form-row' },
+          field('Samples taken', el('label', { style: 'display:flex;align-items:center;gap:6px' }, sampleChk, 'Yes')),
+          field('Taken at', sampleAtInp)),
+        field('Notes', notesInp),
+        el('div', { style: 'display:flex;gap:10px;align-items:center;margin-top:6px' }, saveBtn, delBtn, rowStatus)));
+    });
+  }
+  draw();
+  const addBtn = el('button', {
+    type: 'button', class: 'secondary', onclick: async () => {
+      try { const rid = await getRunId(); const r = await api('POST', '/production/' + rid + '/dilutions', {}); items = r.dilutions; draw(); }
+      catch (e) { status.textContent = e.message; }
+    }
+  }, '+ Add tank');
+  return el('div', {}, listHost, addBtn, status);
+}
+
+async function openRun(draftSummary) {
+  // Re-fetch a resumed draft in full (list snapshots omit stage/solids/dilution detail).
+  const draft = (draftSummary && draftSummary.id) ? (await api('GET', '/production/drafts/' + draftSummary.id)).run : draftSummary;
   const totes = (await api('GET', '/totes?status=in_stock')).totes;
   const skus = State.ref.skus;
   const locs = State.ref.locations.map(l => [l, l]);
@@ -940,6 +1408,7 @@ async function openRun(draft) {
   const search = el('input', { placeholder: 'Filter totes…', oninput: () => filterTotes() });
   const pickHost = el('div', { class: 'tote-pick' });
   const summary = el('div', { class: 'summary-line' });
+  const feedstockHost = el('div', {});
   const pkgInputs = {};
   const draftQty = {};
   (draft?.packages || []).forEach(p => { draftQty[p.size] = p.qty; });
@@ -950,6 +1419,16 @@ async function openRun(draft) {
   }));
   let selected = new Set(draft?.toteIds || []);
   let draftId = draft ? draft.id : null;
+  let feedstockState = Object.assign({}, draft?.feedstockDetails || {});
+  const operatorsSelect = buildOperatorsSelect(draft?.operators || '');
+
+  // A section that needs a real run id (photos, stages, repeatable lists) calls
+  // this first — for a brand-new run it silently saves a draft to get one.
+  async function ensureRunId() {
+    if (draftId) return draftId;
+    await saveDraft(true);
+    return draftId;
+  }
 
   function speciesOfSku() { const s = skus.find(x => x.code === skuSel.value); return s ? s.species : null; }
   function filterTotes() {
@@ -960,7 +1439,7 @@ async function openRun(draft) {
       el('thead', {}, el('tr', {}, el('th', { class: 'checkcol' }, ''), el('th', {}, 'Lot'), el('th', {}, 'Site'), el('th', { class: 'num' }, 'Avg kg'), el('th', {}, 'pH'), el('th', {}, 'Location'))));
     const tb = el('tbody', {});
     for (const t of rows) {
-      const cb = el('input', { type: 'checkbox', onchange: () => { cb.checked ? selected.add(t.id) : selected.delete(t.id); recompute(); } });
+      const cb = el('input', { type: 'checkbox', onchange: () => { cb.checked ? selected.add(t.id) : selected.delete(t.id); recompute(); renderFeedstockCards(); } });
       cb.checked = selected.has(t.id);
       tb.append(el('tr', {}, el('td', { class: 'checkcol' }, cb), el('td', { class: 'mono' }, t.lot), el('td', {}, t.site), el('td', { class: 'num' }, fmt(t.avgWeightKg, 1)), el('td', {}, t.ph ?? '—'), el('td', {}, t.location || '—')));
     }
@@ -975,21 +1454,84 @@ async function openRun(draft) {
     summary.append(sl('Totes', chosen.length), sl('Input', fmt(inputKg, 1) + ' kg'),
       sl('Output', fmt(outL, 0) + ' L'), sl('Conversion factor', inputKg ? (outL / inputKg).toFixed(2) + ' L/kg' : '—'));
   }
+  // Rebuilt only when tote selection changes (not on every keystroke elsewhere
+  // in the modal) so in-progress typing inside a tote's card is never wiped.
+  function renderFeedstockCards() {
+    feedstockHost.innerHTML = '';
+    const chosen = totes.filter(t => selected.has(t.id));
+    if (!chosen.length) { feedstockHost.append(el('div', { class: 'help' }, 'Select totes above to characterize the feedstock.')); return; }
+    for (const t of chosen) {
+      feedstockHost.append(buildFeedstockCard({
+        label: t.lot + (t.site ? '  ·  ' + t.site : ''),
+        initial: feedstockState[t.id],
+        mode: 'draft',
+        onChange: vals => { feedstockState[t.id] = vals; },
+        uploadPhoto: async (slot, file, b64) => {
+          const rid = await ensureRunId();
+          const r = await api('POST', '/production/' + rid + '/feedstock-photo',
+            { slot, filename: file.name, contentType: file.type || 'image/jpeg', dataB64: b64 });
+          return r.attachmentId;
+        },
+        photoUrl: attId => attDownloadUrl(draftId, attId, false)
+      }));
+    }
+  }
+
+  const rejectedHost = buildRejectedFeedstockSection(draft?.rejectedFeedstock || [], ensureRunId);
+  const stages = draft?.stages || {};
+  const homogSection = buildStageSection(ensureRunId, STAGE_DEFS.homogenization, stages.homogenization);
+  const extractionSection = buildStageSection(ensureRunId, STAGE_DEFS.extraction, stages.extraction);
+  const separationParams = buildStageSection(ensureRunId, STAGE_DEFS.separation, stages.separation, true);
+  const sepSolidsSection = buildSepSolidsSection(draft?.separationSolids || [], ensureRunId, attId => attDownloadUrl(draftId, attId, false));
+  const pasteurizationSection = buildStageSection(ensureRunId, STAGE_DEFS.pasteurization, stages.pasteurization);
+  const dilutionsSection = buildDilutionsSection(draft?.dilutions || [], ensureRunId);
+  const packagingStartedInp = el('input', { type: 'datetime-local', value: stages.packaging?.startedAt || '' });
+  const packagingStatus = el('span', { class: 'help' });
+  const packagingSaveBtn = el('button', {
+    type: 'button', class: 'secondary', onclick: async () => {
+      packagingStatus.textContent = ''; packagingSaveBtn.disabled = true;
+      try {
+        const rid = await ensureRunId();
+        await api('PUT', '/production/' + rid + '/stages/packaging', { startedAt: packagingStartedInp.value || null });
+        packagingStatus.textContent = 'Saved.';
+      } catch (e) { packagingStatus.textContent = e.message; }
+      packagingSaveBtn.disabled = false;
+    }
+  }, 'Save timestamp');
 
   const body = el('div', {},
-    el('div', { class: 'form-row' }, field('Finished-good SKU', skuSel),
-      field('Target TDS (%)', el('input', { type: 'number', step: '0.1', id: 'r_tds', placeholder: 'e.g. 4.0', value: draft?.targetTds ?? '' }))),
-    field('Select stabilized totes to process', search), pickHost, summary,
-    el('h3', { style: 'margin:16px 0 8px;font-size:14px' }, 'Bottling / packaging output'), pkgGrid,
-    el('div', { class: 'form-row' },
-      field('Citric acid (kg)', el('input', { type: 'number', step: '0.1', min: '0', id: 'r_citric', value: draft?.citricKg ?? 0 })),
-      field('Potassium sorbate (kg)', el('input', { type: 'number', step: '0.1', min: '0', id: 'r_sorbate', value: draft?.sorbateKg ?? 0 }))),
-    el('div', { class: 'form-row' },
-      field('Run date', el('input', { type: 'date', id: 'r_date', value: draft?.runDate || new Date().toISOString().slice(0, 10) })),
-      field('Location', editableSelect(locs, 'r_loc'))),
-    field('Notes', el('textarea', { id: 'r_notes', rows: '2', placeholder: 'Optional batch notes' }, draft?.notes || '')));
+    el('details', { class: 'accordion', open: '' }, el('summary', {}, 'Initiation'),
+      el('div', { class: 'accordion-body' },
+        el('div', { class: 'form-row' }, field('Finished-good SKU', skuSel),
+          field('Target TDS (%)', el('input', { type: 'number', step: '0.1', id: 'r_tds', placeholder: 'e.g. 4.0', value: draft?.targetTds ?? '' }))),
+        el('div', { class: 'form-row' },
+          field('Run date', el('input', { type: 'date', id: 'r_date', value: draft?.runDate || new Date().toISOString().slice(0, 10) })),
+          field('Location', editableSelect(locs, 'r_loc'))),
+        field('Operators', operatorsSelect.el),
+        field('Notes', el('textarea', { id: 'r_notes', rows: '2', placeholder: 'Optional batch notes' }, draft?.notes || '')))),
+    el('details', { class: 'accordion', open: '' }, el('summary', {}, 'Feedstock'),
+      el('div', { class: 'accordion-body' },
+        field('Select stabilized totes to process', search), pickHost, summary,
+        el('h4', { style: 'margin:14px 0 4px;font-size:13px' }, 'Feedstock characterization'), feedstockHost,
+        el('h4', { style: 'margin:14px 0 4px;font-size:13px' }, 'Rejected feedstock (inspected, not used)'), rejectedHost)),
+    homogSection, extractionSection,
+    el('details', { class: 'accordion' }, el('summary', {}, 'Separation'),
+      el('div', { class: 'accordion-body' }, separationParams,
+        el('h4', { style: 'margin:14px 0 4px;font-size:13px' }, 'Solids collections'), sepSolidsSection)),
+    pasteurizationSection,
+    el('details', { class: 'accordion' }, el('summary', {}, 'Dilution & Preservation'),
+      el('div', { class: 'accordion-body' }, dilutionsSection)),
+    el('details', { class: 'accordion' }, el('summary', {}, 'Packaging'),
+      el('div', { class: 'accordion-body' },
+        el('h4', { style: 'margin:0 0 8px;font-size:13px' }, 'Bottling / packaging output'), pkgGrid,
+        el('div', { class: 'form-row' },
+          field('Citric acid (kg)', el('input', { type: 'number', step: '0.1', min: '0', id: 'r_citric', value: draft?.citricKg ?? 0 })),
+          field('Potassium sorbate (kg)', el('input', { type: 'number', step: '0.1', min: '0', id: 'r_sorbate', value: draft?.sorbateKg ?? 0 }))),
+        field('Packaging started at', packagingStartedInp),
+        el('div', { style: 'margin-top:6px' }, packagingSaveBtn, packagingStatus))));
   body.querySelector('#r_loc').value = draft?.location || '';
   filterTotes();
+  renderFeedstockCards();
 
   function buildPayload() {
     const packages = Object.keys(pkgInputs).map(sz => ({ size: sz, qty: +pkgInputs[sz].value || 0 })).filter(p => p.qty > 0);
@@ -997,17 +1539,18 @@ async function openRun(draft) {
       sku: skuSel.value, toteIds: [...selected], targetTds: body.querySelector('#r_tds').value || null,
       citricKg: +body.querySelector('#r_citric').value || 0, sorbateKg: +body.querySelector('#r_sorbate').value || 0,
       runDate: body.querySelector('#r_date').value, location: body.querySelector('#r_loc').value,
-      notes: body.querySelector('#r_notes').value, packages
+      operators: operatorsSelect.value,
+      notes: body.querySelector('#r_notes').value, packages,
+      feedstockDetails: feedstockState
     };
   }
-  async function saveDraft() {
+  async function saveDraft(silent) {
     const payload = buildPayload();
     const r = draftId
       ? await api('PUT', '/production/drafts/' + draftId, payload)
       : await api('POST', '/production/drafts', payload);
     draftId = r.run.id;
-    toast('Progress saved — resume it anytime from “In progress”.');
-    render();
+    if (!silent) { toast('Progress saved — resume it anytime from “In progress”.'); render(); }
   }
   async function finalizeRun() {
     const payload = buildPayload();
@@ -1020,7 +1563,70 @@ async function openRun(draft) {
     render();
   }
   modal(draft ? 'Resume production run' : 'New production run', body, finalizeRun, 'Create run',
-    { extraLabel: 'Save & close', onExtra: saveDraft });
+    { extraLabel: 'Save & close', onExtra: saveDraft, wide: true });
+}
+
+// Post-finalize view: feedstock characterization + process stages can still be
+// filled in or corrected at any time (matching how the real paper logs are
+// often completed days after the run), independent of the locked-in
+// tote-consumption / packaging numbers (corrected via the separate Edit modal).
+async function openProcessLog(run) {
+  const stages = run.stages || {};
+  const feedstockHost = el('div', {});
+  (run.inputs || []).forEach(inp => {
+    feedstockHost.append(buildFeedstockCard({
+      label: inp.toteLot + (inp.site ? '  ·  ' + inp.site : ''),
+      initial: inp,
+      mode: 'completed',
+      onSave: async vals => { await api('PUT', '/production/' + run.id + '/inputs/' + inp.id, vals); },
+      uploadPhoto: async (slot, file, b64) => {
+        const r = await api('POST', '/production/' + run.id + '/inputs/' + inp.id + '/photo',
+          { slot, filename: file.name, contentType: file.type || 'image/jpeg', dataB64: b64 });
+        const updated = r.inputs.find(i => i.id === inp.id);
+        return slot === 'surface' ? updated.surfacePhoto : updated.striationPhoto;
+      },
+      photoUrl: attId => attDownloadUrl(run.id, attId, false)
+    }));
+  });
+  if (!run.inputs || !run.inputs.length) feedstockHost.append(el('div', { class: 'help' }, 'No feedstock characterization recorded.'));
+
+  const getRunId = async () => run.id;
+  const rejectedHost = buildRejectedFeedstockSection(run.rejectedFeedstock || [], getRunId);
+  const homogSection = buildStageSection(getRunId, STAGE_DEFS.homogenization, stages.homogenization);
+  const extractionSection = buildStageSection(getRunId, STAGE_DEFS.extraction, stages.extraction);
+  const separationParams = buildStageSection(getRunId, STAGE_DEFS.separation, stages.separation, true);
+  const sepSolidsSection = buildSepSolidsSection(run.separationSolids || [], getRunId, attId => attDownloadUrl(run.id, attId, false));
+  const pasteurizationSection = buildStageSection(getRunId, STAGE_DEFS.pasteurization, stages.pasteurization);
+  const dilutionsSection = buildDilutionsSection(run.dilutions || [], getRunId);
+  const packagingStartedInp = el('input', { type: 'datetime-local', value: stages.packaging?.startedAt || '' });
+  const packagingStatus = el('span', { class: 'help' });
+  const packagingSaveBtn = el('button', {
+    type: 'button', class: 'secondary', onclick: async () => {
+      packagingStatus.textContent = ''; packagingSaveBtn.disabled = true;
+      try { await api('PUT', '/production/' + run.id + '/stages/packaging', { startedAt: packagingStartedInp.value || null }); packagingStatus.textContent = 'Saved.'; }
+      catch (e) { packagingStatus.textContent = e.message; }
+      packagingSaveBtn.disabled = false;
+    }
+  }, 'Save timestamp');
+
+  const body = el('div', {},
+    el('div', { class: 'summary-line' }, sl('Run', run.processingLot), sl('SKU', skuName(run.sku)),
+      el('span', { class: 'muted' }, 'Each section saves independently and can be filled in or corrected any time.')),
+    el('details', { class: 'accordion', open: '' }, el('summary', {}, 'Feedstock characterization'),
+      el('div', { class: 'accordion-body' }, feedstockHost,
+        el('h4', { style: 'margin:14px 0 4px;font-size:13px' }, 'Rejected feedstock (inspected, not used)'), rejectedHost)),
+    homogSection, extractionSection,
+    el('details', { class: 'accordion' }, el('summary', {}, 'Separation'),
+      el('div', { class: 'accordion-body' }, separationParams,
+        el('h4', { style: 'margin:14px 0 4px;font-size:13px' }, 'Solids collections'), sepSolidsSection)),
+    pasteurizationSection,
+    el('details', { class: 'accordion' }, el('summary', {}, 'Dilution & Preservation'),
+      el('div', { class: 'accordion-body' }, dilutionsSection)),
+    el('details', { class: 'accordion' }, el('summary', {}, 'Packaging'),
+      el('div', { class: 'accordion-body' }, field('Packaging started at', packagingStartedInp),
+        el('div', { style: 'margin-top:6px' }, packagingSaveBtn, packagingStatus))));
+
+  modal('Process log — ' + run.processingLot, body, async () => { render(); }, 'Done', { wide: true });
 }
 
 /* ---------------- Finished goods ---------------- */
@@ -1708,7 +2314,7 @@ function modal(title, body, onSubmit, submitLabel = 'Save', opts = {}) {
     actions.append(extraBtn);
   }
   actions.append(submitBtn);
-  const card = el('div', { class: 'modal' }, el('h3', {}, title), body, errBox, actions);
+  const card = el('div', { class: 'modal' + (opts.wide ? ' wide' : '') }, el('h3', {}, title), body, errBox, actions);
   // Backdrop clicks do NOT close the dialog — only Cancel or completing the
   // action does, so a stray click off the popup can't discard your input.
   const bg = el('div', { class: 'modal-bg' }, card);
