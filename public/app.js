@@ -2358,7 +2358,9 @@ function changePasswordModal(forced) {
 /* ---------------- Admin ---------------- */
 async function pageAdmin(v) {
   v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Admin — Users'),
-    el('div', { class: 'actions' }, el('button', { onclick: addUser }, '+ Add user'))));
+    el('div', { class: 'actions' },
+      el('button', { class: 'secondary', onclick: downloadDbBackup }, '⬇ Download database backup'),
+      el('button', { onclick: addUser }, '+ Add user'))));
   const r = await api('GET', '/users');
   v.append(table(
     ['Name', 'Email', 'Role', 'Status', 'Actions'],
@@ -2374,6 +2376,17 @@ async function pageAdmin(v) {
     ]), [false, false, false, false, false]));
   v.append(el('div', { class: 'help', style: 'margin-top:10px' },
     'New users and password resets require the person to set a new password on next sign-in.'));
+}
+// Downloads a full, consistent snapshot of the live database (sqlite3's
+// backup API server-side, not a raw file copy) straight to the browser —
+// an off-server copy, since a backup sitting on the same disk as the
+// original doesn't help if that disk is lost.
+function downloadDbBackup() {
+  const ts = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+  const url = '/api/admin/backup?token=' + encodeURIComponent(State.token);
+  const a = el('a', { href: url, download: 'kelpworks-backup-' + ts + '.db' });
+  document.body.append(a); a.click(); a.remove();
+  toast('Backup downloading…');
 }
 function addUser() {
   const body = el('div', {},

@@ -46,6 +46,7 @@ import zipfile
 import hashlib
 import sqlite3
 import secrets
+import tempfile
 import datetime
 from xml.sax.saxutils import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -767,6 +768,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._download_attachment(path)
         if path == "/api/reports/xlsx":
             return self._report_xlsx()
+        if path == "/api/admin/backup":
+            return self._admin_backup()
         if path.startswith("/api/"):
             return self._handle_api("GET")
         return self._serve_static(path)
@@ -793,6 +796,54 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition",
                              'attachment; filename="kelpworks-report-%s_%s.xlsx"'
                              % (data["from"], data["to"]))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(content)
+        except Exception as e:  # pragma: no cover
+            self._send_json({"error": "Server error: %s" % e}, 500)
+        finally:
+            conn.close()
+
+    def _admin_backup(self):
+        """Stream a consistent snapshot of the live database as a downloadable
+        .db file. Uses sqlite3's own backup API (not a raw file copy) so it's
+        safe to run against a database that's being written to concurrently —
+        WAL-mode writers don't corrupt or block the snapshot. Admin-only:
+        the file includes password hashes and every business record."""
+        conn = db()
+        try:
+            qs = parse_qs(urlparse(self.path).query)
+            header = self.headers.get("Authorization", "")
+            tok = header[7:] if header.startswith("Bearer ") else qs.get("token", [None])[0]
+            payload = read_token(tok or "")
+            if not payload:
+                return self._send_json({"error": "Invalid or missing token"}, 401)
+            user = conn.execute("SELECT * FROM users WHERE id=?", (payload["uid"],)).fetchone()
+            if not user or not user["active"]:
+                return self._send_json({"error": "Invalid or missing token"}, 401)
+            if user["role"] != "admin":
+                return self._send_json({"error": "Administrator access required"}, 403)
+            fd, tmp_path = tempfile.mkstemp(suffix=".db")
+            os.close(fd)
+            try:
+                dst = sqlite3.connect(tmp_path)
+                try:
+                    conn.backup(dst)
+                finally:
+                    dst.close()
+                with open(tmp_path, "rb") as f:
+                    content = f.read()
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            ts = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Content-Disposition",
+                             'attachment; filename="kelpworks-backup-%s.db"' % ts)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(content)
