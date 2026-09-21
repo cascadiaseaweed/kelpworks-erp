@@ -529,6 +529,10 @@ def migrate(conn):
         conn.execute("DROP TABLE qc_logs")
         conn.execute("ALTER TABLE qc_logs_new RENAME TO qc_logs")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_qc_run ON qc_logs(run_id)")
+    # Renamed from "Saccharina Liquid Kelp Extract" — fix up rows seeded under
+    # the old name so already-running databases pick up the new one too.
+    conn.execute("UPDATE fg_skus SET name='Sugar Kelp Extract'"
+                 " WHERE code='SACC-LKE' AND name != 'Sugar Kelp Extract'")
 
 
 def ensure_users(conn):
@@ -1029,8 +1033,9 @@ class Handler(BaseHTTPRequestHandler):
         sites = [dict(code=r["code"], name=r["name"])
                  for r in conn.execute("SELECT * FROM sites ORDER BY code")]
         locations = [r["name"] for r in conn.execute("SELECT name FROM locations ORDER BY name")]
+        # Sugar Kelp (SACC-LKE) is the default/most-used SKU — list it first.
         skus = [dict(code=r["code"], name=r["name"], species=r["species_code"])
-                for r in conn.execute("SELECT * FROM fg_skus ORDER BY code")]
+                for r in conn.execute("SELECT * FROM fg_skus ORDER BY (code != 'SACC-LKE'), code")]
         customers = [self._customer_public(r) for r in conn.execute(
             "SELECT * FROM customers WHERE active=1 ORDER BY name")]
         return {"species": species, "sites": sites, "locations": locations,
@@ -1319,7 +1324,7 @@ class Handler(BaseHTTPRequestHandler):
         ("target_tds", "targetTds", "Target TDS", "num"),
         ("citric_kg", "citricKg", "Citric acid (kg)", "num"),
         ("sorbate_kg", "sorbateKg", "Potassium sorbate (kg)", "num"),
-        ("location", "location", "Location", "text"),
+        ("location", "location", "Production Location", "text"),
         ("notes", "notes", "Notes", "text"),
         ("operators", "operators", "Operators", "text"),
     ]

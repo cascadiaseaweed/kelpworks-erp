@@ -479,7 +479,6 @@ function editHistoryBlock(edits) {
 }
 function fmtWhen(iso) { if (!iso) return '—'; return iso.replace('T', ' ').replace('Z', '').slice(0, 16); }
 async function editRun(run) {
-  const locs = State.ref.locations.map(l => [l, l]);
   const operatorsSelect = buildOperatorsSelect(run.operators || '');
   const body = el('div', {},
     el('div', { class: 'summary-line' }, sl('Processing lot', run.processingLot), sl('SKU', skuName(run.sku)),
@@ -491,11 +490,10 @@ async function editRun(run) {
       field('Citric acid (kg)', el('input', { type: 'number', step: '0.1', id: 'e_citric', value: run.citricKg ?? 0 })),
       field('Potassium sorbate (kg)', el('input', { type: 'number', step: '0.1', id: 'e_sorbate', value: run.sorbateKg ?? 0 }))),
     el('div', { class: 'form-row' },
-      field('Location', editableSelect(locs, 'e_loc')),
+      field('Production Location', productionLocationSelect('e_loc', run.location)),
       field('Operators', operatorsSelect.el)),
     field('Notes', el('textarea', { id: 'e_notes', rows: '2' }, run.notes || '')),
     el('div', { class: 'help' }, 'Changing citric / sorbate adjusts consumable stock by the difference. Every change is logged with your name.'));
-  body.querySelector('#e_loc').value = run.location || '';
   modal('Edit run — ' + run.processingLot, body, async () => {
     const r = await api('PUT', '/production/' + run.id, {
       runDate: body.querySelector('#e_date').value,
@@ -1043,6 +1041,16 @@ const REF_OPERATORS = [
   { last: 'Claxton', first: 'Adam', initials: 'AC' },
   { last: 'Ismael', first: 'Imronn', initials: 'II' },
 ];
+// Facilities a production run can be logged at. Only one today (Port Edward),
+// kept as its own list — separate from the general warehouse/tote `locations`
+// reference data — so more facilities can be added here later without
+// touching storage-location pickers elsewhere in the app.
+const PRODUCTION_LOCATIONS = ['Port Edward Facility'];
+function productionLocationSelect(id, currentValue) {
+  const sel = selectFrom('', PRODUCTION_LOCATIONS.map(l => [l, l]), null, id);
+  sel.value = PRODUCTION_LOCATIONS.includes(currentValue) ? currentValue : PRODUCTION_LOCATIONS[0];
+  return sel;
+}
 // Multi-select operator picker (a run usually has more than one) built on the
 // same floating-panel pattern as the QC sample-location dropdown. Stores/reads
 // a comma-separated string of initials (+ any free-text "Other" names) so it
@@ -1402,7 +1410,6 @@ async function openRun(draftSummary) {
   const draft = (draftSummary && draftSummary.id) ? (await api('GET', '/production/drafts/' + draftSummary.id)).run : draftSummary;
   const totes = (await api('GET', '/totes?status=in_stock')).totes;
   const skus = State.ref.skus;
-  const locs = State.ref.locations.map(l => [l, l]);
   const skuSel = selectFrom('', skus.map(s => [s.code, s.name]), () => filterTotes(), 'r_sku');
   if (draft && draft.sku) skuSel.value = draft.sku;
   const search = el('input', { placeholder: 'Filter totes…', oninput: () => filterTotes() });
@@ -1506,7 +1513,7 @@ async function openRun(draftSummary) {
           field('Target TDS (%)', el('input', { type: 'number', step: '0.1', id: 'r_tds', placeholder: 'e.g. 4.0', value: draft?.targetTds ?? '' }))),
         el('div', { class: 'form-row' },
           field('Run date', el('input', { type: 'date', id: 'r_date', value: draft?.runDate || new Date().toISOString().slice(0, 10) })),
-          field('Location', editableSelect(locs, 'r_loc'))),
+          field('Production Location', productionLocationSelect('r_loc', draft?.location))),
         field('Operators', operatorsSelect.el),
         field('Notes', el('textarea', { id: 'r_notes', rows: '2', placeholder: 'Optional batch notes' }, draft?.notes || '')))),
     el('details', { class: 'accordion', open: '' }, el('summary', {}, 'Feedstock'),
@@ -1529,7 +1536,6 @@ async function openRun(draftSummary) {
           field('Potassium sorbate (kg)', el('input', { type: 'number', step: '0.1', min: '0', id: 'r_sorbate', value: draft?.sorbateKg ?? 0 }))),
         field('Packaging started at', packagingStartedInp),
         el('div', { style: 'margin-top:6px' }, packagingSaveBtn, packagingStatus))));
-  body.querySelector('#r_loc').value = draft?.location || '';
   filterTotes();
   renderFeedstockCards();
 
