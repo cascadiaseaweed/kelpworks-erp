@@ -169,9 +169,24 @@ CREATE TABLE IF NOT EXISTS tote_stability_log (
     note          TEXT,
     created_at    TEXT NOT NULL,
     run_id        INTEGER,        -- production run this entry originated from, if any
-    attachment_id INTEGER         -- run_attachments.id when new_value is an uploaded photo
+    attachment_id INTEGER         -- an uploaded photo: run_attachments.id if run_id is set,
+                                   -- else tote_attachments.id (this row's own tote_lot_id)
 );
 CREATE INDEX IF NOT EXISTS idx_stability_tote ON tote_stability_log(tote_lot_id);
+
+-- Photos captured against a tote directly (e.g. from Feedstock Inventory's
+-- Detail card), independent of any production run.
+CREATE TABLE IF NOT EXISTS tote_attachments (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    tote_lot_id  INTEGER NOT NULL REFERENCES tote_lots(id) ON DELETE CASCADE,
+    filename     TEXT NOT NULL,
+    content_type TEXT,
+    size         INTEGER,
+    stored_name  TEXT NOT NULL,
+    uploaded_by  TEXT,
+    uploaded_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tote_attach_tote ON tote_attachments(tote_lot_id);
 
 -- Location move history for totes and finished-goods lots.
 CREATE TABLE IF NOT EXISTS location_moves (
@@ -459,7 +474,7 @@ def lot_number_for(created_at, rid):
     that row's own autoincrement id — never recomputed later, so numbers
     stay dense/unique even with several runs started concurrently."""
     date_part = (created_at or now_iso())[:10].replace("-", "")
-    return "PR-%s-%05d" % (date_part, rid)
+    return "PR-%s-%03d" % (date_part, rid)
 
 
 QAQC_HOLD_LOCATION = "QAQC Hold"
@@ -980,10 +995,14 @@ class Handler(BaseHTTPRequestHandler):
             tok = header[7:] if header.startswith("Bearer ") else qs.get("token", [None])[0]
             if not read_token(tok or ""):
                 return self._send_json({"error": "Invalid or missing token"}, 401)
-            seg = [s for s in path.split("/") if s]   # api production :id attachments :aid download
-            rid, aid = int(seg[2]), int(seg[4])
-            r = conn.execute("SELECT * FROM run_attachments WHERE id=? AND run_id=?",
-                             (aid, rid)).fetchone()
+            seg = [s for s in path.split("/") if s]   # api production|totes :id attachments :aid download
+            kind, rid, aid = seg[1], int(seg[2]), int(seg[4])
+            if kind == "totes":
+                r = conn.execute("SELECT * FROM tote_attachments WHERE id=? AND tote_lot_id=?",
+                                 (aid, rid)).fetchone()
+            else:
+                r = conn.execute("SELECT * FROM run_attachments WHERE id=? AND run_id=?",
+                                 (aid, rid)).fetchone()
             if not r:
                 return self._send_json({"error": "Attachment not found"}, 404)
             full = os.path.join(UPLOAD_DIR, r["stored_name"])
@@ -1250,10 +1269,25 @@ class Handler(BaseHTTPRequestHandler):
     def route_totes(self, method, seg, query, conn, user):
         if seg == ["api", "totes"] and method == "GET":
             status = query.get("status", [""])[0]
-            sql = ("SELECT * FROM tote_lots WHERE 1=1"
-                   + (" AND status=?" if status else "")
+            # includeRunId: also return this run's own totes regardless of
+            # status (e.g. WIP totes already locked to an in-progress run),
+            # so its Feedstock picker can still show/unselect them even
+            # though a plain status filter would otherwise hide them.
+            include_run_id = query.get("includeRunId", [""])[0]
+            where, params = [], []
+            if status and include_run_id:
+                where.append("(status=? OR run_id=?)")
+                params += [status, int(include_run_id)]
+            elif status:
+                where.append("status=?")
+                params.append(status)
+            elif include_run_id:
+                where.append("run_id=?")
+                params.append(int(include_run_id))
+            sql = ("SELECT * FROM tote_lots"
+                   + (" WHERE " + " AND ".join(where) if where else "")
                    + " ORDER BY checkin_date DESC, lot_number")
-            rows = conn.execute(sql, (status,) if status else ()).fetchall()
+            rows = conn.execute(sql, params).fetchall()
             last_map = {r["tote_lot_id"]: r["last"] for r in conn.execute(
                 "SELECT tote_lot_id, MAX(created_at) AS last FROM tote_stability_log GROUP BY tote_lot_id")}
             totes = []
@@ -1320,7 +1354,8 @@ class Handler(BaseHTTPRequestHandler):
                     return {"stabilityLog": self._stability_log(conn, tid),
                             "ph": it["ph"], "phUpdated": it["ph_updated"],
                             "orp": it["orp"], "orpUpdated": it["orp_updated"],
-                            "lastUpdated": self._tote_with_last_updated(conn, it)["lastUpdated"]}
+                            "lastUpdated": self._tote_with_last_updated(conn, it)["lastUpdated"],
+                            "latestCharacterization": self._latest_characterization(conn, tid, it)}
                 if method == "POST":
                     d = self._body_json()
                     ph = numn(d.get("ph")) if d.get("ph") not in (None, "") else None
@@ -1344,6 +1379,16 @@ class Handler(BaseHTTPRequestHandler):
                         "SELECT * FROM tote_lots WHERE id=?", (tid,)).fetchone()),
                         "stabilityLog": self._stability_log(conn, tid)}
                 raise ApiError(405, "Method not allowed")
+
+            # /api/totes/:id/photo  — upload a Detail-card photo (no run involved)
+            if len(seg) == 4 and seg[3] == "photo" and method == "POST":
+                return self.upload_tote_photo(conn, tid, user)
+
+            # /api/totes/:id/characterize  — Feedstock Inventory's Detail card:
+            # the same characterization capture as a production run's
+            # Feedstock section, standalone (see characterize_tote).
+            if len(seg) == 4 and seg[3] == "characterize" and method == "POST":
+                return self.characterize_tote(conn, tid, user)
 
             if len(seg) == 3 and method == "PUT":
                 d = self._body_json()
@@ -1381,6 +1426,8 @@ class Handler(BaseHTTPRequestHandler):
             if len(seg) == 3 and method == "DELETE":
                 if it["status"] == "consumed":
                     raise ApiError(400, "Cannot delete a tote already consumed by a run")
+                if it["status"] == "wip":
+                    raise ApiError(400, "Cannot delete a tote that's locked into an in-progress run")
                 conn.execute("DELETE FROM tote_lots WHERE id=?", (tid,))
                 return {"ok": True}
         raise ApiError(404, "Unknown totes endpoint")
@@ -1660,15 +1707,15 @@ class Handler(BaseHTTPRequestHandler):
         if seg == ["api", "production", "drafts"] and method == "GET":
             return self.list_drafts(conn)
         if seg == ["api", "production", "drafts"] and method == "POST":
-            return self.save_draft(conn, None)
+            return self.save_draft(conn, None, user)
         if len(seg) == 4 and seg[2] == "drafts" and seg[3].isdigit():
             rid = int(seg[3])
             if method == "GET":
                 return self.get_draft(conn, rid)
             if method == "PUT":
-                return self.save_draft(conn, rid)
+                return self.save_draft(conn, rid, user)
             if method == "DELETE":
-                return self.delete_draft(conn, rid)
+                return self.delete_draft(conn, rid, user)
         if len(seg) == 5 and seg[2] == "drafts" and seg[3].isdigit() and seg[4] == "finalize" and method == "POST":
             return self.finalize_draft(conn, int(seg[3]))
         if seg == ["api", "production", "qc"] and method == "GET":
@@ -1704,6 +1751,9 @@ class Handler(BaseHTTPRequestHandler):
         if (len(seg) == 6 and seg[2].isdigit() and seg[3] == "feedstock" and seg[4].isdigit()
                 and seg[5] == "save" and method == "POST"):
             return self.save_feedstock_input(conn, int(seg[2]), int(seg[4]), user)
+        if (len(seg) == 5 and seg[2].isdigit() and seg[3] == "feedstock" and seg[4].isdigit()
+                and method == "DELETE"):
+            return self.release_feedstock_tote(conn, int(seg[2]), int(seg[4]), user)
         if (len(seg) == 6 and seg[2].isdigit() and seg[3] == "inputs" and seg[4].isdigit()
                 and seg[5] == "photo" and method == "POST"):
             return self.upload_input_photo(conn, int(seg[2]), int(seg[4]), user)
@@ -1848,7 +1898,7 @@ class Handler(BaseHTTPRequestHandler):
             sets = ", ".join("%s=?" % c for c in updates)
             conn.execute("UPDATE run_inputs SET %s WHERE id=?" % sets, (*updates.values(), input_id))
         if updates.get("decision") == "rejected" and tote_lot_id:
-            conn.execute("UPDATE tote_lots SET location=?, status='hold' WHERE id=?",
+            conn.execute("UPDATE tote_lots SET location=?, status='hold', run_id=NULL WHERE id=?",
                          (QAQC_HOLD_LOCATION, tote_lot_id))
 
     def update_run_input(self, conn, run_id, input_id, user):
@@ -1862,9 +1912,11 @@ class Handler(BaseHTTPRequestHandler):
         self._apply_feedstock_detail(conn, input_id, d, row["tote_lot_id"])
         return {"inputs": self._run_inputs_public(conn, run_id)}
 
-    # Field labels for the Feedstock Stability log, when a tote is rejected
-    # (and thus pulled out of the run) via the per-tote Save button below.
-    REJECTED_INPUT_LABELS = [
+    # Field labels for the Feedstock Stability log, shared by every path that
+    # writes a tote's captured characterization there directly (a tote
+    # rejected from a production run, or any save from Feedstock Inventory's
+    # own Detail card, which has no run to hang a run_inputs row off of).
+    CHARACTERIZATION_LABELS = [
         ("loadedAt", "Loaded at"), ("ph", "pH"), ("orp", "ORP (mV)"),
         ("orpRange", "ORP classification"), ("weightKg", "Weight (kg)"),
         ("volumeL", "Volume (L)"), ("densityKgL", "Density (kg/L)"),
@@ -1873,69 +1925,265 @@ class Handler(BaseHTTPRequestHandler):
         ("notes", "Notes"),
     ]
 
-    def save_feedstock_input(self, conn, run_id, tote_lot_id, user):
-        """Per-tote 'lock in' Save for the Feedstock characterization card
-        while a run is still in progress (draft). An accepted tote gets (or
-        keeps) a run_inputs row, same shape as finalize. A rejected tote is
-        pulled out of the run entirely instead: no run_inputs row is kept for
-        it (there'd be nothing left in the finalized run to point it at), and
-        every field the operator captured -- plus any uploaded photos -- is
-        written onto the tote's permanent Feedstock Stability log instead,
-        since that's the only place this data survives once the tote is
-        delisted from this run."""
-        run = conn.execute("SELECT * FROM production_runs WHERE id=? AND status='draft'",
-                           (run_id,)).fetchone()
-        if not run:
-            raise ApiError(404, "Draft not found")
+    def _latest_characterization(self, conn, tote_lot_id, tote):
+        """Best-known current value for each Feedstock characterization
+        field, to pre-fill a fresh card with -- pH/ORP come from the tote's
+        own current reading; every other field has no persisted 'current'
+        column, so it's pulled from its own most recent Feedstock Stability
+        log entry, if any. Decision and rejection reason are deliberately
+        left out: a new characterization always starts as a fresh accepted
+        inspection, never a carry-over of a past rejection."""
+        kind_for = {key: kind for _, key, kind in self.INPUT_FIELDS}
+        out = {"ph": tote["ph"], "orp": tote["orp"]}
+        for key, label in self.CHARACTERIZATION_LABELS:
+            if key in out or key == "rejectionReason":
+                continue
+            last = conn.execute(
+                "SELECT new_value FROM tote_stability_log WHERE tote_lot_id=? AND field=?"
+                " ORDER BY id DESC LIMIT 1", (tote_lot_id, label)).fetchone()
+            val = last["new_value"] if last else None
+            if val is not None and kind_for.get(key) == "num":
+                val = numn(val)
+            out[key] = val
+        return out
+
+    def _log_characterization_fields(self, conn, tote_lot_id, user, fd, note, run_id=None):
+        """Write a Feedstock Stability log row only for fields that actually
+        changed since they were last captured -- re-saving a card with the
+        same values (e.g. touching just one field) shouldn't spam the log
+        with rows that all read 'unchanged'. pH/ORP are diffed against the
+        tote's current reading (also its 'From' baseline, since every writer
+        of those two columns keeps this log in step with them); every other
+        field has no persisted 'current value' outside this log, so it's
+        diffed against its own most recent entry for this tote (or treated
+        as new/changed if there isn't one yet). A photo is diffed the same
+        way, by attachment id, so re-submitting an already-logged photo on an
+        unrelated field change doesn't create a duplicate row either."""
+        tote = conn.execute("SELECT ph, orp FROM tote_lots WHERE id=?", (tote_lot_id,)).fetchone()
+        current_for = {"ph": tote["ph"], "orp": tote["orp"]}
+        for key, label in self.CHARACTERIZATION_LABELS:
+            val = fd.get(key)
+            if val in (None, ""):
+                continue
+            if key in current_for:
+                old = current_for[key]
+            else:
+                last = conn.execute(
+                    "SELECT new_value FROM tote_stability_log WHERE tote_lot_id=? AND field=?"
+                    " ORDER BY id DESC LIMIT 1", (tote_lot_id, label)).fetchone()
+                old = last["new_value"] if last else None
+            if _fmtval(old) == _fmtval(val):
+                continue
+            self._log_stability(conn, tote_lot_id, user, label, old, val, note, run_id=run_id)
+        for slot_key, label in (("surfacePhotoId", "Surface photo"),
+                                 ("striationPhotoId", "Settling/striation photo")):
+            att_id = fd.get(slot_key)
+            if not att_id:
+                continue
+            last_photo = conn.execute(
+                "SELECT attachment_id FROM tote_stability_log WHERE tote_lot_id=? AND field=?"
+                " ORDER BY id DESC LIMIT 1", (tote_lot_id, label)).fetchone()
+            if last_photo and last_photo["attachment_id"] == att_id:
+                continue
+            if run_id:
+                att = conn.execute("SELECT filename FROM run_attachments WHERE id=? AND run_id=?",
+                                   (att_id, run_id)).fetchone()
+            else:
+                att = conn.execute("SELECT filename FROM tote_attachments WHERE id=? AND tote_lot_id=?",
+                                   (att_id, tote_lot_id)).fetchone()
+            self._log_stability(conn, tote_lot_id, user, label, None,
+                               att["filename"] if att else "Photo", note,
+                               run_id=run_id, attachment_id=att_id)
+
+    def _apply_ph_orp_override(self, conn, tote, fd):
+        """pH/ORP captured on a characterization save become the tote's
+        current reading (same columns Feedstock Inventory's own Update/pH
+        flow writes to), so the main table and future 'From' values reflect
+        it. Returns the (ph, ph_updated, orp, orp_updated) tuple to persist."""
+        ph = numn(fd.get("ph")) if fd.get("ph") not in (None, "") else None
+        orp = numn(fd.get("orp")) if fd.get("orp") not in (None, "") else None
+        ph_updated = today_iso() if ph is not None else tote["ph_updated"]
+        orp_updated = today_iso() if orp is not None else tote["orp_updated"]
+        return (ph if ph is not None else tote["ph"], ph_updated,
+                orp if orp is not None else tote["orp"], orp_updated)
+
+    def _apply_tote_characterization(self, conn, run_id, tote_lot_id, fd, user, processing_lot):
+        """Shared by every path that locks a tote's Feedstock characterization
+        into an in-progress run -- the card's own Save button, and the outer
+        Save & close / draft-save flow. Every populated field (plus any
+        photos) is written to the tote's permanent Feedstock Stability log,
+        with pH/ORP overriding its current reading, exactly like Feedstock
+        Inventory's own Update flow. An accepted tote also gets/keeps a
+        run_inputs row and moves to status='wip' -- tied to this run via
+        run_id -- so it can never be picked for another run until this one
+        finishes (-> consumed) or is discarded (-> back to in_stock). A
+        rejected tote is pulled out of the run instead: no run_inputs row,
+        relocated to QAQC Hold. Returns True if rejected."""
         tote = conn.execute("SELECT * FROM tote_lots WHERE id=?", (tote_lot_id,)).fetchone()
         if not tote:
             raise ApiError(404, "Tote not found")
-        d = self._body_json()
-        if d.get("decision") not in ("accepted", "rejected"):
-            raise ApiError(400, "A decision (accepted/rejected) is required")
-
+        fd = fd or {}
+        decision = fd.get("decision") or "accepted"
         existing_input = conn.execute(
             "SELECT * FROM run_inputs WHERE run_id=? AND tote_lot_id=?",
             (run_id, tote_lot_id)).fetchone()
 
-        if d["decision"] == "rejected":
+        if decision == "rejected":
             # Any characterization already locked in for this tote on this
             # run is superseded by the stability-log entries below.
             if existing_input:
                 conn.execute("DELETE FROM run_inputs WHERE id=?", (existing_input["id"],))
-            note = "Rejected from production run %s" % run["processing_lot"]
-            for key, label in self.REJECTED_INPUT_LABELS:
-                val = d.get(key)
-                if val in (None, ""):
-                    continue
-                self._log_stability(conn, tote_lot_id, user, label, None, val, note, run_id=run_id)
+            note = "Rejected from production run %s" % processing_lot
+            self._log_characterization_fields(conn, tote_lot_id, user, fd, note, run_id=run_id)
             self._log_stability(conn, tote_lot_id, user, "Decision", None, "rejected", note, run_id=run_id)
-            for slot_key, label in (("surfacePhotoId", "Surface photo"),
-                                     ("striationPhotoId", "Settling/striation photo")):
-                att_id = d.get(slot_key)
-                if not att_id:
-                    continue
-                att = conn.execute("SELECT filename FROM run_attachments WHERE id=? AND run_id=?",
-                                   (att_id, run_id)).fetchone()
-                self._log_stability(conn, tote_lot_id, user, label, None,
-                                   att["filename"] if att else "Photo", note,
-                                   run_id=run_id, attachment_id=att_id)
             self._log_stability(conn, tote_lot_id, user, "Location", tote["location"],
                                QAQC_HOLD_LOCATION, note)
             self._log_stability(conn, tote_lot_id, user, "Status", tote["status"], "hold", note)
-            conn.execute("UPDATE tote_lots SET location=?, status='hold' WHERE id=?",
-                         (QAQC_HOLD_LOCATION, tote_lot_id))
-            return {"rejected": True}
+            ph, ph_updated, orp, orp_updated = self._apply_ph_orp_override(conn, tote, fd)
+            conn.execute(
+                "UPDATE tote_lots SET location=?, status='hold', ph=?, ph_updated=?, orp=?, orp_updated=?,"
+                " run_id=NULL WHERE id=?",
+                (QAQC_HOLD_LOCATION, ph, ph_updated, orp, orp_updated, tote_lot_id))
+            return True
 
-        # Accepted: create-or-update this tote's run_inputs row, same shape as finalize.
+        # Accepted: log any captured fields, create/update this tote's
+        # run_inputs row (same shape as finalize), and lock it to this run.
+        note = "Characterized during production run %s" % processing_lot
+        self._log_characterization_fields(conn, tote_lot_id, user, fd, note, run_id=run_id)
         if existing_input:
             input_id = existing_input["id"]
         else:
             cur = conn.cursor()
             cur.execute("INSERT INTO run_inputs (run_id,tote_lot_id) VALUES (?,?)", (run_id, tote_lot_id))
             input_id = cur.lastrowid
-        self._apply_feedstock_detail(conn, input_id, d, tote_lot_id)
-        return {"rejected": False, "inputs": self._run_inputs_public(conn, run_id)}
+        self._apply_feedstock_detail(conn, input_id, fd, tote_lot_id)
+        ph, ph_updated, orp, orp_updated = self._apply_ph_orp_override(conn, tote, fd)
+        if tote["status"] != "wip":
+            self._log_stability(conn, tote_lot_id, user, "Status", tote["status"], "wip", note, run_id=run_id)
+        conn.execute(
+            "UPDATE tote_lots SET status='wip', run_id=?, ph=?, ph_updated=?, orp=?, orp_updated=? WHERE id=?",
+            (run_id, ph, ph_updated, orp, orp_updated, tote_lot_id))
+        return False
+
+    def save_feedstock_input(self, conn, run_id, tote_lot_id, user):
+        """Per-tote 'lock in' Save for the Feedstock characterization card
+        while a run is still in progress (draft) -- see
+        _apply_tote_characterization for what actually happens."""
+        run = conn.execute("SELECT * FROM production_runs WHERE id=? AND status='draft'",
+                           (run_id,)).fetchone()
+        if not run:
+            raise ApiError(404, "Draft not found")
+        d = self._body_json()
+        if d.get("decision") not in ("accepted", "rejected"):
+            raise ApiError(400, "A decision (accepted/rejected) is required")
+        rejected = self._apply_tote_characterization(conn, run_id, tote_lot_id, d, user, run["processing_lot"])
+        return {"rejected": rejected}
+
+    def release_feedstock_tote(self, conn, run_id, tote_lot_id, user):
+        """Un-selecting a tote from an in-progress run's Feedstock section
+        (the picker checkbox): discards any run_inputs row staged for it and
+        releases it back to in_stock, available again for this or any other
+        run. Also scrubs it out of the draft's own persisted selection right
+        away, so a later Resume doesn't show it as still picked."""
+        run = conn.execute("SELECT * FROM production_runs WHERE id=? AND status='draft'",
+                           (run_id,)).fetchone()
+        if not run:
+            raise ApiError(404, "Draft not found")
+        tote = conn.execute("SELECT * FROM tote_lots WHERE id=? AND run_id=?",
+                            (tote_lot_id, run_id)).fetchone()
+        if not tote:
+            raise ApiError(404, "Tote not found on this run")
+        conn.execute("DELETE FROM run_inputs WHERE run_id=? AND tote_lot_id=?", (run_id, tote_lot_id))
+        note = "Removed from production run %s" % run["processing_lot"]
+        if tote["status"] == "wip":
+            self._log_stability(conn, tote_lot_id, user, "Status", "wip", "in_stock", note, run_id=run_id)
+        conn.execute("UPDATE tote_lots SET status='in_stock', run_id=NULL WHERE id=?", (tote_lot_id,))
+        try:
+            dd = json.loads(run["draft_data"] or "{}")
+        except ValueError:
+            dd = {}
+        dd["toteIds"] = [t for t in (dd.get("toteIds") or []) if t != tote_lot_id]
+        fdet = dd.get("feedstockDetails") or {}
+        fdet.pop(str(tote_lot_id), None)
+        dd["feedstockDetails"] = fdet
+        conn.execute("UPDATE production_runs SET draft_data=? WHERE id=?", (json.dumps(dd), run_id))
+        return {"ok": True}
+
+    def _store_tote_attachment(self, conn, tote_id, filename, content_type, data_b64, uploaded_by):
+        """Decode+store one base64 file and insert its tote_attachments row --
+        the tote-scoped counterpart to _store_attachment (run-scoped)."""
+        filename = (filename or "photo").strip().replace("\\", "/").split("/")[-1] or "photo"
+        data_b64 = data_b64 or ""
+        if data_b64.startswith("data:") and "," in data_b64:
+            data_b64 = data_b64.split(",", 1)[1]
+        try:
+            raw = base64.b64decode(data_b64)
+        except Exception:
+            raise ApiError(400, "Could not decode file data")
+        if not raw:
+            raise ApiError(400, "The file is empty")
+        if len(raw) > MAX_UPLOAD_BYTES:
+            raise ApiError(400, "File exceeds the %d MB limit" % (MAX_UPLOAD_BYTES // (1024 * 1024)))
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        ext = os.path.splitext(filename)[1][:12]
+        stored = secrets.token_hex(8) + ext
+        with open(os.path.join(UPLOAD_DIR, stored), "wb") as f:
+            f.write(raw)
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO tote_attachments (tote_lot_id,filename,content_type,size,stored_name,"
+            "uploaded_by,uploaded_at) VALUES (?,?,?,?,?,?,?)",
+            (tote_id, filename, content_type or "application/octet-stream", len(raw), stored,
+             uploaded_by, now_iso()))
+        return cur.lastrowid
+
+    def upload_tote_photo(self, conn, tote_id, user):
+        """Photo upload for Feedstock Inventory's Detail card -- a tote isn't
+        tied to any production run there, so this stores into
+        tote_attachments instead of run_attachments."""
+        if not conn.execute("SELECT 1 FROM tote_lots WHERE id=?", (tote_id,)).fetchone():
+            raise ApiError(404, "Tote not found")
+        d = self._body_json()
+        slot = d.get("slot")
+        if slot not in ("surface", "striation"):
+            raise ApiError(400, "Invalid photo slot")
+        new_id = self._store_tote_attachment(conn, tote_id, d.get("filename") or "feedstock.jpg",
+                                             d.get("contentType"), d.get("dataB64") or "",
+                                             user["name"] if user else None)
+        return {"attachmentId": new_id}
+
+    def characterize_tote(self, conn, tote_id, user):
+        """Feedstock Inventory's Detail card: the same characterization
+        capture as a production run's Feedstock section, but for a tote on
+        its own -- there's no run_inputs row to keep it in, so every field
+        (plus photos) always lands on the tote's Feedstock Stability log.
+        pH/ORP additionally become the tote's current reading. A rejected
+        decision also relocates it to QAQC Hold, same as from a run."""
+        tote = conn.execute("SELECT * FROM tote_lots WHERE id=?", (tote_id,)).fetchone()
+        if not tote:
+            raise ApiError(404, "Tote not found")
+        d = self._body_json()
+        decision = d.get("decision") or "accepted"
+        if decision not in ("accepted", "rejected"):
+            raise ApiError(400, "Invalid decision")
+        note = ("Rejected via Feedstock Inventory" if decision == "rejected"
+                else "Characterized via Feedstock Inventory")
+        self._log_characterization_fields(conn, tote_id, user, d, note)
+        ph, ph_updated, orp, orp_updated = self._apply_ph_orp_override(conn, tote, d)
+        if decision == "rejected":
+            self._log_stability(conn, tote_id, user, "Decision", None, "rejected", note)
+            self._log_stability(conn, tote_id, user, "Location", tote["location"], QAQC_HOLD_LOCATION, note)
+            self._log_stability(conn, tote_id, user, "Status", tote["status"], "hold", note)
+            conn.execute(
+                "UPDATE tote_lots SET location=?, status='hold', ph=?, ph_updated=?, orp=?, orp_updated=?"
+                " WHERE id=?",
+                (QAQC_HOLD_LOCATION, ph, ph_updated, orp, orp_updated, tote_id))
+        else:
+            conn.execute("UPDATE tote_lots SET ph=?, ph_updated=?, orp=?, orp_updated=? WHERE id=?",
+                         (ph, ph_updated, orp, orp_updated, tote_id))
+        return {"rejected": decision == "rejected",
+                "tote": self._tote_with_last_updated(conn, conn.execute(
+                    "SELECT * FROM tote_lots WHERE id=?", (tote_id,)).fetchone())}
 
     def upload_input_photo(self, conn, run_id, input_id, user):
         row = conn.execute("SELECT * FROM run_inputs WHERE id=? AND run_id=?",
@@ -2254,15 +2502,17 @@ class Handler(BaseHTTPRequestHandler):
         operators = (d.get("operators") or "").strip() or None
         feedstock_details = d.get("feedstockDetails") or {}
 
-        # Validate totes are all in stock.
+        # Validate totes are available -- either never touched yet (in_stock)
+        # or already locked to this same draft as WIP by an earlier
+        # per-tote/draft save.
         rows = conn.execute(
             "SELECT * FROM tote_lots WHERE id IN (%s)" % ",".join("?" * len(tote_ids)),
             tote_ids).fetchall()
         if len(rows) != len(tote_ids):
             raise ApiError(400, "Some selected totes were not found")
         for r in rows:
-            if r["status"] != "in_stock":
-                raise ApiError(400, "Tote %s is not in stock" % r["lot_number"])
+            if r["status"] not in ("in_stock", "wip"):
+                raise ApiError(400, "Tote %s is not available (status: %s)" % (r["lot_number"], r["status"]))
 
         # A tote marked rejected during characterization contributes nothing to
         # this run — no input weight, no consumption — but is still logged (see
@@ -2333,12 +2583,20 @@ class Handler(BaseHTTPRequestHandler):
 
         # Log every selected tote's receiving inspection, carrying over any
         # characterization staged while this was still a draft (photos already
-        # uploaded as attachments) — but only *consume* the accepted ones.
+        # uploaded as attachments) — but only *consume* the accepted ones. A
+        # tote already WIP from an earlier per-tote/draft save already has a
+        # run_inputs row (and its own stability-log trail) from that save --
+        # reuse it here instead of inserting a second one for the same tote.
         # A rejected tote's _apply_feedstock_detail call relocates it to QAQC
         # Hold (status='hold') and gets no run_id.
         for r in rows:
-            cur.execute("INSERT INTO run_inputs (run_id,tote_lot_id) VALUES (?,?)", (run_id, r["id"]))
-            input_id = cur.lastrowid
+            existing_input = conn.execute(
+                "SELECT id FROM run_inputs WHERE run_id=? AND tote_lot_id=?", (run_id, r["id"])).fetchone()
+            if existing_input:
+                input_id = existing_input["id"]
+            else:
+                cur.execute("INSERT INTO run_inputs (run_id,tote_lot_id) VALUES (?,?)", (run_id, r["id"]))
+                input_id = cur.lastrowid
             fd = feedstock_details.get(str(r["id"])) or feedstock_details.get(r["id"])
             self._apply_feedstock_detail(conn, input_id, fd, r["id"])
             if r["id"] in accepted_ids:
@@ -2405,10 +2663,13 @@ class Handler(BaseHTTPRequestHandler):
         d["dilutions"] = self._dilutions_public(conn, rid)
         return {"run": d}
 
-    def save_draft(self, conn, rid):
-        """Create (rid=None) or update (rid given) a run in progress. No
-        validation beyond what's needed to store the snapshot — totes aren't
-        consumed and consumables aren't deducted until finalize."""
+    def save_draft(self, conn, rid, user):
+        """Create (rid=None) or update (rid given) a run in progress.
+        Beyond storing the snapshot, every selected tote gets the same
+        lock-in treatment as the characterization card's own Save button
+        (see _apply_tote_characterization) -- accepted totes move to WIP,
+        tied to this run until it's finalized or discarded; a rejected one
+        is pulled out of the selection entirely before it's persisted."""
         d = self._body_json()
         sku = (d.get("sku") or "").strip() or None
         species = None
@@ -2429,8 +2690,6 @@ class Handler(BaseHTTPRequestHandler):
         tote_ids = [int(x) for x in (d.get("toteIds") or [])]
         packages = [p for p in (d.get("packages") or []) if p.get("size") in PACKAGE_SIZES]
         feedstock_details = d.get("feedstockDetails") or {}
-        draft_data = json.dumps({"toteIds": tote_ids, "packages": packages,
-                                  "feedstockDetails": feedstock_details})
 
         if rid is None:
             cur = conn.cursor()
@@ -2438,10 +2697,10 @@ class Handler(BaseHTTPRequestHandler):
             ts = now_iso()
             cur.execute(
                 "INSERT INTO production_runs (processing_lot,run_date,species_code,sku_code,"
-                "target_tds,citric_kg,sorbate_kg,location,notes,operators,status,draft_data,created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?, 'draft', ?, ?)",
+                "target_tds,citric_kg,sorbate_kg,location,notes,operators,status,created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?, 'draft', ?)",
                 (placeholder, run_date, species, sku, target_tds, citric, sorbate,
-                 location, notes, operators, draft_data, ts))
+                 location, notes, operators, ts))
             rid = cur.lastrowid
             # Reserved immediately — this is the run's permanent number, not a
             # placeholder that gets swapped out at finalize.
@@ -2455,16 +2714,38 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(409, "This run has already been finalized")
             conn.execute(
                 "UPDATE production_runs SET run_date=?, species_code=?, sku_code=?, target_tds=?,"
-                " citric_kg=?, sorbate_kg=?, location=?, notes=?, operators=?, draft_data=? WHERE id=?",
+                " citric_kg=?, sorbate_kg=?, location=?, notes=?, operators=? WHERE id=?",
                 (run_date, species, sku, target_tds, citric, sorbate,
-                 location, notes, operators, draft_data, rid))
-        return {"run": run_public(conn.execute(
-            "SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone())}
+                 location, notes, operators, rid))
 
-    def delete_draft(self, conn, rid):
+        processing_lot = conn.execute(
+            "SELECT processing_lot FROM production_runs WHERE id=?", (rid,)).fetchone()["processing_lot"]
+        rejected_ids = []
+        kept_ids = []
+        for tid in tote_ids:
+            fd = feedstock_details.get(str(tid)) or feedstock_details.get(tid) or {}
+            if self._apply_tote_characterization(conn, rid, tid, fd, user, processing_lot):
+                rejected_ids.append(tid)
+            else:
+                kept_ids.append(tid)
+        feedstock_details = {k: v for k, v in feedstock_details.items() if int(k) not in rejected_ids}
+        draft_data = json.dumps({"toteIds": kept_ids, "packages": packages,
+                                  "feedstockDetails": feedstock_details})
+        conn.execute("UPDATE production_runs SET draft_data=? WHERE id=?", (draft_data, rid))
+        return {"run": run_public(conn.execute(
+            "SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()),
+            "rejectedToteIds": rejected_ids}
+
+    def delete_draft(self, conn, rid, user):
         r = conn.execute("SELECT * FROM production_runs WHERE id=? AND status='draft'", (rid,)).fetchone()
         if not r:
             raise ApiError(404, "Draft not found")
+        # Any tote this draft had locked to WIP is released back to stock --
+        # otherwise it'd be stuck WIP forever, tied to a run that no longer exists.
+        note = "Production run %s discarded" % r["processing_lot"]
+        for t in conn.execute("SELECT * FROM tote_lots WHERE run_id=? AND status='wip'", (rid,)):
+            self._log_stability(conn, t["id"], user, "Status", "wip", "in_stock", note, run_id=rid)
+            conn.execute("UPDATE tote_lots SET status='in_stock', run_id=NULL WHERE id=?", (t["id"],))
         conn.execute("DELETE FROM production_runs WHERE id=?", (rid,))
         return {"ok": True}
 
