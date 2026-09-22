@@ -130,7 +130,7 @@ function tile(k, val, u, accent) { return el('div', { class: 'tile' + (accent ? 
 
 /* ---------------- Feedstock inventory ---------------- */
 let stabCache = [];
-const STATUS_LABELS = { in_stock: 'In stock', hold: 'Hold', consumed: 'Consumed', disposed: 'Disposed' };
+const STATUS_LABELS = { in_stock: 'In stock', hold: 'Hold', wip: 'WIP', consumed: 'Consumed', disposed: 'Disposed' };
 function statusLabel(s) { return STATUS_LABELS[s] || s || '—'; }
 // One entry per real table column (checkbox + actions are handled separately).
 // `value(t)` is what's sorted/filtered on — the human-readable form, so a
@@ -333,18 +333,20 @@ function orpCell(t) {
   if (t.orp == null) return el('span', { class: 'muted' }, '—');
   return el('span', {}, String(t.orp));
 }
-function stabilityLogTable(log) {
+function stabilityLogTable(log, toteId) {
   if (!log.length) return el('div', { class: 'help' }, 'No changes logged yet.');
   return el('div', { class: 'tablewrap', style: 'margin-top:6px' },
     el('table', {},
       el('thead', {}, el('tr', {}, el('th', {}, 'When'), el('th', {}, 'Field'), el('th', {}, 'From'), el('th', {}, 'To'), el('th', {}, 'Note'), el('th', {}, 'By'))),
       el('tbody', {}, ...log.map(r => {
-        // A row logged with a photo attachment (e.g. a tote rejected during a
-        // production run) links straight to the image instead of showing an
-        // inert filename.
-        const toCell = (r.runId && r.attachmentId)
-          ? el('a', { href: attDownloadUrl(r.runId, r.attachmentId, false), target: '_blank', rel: 'noopener' }, r.newValue || 'View photo')
-          : el('b', {}, r.newValue ?? '—');
+        // A row logged with a photo attachment -- from a tote rejected during
+        // a production run (runId set) or from Feedstock Inventory's own
+        // Detail card (no run, just this tote's own attachments) -- links
+        // straight to the image instead of showing an inert filename.
+        let toCell;
+        if (r.attachmentId && r.runId) toCell = el('a', { href: attDownloadUrl(r.runId, r.attachmentId, false), target: '_blank', rel: 'noopener' }, r.newValue || 'View photo');
+        else if (r.attachmentId && toteId) toCell = el('a', { href: toteAttDownloadUrl(toteId, r.attachmentId, false), target: '_blank', rel: 'noopener' }, r.newValue || 'View photo');
+        else toCell = el('b', {}, r.newValue ?? '—');
         return el('tr', {},
           el('td', { class: 'muted' }, fmtWhen(r.at)), el('td', {}, r.field),
           el('td', { class: 'muted' }, r.oldValue ?? '—'), el('td', {}, toCell),
@@ -355,24 +357,64 @@ async function showHistory(t) {
   const data = await api('GET', '/totes/' + t.id + '/ph');
   const body = el('div', {},
     el('div', { class: 'summary-line' }, sl('Tote', t.lot)),
-    stabilityLogTable(data.stabilityLog));
+    stabilityLogTable(data.stabilityLog, t.id));
   modal('Feedstock Stability log — ' + t.lot, body, async () => {}, 'Close', { noCancel: true });
 }
 async function updateCondition(t) {
   const data = await api('GET', '/totes/' + t.id + '/ph');
-  const history = el('div', {}, stabilityLogTable(data.stabilityLog));
+  function summaryLines(d) {
+    return [sl('Tote', t.lot),
+      sl('Current pH', d.ph == null ? '—' : d.ph),
+      sl('Current ORP', d.orp == null ? '—' : d.orp + ' mV'),
+      sl('ORP meter range', d.orp == null ? '—' : (classifyOrp(d.orp) || '—')),
+      sl('Last updated', d.lastUpdated ? fmtWhen(d.lastUpdated) : 'never')];
+  }
+  const summary = el('div', { class: 'summary-line' }, ...summaryLines(data));
+  const history = el('div', {}, stabilityLogTable(data.stabilityLog, t.id));
+  // The Details card's own Save posts straight to the server (see
+  // characterize_tote) and refreshes this modal's summary/history in place —
+  // it doesn't touch the "New pH/ORP reading" quick-update fields below,
+  // which stay a separate, simpler action via "Log reading".
+  async function refreshDetail() {
+    const fresh = await api('GET', '/totes/' + t.id + '/ph');
+    summary.innerHTML = '';
+    summary.append(...summaryLines(fresh));
+    history.innerHTML = '';
+    history.append(stabilityLogTable(fresh.stabilityLog, t.id));
+    render();
+  }
+  const detailCard = buildFeedstockCard({
+    label: 'Details',
+    // pH/ORP live in the summary + quick-update fields above instead of
+    // here, so the same reading isn't captured twice in this modal.
+    omit: ['ph', 'orp', 'orpRange'],
+    // Pre-fills from whatever was captured most recently (this tote's own
+    // reading for pH/ORP, its latest Feedstock Stability log entry for
+    // everything else) rather than starting blank every time.
+    initial: data.latestCharacterization,
+    mode: 'draft',
+    onSave: async vals => {
+      const r = await api('POST', '/totes/' + t.id + '/characterize', vals);
+      await refreshDetail();
+      toast(r.rejected ? t.lot + ' rejected — moved to QAQC Hold.' : 'Characterization saved for ' + t.lot);
+    },
+    uploadPhoto: async (slot, file, b64) => {
+      const r = await api('POST', '/totes/' + t.id + '/photo',
+        { slot, filename: file.name, contentType: file.type || 'image/jpeg', dataB64: b64 });
+      return r.attachmentId;
+    },
+    photoUrl: attId => toteAttDownloadUrl(t.id, attId, false)
+  });
   const body = el('div', {},
-    el('div', { class: 'summary-line' }, sl('Tote', t.lot),
-      sl('Current pH', data.ph == null ? '—' : data.ph),
-      sl('Current ORP', data.orp == null ? '—' : data.orp + ' mV'),
-      sl('Last updated', data.lastUpdated ? fmtWhen(data.lastUpdated) : 'never')),
+    summary,
     el('div', { class: 'form-row' },
       field('New pH reading', el('input', { type: 'number', step: '0.1', id: 'p_ph', placeholder: 'e.g. 3.7' })),
       field('New ORP reading', el('input', { type: 'number', step: '1', id: 'p_orp', placeholder: 'e.g. -150' }))),
     field('Reading date', el('input', { type: 'date', id: 'p_date', value: new Date().toISOString().slice(0, 10) })),
     field('Note (optional)', el('input', { id: 'p_note', placeholder: 'who / instrument / observation' })),
+    detailCard,
     el('label', {}, 'Feedstock Stability log'), history);
-  modal('Update condition — ' + t.lot, body, async () => {
+  modal('Update feedstock conditions — ' + t.lot, body, async () => {
     const ph = body.querySelector('#p_ph').value;
     const orp = body.querySelector('#p_orp').value;
     if (ph === '' && orp === '') throw new Error('Enter a pH and/or ORP value.');
@@ -382,7 +424,7 @@ async function updateCondition(t) {
     });
     toast('Condition logged for ' + t.lot);
     render();
-  }, 'Log reading');
+  }, 'Log reading', { wide: true });
 }
 const todayStr = () => new Date().toISOString().slice(0, 10);
 function drawMoveHistory(host, log, showQty) {
@@ -651,6 +693,10 @@ function fileIcon(ct) {
 }
 function attDownloadUrl(rid, aid, dl) {
   return '/api/production/' + rid + '/attachments/' + aid + '/download?' +
+    (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(State.token);
+}
+function toteAttDownloadUrl(tid, aid, dl) {
+  return '/api/totes/' + tid + '/attachments/' + aid + '/download?' +
     (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(State.token);
 }
 function uploadAtt(rid, file) {
@@ -1349,13 +1395,24 @@ function buildFeedstockCard(opts) {
       status);
   }
 
+  // Feedstock Inventory's own Details card omits pH/ORP entirely -- those
+  // live in the "Current pH/ORP" summary and quick-update fields just above
+  // it in that modal instead, so the same reading isn't captured twice.
+  const omit = opts.omit || [];
+  const allFields = [
+    ['loadedAt', field('Loaded at', loadedAt)],
+    ['ph', field('pH', el('div', {}, phInp, phMeasuredNote))],
+    ['orp', field('ORP (mV)', orpInp)],
+    ['orpRange', field('ORP meter range (calculated)', orpRangeNote)],
+    ['weightKg', field('Weight (kg)', weightInp)],
+    ['volumeL', field('Volume (L)', volumeInp)],
+    ['densityKgL', field('Density (calculated)', densityNote)],
+    ['odour', field('Odour', odourMultiSelect.el)],
+    ['odourIntensity', field('Odour intensity', intensitySel)],
+    ['decision', field('Decision', decisionSel)],
+  ];
   const fieldsRow = el('div', { class: 'form-row' },
-    field('Loaded at', loadedAt), field('pH', el('div', {}, phInp, phMeasuredNote)),
-    field('ORP (mV)', orpInp), field('ORP meter range (calculated)', orpRangeNote),
-    field('Weight (kg)', weightInp), field('Volume (L)', volumeInp),
-    field('Density (calculated)', densityNote),
-    field('Odour', odourMultiSelect.el),
-    field('Odour intensity', intensitySel), field('Decision', decisionSel));
+    ...allFields.filter(([key]) => !omit.includes(key)).map(([, fieldEl]) => fieldEl));
   const bodyEls = [fieldsRow, reasonField, field('Notes', notesInp),
     el('div', { style: 'display:flex;gap:14px;flex-wrap:wrap;margin-top:8px' },
       photoSlot('surfacePhotoId', 'Surface photo'), photoSlot('striationPhotoId', 'Settling / striation photo'))];
@@ -1575,7 +1632,8 @@ async function openNewRun() {
 async function openRun(draftSummary) {
   // Re-fetch a resumed draft in full (list snapshots omit stage/solids/dilution detail).
   const draft = (draftSummary && draftSummary.id) ? (await api('GET', '/production/drafts/' + draftSummary.id)).run : draftSummary;
-  const totes = (await api('GET', '/totes?status=in_stock')).totes;
+  const totes = (await api('GET', '/totes?status=in_stock'
+    + (draft && draft.id ? '&includeRunId=' + draft.id : ''))).totes;
   const skus = State.ref.skus.filter(s => s.active);
   const skuSel = selectFrom('', skus.map(s => [s.code, s.name]), () => { filterTotes(); renderSpecPanel(); }, 'r_sku');
   if (draft && draft.sku) skuSel.value = draft.sku;
@@ -1591,9 +1649,16 @@ async function openRun(draftSummary) {
       sl('Ksorbate (w/v)', s.ksorbateTarget != null ? (s.ksorbateTarget * 100).toFixed(2) + '%' : '—'),
       sl('Nabenzoate (w/v)', s.nabenzoateTarget != null ? (s.nabenzoateTarget * 100).toFixed(2) + '%' : '—'));
   }
-  const search = el('input', { placeholder: 'Filter totes…', oninput: () => filterTotes() });
+  const generalFilterInp = el('input', { placeholder: 'Filter by lot, site, or location…' });
+  generalFilterInp.addEventListener('input', () => filterTotes());
+  const stabFilterSel = el('select', {}, ...['Citric acid', 'Fresh', ''].map(v =>
+    el('option', { value: v }, v || 'All')));
+  stabFilterSel.value = 'Citric acid';
+  stabFilterSel.addEventListener('change', () => filterTotes());
+  const pickFilters = { site: '', location: '' };
   const pickHost = el('div', { class: 'tote-pick' });
   const summary = el('div', { class: 'summary-line' });
+  let pickFilteredCount = 0;
   const feedstockHost = el('div', {});
   const pkgInputs = {};
   const draftQty = {};
@@ -1616,35 +1681,107 @@ async function openRun(draftSummary) {
     return draftId;
   }
 
+  // FieldKelp-style SKUs map to more than one species (e.g. FieldKelp covers
+  // both Sugar Kelp and Giant Kelp) via fg_sku_species, so this can return
+  // several codes -- the picker then matches a tote on any of them.
   function speciesOfSku() { const s = skus.find(x => x.code === skuSel.value); return s ? s.species : []; }
   function filterTotes() {
-    const sp = speciesOfSku(), q = search.value.toLowerCase();
-    // Rejected totes are relocated to QAQC Hold and aren't available for a new run.
-    const rows = totes.filter(t => t.location !== 'QAQC Hold' &&
-      (!sp.length || sp.includes(t.species)) && (!q || (t.lot + ' ' + (t.location || '')).toLowerCase().includes(q)));
+    const sp = speciesOfSku();
+    const q = generalFilterInp.value.toLowerCase();
+    // A tote already selected for this run always shows (even mid-run as
+    // WIP, so it can still be unselected right up until the run finishes) —
+    // otherwise it's an ordinary in-stock candidate that has to pass the
+    // active filters, and any tote already WIP for some *other* run is never
+    // offered here at all, same as one on QAQC Hold.
+    const rows = totes.filter(t => {
+      if (t.location === 'QAQC Hold') return false;
+      if (selected.has(t.id)) return true;
+      if (t.status === 'wip') return false;
+      return (!sp.length || sp.includes(t.species)) &&
+        (!stabFilterSel.value || (t.stabilizationMethod || '') === stabFilterSel.value) &&
+        (!q || (t.lot + ' ' + siteName(t.site) + ' ' + (t.location || '')).toLowerCase().includes(q)) &&
+        (!pickFilters.site || siteName(t.site) === pickFilters.site) &&
+        (!pickFilters.location || (t.location || '') === pickFilters.location);
+    });
+    pickFilteredCount = rows.length;
     pickHost.innerHTML = '';
-    const tbl = el('table', {},
-      el('thead', {}, el('tr', {}, el('th', { class: 'checkcol' }, ''), el('th', {}, 'Lot'), el('th', {}, 'Site'), el('th', { class: 'num' }, 'Avg kg'), el('th', {}, 'pH'), el('th', {}, 'Location'))));
+    const headRow = el('tr', {}, el('th', { class: 'checkcol' }, ''), el('th', {}, 'Lot'), el('th', {}, 'Site'),
+      el('th', { class: 'num' }, 'Avg kg'), el('th', {}, 'pH'), el('th', {}, 'Location'));
+    const siteOpts = (State.ref.sites || []).map(s => s.name);
+    const locOpts = State.ref.locations || [];
+    const siteFilterSel = el('select', {}, el('option', { value: '' }, 'All'), ...siteOpts.map(o => el('option', { value: o }, o)));
+    siteFilterSel.value = pickFilters.site;
+    siteFilterSel.addEventListener('change', () => { pickFilters.site = siteFilterSel.value; filterTotes(); });
+    const locFilterSel = el('select', {}, el('option', { value: '' }, 'All'), ...locOpts.map(o => el('option', { value: o }, o)));
+    locFilterSel.value = pickFilters.location;
+    locFilterSel.addEventListener('change', () => { pickFilters.location = locFilterSel.value; filterTotes(); });
+    // Leading empty cell matches the checkbox column in headRow, so each
+    // filter input lines up under its own column instead of the one to its right.
+    const filterRow = el('tr', { class: 'filter-row' }, el('th', {}, ''),
+      el('th', {}, ''), el('th', {}, siteFilterSel),
+      el('th', {}, ''), el('th', {}, ''), el('th', {}, locFilterSel));
+    const tbl = el('table', {}, el('thead', {}, headRow, filterRow));
     const tb = el('tbody', {});
     for (const t of rows) {
-      const cb = el('input', { type: 'checkbox', onchange: () => { cb.checked ? selected.add(t.id) : selected.delete(t.id); recompute(); renderFeedstockCards(); } });
+      const cb = el('input', {
+        type: 'checkbox', onchange: async () => {
+          if (cb.checked) { selected.add(t.id); recompute(); renderFeedstockCards(); return; }
+          // Unselecting a tote already locked in as WIP releases it back to
+          // stock (for this or any other run) instead of just forgetting it
+          // locally -- otherwise it'd stay tied up until the run finishes.
+          selected.delete(t.id);
+          if (t.status === 'wip') {
+            try {
+              const rid = await ensureRunId();
+              await api('DELETE', '/production/' + rid + '/feedstock/' + t.id);
+              const idx = totes.findIndex(x => x.id === t.id);
+              if (idx !== -1) totes[idx] = Object.assign({}, totes[idx], { status: 'in_stock' });
+              delete feedstockState[t.id];
+              toast(t.lot + ' removed from this run — back in stock.');
+            } catch (e) {
+              selected.add(t.id);
+              toast(e.message, true);
+            }
+          }
+          filterTotes();
+          renderFeedstockCards();
+        }
+      });
       cb.checked = selected.has(t.id);
-      tb.append(el('tr', {}, el('td', { class: 'checkcol' }, cb), el('td', { class: 'mono' }, t.lot), el('td', {}, t.site), el('td', { class: 'num' }, fmt(t.avgWeightKg, 1)), el('td', {}, t.ph ?? '—'), el('td', {}, t.location || '—')));
+      tb.append(el('tr', {}, el('td', { class: 'checkcol' }, cb), el('td', { class: 'mono' }, t.lot), el('td', {}, siteName(t.site)), el('td', { class: 'num' }, fmt(t.avgWeightKg, 1)), el('td', {}, t.ph ?? '—'), el('td', {}, t.location || '—')));
     }
-    if (!rows.length) tb.append(el('tr', {}, el('td', { colspan: 6, class: 'empty' }, 'No in-stock totes for this species.')));
+    if (!rows.length) tb.append(el('tr', {}, el('td', { colspan: 6, class: 'empty' }, 'No in-stock totes match these filters.')));
     tbl.append(tb); pickHost.append(tbl); recompute();
   }
   function recompute() {
     const chosen = totes.filter(t => selected.has(t.id));
     const inputKg = chosen.reduce((a, b) => a + (b.avgWeightKg || 0), 0);
     summary.innerHTML = '';
-    summary.append(sl('Totes', chosen.length), sl('Input', fmt(inputKg, 1) + ' kg'));
+    summary.append(sl('Totes', chosen.length), sl('Input', fmt(inputKg, 1) + ' kg'),
+      sl('Totes remaining', Math.max(0, pickFilteredCount - selected.size)));
   }
   // Rebuilt only when tote selection changes (not on every keystroke elsewhere
   // in the modal) so in-progress typing inside a tote's card is never wiped.
-  function renderFeedstockCards() {
-    feedstockHost.innerHTML = '';
+  let feedstockRenderGen = 0;
+  async function renderFeedstockCards() {
+    const gen = ++feedstockRenderGen;
     const chosen = totes.filter(t => selected.has(t.id));
+    // A tote with no in-memory characterization yet this session (never
+    // edited/saved here) is pre-filled from its most recently captured
+    // values, if any, so re-selecting an already-characterized tote doesn't
+    // start every field blank.
+    const needsPrefill = chosen.filter(t => !feedstockState[t.id]);
+    if (needsPrefill.length) {
+      const fetched = await Promise.all(needsPrefill.map(t =>
+        api('GET', '/totes/' + t.id + '/ph').catch(() => null)));
+      if (gen !== feedstockRenderGen) return; // a newer render started meanwhile
+      needsPrefill.forEach((t, i) => {
+        const r = fetched[i];
+        if (r && r.latestCharacterization && !feedstockState[t.id]) feedstockState[t.id] = r.latestCharacterization;
+      });
+    }
+    if (gen !== feedstockRenderGen) return;
+    feedstockHost.innerHTML = '';
     if (!chosen.length) { feedstockHost.append(el('div', { class: 'help' }, 'Select totes above to characterize the feedstock.')); return; }
     for (const t of chosen) {
       feedstockHost.append(buildFeedstockCard({
@@ -1653,23 +1790,32 @@ async function openRun(draftSummary) {
         mode: 'draft',
         onChange: vals => { feedstockState[t.id] = vals; },
         // Locks this tote's characterization in immediately instead of only
-        // bundling it into the next draft save/finalize. A rejected tote is
-        // pulled out of the run right away: it drops out of both the picker
-        // and this list, and everything captured for it (plus any photos)
-        // lands in the tote's own Feedstock Stability log instead, since it
-        // won't have a run_inputs row to carry that data once it's gone.
+        // bundling it into the next draft save/finalize, and updates its
+        // Feedstock Inventory record the same way either way. An accepted
+        // tote moves to WIP -- tied up in this run (never selectable in any
+        // other run's pick table) until the run is finalized (-> Consumed)
+        // or discarded (-> back to In stock). A rejected tote is pulled out
+        // of the run right away instead: it drops out of both the picker and
+        // this list, and everything captured for it (plus any photos) lands
+        // in the tote's own Feedstock Stability log, since it won't have a
+        // run_inputs row to carry that data once it's gone.
         onSave: async vals => {
           feedstockState[t.id] = vals;
           const rid = await ensureRunId();
           const r = await api('POST', '/production/' + rid + '/feedstock/' + t.id + '/save', vals);
+          const idx = totes.findIndex(x => x.id === t.id);
           if (r.rejected) {
             selected.delete(t.id);
             delete feedstockState[t.id];
-            const idx = totes.findIndex(x => x.id === t.id);
             if (idx !== -1) totes[idx] = Object.assign({}, totes[idx], { location: 'QAQC Hold', status: 'hold' });
             toast(t.lot + ' rejected — moved to QAQC Hold and removed from this run.');
             filterTotes();
             renderFeedstockCards();
+          } else {
+            // Just hide this tote's now-stale picker row -- other cards'
+            // in-progress edits shouldn't be disturbed by this save.
+            if (idx !== -1) totes[idx] = Object.assign({}, totes[idx], { status: 'wip' });
+            filterTotes();
           }
         },
         uploadPhoto: async (slot, file, b64) => {
@@ -1719,7 +1865,8 @@ async function openRun(draftSummary) {
         field('Notes', el('textarea', { id: 'r_notes', rows: '2', placeholder: 'Optional batch notes' }, draft?.notes || '')))),
     el('details', { class: 'accordion', open: '' }, el('summary', {}, 'Feedstock'),
       el('div', { class: 'accordion-body' },
-        field('Select stabilized totes to process', search), pickHost, summary,
+        field('Filter totes', generalFilterInp),
+        field('Stabilization method', stabFilterSel), pickHost, summary,
         el('h4', { style: 'margin:14px 0 4px;font-size:13px' }, 'Feedstock characterization'), feedstockHost)),
     homogSection, extractionSection,
     el('details', { class: 'accordion' }, el('summary', {}, 'Separation'),
@@ -1757,6 +1904,27 @@ async function openRun(draftSummary) {
       ? await api('PUT', '/production/drafts/' + draftId, payload)
       : await api('POST', '/production/drafts', payload);
     draftId = r.run.id;
+    // Every selected tote gets the same lock-in treatment here as the
+    // characterization card's own Save button: accepted totes move to WIP
+    // (so they drop out of every pick table until this run finishes or is
+    // discarded), rejected ones are pulled out of the run and relocated.
+    const rejectedIds = r.rejectedToteIds || [];
+    if (rejectedIds.length) {
+      rejectedIds.forEach(tid => {
+        selected.delete(tid);
+        delete feedstockState[tid];
+        const idx = totes.findIndex(x => x.id === tid);
+        if (idx !== -1) totes[idx] = Object.assign({}, totes[idx], { location: 'QAQC Hold', status: 'hold' });
+      });
+      toast(rejectedIds.length + ' tote' + (rejectedIds.length === 1 ? '' : 's') + ' rejected during save and moved to QAQC Hold.');
+      renderFeedstockCards();
+    }
+    totes.forEach((t, idx) => {
+      if (selected.has(t.id) && t.status !== 'wip' && !rejectedIds.includes(t.id)) {
+        totes[idx] = Object.assign({}, t, { status: 'wip' });
+      }
+    });
+    filterTotes();
     if (!silent) { toast('Progress saved — resume it anytime from “In progress”.'); render(); }
   }
   async function finalizeRun() {

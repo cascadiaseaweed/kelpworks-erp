@@ -167,6 +167,7 @@ th.sortable:hover { background: #e2ece9; }
 .badge.consumed, .badge.sold { background: #eceff0; color: var(--muted); }
 .badge.disposed { background: #f1e0e0; color: #9a4040; text-decoration: line-through; }
 .badge.hold { background: #fcefd6; color: var(--warn); }
+.badge.wip { background: #e1ecf7; color: #2a5c94; }
 .badge.low { background: #fbe3df; color: var(--danger); }
 .pill { display:inline-block; padding:1px 7px; border-radius:6px; background:#eef3f2; color:var(--teal-dark); font-weight:600; font-size:11px; }
 
