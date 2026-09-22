@@ -500,7 +500,7 @@ async function openHarvest() {
 async function pageProduction(v) {
   v.append(el('div', { class: 'page-head' },
     el('h2', {}, 'Production Runs'),
-    el('div', { class: 'actions' }, el('button', { onclick: () => openRun() }, '+ New production run'))));
+    el('div', { class: 'actions' }, el('button', { onclick: () => openNewRun() }, '+ New production run'))));
   const [r, dr] = await Promise.all([api('GET', '/production'), api('GET', '/production/drafts')]);
   if (dr.drafts.length) {
     v.append(el('h3', { style: 'margin:0 0 8px' }, 'In progress'));
@@ -556,7 +556,7 @@ function draftCard(d) {
   const pkgSummary = (d.packages || []).filter(p => p.qty > 0).map(p => `${fmt(p.qty)} × ${p.size}`).join(', ') || '—';
   return el('div', { class: 'card' },
     el('div', { class: 'page-head', style: 'margin:0 0 8px' },
-      el('h3', { style: 'margin:0' }, 'In-progress run', '  ', el('span', { class: 'badge hold' }, 'Not yet submitted')),
+      el('h3', { style: 'margin:0' }, mono(d.processingLot), '  ', el('span', { class: 'badge hold' }, 'Not yet submitted')),
       el('div', { class: 'actions' },
         el('button', { onclick: () => openRun(d) }, 'Resume'),
         el('button', { class: 'danger', onclick: () => discardDraft(d) }, 'Discard'))),
@@ -1515,6 +1515,55 @@ function buildDilutionsSection(initial, getRunId) {
   return el('div', {}, listHost, addBtn, status);
 }
 
+// Step 1 of creating a run: Initiation only. Every field but Notes is
+// required — submitting reserves the run's permanent PR-... code (via the
+// same draft-creation endpoint used for "Save & close" later) and hands off
+// to openRun() for everything else, which only becomes reachable once a run
+// actually exists.
+async function openNewRun() {
+  const skus = State.ref.skus.filter(s => s.active);
+  const skuSel = selectFrom('', [['', 'Select a SKU…'], ...skus.map(s => [s.code, s.name])], () => renderSpecPanel(), 'nr_sku');
+  const specPanel = el('div', { class: 'summary-line' });
+  function renderSpecPanel() {
+    const s = skus.find(x => x.code === skuSel.value);
+    specPanel.innerHTML = '';
+    if (!s) { specPanel.append(el('span', { class: 'muted' }, 'Select a SKU to see its spec.')); return; }
+    specPanel.append(
+      sl('Species', (s.species || []).map(speciesName).join(' & ') || '—'),
+      sl('Target TDS', s.tdsTarget != null ? s.tdsTarget + '%' : '—'),
+      sl('Target pH', s.phTarget ?? '—'),
+      sl('Ksorbate (w/v)', s.ksorbateTarget != null ? (s.ksorbateTarget * 100).toFixed(2) + '%' : '—'),
+      sl('Nabenzoate (w/v)', s.nabenzoateTarget != null ? (s.nabenzoateTarget * 100).toFixed(2) + '%' : '—'));
+  }
+  renderSpecPanel();
+  const dateInp = el('input', { type: 'date', id: 'nr_date', value: new Date().toISOString().slice(0, 10) });
+  const locSel = productionLocationSelect('nr_loc');
+  const operatorsSelect = buildOperatorsSelect('');
+  const body = el('div', {},
+    el('div', { class: 'form-row' },
+      field('Product SKU (required)', skuSel),
+      field('Run date (required)', dateInp)),
+    specPanel,
+    el('div', { class: 'form-row', style: 'margin-top:8px' },
+      field('Production Location (required)', locSel),
+      field('Operators (required)', operatorsSelect.el)),
+    field('Notes', el('textarea', { id: 'nr_notes', rows: '2', placeholder: 'Optional batch notes' })),
+    el('div', { class: 'help' },
+      'Feedstock, process stages and packaging open up once the run is created and a run code is assigned.'));
+  modal('New production run', body, async () => {
+    if (!skuSel.value) throw new Error('Choose a product SKU.');
+    if (!dateInp.value) throw new Error('Enter a run date.');
+    if (!locSel.value) throw new Error('Choose a production location.');
+    if (!operatorsSelect.value.trim()) throw new Error('Select at least one operator.');
+    const r = await api('POST', '/production/drafts', {
+      sku: skuSel.value, runDate: dateInp.value, location: locSel.value,
+      operators: operatorsSelect.value, notes: body.querySelector('#nr_notes').value,
+      toteIds: [], packages: [], feedstockDetails: {}
+    });
+    toast('Run ' + r.run.processingLot + ' created.');
+    openRun(r.run);
+  }, 'Create run');
+}
 async function openRun(draftSummary) {
   // Re-fetch a resumed draft in full (list snapshots omit stage/solids/dilution detail).
   const draft = (draftSummary && draftSummary.id) ? (await api('GET', '/production/drafts/' + draftSummary.id)).run : draftSummary;
@@ -1628,7 +1677,9 @@ async function openRun(draftSummary) {
   }, 'Save timestamp');
 
   const body = el('div', {},
-    el('details', { class: 'accordion', open: '' }, el('summary', {}, 'Initiation'),
+    draft ? el('div', { class: 'summary-line', style: 'margin-bottom:10px' },
+      sl('Run code', mono(draft.processingLot)), sl('SKU', skuName(draft.sku))) : null,
+    el('details', { class: 'accordion' }, el('summary', {}, 'Initiation'),
       el('div', { class: 'accordion-body' },
         el('div', { class: 'form-row' },
           field('Product SKU', skuSel),
@@ -1690,7 +1741,7 @@ async function openRun(draftSummary) {
     toast(`Run ${r.processingLot}: ${fmt(r.inputKg, 0)} kg → ${fmt(r.outputLitres, 0)} L`);
     render();
   }
-  modal(draft ? 'Resume production run' : 'New production run', body, finalizeRun, 'Create run',
+  modal(draft ? 'Production run — ' + draft.processingLot : 'New production run', body, finalizeRun, 'Finalize run',
     { extraLabel: 'Save & close', onExtra: saveDraft, wide: true });
 }
 
