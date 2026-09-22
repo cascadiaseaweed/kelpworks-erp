@@ -33,6 +33,7 @@ const el = (tag, attrs = {}, ...kids) => {
 const fmt = (n, d = 0) => (n == null ? '—' : Number(n).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d }));
 const speciesName = c => { const s = (State.ref?.species || []).find(x => x.code === c); return s ? (s.common || s.name) : (c || '—'); };
 const skuName = c => { const s = (State.ref?.skus || []).find(x => x.code === c); return s ? s.name : (c || '—'); };
+const siteName = c => { const s = (State.ref?.sites || []).find(x => x.code === c); return s ? s.name : (c || '—'); };
 function toast(msg, isErr) {
   const t = el('div', { class: 'summary-line', style: 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:99;box-shadow:var(--shadow);' + (isErr ? 'background:#fbe3df;color:#c0392b' : 'background:#e2f3ef;color:#15564F') }, msg);
   document.body.append(t); setTimeout(() => t.remove(), 3200);
@@ -127,23 +128,43 @@ async function pageDashboard(v) {
 }
 function tile(k, val, u, accent) { return el('div', { class: 'tile' + (accent ? ' accent' : '') }, el('div', { class: 'k' }, k), el('div', { class: 'v' }, val), el('div', { class: 'u' }, u)); }
 
-/* ---------------- Stabilized inventory ---------------- */
+/* ---------------- Feedstock inventory ---------------- */
 let stabCache = [];
+const STATUS_LABELS = { in_stock: 'In stock', hold: 'Hold', consumed: 'Consumed', disposed: 'Disposed' };
+function statusLabel(s) { return STATUS_LABELS[s] || s || '—'; }
+// One entry per real table column (checkbox + actions are handled separately).
+// `value(t)` is what's sorted/filtered on — the human-readable form, so a
+// filter/sort on "Site" or "Status" matches what's actually displayed.
+const STAB_COLUMNS = [
+  { key: 'lot', label: 'Lot number', value: t => t.lot },
+  { key: 'site', label: 'Site', value: t => siteName(t.site), options: () => (State.ref.sites || []).map(s => s.name) },
+  { key: 'species', label: 'Species', value: t => speciesName(t.species),
+    options: () => [...new Set((State.ref.species || []).map(s => s.common || s.name))] },
+  { key: 'stabMethod', label: 'Stabilization method', value: t => t.stabilizationMethod || '',
+    options: () => ['Citric acid', 'Fresh'] },
+  { key: 'checkin', label: 'Checked in', value: t => t.checkinDate || '' },
+  { key: 'avgKg', label: 'Avg kg', value: t => t.avgWeightKg, numeric: true },
+  { key: 'ph', label: 'pH', value: t => t.ph, numeric: true },
+  { key: 'orp', label: 'ORP (mV)', value: t => t.orp, numeric: true },
+  { key: 'lastUpdated', label: 'Last updated', value: t => t.lastUpdated ? fmtWhen(t.lastUpdated) : '' },
+  { key: 'location', label: 'Location', value: t => t.location || '' },
+  { key: 'status', label: 'Status', value: t => statusLabel(t.status), options: () => Object.values(STATUS_LABELS) },
+];
 async function pageStabilized(v) {
   v.append(el('div', { class: 'page-head' },
-    el('h2', {}, 'Stabilized Inventory'),
+    el('h2', {}, 'Feedstock Inventory'),
     el('div', { class: 'actions' }, el('button', { onclick: openHarvest }, '+ Check in harvest'))));
   const r = await api('GET', '/totes');
   stabCache = r.totes;
-  const search = el('input', { placeholder: 'Search lot / location…', oninput: drawStab });
-  const spcF = selectFrom('Species', [['', 'All species'], ...(State.ref.species.map(s => [s.code, s.common || s.name]))], drawStab);
-  const stF = selectFrom('Status', [['', 'All'], ['in_stock', 'In stock'], ['consumed', 'Consumed'], ['disposed', 'Disposed']], drawStab);
-  const bar = el('div', { class: 'toolbar' }, search, spcF, stF, el('span', { class: 'muted', id: 'stabCount' }));
+  const countEl = el('span', { class: 'muted' });
+  const bar = el('div', { class: 'toolbar' }, countEl);
   const bulkBar = el('div', { class: 'bulkbar hidden' });
   const host = el('div', {});
   v.append(bar, bulkBar, host);
   const selected = new Set();
-  let visibleInStock = [];
+  const filters = {};
+  let sortKey = null, sortDir = 1;
+  let visibleSelectable = [];
 
   function updateBulk() {
     const n = selected.size;
@@ -157,35 +178,84 @@ async function pageStabilized(v) {
       el('button', { class: 'secondary', onclick: () => { selected.clear(); drawStab(); } }, 'Clear'));
   }
   function drawStab() {
-    const q = search.value.toLowerCase(), sp = spcF.value, st = stF.value;
-    const rows = stabCache.filter(t =>
-      (!sp || t.species === sp) && (!st || t.status === st) &&
-      (!q || (t.lot + ' ' + (t.location || '')).toLowerCase().includes(q)));
-    visibleInStock = rows.filter(t => t.status === 'in_stock');
-    // drop selections no longer visible/in-stock
-    [...selected].forEach(id => { if (!visibleInStock.some(t => t.id === id)) selected.delete(id); });
-    $('#stabCount').textContent = rows.length + ' totes · ' + fmt(rows.filter(x => x.status === 'in_stock').reduce((a, b) => a + (b.avgWeightKg || 0), 0), 0) + ' kg shown';
+    let rows = stabCache.filter(t => STAB_COLUMNS.every(c => {
+      const f = (filters[c.key] || '').toLowerCase();
+      if (!f) return true;
+      return String(c.value(t) ?? '').toLowerCase().includes(f);
+    }));
+    if (sortKey) {
+      const col = STAB_COLUMNS.find(c => c.key === sortKey);
+      rows = rows.slice().sort((a, b) => {
+        const av = col.value(a), bv = col.value(b);
+        const cmp = col.numeric ? (av ?? -Infinity) - (bv ?? -Infinity) : String(av ?? '').localeCompare(String(bv ?? ''));
+        return cmp * sortDir;
+      });
+    }
+    // Totes on hold are still selectable (for moving/releasing/disposing) —
+    // only consumed/disposed items drop out of bulk actions.
+    visibleSelectable = rows.filter(t => t.status === 'in_stock' || t.status === 'hold');
+    [...selected].forEach(id => { if (!visibleSelectable.some(t => t.id === id)) selected.delete(id); });
+    const kgInStock = rows.filter(x => x.status === 'in_stock').reduce((a, b) => a + (b.avgWeightKg || 0), 0);
+    countEl.textContent = rows.length + ' totes shown · ' + fmt(kgInStock, 0) + ' kg in stock';
     host.innerHTML = '';
-    const allCb = el('input', { type: 'checkbox', title: 'Select all in stock', onchange: () => {
-      visibleInStock.forEach(t => allCb.checked ? selected.add(t.id) : selected.delete(t.id));
+
+    const allCb = el('input', { type: 'checkbox', title: 'Select all shown', onchange: () => {
+      visibleSelectable.forEach(t => allCb.checked ? selected.add(t.id) : selected.delete(t.id));
       drawStab();
     } });
-    allCb.checked = visibleInStock.length > 0 && visibleInStock.every(t => selected.has(t.id));
-    const t = table(
-      [allCb, 'Lot number', 'Site', 'Species', 'Checked in', 'Avg kg', 'pH', 'Location', 'Status', ''],
-      rows.map(t => [
-        rowCheck(t, selected, updateBulk),
-        mono(t.lot), t.site, speciesName(t.species), t.checkinDate || '—',
-        num(fmt(t.avgWeightKg, 1)), phCell(t), t.location || '—',
-        badge(t.status, t.status === 'in_stock' ? 'In stock' : t.status === 'disposed' ? 'Disposed' : 'Consumed'),
-        rowActions([
-          t.status === 'in_stock' ? ['Move', () => moveTote(t)] : null,
-          t.status === 'in_stock' ? ['Update pH', () => updatePh(t)] : null,
+    allCb.checked = visibleSelectable.length > 0 && visibleSelectable.every(t => selected.has(t.id));
+
+    const headRow = el('tr', {}, el('th', { class: 'checkcol' }, allCb),
+      ...STAB_COLUMNS.map(c => {
+        const arrow = sortKey === c.key ? (sortDir === 1 ? ' ▲' : ' ▼') : '';
+        return el('th', {
+          class: (c.numeric ? 'num ' : '') + 'sortable', title: 'Click to sort',
+          onclick: () => { sortKey === c.key ? (sortDir = -sortDir) : (sortKey = c.key, sortDir = 1); drawStab(); }
+        }, c.label + arrow);
+      }), el('th', {}, ''));
+
+    const filterRow = el('tr', { class: 'filter-row' }, el('th', {}, ''),
+      ...STAB_COLUMNS.map(c => {
+        const cell = el('th', {});
+        if (c.options) {
+          const sel = el('select', {}, el('option', { value: '' }, 'All'), ...c.options().map(o => el('option', { value: o }, o)));
+          sel.value = filters[c.key] || '';
+          sel.addEventListener('change', () => { filters[c.key] = sel.value; drawStab(); });
+          cell.append(sel);
+        } else {
+          const inp = el('input', { placeholder: 'Filter…', value: filters[c.key] || '' });
+          inp.addEventListener('input', () => { filters[c.key] = inp.value; drawStab(); });
+          cell.append(inp);
+        }
+        return cell;
+      }), el('th', {}));
+
+    const tbody = el('tbody', {});
+    if (!rows.length) tbody.append(el('tr', {}, el('td', { colspan: STAB_COLUMNS.length + 2, class: 'empty' }, 'No totes match.')));
+    rows.forEach(t => {
+      const movable = t.status === 'in_stock' || t.status === 'hold';
+      tbody.append(el('tr', {
+        class: 'clickable',
+        title: 'Click for the full Feedstock Stability log',
+        onclick: e => { if (!e.target.closest('.checkcol, .row-actions')) showHistory(t); }
+      },
+        el('td', { class: 'checkcol' }, rowCheck(t, selected, updateBulk)),
+        el('td', { class: 'mono' }, t.lot), el('td', {}, siteName(t.site)), el('td', {}, speciesName(t.species)),
+        el('td', {}, t.stabilizationMethod || '—'),
+        el('td', {}, t.checkinDate || '—'), el('td', { class: 'num' }, fmt(t.avgWeightKg, 1)),
+        el('td', { class: 'num' }, phCell(t)), el('td', { class: 'num' }, orpCell(t)),
+        el('td', {}, t.lastUpdated ? fmtWhen(t.lastUpdated) : '—'),
+        el('td', {}, t.location || '—'), el('td', {}, badge(t.status, statusLabel(t.status))),
+        el('td', {}, rowActions([
+          movable ? ['Move', () => moveTote(t)] : null,
+          movable ? ['Update', () => updateCondition(t)] : null,
           ['Label', () => printLabels([toteLabel(t)])],
-          t.status === 'in_stock' ? ['Delete', () => delTote(t), 'danger'] : null
-        ])
-      ]), [false, false, false, false, false, true, true, false, false, false]);
-    host.append(t);
+          movable ? ['Delete', () => delTote(t), 'danger'] : null
+        ]))));
+    });
+
+    host.append(el('div', { class: 'tablewrap sticky-actions' },
+      el('table', {}, el('thead', {}, headRow, filterRow), tbody)));
     updateBulk();
   }
   drawStab();
@@ -257,37 +327,60 @@ async function delTote(t) {
 }
 function phCell(t) {
   if (t.ph == null) return el('span', { class: 'muted' }, '—');
-  return el('span', {}, String(t.ph),
-    t.phUpdated ? el('span', { class: 'help', style: 'margin-top:0' }, 'updated ' + t.phUpdated) : null);
+  return el('span', {}, String(t.ph));
 }
-async function updatePh(t) {
+function orpCell(t) {
+  if (t.orp == null) return el('span', { class: 'muted' }, '—');
+  return el('span', {}, String(t.orp));
+}
+function stabilityLogTable(log) {
+  if (!log.length) return el('div', { class: 'help' }, 'No changes logged yet.');
+  return el('div', { class: 'tablewrap', style: 'margin-top:6px' },
+    el('table', {},
+      el('thead', {}, el('tr', {}, el('th', {}, 'When'), el('th', {}, 'Field'), el('th', {}, 'From'), el('th', {}, 'To'), el('th', {}, 'Note'), el('th', {}, 'By'))),
+      el('tbody', {}, ...log.map(r => {
+        // A row logged with a photo attachment (e.g. a tote rejected during a
+        // production run) links straight to the image instead of showing an
+        // inert filename.
+        const toCell = (r.runId && r.attachmentId)
+          ? el('a', { href: attDownloadUrl(r.runId, r.attachmentId, false), target: '_blank', rel: 'noopener' }, r.newValue || 'View photo')
+          : el('b', {}, r.newValue ?? '—');
+        return el('tr', {},
+          el('td', { class: 'muted' }, fmtWhen(r.at)), el('td', {}, r.field),
+          el('td', { class: 'muted' }, r.oldValue ?? '—'), el('td', {}, toCell),
+          el('td', { class: 'muted' }, r.note || '—'), el('td', {}, r.by || '—'));
+      }))));
+}
+async function showHistory(t) {
   const data = await api('GET', '/totes/' + t.id + '/ph');
-  const history = el('div', {});
-  function drawHistory(log) {
-    history.innerHTML = '';
-    if (!log.length) { history.append(el('div', { class: 'help' }, 'No pH readings logged yet.')); return; }
-    history.append(el('div', { class: 'tablewrap', style: 'margin-top:6px' },
-      el('table', {}, el('thead', {}, el('tr', {}, el('th', {}, 'Date'), el('th', { class: 'num' }, 'pH'), el('th', {}, 'Note'))),
-        el('tbody', {}, ...log.map(r => el('tr', {},
-          el('td', {}, r.date), el('td', { class: 'num' }, r.ph), el('td', { class: 'muted' }, r.note || '—')))))));
-  }
+  const body = el('div', {},
+    el('div', { class: 'summary-line' }, sl('Tote', t.lot)),
+    stabilityLogTable(data.stabilityLog));
+  modal('Feedstock Stability log — ' + t.lot, body, async () => {}, 'Close', { noCancel: true });
+}
+async function updateCondition(t) {
+  const data = await api('GET', '/totes/' + t.id + '/ph');
+  const history = el('div', {}, stabilityLogTable(data.stabilityLog));
   const body = el('div', {},
     el('div', { class: 'summary-line' }, sl('Tote', t.lot),
       sl('Current pH', data.ph == null ? '—' : data.ph),
-      sl('Last updated', data.phUpdated || 'never')),
+      sl('Current ORP', data.orp == null ? '—' : data.orp + ' mV'),
+      sl('Last updated', data.lastUpdated ? fmtWhen(data.lastUpdated) : 'never')),
     el('div', { class: 'form-row' },
       field('New pH reading', el('input', { type: 'number', step: '0.1', id: 'p_ph', placeholder: 'e.g. 3.7' })),
-      field('Reading date', el('input', { type: 'date', id: 'p_date', value: new Date().toISOString().slice(0, 10) }))),
+      field('New ORP reading', el('input', { type: 'number', step: '1', id: 'p_orp', placeholder: 'e.g. -150' }))),
+    field('Reading date', el('input', { type: 'date', id: 'p_date', value: new Date().toISOString().slice(0, 10) })),
     field('Note (optional)', el('input', { id: 'p_note', placeholder: 'who / instrument / observation' })),
-    el('label', {}, 'Reading history'), history);
-  drawHistory(data.phLog);
-  modal('Update pH — ' + t.lot, body, async () => {
+    el('label', {}, 'Feedstock Stability log'), history);
+  modal('Update condition — ' + t.lot, body, async () => {
     const ph = body.querySelector('#p_ph').value;
-    if (ph === '') throw new Error('Enter a pH value.');
-    const r = await api('POST', '/totes/' + t.id + '/ph', {
-      ph: +ph, date: body.querySelector('#p_date').value, note: body.querySelector('#p_note').value || null
+    const orp = body.querySelector('#p_orp').value;
+    if (ph === '' && orp === '') throw new Error('Enter a pH and/or ORP value.');
+    await api('POST', '/totes/' + t.id + '/ph', {
+      ph: ph === '' ? null : +ph, orp: orp === '' ? null : +orp,
+      date: body.querySelector('#p_date').value, note: body.querySelector('#p_note').value || null
     });
-    toast('pH ' + r.tote.ph + ' logged on ' + r.tote.phUpdated);
+    toast('Condition logged for ' + t.lot);
     render();
   }, 'Log reading');
 }
@@ -351,41 +444,62 @@ async function openHarvest() {
   const sites = State.ref.sites.map(s => [s.code, s.code + ' — ' + s.name]);
   const species = State.ref.species.map(s => [s.code, s.common || s.name]);
   const locs = State.ref.locations.map(l => [l, l]);
-  const ibcSources = (await api('GET', '/consumables')).consumables.filter(c => c.unit === 'tote');
-  const ibcOpts = ibcSources.map(c => [String(c.id), c.name + ' (' + fmt(c.onHand, 0) + ' on hand)']);
+  const sourceConsumables = (await api('GET', '/consumables')).consumables.filter(c => c.unit === 'tote');
+  // Burlap sacks aren't inventory-tracked as a consumable, so it's always
+  // offered as a literal extra option alongside whatever IBC-tote stock exists.
+  const sourceOpts = [...sourceConsumables.map(c => [String(c.id), c.name + ' (' + fmt(c.onHand, 0) + ' on hand)']),
+    ['BURLAP', 'Burlap sack']];
+  // Stabilization method drives sensible defaults for the two fields below it:
+  // Citric acid → Tote; Fresh → Bag + Burlap sack (fresh kelp is commonly
+  // bagged and delivered loose rather than in a tracked IBC tote).
+  const onStabChange = () => {
+    const fresh = body.querySelector('#h_stab').value === 'Fresh';
+    body.querySelector('#h_unit').value = fresh ? 'Bag' : 'Tote';
+    body.querySelector('#h_source').value = fresh ? 'BURLAP' : (sourceOpts[0] ? sourceOpts[0][0] : 'BURLAP');
+  };
   const body = el('div', {},
     el('div', { class: 'form-row' },
-      field('Farm site', selectFrom('', sites, null, 'h_site')),
-      field('Species', selectFrom('', species, null, 'h_species'))),
+      field('Stabilization method', selectFrom('', [['Citric acid', 'Citric acid'], ['Fresh', 'Fresh']], () => onStabChange(), 'h_stab')),
+      field('Farm site', selectFrom('', sites, null, 'h_site'))),
     el('div', { class: 'form-row' },
-      field('Check-in date', el('input', { type: 'date', id: 'h_date', value: new Date().toISOString().slice(0, 10) })),
-      field('Storage location', editableSelect(locs, 'h_loc'))),
+      field('Species', selectFrom('', species, null, 'h_species')),
+      field('Check-in date', el('input', { type: 'date', id: 'h_date', value: new Date().toISOString().slice(0, 10) }))),
     el('div', { class: 'form-row' },
-      field('Number of totes', el('input', { type: 'number', id: 'h_count', min: '1', value: '1' })),
-      field('Total harvest (kg)', el('input', { type: 'number', id: 'h_kg', min: '0', step: '0.01', placeholder: 'averaged across totes' }))),
+      field('Storage location', editableSelect(locs, 'h_loc')),
+      field('Number of storage units', el('input', { type: 'number', id: 'h_count', min: '1', value: '1' }))),
     el('div', { class: 'form-row' },
-      field('IBC tote source', ibcOpts.length ? selectFrom('', ibcOpts, null, 'h_ibc') : el('input', { id: 'h_ibc', disabled: 'disabled', placeholder: 'no IBC stock' })),
+      field('Total harvest (kg)', el('input', { type: 'number', id: 'h_kg', min: '0', step: '0.01', placeholder: 'averaged across storage units' })),
+      field('Storage unit', selectFrom('', [['Tote', 'Tote'], ['Bag', 'Bag']], null, 'h_unit'))),
+    el('div', { class: 'form-row' },
+      field('Storage unit source', selectFrom('', sourceOpts, null, 'h_source')),
       field('pH', el('input', { type: 'number', id: 'h_ph', step: '0.1', placeholder: 'e.g. 3.7' }))),
-    el('div', { class: 'help' }, 'The selected empty-IBC stock is reduced by the number of totes checked in.'),
+    field('ORP (mV) — optional', el('input', { type: 'number', id: 'h_orp', step: '1', placeholder: 'e.g. -150' })),
+    field('Notes', el('textarea', { id: 'h_notes', rows: '2', placeholder: 'Optional' })),
+    el('div', { class: 'help' }, 'The selected storage unit source stock is reduced by the number of storage units checked in (Burlap sack is not inventory-tracked).'),
     el('div', { class: 'help', id: 'h_preview' }));
   const c_count = body.querySelector('#h_count'), c_kg = body.querySelector('#h_kg');
   const upd = () => {
     const n = +c_count.value || 0, kg = +c_kg.value || 0;
-    body.querySelector('#h_preview').textContent = n > 0 ? `Creates ${n} tote lot(s); average weight ${n ? (kg / n).toFixed(2) : 0} kg each.` : '';
+    body.querySelector('#h_preview').textContent = n > 0 ? `Creates ${n} storage unit(s); average weight ${n ? (kg / n).toFixed(2) : 0} kg each.` : '';
   };
   c_count.addEventListener('input', upd); c_kg.addEventListener('input', upd); upd();
+  onStabChange();
   modal('Check in a harvest batch', body, async () => {
-    const ibcSel = body.querySelector('#h_ibc');
-    const ibcId = ibcSel && ibcSel.value && !ibcSel.disabled ? +ibcSel.value : null;
+    const sourceSel = body.querySelector('#h_source');
+    const isBurlap = sourceSel.value === 'BURLAP';
     const payload = {
       site: body.querySelector('#h_site').value, species: body.querySelector('#h_species').value,
       checkinDate: body.querySelector('#h_date').value, location: body.querySelector('#h_loc').value,
       toteCount: +body.querySelector('#h_count').value, totalKg: +body.querySelector('#h_kg').value,
-      ph: body.querySelector('#h_ph').value || null, ibcConsumableId: ibcId
+      stabilizationMethod: body.querySelector('#h_stab').value, storageUnit: body.querySelector('#h_unit').value,
+      ibcConsumableId: isBurlap ? null : (sourceSel.value ? +sourceSel.value : null),
+      storageSourceLabel: isBurlap ? 'Burlap sack' : null,
+      ph: body.querySelector('#h_ph').value || null, orp: body.querySelector('#h_orp').value || null,
+      notes: body.querySelector('#h_notes').value || null
     };
     const r = await api('POST', '/harvest', payload);
     State.ref = await api('GET', '/refdata');
-    toast(`Created ${r.count} totes · ${r.avgWeightKg} kg each` + (r.ibcSource ? ` · ${r.count} from ${r.ibcSource}` : ''));
+    toast(`Created ${r.count} storage unit(s) · ${r.avgWeightKg} kg each` + (r.storageSource ? ` · ${r.count} from ${r.storageSource}` : ''));
     render();
   }, 'Check in');
 }
@@ -394,7 +508,7 @@ async function openHarvest() {
 async function pageProduction(v) {
   v.append(el('div', { class: 'page-head' },
     el('h2', {}, 'Production Runs'),
-    el('div', { class: 'actions' }, el('button', { onclick: () => openRun() }, '+ New production run'))));
+    el('div', { class: 'actions' }, el('button', { onclick: () => openNewRun() }, '+ New production run'))));
   const [r, dr] = await Promise.all([api('GET', '/production'), api('GET', '/production/drafts')]);
   if (dr.drafts.length) {
     v.append(el('h3', { style: 'margin:0 0 8px' }, 'In progress'));
@@ -450,7 +564,7 @@ function draftCard(d) {
   const pkgSummary = (d.packages || []).filter(p => p.qty > 0).map(p => `${fmt(p.qty)} × ${p.size}`).join(', ') || '—';
   return el('div', { class: 'card' },
     el('div', { class: 'page-head', style: 'margin:0 0 8px' },
-      el('h3', { style: 'margin:0' }, 'In-progress run', '  ', el('span', { class: 'badge hold' }, 'Not yet submitted')),
+      el('h3', { style: 'margin:0' }, mono(d.processingLot), '  ', el('span', { class: 'badge hold' }, 'Not yet submitted')),
       el('div', { class: 'actions' },
         el('button', { onclick: () => openRun(d) }, 'Resume'),
         el('button', { class: 'danger', onclick: () => discardDraft(d) }, 'Discard'))),
@@ -477,29 +591,39 @@ function editHistoryBlock(edits) {
       el('td', {}, e.field), el('td', { class: 'muted' }, e.old || '—'), el('td', {}, el('b', {}, e.new || '—'))))))));
   return wrap;
 }
-function fmtWhen(iso) { if (!iso) return '—'; return iso.replace('T', ' ').replace('Z', '').slice(0, 16); }
+// Every timestamp we display is stamped in UTC (now_iso() / Date#toISOString())
+// — render it in Pacific time (DST-aware) rather than showing raw UTC, which
+// otherwise reads 7-8 hrs ahead of the plant's actual local time.
+const DISPLAY_TZ = 'America/Vancouver';
+function fmtWhen(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso.replace('T', ' ').replace('Z', '').slice(0, 16);
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: DISPLAY_TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+  }).formatToParts(d);
+  const get = t => (parts.find(p => p.type === t) || {}).value;
+  return get('year') + '-' + get('month') + '-' + get('day') + ' ' + get('hour') + ':' + get('minute');
+}
 async function editRun(run) {
-  const locs = State.ref.locations.map(l => [l, l]);
   const operatorsSelect = buildOperatorsSelect(run.operators || '');
   const body = el('div', {},
     el('div', { class: 'summary-line' }, sl('Processing lot', run.processingLot), sl('SKU', skuName(run.sku)),
+      sl('Target TDS', run.targetTds != null ? run.targetTds + '%' : '—'),
       el('span', { class: 'muted' }, 'Totes consumed & packaged output are fixed; correct the run details below.')),
     el('div', { class: 'form-row' },
       field('Run date', el('input', { type: 'date', id: 'e_date', value: run.runDate || todayStr() })),
-      field('Target TDS (%)', el('input', { type: 'number', step: '0.1', id: 'e_tds', value: run.targetTds ?? '' }))),
+      field('Citric acid (kg)', el('input', { type: 'number', step: '0.1', id: 'e_citric', value: run.citricKg ?? 0 }))),
     el('div', { class: 'form-row' },
-      field('Citric acid (kg)', el('input', { type: 'number', step: '0.1', id: 'e_citric', value: run.citricKg ?? 0 })),
-      field('Potassium sorbate (kg)', el('input', { type: 'number', step: '0.1', id: 'e_sorbate', value: run.sorbateKg ?? 0 }))),
-    el('div', { class: 'form-row' },
-      field('Location', editableSelect(locs, 'e_loc')),
-      field('Operators', operatorsSelect.el)),
+      field('Potassium sorbate (kg)', el('input', { type: 'number', step: '0.1', id: 'e_sorbate', value: run.sorbateKg ?? 0 })),
+      field('Production Location', productionLocationSelect('e_loc', run.location))),
+    field('Operators', operatorsSelect.el),
     field('Notes', el('textarea', { id: 'e_notes', rows: '2' }, run.notes || '')),
     el('div', { class: 'help' }, 'Changing citric / sorbate adjusts consumable stock by the difference. Every change is logged with your name.'));
-  body.querySelector('#e_loc').value = run.location || '';
   modal('Edit run — ' + run.processingLot, body, async () => {
     const r = await api('PUT', '/production/' + run.id, {
       runDate: body.querySelector('#e_date').value,
-      targetTds: body.querySelector('#e_tds').value || null,
       citricKg: body.querySelector('#e_citric').value || 0,
       sorbateKg: body.querySelector('#e_sorbate').value || 0,
       location: body.querySelector('#e_loc').value,
@@ -962,7 +1086,7 @@ const STAGE_DEFS = {
   homogenization: { key: 'homogenization', title: 'Homogenization', fields: [
     ['startedAt', 'Started at', 'dt'], ['rinsingWaterL', 'Rinsing water (L)', 'num'],
     ['slurryL', 'Slurry (L)', 'num'], ['dilutionWaterL', 'Dilution water (L)', 'num'],
-    ['citricKg', 'Citric acid added (kg)', 'num'], ['outputL', 'Output (L)', 'num']] },
+    ['outputL', 'Output (L)', 'num']] },
   extraction: { key: 'extraction', title: 'Extraction', fields: [
     ['startedAt', 'Started at', 'dt'], ['amplitudePct', 'Amplitude (%)', 'num'],
     ['flowrateLpm', 'Flow rate (L/min)', 'num'], ['pressurePsi', 'Pressure (psi)', 'num'],
@@ -1042,43 +1166,57 @@ const REF_OPERATORS = [
   { last: 'Martin', first: 'Sean', initials: 'SM' },
   { last: 'Claxton', first: 'Adam', initials: 'AC' },
   { last: 'Ismael', first: 'Imronn', initials: 'II' },
+  { last: 'Clark', first: 'Jared', initials: 'JC' },
 ];
-// Multi-select operator picker (a run usually has more than one) built on the
-// same floating-panel pattern as the QC sample-location dropdown. Stores/reads
-// a comma-separated string of initials (+ any free-text "Other" names) so it
-// round-trips through the existing `operators` text column unchanged.
-function buildOperatorsSelect(initialValue) {
+// Facilities a production run can be logged at. Only one today (Port Edward),
+// kept as its own list — separate from the general warehouse/tote `locations`
+// reference data — so more facilities can be added here later without
+// touching storage-location pickers elsewhere in the app.
+const PRODUCTION_LOCATIONS = ['Port Edward Facility'];
+function productionLocationSelect(id, currentValue) {
+  const sel = selectFrom('', PRODUCTION_LOCATIONS.map(l => [l, l]), null, id);
+  sel.value = PRODUCTION_LOCATIONS.includes(currentValue) ? currentValue : PRODUCTION_LOCATIONS[0];
+  return sel;
+}
+// Generic multi-select checkbox dropdown (Operators, Odour, ...): a floating
+// panel of checkboxes plus a free-text "Other" field, all folded into one
+// comma-joined value so it round-trips through a single existing text column
+// unchanged. `items` is [{value, label, aliases}] — aliases are the lowercase
+// strings an existing comma-joined value may match against, so old data
+// (e.g. a bare initials or a full odour name) keeps parsing correctly.
+function buildMultiSelectDropdown(items, initialValue, opts) {
+  opts = opts || {};
   const known = new Set();
   let otherText = '';
   (initialValue || '').split(',').map(s => s.trim()).filter(Boolean).forEach(tok => {
-    const match = REF_OPERATORS.find(o => o.initials.toLowerCase() === tok.toLowerCase()
-      || (o.first + ' ' + o.last).toLowerCase() === tok.toLowerCase() || o.last.toLowerCase() === tok.toLowerCase());
-    if (match) known.add(match.initials); else otherText = otherText ? otherText + ', ' + tok : tok;
+    const low = tok.toLowerCase();
+    const match = items.find(it => (it.aliases || [it.value.toLowerCase()]).includes(low));
+    if (match) known.add(match.value); else otherText = otherText ? otherText + ', ' + tok : tok;
   });
   const btn = el('button', { type: 'button', class: 'qc-loc-select-btn' });
   const panel = el('div', { class: 'qc-loc-panel hidden' });
   const wrap = el('div', { class: 'qc-loc-select' }, btn, panel);
-  const otherInput = el('input', { placeholder: 'Other operator name(s)', value: otherText });
+  const otherInput = el('input', { placeholder: opts.otherPlaceholder || 'Other', value: otherText });
   function currentValue() {
-    const parts = REF_OPERATORS.filter(o => known.has(o.initials)).map(o => o.initials);
+    const parts = items.filter(it => known.has(it.value)).map(it => it.value);
     if (otherInput.value.trim()) parts.push(otherInput.value.trim());
     return parts.join(', ');
   }
   function renderBtn() {
     btn.innerHTML = '';
-    btn.append(el('span', {}, currentValue() || 'Select operators…'), el('span', { class: 'qc-loc-caret' }, '▾'));
+    btn.append(el('span', {}, currentValue() || opts.placeholder || 'Select…'), el('span', { class: 'qc-loc-caret' }, '▾'));
   }
   function onDocClick(e) { if (!wrap.contains(e.target)) close(); }
   function open() {
     panel.innerHTML = '';
-    REF_OPERATORS.forEach(o => {
+    items.forEach(it => {
       const cb = el('input', { type: 'checkbox', style: 'width:auto;flex:none' });
-      cb.checked = known.has(o.initials);
-      cb.addEventListener('change', () => { cb.checked ? known.add(o.initials) : known.delete(o.initials); renderBtn(); });
+      cb.checked = known.has(it.value);
+      cb.addEventListener('change', () => { cb.checked ? known.add(it.value) : known.delete(it.value); renderBtn(); });
       panel.append(el('label', { class: 'qc-loc-option', style: 'display:flex;align-items:center;gap:8px;cursor:pointer' },
-        cb, o.first + ' ' + o.last + ' (' + o.initials + ')'));
+        cb, it.label));
     });
-    panel.append(el('div', { class: 'qc-loc-option' }, field('Other', otherInput)));
+    panel.append(el('div', { class: 'qc-loc-option' }, field(opts.otherFieldLabel || 'Other', otherInput)));
     panel.classList.remove('hidden');
     document.addEventListener('click', onDocClick, true);
   }
@@ -1088,14 +1226,26 @@ function buildOperatorsSelect(initialValue) {
   renderBtn();
   return { el: wrap, get value() { return currentValue(); } };
 }
+// Multi-select operator picker (a run usually has more than one). Stores/reads
+// a comma-separated string of initials (+ any free-text "Other" names) so it
+// round-trips through the existing `operators` text column unchanged.
+function buildOperatorsSelect(initialValue) {
+  const items = REF_OPERATORS.map(o => ({
+    value: o.initials, label: o.first + ' ' + o.last + ' (' + o.initials + ')',
+    aliases: [o.initials.toLowerCase(), (o.first + ' ' + o.last).toLowerCase(), o.last.toLowerCase()]
+  }));
+  return buildMultiSelectDropdown(items, initialValue,
+    { placeholder: 'Select operators…', otherPlaceholder: 'Other operator name(s)' });
+}
 
 // One tote's receiving-inspection card: photos, pH/ORP/odour readings and an
 // accept/reject decision. `mode: 'draft'` keeps edits in memory (bundled into
 // the outer save/finalize payload); `mode: 'completed'` saves immediately via
 // its own Save button, since the run may already be finalized.
 function buildFeedstockCard(opts) {
-  const v = Object.assign({ loadedAt: '', ph: null, phMeasuredAt: null, orp: null, orpRange: '', odour: '', odourOther: '',
-    odourIntensity: '', decision: 'accepted', rejectionReason: '', notes: '',
+  const v = Object.assign({ loadedAt: '', ph: null, phMeasuredAt: null, orp: null, orpRange: '', odour: '',
+    odourIntensity: '', weightKg: null, volumeL: null, densityKgL: null,
+    decision: 'accepted', rejectionReason: '', notes: '',
     surfacePhotoId: null, striationPhotoId: null }, opts.initial || {});
 
   const loadedAt = el('input', { type: 'datetime-local', value: v.loadedAt ? v.loadedAt.replace('Z', '').slice(0, 16) : '' });
@@ -1108,11 +1258,19 @@ function buildFeedstockCard(opts) {
   if (v.orp != null) orpInp.value = formatQcValue(v.orp, 0);
   // Calculated from REF_ORP_classification.pdf — never typed by hand.
   const orpRangeNote = el('span', { class: 'help' }, v.orpRange || classifyOrp(v.orp) || 'Enter ORP to classify');
-  const odourSel = el('select', {}, ...REF_ODOURS.map(o => el('option', { value: o }, o)));
-  odourSel.value = REF_ODOURS.includes(v.odour) ? v.odour : (v.odour ? 'Other' : REF_ODOURS[0]);
-  const odourOtherInp = el('input', { placeholder: 'Odour (other)', value: v.odourOther || (odourSel.value === 'Other' && v.odour && !REF_ODOURS.includes(v.odour) ? v.odour : '') });
-  const odourOtherField = field('Odour (other)', odourOtherInp);
-  odourOtherField.classList.toggle('hidden', odourSel.value !== 'Other');
+  const weightInp = el('input', { inputmode: 'decimal', placeholder: 'kg' }); attachNumericMask(weightInp, 1);
+  if (v.weightKg != null) weightInp.value = formatQcValue(v.weightKg, 1);
+  const volumeInp = el('input', { inputmode: 'decimal', placeholder: 'L' }); attachNumericMask(volumeInp, 1);
+  if (v.volumeL != null) volumeInp.value = formatQcValue(v.volumeL, 1);
+  function calcDensity() {
+    const w = weightInp.value.trim() === '' ? null : qcParseValue(weightInp.value);
+    const vol = volumeInp.value.trim() === '' ? null : qcParseValue(volumeInp.value);
+    return (w != null && vol) ? Math.round((w / vol) * 1000) / 1000 : null;
+  }
+  const densityNote = el('span', { class: 'help' }, v.densityKgL != null ? formatQcValue(v.densityKgL, 3) + ' kg/L' : 'Enter weight & volume to calculate');
+  const odourMultiSelect = buildMultiSelectDropdown(
+    REF_ODOURS.filter(o => o !== 'Other').map(o => ({ value: o, label: o })), v.odour,
+    { placeholder: 'Select odour(s)…', otherPlaceholder: 'Other odour', otherFieldLabel: 'Other odour' });
   const intensitySel = el('select', {}, ...ODOUR_INTENSITIES.map(i => el('option', { value: i }, i || '—')));
   intensitySel.value = v.odourIntensity || '';
   const decisionSel = el('select', {}, el('option', { value: 'accepted' }, 'Accepted'), el('option', { value: 'rejected' }, 'Rejected'));
@@ -1129,8 +1287,10 @@ function buildFeedstockCard(opts) {
       phMeasuredAt: v.phMeasuredAt,
       orp: orpInp.value.trim() === '' ? null : qcParseValue(orpInp.value),
       orpRange: classifyOrp(orpInp.value.trim() === '' ? null : qcParseValue(orpInp.value)),
-      odour: odourSel.value,
-      odourOther: odourSel.value === 'Other' ? (odourOtherInp.value.trim() || null) : null,
+      weightKg: weightInp.value.trim() === '' ? null : qcParseValue(weightInp.value),
+      volumeL: volumeInp.value.trim() === '' ? null : qcParseValue(volumeInp.value),
+      densityKgL: calcDensity(),
+      odour: odourMultiSelect.value || null,
       odourIntensity: intensitySel.value || null,
       decision: decisionSel.value,
       rejectionReason: reasonInp.value.trim() || null,
@@ -1148,9 +1308,13 @@ function buildFeedstockCard(opts) {
     orpRangeNote.textContent = classifyOrp(orpInp.value.trim() === '' ? null : qcParseValue(orpInp.value)) || 'Enter ORP to classify';
   });
   orpInp.addEventListener('change', notifyChange);
-  odourSel.addEventListener('change', () => { odourOtherField.classList.toggle('hidden', odourSel.value !== 'Other'); notifyChange(); });
+  [weightInp, volumeInp].forEach(inp => inp.addEventListener('input', () => {
+    const d = calcDensity();
+    densityNote.textContent = d != null ? formatQcValue(d, 3) + ' kg/L' : 'Enter weight & volume to calculate';
+  }));
+  odourMultiSelect.el.addEventListener('change', notifyChange);
   decisionSel.addEventListener('change', () => { reasonField.classList.toggle('hidden', decisionSel.value !== 'rejected'); notifyChange(); });
-  [loadedAt, odourOtherInp, intensitySel, notesInp]
+  [loadedAt, weightInp, volumeInp, intensitySel, notesInp]
     .forEach(inp => inp.addEventListener('change', notifyChange));
 
   function photoSlot(slotKey, label) {
@@ -1188,13 +1352,15 @@ function buildFeedstockCard(opts) {
   const fieldsRow = el('div', { class: 'form-row' },
     field('Loaded at', loadedAt), field('pH', el('div', {}, phInp, phMeasuredNote)),
     field('ORP (mV)', orpInp), field('ORP meter range (calculated)', orpRangeNote),
-    field('Odour', odourSel), odourOtherField,
+    field('Weight (kg)', weightInp), field('Volume (L)', volumeInp),
+    field('Density (calculated)', densityNote),
+    field('Odour', odourMultiSelect.el),
     field('Odour intensity', intensitySel), field('Decision', decisionSel));
   const bodyEls = [fieldsRow, reasonField, field('Notes', notesInp),
     el('div', { style: 'display:flex;gap:14px;flex-wrap:wrap;margin-top:8px' },
       photoSlot('surfacePhotoId', 'Surface photo'), photoSlot('striationPhotoId', 'Settling / striation photo'))];
 
-  if (opts.mode === 'completed') {
+  if (opts.onSave) {
     const status = el('span', { class: 'help' });
     const saveBtn = el('button', {
       type: 'button', class: 'secondary', onclick: async () => {
@@ -1209,46 +1375,6 @@ function buildFeedstockCard(opts) {
   return el('details', { class: 'accordion feedstock-tote' },
     el('summary', {}, opts.label + (v.decision === 'rejected' ? '  ⚠ Rejected' : '')),
     el('div', { class: 'accordion-body' }, ...bodyEls));
-}
-
-// Totes inspected but never selected for the run (e.g. "rejected and discarded
-// due to smell") — a small audit list, independent of tote_lots inventory.
-function buildRejectedFeedstockSection(initialItems, getRunId) {
-  let items = (initialItems || []).slice();
-  const listHost = el('div', {});
-  const toteInp = el('input', { placeholder: 'Tote lot #' });
-  const reasonInp = el('input', { placeholder: 'Reason (e.g. smell)' });
-  const status = el('div', { class: 'help' });
-  function draw() {
-    listHost.innerHTML = '';
-    if (!items.length) { listHost.append(el('div', { class: 'help' }, 'None recorded.')); return; }
-    listHost.append(table(['Tote lot', 'Reason', 'When', ''], items.map((it, i) => [
-      el('span', { class: 'mono' }, it.toteLot), it.reason, fmtWhen(it.at),
-      rowActions([['Remove', () => remove(i), 'danger']])
-    ]), [false, false, false, false]));
-  }
-  async function persist() {
-    status.textContent = 'Saving…';
-    try {
-      const rid = await getRunId();
-      const r = await api('PUT', '/production/' + rid + '/rejected-feedstock', { items });
-      items = r.run.rejectedFeedstock || [];
-      status.textContent = '';
-    } catch (e) { status.textContent = e.message; }
-    draw();
-  }
-  async function add() {
-    const toteLot = toteInp.value.trim(), reason = reasonInp.value.trim();
-    if (!toteLot || !reason) { status.textContent = 'Enter both a tote lot and a reason.'; return; }
-    items.push({ toteLot, reason, at: new Date().toISOString() });
-    toteInp.value = ''; reasonInp.value = '';
-    await persist();
-  }
-  async function remove(i) { items.splice(i, 1); await persist(); }
-  draw();
-  return el('div', {}, listHost,
-    el('div', { class: 'form-row', style: 'margin-top:8px' }, field('Tote lot #', toteInp), field('Reason', reasonInp)),
-    el('button', { type: 'button', class: 'secondary', onclick: add }, '+ Add'), status);
 }
 
 // Separation solids: a run may have several collections (e.g. multiple passes).
@@ -1397,14 +1523,74 @@ function buildDilutionsSection(initial, getRunId) {
   return el('div', {}, listHost, addBtn, status);
 }
 
+// Step 1 of creating a run: Initiation only. Every field but Notes is
+// required — submitting reserves the run's permanent PR-... code (via the
+// same draft-creation endpoint used for "Save & close" later) and hands off
+// to openRun() for everything else, which only becomes reachable once a run
+// actually exists.
+async function openNewRun() {
+  const skus = State.ref.skus.filter(s => s.active);
+  const skuSel = selectFrom('', [['', 'Select a SKU…'], ...skus.map(s => [s.code, s.name])], () => renderSpecPanel(), 'nr_sku');
+  const specPanel = el('div', { class: 'summary-line' });
+  function renderSpecPanel() {
+    const s = skus.find(x => x.code === skuSel.value);
+    specPanel.innerHTML = '';
+    if (!s) { specPanel.append(el('span', { class: 'muted' }, 'Select a SKU to see its spec.')); return; }
+    specPanel.append(
+      sl('Species', (s.species || []).map(speciesName).join(' & ') || '—'),
+      sl('Target TDS', s.tdsTarget != null ? s.tdsTarget + '%' : '—'),
+      sl('Target pH', s.phTarget ?? '—'),
+      sl('Ksorbate (w/v)', s.ksorbateTarget != null ? (s.ksorbateTarget * 100).toFixed(2) + '%' : '—'),
+      sl('Nabenzoate (w/v)', s.nabenzoateTarget != null ? (s.nabenzoateTarget * 100).toFixed(2) + '%' : '—'));
+  }
+  renderSpecPanel();
+  const dateInp = el('input', { type: 'date', id: 'nr_date', value: new Date().toISOString().slice(0, 10) });
+  const locSel = productionLocationSelect('nr_loc');
+  const operatorsSelect = buildOperatorsSelect('');
+  const body = el('div', {},
+    el('div', { class: 'form-row' },
+      field('Product SKU (required)', skuSel),
+      field('Run date (required)', dateInp)),
+    specPanel,
+    el('div', { class: 'form-row', style: 'margin-top:8px' },
+      field('Production Location (required)', locSel),
+      field('Operators (required)', operatorsSelect.el)),
+    field('Notes', el('textarea', { id: 'nr_notes', rows: '2', placeholder: 'Optional batch notes' })),
+    el('div', { class: 'help' },
+      'Feedstock, process stages and packaging open up once the run is created and a run code is assigned.'));
+  modal('New production run', body, async () => {
+    if (!skuSel.value) throw new Error('Choose a product SKU.');
+    if (!dateInp.value) throw new Error('Enter a run date.');
+    if (!locSel.value) throw new Error('Choose a production location.');
+    if (!operatorsSelect.value.trim()) throw new Error('Select at least one operator.');
+    const r = await api('POST', '/production/drafts', {
+      sku: skuSel.value, runDate: dateInp.value, location: locSel.value,
+      operators: operatorsSelect.value, notes: body.querySelector('#nr_notes').value,
+      toteIds: [], packages: [], feedstockDetails: {}
+    });
+    toast('Run ' + r.run.processingLot + ' created.');
+    openRun(r.run);
+  }, 'Create run');
+}
 async function openRun(draftSummary) {
   // Re-fetch a resumed draft in full (list snapshots omit stage/solids/dilution detail).
   const draft = (draftSummary && draftSummary.id) ? (await api('GET', '/production/drafts/' + draftSummary.id)).run : draftSummary;
   const totes = (await api('GET', '/totes?status=in_stock')).totes;
-  const skus = State.ref.skus;
-  const locs = State.ref.locations.map(l => [l, l]);
-  const skuSel = selectFrom('', skus.map(s => [s.code, s.name]), () => filterTotes(), 'r_sku');
+  const skus = State.ref.skus.filter(s => s.active);
+  const skuSel = selectFrom('', skus.map(s => [s.code, s.name]), () => { filterTotes(); renderSpecPanel(); }, 'r_sku');
   if (draft && draft.sku) skuSel.value = draft.sku;
+  const specPanel = el('div', { class: 'summary-line' });
+  function renderSpecPanel() {
+    const s = skus.find(x => x.code === skuSel.value);
+    specPanel.innerHTML = '';
+    if (!s) { specPanel.append(el('span', { class: 'muted' }, 'Select a SKU to see its spec.')); return; }
+    specPanel.append(
+      sl('Species', (s.species || []).map(speciesName).join(' & ') || '—'),
+      sl('Target TDS', s.tdsTarget != null ? s.tdsTarget + '%' : '—'),
+      sl('Target pH', s.phTarget ?? '—'),
+      sl('Ksorbate (w/v)', s.ksorbateTarget != null ? (s.ksorbateTarget * 100).toFixed(2) + '%' : '—'),
+      sl('Nabenzoate (w/v)', s.nabenzoateTarget != null ? (s.nabenzoateTarget * 100).toFixed(2) + '%' : '—'));
+  }
   const search = el('input', { placeholder: 'Filter totes…', oninput: () => filterTotes() });
   const pickHost = el('div', { class: 'tote-pick' });
   const summary = el('div', { class: 'summary-line' });
@@ -1430,10 +1616,12 @@ async function openRun(draftSummary) {
     return draftId;
   }
 
-  function speciesOfSku() { const s = skus.find(x => x.code === skuSel.value); return s ? s.species : null; }
+  function speciesOfSku() { const s = skus.find(x => x.code === skuSel.value); return s ? s.species : []; }
   function filterTotes() {
     const sp = speciesOfSku(), q = search.value.toLowerCase();
-    const rows = totes.filter(t => (!sp || t.species === sp) && (!q || (t.lot + ' ' + (t.location || '')).toLowerCase().includes(q)));
+    // Rejected totes are relocated to QAQC Hold and aren't available for a new run.
+    const rows = totes.filter(t => t.location !== 'QAQC Hold' &&
+      (!sp.length || sp.includes(t.species)) && (!q || (t.lot + ' ' + (t.location || '')).toLowerCase().includes(q)));
     pickHost.innerHTML = '';
     const tbl = el('table', {},
       el('thead', {}, el('tr', {}, el('th', { class: 'checkcol' }, ''), el('th', {}, 'Lot'), el('th', {}, 'Site'), el('th', { class: 'num' }, 'Avg kg'), el('th', {}, 'pH'), el('th', {}, 'Location'))));
@@ -1449,10 +1637,8 @@ async function openRun(draftSummary) {
   function recompute() {
     const chosen = totes.filter(t => selected.has(t.id));
     const inputKg = chosen.reduce((a, b) => a + (b.avgWeightKg || 0), 0);
-    let outL = 0; for (const sz in pkgInputs) outL += (State.ref.packageSizes[sz] || 0) * (+pkgInputs[sz].value || 0);
     summary.innerHTML = '';
-    summary.append(sl('Totes', chosen.length), sl('Input', fmt(inputKg, 1) + ' kg'),
-      sl('Output', fmt(outL, 0) + ' L'), sl('Conversion factor', inputKg ? (outL / inputKg).toFixed(2) + ' L/kg' : '—'));
+    summary.append(sl('Totes', chosen.length), sl('Input', fmt(inputKg, 1) + ' kg'));
   }
   // Rebuilt only when tote selection changes (not on every keystroke elsewhere
   // in the modal) so in-progress typing inside a tote's card is never wiped.
@@ -1466,6 +1652,26 @@ async function openRun(draftSummary) {
         initial: feedstockState[t.id],
         mode: 'draft',
         onChange: vals => { feedstockState[t.id] = vals; },
+        // Locks this tote's characterization in immediately instead of only
+        // bundling it into the next draft save/finalize. A rejected tote is
+        // pulled out of the run right away: it drops out of both the picker
+        // and this list, and everything captured for it (plus any photos)
+        // lands in the tote's own Feedstock Stability log instead, since it
+        // won't have a run_inputs row to carry that data once it's gone.
+        onSave: async vals => {
+          feedstockState[t.id] = vals;
+          const rid = await ensureRunId();
+          const r = await api('POST', '/production/' + rid + '/feedstock/' + t.id + '/save', vals);
+          if (r.rejected) {
+            selected.delete(t.id);
+            delete feedstockState[t.id];
+            const idx = totes.findIndex(x => x.id === t.id);
+            if (idx !== -1) totes[idx] = Object.assign({}, totes[idx], { location: 'QAQC Hold', status: 'hold' });
+            toast(t.lot + ' rejected — moved to QAQC Hold and removed from this run.');
+            filterTotes();
+            renderFeedstockCards();
+          }
+        },
         uploadPhoto: async (slot, file, b64) => {
           const rid = await ensureRunId();
           const r = await api('POST', '/production/' + rid + '/feedstock-photo',
@@ -1477,7 +1683,6 @@ async function openRun(draftSummary) {
     }
   }
 
-  const rejectedHost = buildRejectedFeedstockSection(draft?.rejectedFeedstock || [], ensureRunId);
   const stages = draft?.stages || {};
   const homogSection = buildStageSection(ensureRunId, STAGE_DEFS.homogenization, stages.homogenization);
   const extractionSection = buildStageSection(ensureRunId, STAGE_DEFS.extraction, stages.extraction);
@@ -1500,20 +1705,22 @@ async function openRun(draftSummary) {
   }, 'Save timestamp');
 
   const body = el('div', {},
-    el('details', { class: 'accordion', open: '' }, el('summary', {}, 'Initiation'),
+    draft ? el('div', { class: 'summary-line', style: 'margin-bottom:10px' },
+      sl('Run code', mono(draft.processingLot)), sl('SKU', skuName(draft.sku))) : null,
+    el('details', { class: 'accordion' }, el('summary', {}, 'Initiation'),
       el('div', { class: 'accordion-body' },
-        el('div', { class: 'form-row' }, field('Finished-good SKU', skuSel),
-          field('Target TDS (%)', el('input', { type: 'number', step: '0.1', id: 'r_tds', placeholder: 'e.g. 4.0', value: draft?.targetTds ?? '' }))),
         el('div', { class: 'form-row' },
-          field('Run date', el('input', { type: 'date', id: 'r_date', value: draft?.runDate || new Date().toISOString().slice(0, 10) })),
-          field('Location', editableSelect(locs, 'r_loc'))),
-        field('Operators', operatorsSelect.el),
+          field('Product SKU', skuSel),
+          field('Run date', el('input', { type: 'date', id: 'r_date', value: draft?.runDate || new Date().toISOString().slice(0, 10) }))),
+        specPanel,
+        el('div', { class: 'form-row', style: 'margin-top:8px' },
+          field('Production Location', productionLocationSelect('r_loc', draft?.location)),
+          field('Operators', operatorsSelect.el)),
         field('Notes', el('textarea', { id: 'r_notes', rows: '2', placeholder: 'Optional batch notes' }, draft?.notes || '')))),
     el('details', { class: 'accordion', open: '' }, el('summary', {}, 'Feedstock'),
       el('div', { class: 'accordion-body' },
         field('Select stabilized totes to process', search), pickHost, summary,
-        el('h4', { style: 'margin:14px 0 4px;font-size:13px' }, 'Feedstock characterization'), feedstockHost,
-        el('h4', { style: 'margin:14px 0 4px;font-size:13px' }, 'Rejected feedstock (inspected, not used)'), rejectedHost)),
+        el('h4', { style: 'margin:14px 0 4px;font-size:13px' }, 'Feedstock characterization'), feedstockHost)),
     homogSection, extractionSection,
     el('details', { class: 'accordion' }, el('summary', {}, 'Separation'),
       el('div', { class: 'accordion-body' }, separationParams,
@@ -1529,14 +1736,14 @@ async function openRun(draftSummary) {
           field('Potassium sorbate (kg)', el('input', { type: 'number', step: '0.1', min: '0', id: 'r_sorbate', value: draft?.sorbateKg ?? 0 }))),
         field('Packaging started at', packagingStartedInp),
         el('div', { style: 'margin-top:6px' }, packagingSaveBtn, packagingStatus))));
-  body.querySelector('#r_loc').value = draft?.location || '';
   filterTotes();
   renderFeedstockCards();
+  renderSpecPanel();
 
   function buildPayload() {
     const packages = Object.keys(pkgInputs).map(sz => ({ size: sz, qty: +pkgInputs[sz].value || 0 })).filter(p => p.qty > 0);
     return {
-      sku: skuSel.value, toteIds: [...selected], targetTds: body.querySelector('#r_tds').value || null,
+      sku: skuSel.value, toteIds: [...selected],
       citricKg: +body.querySelector('#r_citric').value || 0, sorbateKg: +body.querySelector('#r_sorbate').value || 0,
       runDate: body.querySelector('#r_date').value, location: body.querySelector('#r_loc').value,
       operators: operatorsSelect.value,
@@ -1562,7 +1769,7 @@ async function openRun(draftSummary) {
     toast(`Run ${r.processingLot}: ${fmt(r.inputKg, 0)} kg → ${fmt(r.outputLitres, 0)} L`);
     render();
   }
-  modal(draft ? 'Resume production run' : 'New production run', body, finalizeRun, 'Create run',
+  modal(draft ? 'Production run — ' + draft.processingLot : 'New production run', body, finalizeRun, 'Finalize run',
     { extraLabel: 'Save & close', onExtra: saveDraft, wide: true });
 }
 
@@ -1591,7 +1798,6 @@ async function openProcessLog(run) {
   if (!run.inputs || !run.inputs.length) feedstockHost.append(el('div', { class: 'help' }, 'No feedstock characterization recorded.'));
 
   const getRunId = async () => run.id;
-  const rejectedHost = buildRejectedFeedstockSection(run.rejectedFeedstock || [], getRunId);
   const homogSection = buildStageSection(getRunId, STAGE_DEFS.homogenization, stages.homogenization);
   const extractionSection = buildStageSection(getRunId, STAGE_DEFS.extraction, stages.extraction);
   const separationParams = buildStageSection(getRunId, STAGE_DEFS.separation, stages.separation, true);
@@ -1613,8 +1819,7 @@ async function openProcessLog(run) {
     el('div', { class: 'summary-line' }, sl('Run', run.processingLot), sl('SKU', skuName(run.sku)),
       el('span', { class: 'muted' }, 'Each section saves independently and can be filled in or corrected any time.')),
     el('details', { class: 'accordion', open: '' }, el('summary', {}, 'Feedstock characterization'),
-      el('div', { class: 'accordion-body' }, feedstockHost,
-        el('h4', { style: 'margin:14px 0 4px;font-size:13px' }, 'Rejected feedstock (inspected, not used)'), rejectedHost)),
+      el('div', { class: 'accordion-body' }, feedstockHost)),
     homogSection, extractionSection,
     el('details', { class: 'accordion' }, el('summary', {}, 'Separation'),
       el('div', { class: 'accordion-body' }, separationParams,
@@ -2352,7 +2557,9 @@ function changePasswordModal(forced) {
 /* ---------------- Admin ---------------- */
 async function pageAdmin(v) {
   v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Admin — Users'),
-    el('div', { class: 'actions' }, el('button', { onclick: addUser }, '+ Add user'))));
+    el('div', { class: 'actions' },
+      el('button', { class: 'secondary', onclick: downloadDbBackup }, '⬇ Download database backup'),
+      el('button', { onclick: addUser }, '+ Add user'))));
   const r = await api('GET', '/users');
   v.append(table(
     ['Name', 'Email', 'Role', 'Status', 'Actions'],
@@ -2368,6 +2575,17 @@ async function pageAdmin(v) {
     ]), [false, false, false, false, false]));
   v.append(el('div', { class: 'help', style: 'margin-top:10px' },
     'New users and password resets require the person to set a new password on next sign-in.'));
+}
+// Downloads a full, consistent snapshot of the live database (sqlite3's
+// backup API server-side, not a raw file copy) straight to the browser —
+// an off-server copy, since a backup sitting on the same disk as the
+// original doesn't help if that disk is lost.
+function downloadDbBackup() {
+  const ts = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+  const url = '/api/admin/backup?token=' + encodeURIComponent(State.token);
+  const a = el('a', { href: url, download: 'kelpworks-backup-' + ts + '.db' });
+  document.body.append(a); a.click(); a.remove();
+  toast('Backup downloading…');
 }
 function addUser() {
   const body = el('div', {},
