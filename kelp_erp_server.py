@@ -132,9 +132,15 @@ CREATE TABLE IF NOT EXISTS tote_lots (
     avg_weight_kg REAL,                   -- batch total kg / tote count
     location      TEXT,
     description   TEXT,
-    status        TEXT NOT NULL DEFAULT 'in_stock',  -- in_stock | consumed | disposed
+    status        TEXT NOT NULL DEFAULT 'in_stock',  -- in_stock | hold | consumed | disposed
     run_id        INTEGER REFERENCES production_runs(id),
     disposed_date TEXT,                   -- date written off (NULL unless disposed)
+    stabilization_method TEXT DEFAULT 'Citric acid',  -- Citric acid | Fresh
+    storage_unit         TEXT DEFAULT 'Tote',         -- Tote | Bag
+    storage_source       TEXT,   -- where the empty storage unit came from (consumable name, or e.g. "Burlap sack")
+    orp                   REAL,  -- current ORP (mV) reading
+    orp_updated           TEXT,  -- date the ORP reading was last logged
+    notes                 TEXT,  -- free-text operator notes (separate from the auto-generated description)
     created_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tote_status ON tote_lots(status);
@@ -149,6 +155,21 @@ CREATE TABLE IF NOT EXISTS tote_ph_log (
     created_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_phlog_tote ON tote_ph_log(tote_lot_id);
+
+-- Feedstock Stability log: one row per changed field on a tote (pH, weight,
+-- location, status, ...), who changed it and when. Supersedes tote_ph_log
+-- (kept, unused, for any history already in it) as the single audit trail.
+CREATE TABLE IF NOT EXISTS tote_stability_log (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    tote_lot_id   INTEGER NOT NULL REFERENCES tote_lots(id) ON DELETE CASCADE,
+    user_name     TEXT,
+    field         TEXT NOT NULL,
+    old_value     TEXT,
+    new_value     TEXT,
+    note          TEXT,
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_stability_tote ON tote_stability_log(tote_lot_id);
 
 -- Location move history for totes and finished-goods lots.
 CREATE TABLE IF NOT EXISTS location_moves (
@@ -286,9 +307,21 @@ CREATE TABLE IF NOT EXISTS consumable_txns (
 );
 
 CREATE TABLE IF NOT EXISTS fg_skus (
-    code         TEXT PRIMARY KEY,        -- SACC-LKE, MACRO-LKE
-    name         TEXT NOT NULL,
-    species_code TEXT REFERENCES species(code)
+    code               TEXT PRIMARY KEY,        -- SACC-LKE, MACRO-LKE
+    name               TEXT NOT NULL,
+    species_code       TEXT REFERENCES species(code),  -- legacy single-species FK, unused
+    tds_target         REAL,   -- product spec: target TDS (%)
+    ph_target          REAL,   -- product spec: target pH
+    ksorbate_target    REAL,   -- product spec: potassium sorbate (w/v)
+    nabenzoate_target  REAL,   -- product spec: sodium benzoate (w/v)
+    active             INTEGER NOT NULL DEFAULT 1  -- offered in the picker?
+);
+
+-- Many-to-many: a SKU may draw from more than one species (e.g. a blend).
+CREATE TABLE IF NOT EXISTS fg_sku_species (
+    sku_code     TEXT NOT NULL REFERENCES fg_skus(code),
+    species_code TEXT NOT NULL REFERENCES species(code),
+    PRIMARY KEY (sku_code, species_code)
 );
 
 -- Production runs: stabilized totes -> diluted, preserved LKE.
@@ -350,9 +383,12 @@ CREATE TABLE IF NOT EXISTS run_inputs (
     ph_measured_at   TEXT,      -- client-stamped moment the pH reading was entered
     orp              REAL,      -- mV
     orp_range        TEXT,      -- ORP classification, calculated from REF_ORP_classification
-    odour            TEXT,
+    odour            TEXT,      -- comma-joined; multiple odours may be selected
     odour_other      TEXT,
     odour_intensity  TEXT,      -- Mild | Medium | Strong
+    weight_kg        REAL,      -- this tote's weight as measured for this run
+    volume_l         REAL,      -- this tote's volume as measured for this run
+    density_kg_l     REAL,      -- calculated: weight_kg / volume_l
     decision         TEXT NOT NULL DEFAULT 'accepted',  -- accepted | rejected
     rejection_reason TEXT,
     notes            TEXT
@@ -415,6 +451,30 @@ def today_iso():
     return datetime.date.today().isoformat()
 
 
+def lot_number_for(created_at, rid):
+    """A production run's processing lot is reserved the instant its row is
+    first inserted (draft creation, or one-shot finalize) and derived from
+    that row's own autoincrement id — never recomputed later, so numbers
+    stay dense/unique even with several runs started concurrently."""
+    date_part = (created_at or now_iso())[:10].replace("-", "")
+    return "PR-%s-%05d" % (date_part, rid)
+
+
+QAQC_HOLD_LOCATION = "QAQC Hold"
+
+
+def status_for_location(location, current_status):
+    """A tote sitting at QAQC Hold is always status='hold'; moving it away
+    releases it back to 'in_stock'. Never touches a consumed/disposed tote."""
+    if current_status not in ("in_stock", "hold"):
+        return current_status
+    if location == QAQC_HOLD_LOCATION:
+        return "hold"
+    if current_status == "hold":
+        return "in_stock"
+    return current_status
+
+
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -459,6 +519,12 @@ def migrate(conn):
         conn.execute("ALTER TABLE tote_lots ADD COLUMN ph_updated TEXT")
     if "disposed_date" not in cols:
         conn.execute("ALTER TABLE tote_lots ADD COLUMN disposed_date TEXT")
+    for col, decl in [
+        ("stabilization_method", "TEXT DEFAULT 'Citric acid'"), ("storage_unit", "TEXT DEFAULT 'Tote'"),
+        ("storage_source", "TEXT"), ("orp", "REAL"), ("orp_updated", "TEXT"), ("notes", "TEXT"),
+    ]:
+        if col not in cols:
+            conn.execute("ALTER TABLE tote_lots ADD COLUMN %s %s" % (col, decl))
     ccols = {r["name"] for r in conn.execute("PRAGMA table_info(consumables)")}
     if "location" not in ccols:
         conn.execute("ALTER TABLE consumables ADD COLUMN location TEXT")
@@ -495,11 +561,19 @@ def migrate(conn):
         ("loaded_at", "TEXT"), ("surface_photo", "TEXT"), ("striation_photo", "TEXT"),
         ("ph", "REAL"), ("ph_measured_at", "TEXT"), ("orp", "REAL"), ("orp_range", "TEXT"),
         ("odour", "TEXT"), ("odour_other", "TEXT"), ("odour_intensity", "TEXT"),
+        ("weight_kg", "REAL"), ("volume_l", "REAL"), ("density_kg_l", "REAL"),
         ("decision", "TEXT NOT NULL DEFAULT 'accepted'"), ("rejection_reason", "TEXT"),
         ("notes", "TEXT"),
     ]:
         if col not in ricols:
             conn.execute("ALTER TABLE run_inputs ADD COLUMN %s %s" % (col, decl))
+    skucols = {r["name"] for r in conn.execute("PRAGMA table_info(fg_skus)")}
+    for col, decl in [
+        ("tds_target", "REAL"), ("ph_target", "REAL"), ("ksorbate_target", "REAL"),
+        ("nabenzoate_target", "REAL"), ("active", "INTEGER NOT NULL DEFAULT 1"),
+    ]:
+        if col not in skucols:
+            conn.execute("ALTER TABLE fg_skus ADD COLUMN %s %s" % (col, decl))
     qc_info = list(conn.execute("PRAGMA table_info(qc_logs)"))
     qccols = {r["name"] for r in qc_info}
     if "sample_location" not in qccols:
@@ -534,6 +608,41 @@ def migrate(conn):
     # the old name so already-running databases pick up the new one too.
     conn.execute("UPDATE fg_skus SET name='Sugar Kelp Extract'"
                  " WHERE code='SACC-LKE' AND name != 'Sugar Kelp Extract'")
+    # REF_productSKU.xlsx (2026-09-22): the real product line, replacing the
+    # 2 placeholder SKUs. The old ones stay (real historical runs reference
+    # them) but are deactivated so they drop out of the picker.
+    for code in ("SACC-LKE", "MACRO-LKE"):
+        conn.execute("UPDATE fg_skus SET active=0 WHERE code=?", (code,))
+    for code, name, tds, ph, ksorb, nabenz, species_codes in [
+        ("KELPIVEX", "Kelpivex", 1.8, 3.7, 0.0025, 0, ("SL",)),
+        ("REGENAKELP", "RegenaKelp", 1.8, 3.7, 0.0025, 0, ("MT",)),
+        ("FIELDKELP", "FieldKelp", 1.8, 3.7, 0.0025, 0, ("SL", "MT")),
+        ("KELPIVEX-O", "Kelpivex - O", 1.8, 3.7, 0.0025, 0, ("SL",)),
+        ("REGENAKELP-O", "RegenaKelp - O", 1.8, 3.7, 0.0025, 0, ("MT",)),
+        ("FIELDKELP-O", "FieldKelp - O", 1.8, 3.7, 0.0025, 0, ("SL", "MT")),
+    ]:
+        conn.execute(
+            "INSERT INTO fg_skus (code,name,tds_target,ph_target,ksorbate_target,"
+            "nabenzoate_target,active) VALUES (?,?,?,?,?,?,1)"
+            " ON CONFLICT(code) DO UPDATE SET name=excluded.name,"
+            " tds_target=excluded.tds_target, ph_target=excluded.ph_target,"
+            " ksorbate_target=excluded.ksorbate_target,"
+            " nabenzoate_target=excluded.nabenzoate_target, active=1",
+            (code, name, tds, ph, ksorb, nabenz))
+        for sp in species_codes:
+            conn.execute("INSERT OR IGNORE INTO fg_sku_species (sku_code,species_code)"
+                         " VALUES (?,?)", (code, sp))
+    conn.execute("INSERT OR IGNORE INTO locations (name) VALUES ('QAQC Hold')")
+    # Backfill: totes already sitting at QAQC Hold from before the 'hold'
+    # status existed should carry that status now.
+    conn.execute("UPDATE tote_lots SET status='hold' WHERE location=? AND status='in_stock'",
+                 (QAQC_HOLD_LOCATION,))
+    # Drafts created before reserved numbering shipped are still on the old
+    # "DRAFT-<token>" placeholder — give them a real number now.
+    for r in conn.execute("SELECT id, created_at FROM production_runs"
+                          " WHERE status='draft' AND processing_lot LIKE 'DRAFT-%'"):
+        conn.execute("UPDATE production_runs SET processing_lot=? WHERE id=?",
+                     (lot_number_for(r["created_at"], r["id"]), r["id"]))
 
 
 def ensure_users(conn):
@@ -635,7 +744,10 @@ def tote_public(r):
             "volumeL": r["volume_l"], "ph": r["ph"], "phUpdated": r["ph_updated"],
             "avgWeightKg": r["avg_weight_kg"],
             "location": r["location"], "description": r["description"],
-            "status": r["status"], "runId": r["run_id"], "disposedDate": r["disposed_date"]}
+            "status": r["status"], "runId": r["run_id"], "disposedDate": r["disposed_date"],
+            "stabilizationMethod": r["stabilization_method"], "storageUnit": r["storage_unit"],
+            "storageSource": r["storage_source"], "orp": r["orp"], "orpUpdated": r["orp_updated"],
+            "notes": r["notes"]}
 
 
 def fg_public(r):
@@ -955,7 +1067,7 @@ class Handler(BaseHTTPRequestHandler):
         if method == "GET" and seg == ["api", "dashboard"]:
             return self.dashboard(conn)
         if seg[:2] == ["api", "totes"]:
-            return self.route_totes(method, seg, query, conn)
+            return self.route_totes(method, seg, query, conn, user)
         if seg[:2] == ["api", "harvest"]:
             return self.route_harvest(method, seg, conn)
         if seg[:2] == ["api", "consumables"]:
@@ -1084,9 +1196,13 @@ class Handler(BaseHTTPRequestHandler):
         sites = [dict(code=r["code"], name=r["name"])
                  for r in conn.execute("SELECT * FROM sites ORDER BY code")]
         locations = [r["name"] for r in conn.execute("SELECT name FROM locations ORDER BY name")]
-        # Sugar Kelp (SACC-LKE) is the default/most-used SKU — list it first.
-        skus = [dict(code=r["code"], name=r["name"], species=r["species_code"])
-                for r in conn.execute("SELECT * FROM fg_skus ORDER BY (code != 'SACC-LKE'), code")]
+        sku_species = {}
+        for r in conn.execute("SELECT sku_code, species_code FROM fg_sku_species"):
+            sku_species.setdefault(r["sku_code"], []).append(r["species_code"])
+        skus = [dict(code=r["code"], name=r["name"], species=sku_species.get(r["code"], []),
+                    active=bool(r["active"]), tdsTarget=r["tds_target"], phTarget=r["ph_target"],
+                    ksorbateTarget=r["ksorbate_target"], nabenzoateTarget=r["nabenzoate_target"])
+                for r in conn.execute("SELECT * FROM fg_skus ORDER BY (active != 1), code")]
         customers = [self._customer_public(r) for r in conn.execute(
             "SELECT * FROM customers WHERE active=1 ORDER BY name")]
         return {"species": species, "sites": sites, "locations": locations,
@@ -1125,14 +1241,21 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     # ---- stabilized totes ------------------------------------------------- #
-    def route_totes(self, method, seg, query, conn):
+    def route_totes(self, method, seg, query, conn, user):
         if seg == ["api", "totes"] and method == "GET":
             status = query.get("status", [""])[0]
             sql = ("SELECT * FROM tote_lots WHERE 1=1"
                    + (" AND status=?" if status else "")
                    + " ORDER BY checkin_date DESC, lot_number")
             rows = conn.execute(sql, (status,) if status else ()).fetchall()
-            return {"totes": [tote_public(r) for r in rows]}
+            last_map = {r["tote_lot_id"]: r["last"] for r in conn.execute(
+                "SELECT tote_lot_id, MAX(created_at) AS last FROM tote_stability_log GROUP BY tote_lot_id")}
+            totes = []
+            for r in rows:
+                t = tote_public(r)
+                t["lastUpdated"] = last_map.get(r["id"]) or r["created_at"]
+                totes.append(t)
+            return {"totes": totes}
         if seg == ["api", "totes", "move-bulk"] and method == "POST":
             d = self._body_json()
             ids = [int(x) for x in (d.get("ids") or [])]
@@ -1146,10 +1269,13 @@ class Handler(BaseHTTPRequestHandler):
             moved = 0
             for tid in ids:
                 it = conn.execute("SELECT * FROM tote_lots WHERE id=?", (tid,)).fetchone()
-                if not it or it["status"] != "in_stock" or it["location"] == to:
+                if not it or it["status"] not in ("in_stock", "hold") or it["location"] == to:
                     continue
                 self._log_move(conn, "tote", tid, it["lot_number"], it["location"], to, None, date, note)
-                conn.execute("UPDATE tote_lots SET location=? WHERE id=?", (to, tid))
+                new_status = status_for_location(to, it["status"])
+                if new_status != it["status"]:
+                    self._log_stability(conn, tid, user, "Status", it["status"], new_status)
+                conn.execute("UPDATE tote_lots SET location=?, status=? WHERE id=?", (to, new_status, tid))
                 moved += 1
             return {"moved": moved, "toLocation": to}
         if len(seg) >= 3 and seg[2].isdigit():
@@ -1171,47 +1297,80 @@ class Handler(BaseHTTPRequestHandler):
                     if to != it["location"]:
                         self._log_move(conn, "tote", tid, it["lot_number"], it["location"],
                                        to, None, date, d.get("note"))
-                        conn.execute("UPDATE tote_lots SET location=? WHERE id=?", (to, tid))
-                    return {"tote": tote_public(conn.execute(
+                        new_status = status_for_location(to, it["status"])
+                        if new_status != it["status"]:
+                            self._log_stability(conn, tid, user, "Status", it["status"], new_status)
+                        conn.execute("UPDATE tote_lots SET location=?, status=? WHERE id=?",
+                                     (to, new_status, tid))
+                    return {"tote": self._tote_with_last_updated(conn, conn.execute(
                         "SELECT * FROM tote_lots WHERE id=?", (tid,)).fetchone()),
                         "moveLog": self._move_log(conn, "tote", tid)}
                 raise ApiError(405, "Method not allowed")
 
-            # /api/totes/:id/ph  — log a new pH reading / read the history
+            # /api/totes/:id/ph  — log a new pH and/or ORP reading, or read the
+            # Feedstock Stability history (every field edit, not just pH/ORP).
             if len(seg) == 4 and seg[3] == "ph":
                 if method == "GET":
-                    return {"phLog": self._ph_log(conn, tid),
-                            "ph": it["ph"], "phUpdated": it["ph_updated"]}
+                    return {"stabilityLog": self._stability_log(conn, tid),
+                            "ph": it["ph"], "phUpdated": it["ph_updated"],
+                            "orp": it["orp"], "orpUpdated": it["orp_updated"],
+                            "lastUpdated": self._tote_with_last_updated(conn, it)["lastUpdated"]}
                 if method == "POST":
                     d = self._body_json()
-                    ph = numn(d.get("ph"))
-                    if ph is None:
-                        raise ApiError(400, "A pH value is required")
+                    ph = numn(d.get("ph")) if d.get("ph") not in (None, "") else None
+                    orp = numn(d.get("orp")) if d.get("orp") not in (None, "") else None
+                    if ph is None and orp is None:
+                        raise ApiError(400, "Enter a pH and/or ORP value")
                     date = (d.get("date") or today_iso()).strip()
-                    conn.execute(
-                        "INSERT INTO tote_ph_log (tote_lot_id,ph,reading_date,note,created_at)"
-                        " VALUES (?,?,?,?,?)", (tid, ph, date, d.get("note"), now_iso()))
-                    conn.execute("UPDATE tote_lots SET ph=?, ph_updated=? WHERE id=?", (ph, date, tid))
-                    return {"tote": tote_public(conn.execute(
+                    note = d.get("note")
+                    updates = {}
+                    if ph is not None:
+                        self._log_stability(conn, tid, user, "pH", it["ph"], ph, note)
+                        updates["ph"] = ph
+                        updates["ph_updated"] = date
+                    if orp is not None:
+                        self._log_stability(conn, tid, user, "ORP (mV)", it["orp"], orp, note)
+                        updates["orp"] = orp
+                        updates["orp_updated"] = date
+                    sets = ", ".join("%s=?" % c for c in updates)
+                    conn.execute("UPDATE tote_lots SET %s WHERE id=?" % sets, (*updates.values(), tid))
+                    return {"tote": self._tote_with_last_updated(conn, conn.execute(
                         "SELECT * FROM tote_lots WHERE id=?", (tid,)).fetchone()),
-                        "phLog": self._ph_log(conn, tid)}
+                        "stabilityLog": self._stability_log(conn, tid)}
                 raise ApiError(405, "Method not allowed")
 
             if len(seg) == 3 and method == "PUT":
                 d = self._body_json()
-                # A pH change here is also logged, with today's date.
-                if "ph" in d and numn(d["ph"]) is not None and numn(d["ph"]) != it["ph"]:
-                    conn.execute(
-                        "INSERT INTO tote_ph_log (tote_lot_id,ph,reading_date,note,created_at)"
-                        " VALUES (?,?,?,?,?)", (tid, numn(d["ph"]), today_iso(), None, now_iso()))
-                ph_updated = today_iso() if ("ph" in d and numn(d["ph"]) != it["ph"]) else it["ph_updated"]
+                new_ph = numn(d["ph"]) if "ph" in d else it["ph"]
+                new_orp = numn(d["orp"]) if "orp" in d else it["orp"]
+                new_weight = numn(d["avgWeightKg"]) if "avgWeightKg" in d else it["avg_weight_kg"]
+                new_location = d["location"] if "location" in d else it["location"]
+                new_stab_method = d["stabilizationMethod"] if "stabilizationMethod" in d else it["stabilization_method"]
+                new_storage_unit = d["storageUnit"] if "storageUnit" in d else it["storage_unit"]
+                new_notes = d["notes"] if "notes" in d else it["notes"]
+                # An explicit status wins; otherwise a location change may
+                # auto-flip status to/from 'hold' (see status_for_location).
+                new_status = d["status"] if "status" in d else status_for_location(new_location, it["status"])
+                # Feedstock Stability log: one line item per field that actually
+                # changed, who changed it and when.
+                if "ph" in d and new_ph != it["ph"]:
+                    self._log_stability(conn, tid, user, "pH", it["ph"], new_ph)
+                if "orp" in d and new_orp != it["orp"]:
+                    self._log_stability(conn, tid, user, "ORP (mV)", it["orp"], new_orp)
+                if "avgWeightKg" in d and new_weight != it["avg_weight_kg"]:
+                    self._log_stability(conn, tid, user, "Weight (kg)", it["avg_weight_kg"], new_weight)
+                if new_location != it["location"]:
+                    self._log_stability(conn, tid, user, "Location", it["location"], new_location)
+                if new_status != it["status"]:
+                    self._log_stability(conn, tid, user, "Status", it["status"], new_status)
+                ph_updated = today_iso() if ("ph" in d and new_ph != it["ph"]) else it["ph_updated"]
+                orp_updated = today_iso() if ("orp" in d and new_orp != it["orp"]) else it["orp_updated"]
                 conn.execute(
-                    "UPDATE tote_lots SET ph=?, ph_updated=?, avg_weight_kg=?, location=?, status=? WHERE id=?",
-                    (numn(d["ph"]) if "ph" in d else it["ph"], ph_updated,
-                     numn(d["avgWeightKg"]) if "avgWeightKg" in d else it["avg_weight_kg"],
-                     d["location"] if "location" in d else it["location"],
-                     d["status"] if "status" in d else it["status"], tid))
-                return {"tote": tote_public(conn.execute(
+                    "UPDATE tote_lots SET ph=?, ph_updated=?, orp=?, orp_updated=?, avg_weight_kg=?,"
+                    " location=?, status=?, stabilization_method=?, storage_unit=?, notes=? WHERE id=?",
+                    (new_ph, ph_updated, new_orp, orp_updated, new_weight, new_location, new_status,
+                     new_stab_method, new_storage_unit, new_notes, tid))
+                return {"tote": self._tote_with_last_updated(conn, conn.execute(
                     "SELECT * FROM tote_lots WHERE id=?", (tid,)).fetchone())}
             if len(seg) == 3 and method == "DELETE":
                 if it["status"] == "consumed":
@@ -1220,11 +1379,25 @@ class Handler(BaseHTTPRequestHandler):
                 return {"ok": True}
         raise ApiError(404, "Unknown totes endpoint")
 
-    def _ph_log(self, conn, tote_id):
-        return [dict(ph=r["ph"], date=r["reading_date"], note=r["note"], at=r["created_at"])
+    def _tote_with_last_updated(self, conn, row):
+        t = tote_public(row)
+        r = conn.execute("SELECT MAX(created_at) AS last FROM tote_stability_log WHERE tote_lot_id=?",
+                         (row["id"],)).fetchone()
+        t["lastUpdated"] = (r["last"] if r else None) or row["created_at"]
+        return t
+
+    def _stability_log(self, conn, tote_id):
+        return [dict(field=r["field"], oldValue=r["old_value"], newValue=r["new_value"],
+                     note=r["note"], by=r["user_name"], at=r["created_at"])
                 for r in conn.execute(
-                    "SELECT * FROM tote_ph_log WHERE tote_lot_id=? ORDER BY reading_date DESC, id DESC",
+                    "SELECT * FROM tote_stability_log WHERE tote_lot_id=? ORDER BY id DESC",
                     (tote_id,))]
+
+    def _log_stability(self, conn, tote_id, user, field, old, new, note=None):
+        conn.execute(
+            "INSERT INTO tote_stability_log (tote_lot_id,user_name,field,old_value,new_value,note,created_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (tote_id, user["name"] if user else None, field, _fmtval(old), _fmtval(new), note, now_iso()))
 
     # ---- locations & moves ------------------------------------------------ #
     def _ensure_location(self, conn, name):
@@ -1263,20 +1436,27 @@ class Handler(BaseHTTPRequestHandler):
             count = int(num(d.get("toteCount")))
             total_kg = num(d.get("totalKg"))
             ph = numn(d.get("ph"))
+            orp = numn(d.get("orp"))
             location = (d.get("location") or "").strip() or None
+            stabilization_method = (d.get("stabilizationMethod") or "").strip() or "Citric acid"
+            storage_unit = (d.get("storageUnit") or "").strip() or "Tote"
+            notes = (d.get("notes") or "").strip() or None
             if not site or not species or count <= 0:
-                raise ApiError(400, "Site, species and a tote count > 0 are required")
-            # IBC totes consumed for this harvest come from a chosen source (empty
-            # IBC stock). Validate availability before creating any lots.
+                raise ApiError(400, "Site, species and a storage unit count > 0 are required")
+            # Empty storage units consumed for this harvest come from a chosen
+            # source (empty IBC-tote stock); "Burlap sack" isn't inventory-tracked,
+            # so it has no consumable id and nothing is decremented for it.
             ibc_id = d.get("ibcConsumableId")
             ibc_row = None
+            storage_source = (d.get("storageSourceLabel") or "").strip() or None
             if ibc_id:
                 ibc_row = conn.execute("SELECT * FROM consumables WHERE id=?", (ibc_id,)).fetchone()
                 if not ibc_row:
-                    raise ApiError(400, "Unknown IBC tote source")
+                    raise ApiError(400, "Unknown storage unit source")
                 if ibc_row["on_hand"] < count:
                     raise ApiError(400, "Not enough %s on hand (%g < %d)"
                                    % (ibc_row["name"], ibc_row["on_hand"], count))
+                storage_source = storage_source or ibc_row["name"]
             if not conn.execute("SELECT 1 FROM sites WHERE code=?", (site,)).fetchone():
                 conn.execute("INSERT INTO sites (code,name) VALUES (?,?)", (site, site))
             if not conn.execute("SELECT 1 FROM species WHERE code=?", (species,)).fetchone():
@@ -1299,16 +1479,18 @@ class Handler(BaseHTTPRequestHandler):
                 lot = "%s-%s-%s-%03d" % (site, species, datestr, n)
                 conn.execute(
                     "INSERT INTO tote_lots (lot_number,site_code,species_code,harvest_year,"
-                    "checkin_date,tote_number,volume_l,ph,avg_weight_kg,location,description,"
-                    "status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?, 'in_stock', ?)",
-                    (lot, site, species, int(date[:4]), date, n, 1000, ph, avg, location,
-                     "Fresh Stabilized Ground %s" % common, ts))
+                    "checkin_date,tote_number,volume_l,ph,orp,avg_weight_kg,location,description,"
+                    "status,stabilization_method,storage_unit,storage_source,notes,created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'in_stock',?,?,?,?,?)",
+                    (lot, site, species, int(date[:4]), date, n, 1000, ph, orp, avg, location,
+                     "Fresh Stabilized Ground %s" % common, stabilization_method, storage_unit,
+                     storage_source, notes, ts))
                 created.append(lot)
             if ibc_row:
-                self._consume(conn, ibc_row["id"], -count, "Harvest check-in (IBC fill)",
+                self._consume(conn, ibc_row["id"], -count, "Harvest check-in (storage unit fill)",
                               "%s-%s-%s" % (site, species, datestr))
             return {"created": created, "avgWeightKg": avg, "count": len(created),
-                    "ibcSource": ibc_row["name"] if ibc_row else None}
+                    "storageSource": storage_source}
         raise ApiError(404, "Unknown harvest endpoint")
 
     # ---- consumables ------------------------------------------------------ #
@@ -1372,7 +1554,6 @@ class Handler(BaseHTTPRequestHandler):
     # Fields a run edit may touch: (db column, json key, label, kind)
     RUN_EDIT_FIELDS = [
         ("run_date", "runDate", "Run date", "text"),
-        ("target_tds", "targetTds", "Target TDS", "num"),
         ("citric_kg", "citricKg", "Citric acid (kg)", "num"),
         ("sorbate_kg", "sorbateKg", "Potassium sorbate (kg)", "num"),
         ("location", "location", "Production Location", "text"),
@@ -1387,7 +1568,6 @@ class Handler(BaseHTTPRequestHandler):
             ("homog_rinsing_water_l", "rinsingWaterL", "num"),
             ("homog_slurry_l", "slurryL", "num"),
             ("homog_dilution_water_l", "dilutionWaterL", "num"),
-            ("homog_citric_kg", "citricKg", "num"),
             ("homog_output_l", "outputL", "num"),
         ],
         "extraction": [
@@ -1421,6 +1601,9 @@ class Handler(BaseHTTPRequestHandler):
         ("ph_measured_at", "phMeasuredAt", "text"),
         ("orp", "orp", "num"),
         ("orp_range", "orpRange", "text"),
+        ("weight_kg", "weightKg", "num"),
+        ("volume_l", "volumeL", "num"),
+        ("density_kg_l", "densityKgL", "num"),
         ("odour", "odour", "text"),
         ("odour_other", "odourOther", "text"),
         ("odour_intensity", "odourIntensity", "text"),
@@ -1513,8 +1696,6 @@ class Handler(BaseHTTPRequestHandler):
         if (len(seg) == 6 and seg[2].isdigit() and seg[3] == "inputs" and seg[4].isdigit()
                 and seg[5] == "photo" and method == "POST"):
             return self.upload_input_photo(conn, int(seg[2]), int(seg[4]), user)
-        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "rejected-feedstock" and method == "PUT":
-            return self.rejected_feedstock(conn, int(seg[2]), user)
         if len(seg) == 5 and seg[2].isdigit() and seg[3] == "stages" and method == "PUT":
             return self.save_stage(conn, int(seg[2]), seg[4], user)
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "separation-solids":
@@ -1628,15 +1809,19 @@ class Handler(BaseHTTPRequestHandler):
                 "loadedAt": r["loaded_at"], "surfacePhoto": r["surface_photo"],
                 "striationPhoto": r["striation_photo"], "ph": r["ph"],
                 "phMeasuredAt": r["ph_measured_at"], "orp": r["orp"],
-                "orpRange": r["orp_range"], "odour": r["odour"], "odourOther": r["odour_other"],
+                "orpRange": r["orp_range"], "weightKg": r["weight_kg"],
+                "volumeL": r["volume_l"], "densityKgL": r["density_kg_l"],
+                "odour": r["odour"], "odourOther": r["odour_other"],
                 "odourIntensity": r["odour_intensity"], "decision": r["decision"],
                 "rejectionReason": r["rejection_reason"], "notes": r["notes"],
             })
         return out
 
-    def _apply_feedstock_detail(self, conn, input_id, fd):
+    def _apply_feedstock_detail(self, conn, input_id, fd, tote_lot_id=None):
         """Apply staged draft characterization (+ already-uploaded photo attachment
-        ids) onto a freshly-created run_inputs row at finalize time."""
+        ids) onto a run_inputs row. If the decision is (or becomes) 'rejected',
+        also relocate the tote to QAQC Hold — it's excluded from production
+        selection and run calculations from that point on."""
         if not fd:
             return
         updates = {}
@@ -1651,6 +1836,9 @@ class Handler(BaseHTTPRequestHandler):
         if updates:
             sets = ", ".join("%s=?" % c for c in updates)
             conn.execute("UPDATE run_inputs SET %s WHERE id=?" % sets, (*updates.values(), input_id))
+        if updates.get("decision") == "rejected" and tote_lot_id:
+            conn.execute("UPDATE tote_lots SET location=?, status='hold' WHERE id=?",
+                         (QAQC_HOLD_LOCATION, tote_lot_id))
 
     def update_run_input(self, conn, run_id, input_id, user):
         row = conn.execute("SELECT * FROM run_inputs WHERE id=? AND run_id=?",
@@ -1660,7 +1848,7 @@ class Handler(BaseHTTPRequestHandler):
         d = self._body_json()
         if "decision" in d and d["decision"] not in ("accepted", "rejected"):
             raise ApiError(400, "Invalid decision")
-        self._apply_feedstock_detail(conn, input_id, d)
+        self._apply_feedstock_detail(conn, input_id, d, row["tote_lot_id"])
         return {"inputs": self._run_inputs_public(conn, run_id)}
 
     def upload_input_photo(self, conn, run_id, input_id, user):
@@ -1700,23 +1888,6 @@ class Handler(BaseHTTPRequestHandler):
                                         d.get("contentType"), d.get("dataB64") or "",
                                         user["name"] if user else None)
         return {"attachmentId": new_id}
-
-    def rejected_feedstock(self, conn, rid, user):
-        run = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
-        if not run:
-            raise ApiError(404, "Production run not found")
-        d = self._body_json()
-        clean = []
-        for it in (d.get("items") or []):
-            tote_lot = (it.get("toteLot") or "").strip()
-            reason = (it.get("reason") or "").strip()
-            if not tote_lot or not reason:
-                continue
-            clean.append({"toteLot": tote_lot, "reason": reason, "at": it.get("at") or now_iso()})
-        conn.execute("UPDATE production_runs SET rejected_feedstock_json=? WHERE id=?",
-                     (json.dumps(clean), rid))
-        return {"run": run_public(conn.execute(
-            "SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone())}
 
     # ---- process stages (Homogenization / Extraction / Separation / ------- #
     # ---- Pasteurization / Packaging) ---------------------------------------#
@@ -1983,10 +2154,12 @@ class Handler(BaseHTTPRequestHandler):
         sku = (d.get("sku") or "").strip()
         sku_row = conn.execute("SELECT * FROM fg_skus WHERE code=?", (sku,)).fetchone()
         if not sku_row:
-            raise ApiError(400, "Choose a finished-good SKU")
-        species = sku_row["species_code"]
+            raise ApiError(400, "Choose a product SKU")
+        sku_species = [r["species_code"] for r in conn.execute(
+            "SELECT species_code FROM fg_sku_species WHERE sku_code=?", (sku,))]
+        species = sku_species[0] if len(sku_species) == 1 else None
         packages = d.get("packages") or []   # [{size, qty}]
-        target_tds = numn(d.get("targetTds"))
+        target_tds = sku_row["tds_target"]  # fixed product spec, not user-entered
         citric = num(d.get("citricKg"))
         sorbate = num(d.get("sorbateKg"))
         location = (d.get("location") or "").strip() or None
@@ -2004,7 +2177,18 @@ class Handler(BaseHTTPRequestHandler):
         for r in rows:
             if r["status"] != "in_stock":
                 raise ApiError(400, "Tote %s is not in stock" % r["lot_number"])
-        input_kg = round(sum((r["avg_weight_kg"] or 0) for r in rows), 2)
+
+        # A tote marked rejected during characterization contributes nothing to
+        # this run — no input weight, no consumption — but is still logged (see
+        # the run_inputs insert below) as part of the receiving inspection.
+        def _decision_for(tote_id):
+            fd = feedstock_details.get(str(tote_id)) or feedstock_details.get(tote_id)
+            return (fd or {}).get("decision", "accepted")
+        accepted_ids = {r["id"] for r in rows if _decision_for(r["id"]) != "rejected"}
+        accepted_rows = [r for r in rows if r["id"] in accepted_ids]
+        if not accepted_rows:
+            raise ApiError(400, "At least one accepted tote is required to process a run")
+        input_kg = round(sum((r["avg_weight_kg"] or 0) for r in accepted_rows), 2)
 
         # Output litres = sum of packaged litres.
         output_litres = 0.0
@@ -2033,22 +2217,15 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "Not enough empty IBC totes on hand (%d < %d)"
                            % (int(ibc_row["on_hand"]), ibc_used))
 
-        # Processing lot number: PR-YYYYMMDD-NNN (NNN = next completed sequence).
-        lot = (d.get("processingLot") or "").strip()
-        if not lot:
-            seq = conn.execute(
-                "SELECT COUNT(*) c FROM production_runs WHERE status='completed'").fetchone()["c"] + 1
-            lot = "PR-%s-%03d" % (run_date.replace("-", ""), seq)
-        dupe = conn.execute(
-            "SELECT 1 FROM production_runs WHERE processing_lot=? AND id!=?",
-            (lot, existing["id"] if existing else -1)).fetchone()
-        if dupe:
-            raise ApiError(409, "Processing lot %s already exists" % lot)
-
+        # Processing lot number: reserved at draft creation (or, for a direct
+        # one-shot run, right here) from the row's own id — see lot_number_for.
         ts = now_iso()
         cur = conn.cursor()
         if existing:
             run_id = existing["id"]
+            lot = existing["processing_lot"]
+            if lot.startswith("DRAFT-"):  # legacy placeholder never numbered — heal it now
+                lot = lot_number_for(existing["created_at"], run_id)
             cur.execute(
                 "UPDATE production_runs SET processing_lot=?, run_date=?, species_code=?, sku_code=?,"
                 " input_kg=?, target_tds=?, output_litres=?, citric_kg=?, sorbate_kg=?, ibc_used=?,"
@@ -2056,23 +2233,30 @@ class Handler(BaseHTTPRequestHandler):
                 (lot, run_date, species, sku, input_kg, target_tds, output_litres,
                  citric, sorbate, ibc_used, location, notes, operators, run_id))
         else:
+            placeholder = "TEMP-" + secrets.token_hex(6)
             cur.execute(
                 "INSERT INTO production_runs (processing_lot,run_date,species_code,sku_code,input_kg,"
                 "target_tds,output_litres,citric_kg,sorbate_kg,ibc_used,location,notes,operators,"
                 "status,created_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'completed', ?)",
-                (lot, run_date, species, sku, input_kg, target_tds, output_litres,
+                (placeholder, run_date, species, sku, input_kg, target_tds, output_litres,
                  citric, sorbate, ibc_used, location, notes, operators, ts))
             run_id = cur.lastrowid
+            lot = lot_number_for(ts, run_id)
+            cur.execute("UPDATE production_runs SET processing_lot=? WHERE id=?", (lot, run_id))
 
-        # Consume totes, carrying over any feedstock characterization staged
-        # while this was still a draft (photos already uploaded as attachments).
+        # Log every selected tote's receiving inspection, carrying over any
+        # characterization staged while this was still a draft (photos already
+        # uploaded as attachments) — but only *consume* the accepted ones.
+        # A rejected tote's _apply_feedstock_detail call relocates it to QAQC
+        # Hold (status='hold') and gets no run_id.
         for r in rows:
-            cur.execute("UPDATE tote_lots SET status='consumed', run_id=? WHERE id=?", (run_id, r["id"]))
             cur.execute("INSERT INTO run_inputs (run_id,tote_lot_id) VALUES (?,?)", (run_id, r["id"]))
             input_id = cur.lastrowid
             fd = feedstock_details.get(str(r["id"])) or feedstock_details.get(r["id"])
-            self._apply_feedstock_detail(conn, input_id, fd)
+            self._apply_feedstock_detail(conn, input_id, fd, r["id"])
+            if r["id"] in accepted_ids:
+                cur.execute("UPDATE tote_lots SET status='consumed', run_id=? WHERE id=?", (run_id, r["id"]))
 
         # Deduct consumables.
         if citric and citric_row:
@@ -2083,10 +2267,11 @@ class Handler(BaseHTTPRequestHandler):
         if ibc_used and ibc_row:
             self._consume(conn, ibc_row["id"], -ibc_used, "Production run (FG into new IBCs)", lot)
         # The IBC totes the stabilized kelp was stored in are now emptied by
-        # processing and return to the USED-IBC pool (one per tote processed).
+        # processing and return to the USED-IBC pool (one per tote actually
+        # processed — a rejected tote's IBC was never emptied).
         used_row = self._consumable_by_name(conn, "Empty Used IBC Tote")
-        if used_row and rows:
-            self._consume(conn, used_row["id"], len(rows), "Emptied by processing", lot)
+        if used_row and accepted_rows:
+            self._consume(conn, used_row["id"], len(accepted_rows), "Emptied by processing", lot)
 
         # Create FG lots, one per package size.
         fg_created = []
@@ -2141,10 +2326,14 @@ class Handler(BaseHTTPRequestHandler):
         d = self._body_json()
         sku = (d.get("sku") or "").strip() or None
         species = None
+        target_tds = None
         if sku:
             sku_row = conn.execute("SELECT * FROM fg_skus WHERE code=?", (sku,)).fetchone()
-            species = sku_row["species_code"] if sku_row else None
-        target_tds = numn(d.get("targetTds"))
+            if sku_row:
+                target_tds = sku_row["tds_target"]
+                sku_species = [r["species_code"] for r in conn.execute(
+                    "SELECT species_code FROM fg_sku_species WHERE sku_code=?", (sku,))]
+                species = sku_species[0] if len(sku_species) == 1 else None
         citric = num(d.get("citricKg"))
         sorbate = num(d.get("sorbateKg"))
         location = (d.get("location") or "").strip() or None
@@ -2159,16 +2348,19 @@ class Handler(BaseHTTPRequestHandler):
 
         if rid is None:
             cur = conn.cursor()
-            placeholder = "DRAFT-" + secrets.token_hex(6)
+            placeholder = "TEMP-" + secrets.token_hex(6)
+            ts = now_iso()
             cur.execute(
                 "INSERT INTO production_runs (processing_lot,run_date,species_code,sku_code,"
                 "target_tds,citric_kg,sorbate_kg,location,notes,operators,status,draft_data,created_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?, 'draft', ?, ?)",
                 (placeholder, run_date, species, sku, target_tds, citric, sorbate,
-                 location, notes, operators, draft_data, now_iso()))
+                 location, notes, operators, draft_data, ts))
             rid = cur.lastrowid
+            # Reserved immediately — this is the run's permanent number, not a
+            # placeholder that gets swapped out at finalize.
             conn.execute("UPDATE production_runs SET processing_lot=? WHERE id=?",
-                         ("DRAFT-%d" % rid, rid))
+                         (lot_number_for(ts, rid), rid))
         else:
             run = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
             if not run:
@@ -2783,7 +2975,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(400, "Select at least one tote to dispose")
             for tid in ids:
                 t = conn.execute("SELECT * FROM tote_lots WHERE id=?", (tid,)).fetchone()
-                if not t or t["status"] != "in_stock":
+                if not t or t["status"] not in ("in_stock", "hold"):
                     continue
                 conn.execute("UPDATE tote_lots SET status='disposed', disposed_date=? WHERE id=?", (date, tid))
                 log("tote", tid, t["lot_number"], t["avg_weight_kg"], "kg", species=t["species_code"])
