@@ -338,10 +338,18 @@ function stabilityLogTable(log) {
   return el('div', { class: 'tablewrap', style: 'margin-top:6px' },
     el('table', {},
       el('thead', {}, el('tr', {}, el('th', {}, 'When'), el('th', {}, 'Field'), el('th', {}, 'From'), el('th', {}, 'To'), el('th', {}, 'Note'), el('th', {}, 'By'))),
-      el('tbody', {}, ...log.map(r => el('tr', {},
-        el('td', { class: 'muted' }, fmtWhen(r.at)), el('td', {}, r.field),
-        el('td', { class: 'muted' }, r.oldValue ?? '—'), el('td', {}, el('b', {}, r.newValue ?? '—')),
-        el('td', { class: 'muted' }, r.note || '—'), el('td', {}, r.by || '—'))))));
+      el('tbody', {}, ...log.map(r => {
+        // A row logged with a photo attachment (e.g. a tote rejected during a
+        // production run) links straight to the image instead of showing an
+        // inert filename.
+        const toCell = (r.runId && r.attachmentId)
+          ? el('a', { href: attDownloadUrl(r.runId, r.attachmentId, false), target: '_blank', rel: 'noopener' }, r.newValue || 'View photo')
+          : el('b', {}, r.newValue ?? '—');
+        return el('tr', {},
+          el('td', { class: 'muted' }, fmtWhen(r.at)), el('td', {}, r.field),
+          el('td', { class: 'muted' }, r.oldValue ?? '—'), el('td', {}, toCell),
+          el('td', { class: 'muted' }, r.note || '—'), el('td', {}, r.by || '—'));
+      }))));
 }
 async function showHistory(t) {
   const data = await api('GET', '/totes/' + t.id + '/ph');
@@ -1352,7 +1360,7 @@ function buildFeedstockCard(opts) {
     el('div', { style: 'display:flex;gap:14px;flex-wrap:wrap;margin-top:8px' },
       photoSlot('surfacePhotoId', 'Surface photo'), photoSlot('striationPhotoId', 'Settling / striation photo'))];
 
-  if (opts.mode === 'completed') {
+  if (opts.onSave) {
     const status = el('span', { class: 'help' });
     const saveBtn = el('button', {
       type: 'button', class: 'secondary', onclick: async () => {
@@ -1644,6 +1652,26 @@ async function openRun(draftSummary) {
         initial: feedstockState[t.id],
         mode: 'draft',
         onChange: vals => { feedstockState[t.id] = vals; },
+        // Locks this tote's characterization in immediately instead of only
+        // bundling it into the next draft save/finalize. A rejected tote is
+        // pulled out of the run right away: it drops out of both the picker
+        // and this list, and everything captured for it (plus any photos)
+        // lands in the tote's own Feedstock Stability log instead, since it
+        // won't have a run_inputs row to carry that data once it's gone.
+        onSave: async vals => {
+          feedstockState[t.id] = vals;
+          const rid = await ensureRunId();
+          const r = await api('POST', '/production/' + rid + '/feedstock/' + t.id + '/save', vals);
+          if (r.rejected) {
+            selected.delete(t.id);
+            delete feedstockState[t.id];
+            const idx = totes.findIndex(x => x.id === t.id);
+            if (idx !== -1) totes[idx] = Object.assign({}, totes[idx], { location: 'QAQC Hold', status: 'hold' });
+            toast(t.lot + ' rejected — moved to QAQC Hold and removed from this run.');
+            filterTotes();
+            renderFeedstockCards();
+          }
+        },
         uploadPhoto: async (slot, file, b64) => {
           const rid = await ensureRunId();
           const r = await api('POST', '/production/' + rid + '/feedstock-photo',

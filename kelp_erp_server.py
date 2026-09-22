@@ -167,7 +167,9 @@ CREATE TABLE IF NOT EXISTS tote_stability_log (
     old_value     TEXT,
     new_value     TEXT,
     note          TEXT,
-    created_at    TEXT NOT NULL
+    created_at    TEXT NOT NULL,
+    run_id        INTEGER,        -- production run this entry originated from, if any
+    attachment_id INTEGER         -- run_attachments.id when new_value is an uploaded photo
 );
 CREATE INDEX IF NOT EXISTS idx_stability_tote ON tote_stability_log(tote_lot_id);
 
@@ -525,6 +527,10 @@ def migrate(conn):
     ]:
         if col not in cols:
             conn.execute("ALTER TABLE tote_lots ADD COLUMN %s %s" % (col, decl))
+    tscols = {r["name"] for r in conn.execute("PRAGMA table_info(tote_stability_log)")}
+    for col, decl in [("run_id", "INTEGER"), ("attachment_id", "INTEGER")]:
+        if col not in tscols:
+            conn.execute("ALTER TABLE tote_stability_log ADD COLUMN %s %s" % (col, decl))
     ccols = {r["name"] for r in conn.execute("PRAGMA table_info(consumables)")}
     if "location" not in ccols:
         conn.execute("ALTER TABLE consumables ADD COLUMN location TEXT")
@@ -1388,16 +1394,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def _stability_log(self, conn, tote_id):
         return [dict(field=r["field"], oldValue=r["old_value"], newValue=r["new_value"],
-                     note=r["note"], by=r["user_name"], at=r["created_at"])
+                     note=r["note"], by=r["user_name"], at=r["created_at"],
+                     runId=r["run_id"], attachmentId=r["attachment_id"])
                 for r in conn.execute(
                     "SELECT * FROM tote_stability_log WHERE tote_lot_id=? ORDER BY id DESC",
                     (tote_id,))]
 
-    def _log_stability(self, conn, tote_id, user, field, old, new, note=None):
+    def _log_stability(self, conn, tote_id, user, field, old, new, note=None, run_id=None, attachment_id=None):
         conn.execute(
-            "INSERT INTO tote_stability_log (tote_lot_id,user_name,field,old_value,new_value,note,created_at)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (tote_id, user["name"] if user else None, field, _fmtval(old), _fmtval(new), note, now_iso()))
+            "INSERT INTO tote_stability_log (tote_lot_id,user_name,field,old_value,new_value,note,"
+            "created_at,run_id,attachment_id) VALUES (?,?,?,?,?,?,?,?,?)",
+            (tote_id, user["name"] if user else None, field, _fmtval(old), _fmtval(new), note, now_iso(),
+             run_id, attachment_id))
 
     # ---- locations & moves ------------------------------------------------ #
     def _ensure_location(self, conn, name):
@@ -1693,6 +1701,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.feedstock_photo_draft(conn, int(seg[2]), user)
         if len(seg) == 5 and seg[2].isdigit() and seg[3] == "inputs" and seg[4].isdigit() and method == "PUT":
             return self.update_run_input(conn, int(seg[2]), int(seg[4]), user)
+        if (len(seg) == 6 and seg[2].isdigit() and seg[3] == "feedstock" and seg[4].isdigit()
+                and seg[5] == "save" and method == "POST"):
+            return self.save_feedstock_input(conn, int(seg[2]), int(seg[4]), user)
         if (len(seg) == 6 and seg[2].isdigit() and seg[3] == "inputs" and seg[4].isdigit()
                 and seg[5] == "photo" and method == "POST"):
             return self.upload_input_photo(conn, int(seg[2]), int(seg[4]), user)
@@ -1850,6 +1861,81 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "Invalid decision")
         self._apply_feedstock_detail(conn, input_id, d, row["tote_lot_id"])
         return {"inputs": self._run_inputs_public(conn, run_id)}
+
+    # Field labels for the Feedstock Stability log, when a tote is rejected
+    # (and thus pulled out of the run) via the per-tote Save button below.
+    REJECTED_INPUT_LABELS = [
+        ("loadedAt", "Loaded at"), ("ph", "pH"), ("orp", "ORP (mV)"),
+        ("orpRange", "ORP classification"), ("weightKg", "Weight (kg)"),
+        ("volumeL", "Volume (L)"), ("densityKgL", "Density (kg/L)"),
+        ("odour", "Odour"), ("odourOther", "Odour (other)"),
+        ("odourIntensity", "Odour intensity"), ("rejectionReason", "Rejection reason"),
+        ("notes", "Notes"),
+    ]
+
+    def save_feedstock_input(self, conn, run_id, tote_lot_id, user):
+        """Per-tote 'lock in' Save for the Feedstock characterization card
+        while a run is still in progress (draft). An accepted tote gets (or
+        keeps) a run_inputs row, same shape as finalize. A rejected tote is
+        pulled out of the run entirely instead: no run_inputs row is kept for
+        it (there'd be nothing left in the finalized run to point it at), and
+        every field the operator captured -- plus any uploaded photos -- is
+        written onto the tote's permanent Feedstock Stability log instead,
+        since that's the only place this data survives once the tote is
+        delisted from this run."""
+        run = conn.execute("SELECT * FROM production_runs WHERE id=? AND status='draft'",
+                           (run_id,)).fetchone()
+        if not run:
+            raise ApiError(404, "Draft not found")
+        tote = conn.execute("SELECT * FROM tote_lots WHERE id=?", (tote_lot_id,)).fetchone()
+        if not tote:
+            raise ApiError(404, "Tote not found")
+        d = self._body_json()
+        if d.get("decision") not in ("accepted", "rejected"):
+            raise ApiError(400, "A decision (accepted/rejected) is required")
+
+        existing_input = conn.execute(
+            "SELECT * FROM run_inputs WHERE run_id=? AND tote_lot_id=?",
+            (run_id, tote_lot_id)).fetchone()
+
+        if d["decision"] == "rejected":
+            # Any characterization already locked in for this tote on this
+            # run is superseded by the stability-log entries below.
+            if existing_input:
+                conn.execute("DELETE FROM run_inputs WHERE id=?", (existing_input["id"],))
+            note = "Rejected from production run %s" % run["processing_lot"]
+            for key, label in self.REJECTED_INPUT_LABELS:
+                val = d.get(key)
+                if val in (None, ""):
+                    continue
+                self._log_stability(conn, tote_lot_id, user, label, None, val, note, run_id=run_id)
+            self._log_stability(conn, tote_lot_id, user, "Decision", None, "rejected", note, run_id=run_id)
+            for slot_key, label in (("surfacePhotoId", "Surface photo"),
+                                     ("striationPhotoId", "Settling/striation photo")):
+                att_id = d.get(slot_key)
+                if not att_id:
+                    continue
+                att = conn.execute("SELECT filename FROM run_attachments WHERE id=? AND run_id=?",
+                                   (att_id, run_id)).fetchone()
+                self._log_stability(conn, tote_lot_id, user, label, None,
+                                   att["filename"] if att else "Photo", note,
+                                   run_id=run_id, attachment_id=att_id)
+            self._log_stability(conn, tote_lot_id, user, "Location", tote["location"],
+                               QAQC_HOLD_LOCATION, note)
+            self._log_stability(conn, tote_lot_id, user, "Status", tote["status"], "hold", note)
+            conn.execute("UPDATE tote_lots SET location=?, status='hold' WHERE id=?",
+                         (QAQC_HOLD_LOCATION, tote_lot_id))
+            return {"rejected": True}
+
+        # Accepted: create-or-update this tote's run_inputs row, same shape as finalize.
+        if existing_input:
+            input_id = existing_input["id"]
+        else:
+            cur = conn.cursor()
+            cur.execute("INSERT INTO run_inputs (run_id,tote_lot_id) VALUES (?,?)", (run_id, tote_lot_id))
+            input_id = cur.lastrowid
+        self._apply_feedstock_detail(conn, input_id, d, tote_lot_id)
+        return {"rejected": False, "inputs": self._run_inputs_public(conn, run_id)}
 
     def upload_input_photo(self, conn, run_id, input_id, user):
         row = conn.execute("SELECT * FROM run_inputs WHERE id=? AND run_id=?",
