@@ -60,6 +60,10 @@ DB_PATH = os.environ.get("KELP_ERP_DB", os.path.join(BASE_DIR, "kelp_erp.db"))
 PUBLIC_DIR = os.path.join(BASE_DIR, "public")
 SEED_FILE = os.path.join(BASE_DIR, "seed.json")
 UPLOAD_DIR = os.environ.get("KELP_ERP_UPLOADS", os.path.join(BASE_DIR, "uploads"))
+# Controlled documents (SOPs) live in their own folder, but as a sibling of
+# UPLOAD_DIR so they land on the same persistent disk in production (see
+# render.yaml) without needing a separate env var / disk mount of their own.
+SOP_DIR = os.path.join(os.path.dirname(UPLOAD_DIR), "sop_documents")
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB per file
 PORT = int(os.environ.get("PORT", "8002"))
 HOST = os.environ.get("HOST", "0.0.0.0")
@@ -228,6 +232,37 @@ CREATE TABLE IF NOT EXISTS run_attachments (
 );
 CREATE INDEX IF NOT EXISTS idx_attach_run ON run_attachments(run_id);
 
+-- Controlled documents (Standard Operating Procedures) referenced by name
+-- from spots in the production log (e.g. a QC Check's "Determining % Wet
+-- Solids SOP" link) -- admin-managed via Admin > SOP Documents, so the
+-- actual file can be uploaded/replaced without touching any code.
+CREATE TABLE IF NOT EXISTS sop_documents (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT NOT NULL UNIQUE,   -- editable display name, shown wherever this doc is linked
+    key          TEXT UNIQUE,            -- stable internal reference code a link is coded against,
+                                          -- so renaming `name` never breaks that link; set once, not editable
+    filename     TEXT,
+    content_type TEXT,
+    size         INTEGER,
+    stored_name  TEXT,                  -- opaque name on disk; NULL until a file is uploaded
+    uploaded_by  TEXT,
+    uploaded_at  TEXT,
+    updated_at   TEXT NOT NULL
+);
+
+-- Audit trail for sop_documents edits (name/file changes) -- one row per
+-- changed field, same shape as tote_stability_log/run_edits.
+CREATE TABLE IF NOT EXISTS sop_document_edits (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    sop_id        INTEGER NOT NULL REFERENCES sop_documents(id) ON DELETE CASCADE,
+    user_name     TEXT,
+    field         TEXT NOT NULL,
+    old_value     TEXT,
+    new_value     TEXT,
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sop_edits_sop ON sop_document_edits(sop_id);
+
 -- Lot-specific quality control measurements, traced back to the production
 -- run (processing lot) they were taken on.
 CREATE TABLE IF NOT EXISTS qc_logs (
@@ -366,6 +401,27 @@ CREATE TABLE IF NOT EXISTS production_runs (
     homog_citric_kg          REAL,
     homog_output_l           REAL,
     homog_started_at         TEXT,
+    homog_wet_solids_wt_g    REAL,  -- Homogenization Input QC Check
+    homog_liquid_wt_g        REAL,
+    homog_pct_wet_solids     REAL,  -- calculated: wet_solids_wt / (wet_solids_wt + liquid_wt)
+    homog_initial_ph              REAL,  -- Homogenization Input
+    homog_target_pct_wet_solids   REAL,  -- Homogenization Output, entered as a percent (e.g. 50.0)
+    homog_dilution_water_target_l REAL,  -- calculated: water needed to reach the target from tank_level/pct_wet_solids
+    homog_final_ph                REAL,
+    -- Homogenization Output, QC Check #1 (lot characterization)
+    homog_tds_pct            REAL,
+    homog_brix_pct           REAL,
+    homog_mannitol_pct       REAL,
+    homog_ts_liquid_pct      REAL,
+    homog_rho_liquid_g_ml    REAL,
+    homog_ts_slurry_pct      REAL,
+    homog_rho_slurry_g_ml    REAL,
+    homog_ts_solids_pct      REAL,
+    -- Homogenization Output, Sample Point #1 checklist (fixed rows, 0/1 collected)
+    homog_sample_slurry_microbial  INTEGER DEFAULT 0,
+    homog_sample_slurry_retention  INTEGER DEFAULT 0,
+    homog_sample_liquid_metals     INTEGER DEFAULT 0,
+    homog_sample_solids_proximate  INTEGER DEFAULT 0,
     -- Extraction stage (singular per run)
     extraction_amplitude_pct     REAL,
     extraction_flowrate_lpm      REAL,
@@ -566,6 +622,16 @@ def migrate(conn):
         ("homog_rinsing_water_l", "REAL"), ("homog_slurry_l", "REAL"),
         ("homog_dilution_water_l", "REAL"), ("homog_citric_kg", "REAL"),
         ("homog_output_l", "REAL"), ("homog_started_at", "TEXT"),
+        ("homog_wet_solids_wt_g", "REAL"), ("homog_liquid_wt_g", "REAL"), ("homog_pct_wet_solids", "REAL"),
+        ("homog_initial_ph", "REAL"), ("homog_target_pct_wet_solids", "REAL"),
+        ("homog_dilution_water_target_l", "REAL"), ("homog_final_ph", "REAL"),
+        ("homog_tds_pct", "REAL"), ("homog_brix_pct", "REAL"), ("homog_mannitol_pct", "REAL"),
+        ("homog_ts_liquid_pct", "REAL"), ("homog_rho_liquid_g_ml", "REAL"),
+        ("homog_ts_slurry_pct", "REAL"), ("homog_rho_slurry_g_ml", "REAL"), ("homog_ts_solids_pct", "REAL"),
+        ("homog_sample_slurry_microbial", "INTEGER DEFAULT 0"),
+        ("homog_sample_slurry_retention", "INTEGER DEFAULT 0"),
+        ("homog_sample_liquid_metals", "INTEGER DEFAULT 0"),
+        ("homog_sample_solids_proximate", "INTEGER DEFAULT 0"),
         ("extraction_amplitude_pct", "REAL"), ("extraction_flowrate_lpm", "REAL"),
         ("extraction_pressure_psi", "REAL"), ("extraction_starting_power_w", "REAL"),
         ("extraction_started_at", "TEXT"),
@@ -664,6 +730,16 @@ def migrate(conn):
                           " WHERE status='draft' AND processing_lot LIKE 'DRAFT-%'"):
         conn.execute("UPDATE production_runs SET processing_lot=? WHERE id=?",
                      (lot_number_for(r["created_at"], r["id"]), r["id"]))
+    sopcols = {r["name"] for r in conn.execute("PRAGMA table_info(sop_documents)")}
+    if "key" not in sopcols:
+        conn.execute("ALTER TABLE sop_documents ADD COLUMN key TEXT")
+    # Seed the one SOP the Homogenization QC Check links to (by key, not
+    # name, so an admin can freely rename it later without breaking that
+    # link) -- an admin still has to upload the actual file via Admin > SOP Documents.
+    conn.execute("INSERT OR IGNORE INTO sop_documents (name, key, updated_at) VALUES (?, ?, ?)",
+                 ("Determining % Wet Solids SOP", "wet_solids_sop", now_iso()))
+    conn.execute("UPDATE sop_documents SET key='wet_solids_sop'"
+                 " WHERE name='Determining % Wet Solids SOP' AND key IS NULL")
 
 
 def ensure_users(conn):
@@ -794,7 +870,20 @@ def run_public(r):
         "homogenization": {
             "startedAt": r["homog_started_at"], "rinsingWaterL": r["homog_rinsing_water_l"],
             "slurryL": r["homog_slurry_l"], "dilutionWaterL": r["homog_dilution_water_l"],
-            "citricKg": r["homog_citric_kg"], "outputL": r["homog_output_l"]},
+            "citricKg": r["homog_citric_kg"], "outputL": r["homog_output_l"],
+            "wetSolidsWtG": r["homog_wet_solids_wt_g"], "liquidWtG": r["homog_liquid_wt_g"],
+            "pctWetSolids": r["homog_pct_wet_solids"], "initialPh": r["homog_initial_ph"],
+            "targetPctWetSolids": r["homog_target_pct_wet_solids"],
+            "dilutionWaterTargetL": r["homog_dilution_water_target_l"],
+            "finalPh": r["homog_final_ph"],
+            "tdsPct": r["homog_tds_pct"], "brixPct": r["homog_brix_pct"],
+            "mannitolPct": r["homog_mannitol_pct"], "tsLiquidPct": r["homog_ts_liquid_pct"],
+            "rhoLiquidGMl": r["homog_rho_liquid_g_ml"], "tsSlurryPct": r["homog_ts_slurry_pct"],
+            "rhoSlurryGMl": r["homog_rho_slurry_g_ml"], "tsSolidsPct": r["homog_ts_solids_pct"],
+            "sampleSlurryMicrobial": bool(r["homog_sample_slurry_microbial"]),
+            "sampleSlurryRetention": bool(r["homog_sample_slurry_retention"]),
+            "sampleLiquidMetals": bool(r["homog_sample_liquid_metals"]),
+            "sampleSolidsProximate": bool(r["homog_sample_solids_proximate"])},
         "extraction": {
             "startedAt": r["extraction_started_at"], "amplitudePct": r["extraction_amplitude_pct"],
             "flowrateLpm": r["extraction_flowrate_lpm"], "pressurePsi": r["extraction_pressure_psi"],
@@ -899,6 +988,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if "/attachments/" in path and path.endswith("/download"):
             return self._download_attachment(path)
+        if path.startswith("/api/sop-documents/") and path.endswith("/download"):
+            return self._download_sop(path)
         if path == "/api/reports/xlsx":
             return self._report_xlsx()
         if path == "/api/admin/backup":
@@ -1025,6 +1116,42 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def _download_sop(self, path):
+        """Stream a controlled document's bytes. Any signed-in user can open
+        one (it's just linked by name from the production log); only admins
+        can add/replace/remove them (see route_sop_documents)."""
+        conn = db()
+        try:
+            qs = parse_qs(urlparse(self.path).query)
+            header = self.headers.get("Authorization", "")
+            tok = header[7:] if header.startswith("Bearer ") else qs.get("token", [None])[0]
+            if not read_token(tok or ""):
+                return self._send_json({"error": "Invalid or missing token"}, 401)
+            seg = [s for s in path.split("/") if s]   # api sop-documents :id download
+            sid = int(seg[2])
+            r = conn.execute("SELECT * FROM sop_documents WHERE id=?", (sid,)).fetchone()
+            if not r or not r["stored_name"]:
+                return self._send_json({"error": "Document not found"}, 404)
+            full = os.path.join(SOP_DIR, r["stored_name"])
+            if not os.path.isfile(full):
+                return self._send_json({"error": "File missing on disk"}, 404)
+            with open(full, "rb") as f:
+                data = f.read()
+            disp = "attachment" if qs.get("dl", [""])[0] else "inline"
+            safe = (r["filename"] or r["name"]).replace('"', '').replace("\r", "").replace("\n", "")
+            self.send_response(200)
+            self.send_header("Content-Type", r["content_type"] or "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", '%s; filename="%s"' % (disp, safe))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:  # pragma: no cover
+            self._send_json({"error": "Server error: %s" % e}, 500)
+        finally:
+            conn.close()
+
     def do_POST(self):
         return self._handle_api("POST")
 
@@ -1089,6 +1216,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.route_users(method, seg, conn, user)
         if method == "GET" and seg == ["api", "refdata"]:
             return self.refdata(conn)
+        if seg[:2] == ["api", "sop-documents"]:
+            return self.route_sop_documents(method, seg, conn, user)
         if method == "GET" and seg == ["api", "dashboard"]:
             return self.dashboard(conn)
         if seg[:2] == ["api", "totes"]:
@@ -1230,8 +1359,148 @@ class Handler(BaseHTTPRequestHandler):
                 for r in conn.execute("SELECT * FROM fg_skus ORDER BY (active != 1), code")]
         customers = [self._customer_public(r) for r in conn.execute(
             "SELECT * FROM customers WHERE active=1 ORDER BY name")]
+        # Lightweight, app-wide so any production-log QC Check can resolve its
+        # SOP link by its stable key (not name -- a name can be renamed by an
+        # admin at any time; matching by key means that rename is picked up
+        # everywhere automatically) without a separate round trip. The full
+        # admin CRUD view fetches /api/sop-documents itself.
+        sops = [dict(id=r["id"], name=r["name"], key=r["key"], hasFile=bool(r["stored_name"]))
+                for r in conn.execute("SELECT id, name, key, stored_name FROM sop_documents ORDER BY name")]
         return {"species": species, "sites": sites, "locations": locations,
-                "skus": skus, "packageSizes": PACKAGE_SIZES, "customers": customers}
+                "skus": skus, "packageSizes": PACKAGE_SIZES, "customers": customers, "sops": sops}
+
+    # ---- SOP documents (controlled documents, admin-managed) -------------- #
+    def _sop_public(self, r):
+        return {"id": r["id"], "name": r["name"], "key": r["key"], "filename": r["filename"],
+                "hasFile": bool(r["stored_name"]), "size": r["size"],
+                "uploadedBy": r["uploaded_by"], "uploadedAt": r["uploaded_at"],
+                "updatedAt": r["updated_at"]}
+
+    def _sop_edits(self, conn, sid):
+        return [dict(field=r["field"], oldValue=r["old_value"], newValue=r["new_value"],
+                     by=r["user_name"], at=r["created_at"])
+                for r in conn.execute(
+                    "SELECT * FROM sop_document_edits WHERE sop_id=? ORDER BY id DESC", (sid,))]
+
+    def _log_sop_edit(self, conn, sid, user, field, old, new):
+        conn.execute(
+            "INSERT INTO sop_document_edits (sop_id,user_name,field,old_value,new_value,created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (sid, user["name"] if user else None, field, old, new, now_iso()))
+
+    def route_sop_documents(self, method, seg, conn, user):
+        if seg == ["api", "sop-documents"] and method == "GET":
+            rows = conn.execute("SELECT * FROM sop_documents ORDER BY name").fetchall()
+            return {"sops": [self._sop_public(r) for r in rows]}
+        if seg == ["api", "sop-documents"] and method == "POST":
+            self._require_admin(user)
+            return self._create_sop(conn, user)
+        if len(seg) == 3 and seg[2].isdigit():
+            sid = int(seg[2])
+            row = conn.execute("SELECT * FROM sop_documents WHERE id=?", (sid,)).fetchone()
+            if not row:
+                raise ApiError(404, "Document not found")
+            if method == "PUT":
+                self._require_admin(user)
+                return self._update_sop(conn, sid, row, user)
+            if method == "DELETE":
+                self._require_admin(user)
+                return self._delete_sop(conn, sid, row)
+        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "edits" and method == "GET":
+            sid = int(seg[2])
+            if not conn.execute("SELECT 1 FROM sop_documents WHERE id=?", (sid,)).fetchone():
+                raise ApiError(404, "Document not found")
+            return {"edits": self._sop_edits(conn, sid)}
+        raise ApiError(404, "Unknown SOP documents endpoint")
+
+    def _store_sop_file(self, filename, content_type, data_b64):
+        """Decode+store one base64 file under SOP_DIR -- the tote/run
+        attachment stores' sibling, for admin-managed controlled documents."""
+        filename = (filename or "document").strip().replace("\\", "/").split("/")[-1] or "document"
+        data_b64 = data_b64 or ""
+        if data_b64.startswith("data:") and "," in data_b64:
+            data_b64 = data_b64.split(",", 1)[1]
+        try:
+            raw = base64.b64decode(data_b64)
+        except Exception:
+            raise ApiError(400, "Could not decode file data")
+        if not raw:
+            raise ApiError(400, "The file is empty")
+        if len(raw) > MAX_UPLOAD_BYTES:
+            raise ApiError(400, "File exceeds the %d MB limit" % (MAX_UPLOAD_BYTES // (1024 * 1024)))
+        os.makedirs(SOP_DIR, exist_ok=True)
+        ext = os.path.splitext(filename)[1][:12]
+        stored = secrets.token_hex(8) + ext
+        with open(os.path.join(SOP_DIR, stored), "wb") as f:
+            f.write(raw)
+        return filename, stored, len(raw)
+
+    def _create_sop(self, conn, user):
+        d = self._body_json()
+        name = (d.get("name") or "").strip()
+        if not name:
+            raise ApiError(400, "A document name is required")
+        if conn.execute("SELECT 1 FROM sop_documents WHERE name=?", (name,)).fetchone():
+            raise ApiError(400, "A document named \"%s\" already exists" % name)
+        key = (d.get("key") or "").strip() or None
+        if key and conn.execute("SELECT 1 FROM sop_documents WHERE key=?", (key,)).fetchone():
+            raise ApiError(400, "Reference key \"%s\" is already in use" % key)
+        ts = now_iso()
+        filename = stored = size = content_type = None
+        if d.get("dataB64"):
+            filename, stored, size = self._store_sop_file(d.get("filename"), d.get("contentType"), d["dataB64"])
+            content_type = d.get("contentType")
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO sop_documents (name,key,filename,content_type,size,stored_name,uploaded_by,uploaded_at,"
+            "updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (name, key, filename, content_type, size, stored, user["name"] if user else None,
+             ts if stored else None, ts))
+        return {"sop": self._sop_public(conn.execute(
+            "SELECT * FROM sop_documents WHERE id=?", (cur.lastrowid,)).fetchone())}
+
+    def _update_sop(self, conn, sid, row, user):
+        """Applies edits and writes one sop_document_edits row per field that
+        actually changed (name, and/or the file itself) -- the reference
+        `key` is intentionally not editable here, so a link coded against it
+        never breaks."""
+        d = self._body_json()
+        name = row["name"]
+        if "name" in d:
+            name = (d.get("name") or "").strip()
+            if not name:
+                raise ApiError(400, "A document name is required")
+            dup = conn.execute("SELECT 1 FROM sop_documents WHERE name=? AND id!=?", (name, sid)).fetchone()
+            if dup:
+                raise ApiError(400, "A document named \"%s\" already exists" % name)
+        updates = {"name": name, "updated_at": now_iso()}
+        if name != row["name"]:
+            self._log_sop_edit(conn, sid, user, "Name", row["name"], name)
+        if d.get("dataB64"):
+            filename, stored, size = self._store_sop_file(d.get("filename"), d.get("contentType"), d["dataB64"])
+            old_stored = row["stored_name"]
+            updates.update(filename=filename, content_type=d.get("contentType"), size=size,
+                           stored_name=stored, uploaded_by=user["name"] if user else None,
+                           uploaded_at=now_iso())
+            self._log_sop_edit(conn, sid, user, "File", row["filename"] or "—", filename)
+            if old_stored:
+                try:
+                    os.remove(os.path.join(SOP_DIR, old_stored))
+                except OSError:
+                    pass
+        sets = ", ".join("%s=?" % c for c in updates)
+        conn.execute("UPDATE sop_documents SET %s WHERE id=?" % sets, (*updates.values(), sid))
+        return {"sop": self._sop_public(conn.execute(
+            "SELECT * FROM sop_documents WHERE id=?", (sid,)).fetchone())}
+
+    def _delete_sop(self, conn, sid, row):
+        if row["stored_name"]:
+            try:
+                os.remove(os.path.join(SOP_DIR, row["stored_name"]))
+            except OSError:
+                pass
+        conn.execute("DELETE FROM sop_documents WHERE id=?", (sid,))
+        return {"ok": True}
 
     # ---- dashboard -------------------------------------------------------- #
     def dashboard(self, conn):
@@ -1622,8 +1891,30 @@ class Handler(BaseHTTPRequestHandler):
             ("homog_started_at", "startedAt", "text"),
             ("homog_rinsing_water_l", "rinsingWaterL", "num"),
             ("homog_slurry_l", "slurryL", "num"),
+            ("homog_initial_ph", "initialPh", "num"),
+            ("homog_wet_solids_wt_g", "wetSolidsWtG", "num"),
+            ("homog_liquid_wt_g", "liquidWtG", "num"),
+            ("homog_pct_wet_solids", "pctWetSolids", "num"),
+            ("homog_target_pct_wet_solids", "targetPctWetSolids", "num"),
+            ("homog_dilution_water_target_l", "dilutionWaterTargetL", "num"),
             ("homog_dilution_water_l", "dilutionWaterL", "num"),
-            ("homog_output_l", "outputL", "num"),
+            ("homog_citric_kg", "citricKg", "num"),
+            ("homog_final_ph", "finalPh", "num"),
+            ("homog_tds_pct", "tdsPct", "num"),
+            ("homog_brix_pct", "brixPct", "num"),
+            ("homog_mannitol_pct", "mannitolPct", "num"),
+            ("homog_ts_liquid_pct", "tsLiquidPct", "num"),
+            ("homog_rho_liquid_g_ml", "rhoLiquidGMl", "num"),
+            ("homog_ts_slurry_pct", "tsSlurryPct", "num"),
+            ("homog_rho_slurry_g_ml", "rhoSlurryGMl", "num"),
+            ("homog_ts_solids_pct", "tsSolidsPct", "num"),
+            ("homog_sample_slurry_microbial", "sampleSlurryMicrobial", "bool"),
+            ("homog_sample_slurry_retention", "sampleSlurryRetention", "bool"),
+            ("homog_sample_liquid_metals", "sampleLiquidMetals", "bool"),
+            ("homog_sample_solids_proximate", "sampleSolidsProximate", "bool"),
+            # homog_output_l column stays (additive-only) but is no longer
+            # collected -- "Output (L)" was removed from the Homogenization
+            # Output section.
         ],
         "extraction": [
             ("extraction_started_at", "startedAt", "text"),
@@ -2236,7 +2527,12 @@ class Handler(BaseHTTPRequestHandler):
         for col, key, kind in self.STAGE_FIELDS[stage]:
             if key not in d:
                 continue
-            updates[col] = numn(d[key]) if kind == "num" else ((d[key] or "").strip() or None)
+            if kind == "num":
+                updates[col] = numn(d[key])
+            elif kind == "bool":
+                updates[col] = 1 if d[key] else 0
+            else:
+                updates[col] = (d[key] or "").strip() or None
         if updates:
             sets = ", ".join("%s=?" % c for c in updates)
             conn.execute("UPDATE production_runs SET %s WHERE id=?" % sets, (*updates.values(), rid))

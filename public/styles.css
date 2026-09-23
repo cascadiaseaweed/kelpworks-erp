@@ -283,6 +283,37 @@ th.sortable:hover { background: #e2ece9; }
 
 .repeat-item { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-bottom: 10px; background: #fafcfc; }
 
+/* QC Check: a recurring pattern through the production log for a stage's
+   built-in quality checkpoint (a calculated value + the readings behind it
+   + a link to the governing SOP) -- a grey box with a blue title sets it
+   apart from the surrounding plain stage fields at a glance. */
+.qc-check-box { background: #f2f4f5; border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin: 10px 0; }
+.qc-check-title { font-size: 12px; font-weight: 700; color: #2a5c94; text-transform: uppercase; letter-spacing: .6px; margin-bottom: 2px; }
+.qc-check-subtitle { font-size: 12px; font-style: italic; color: var(--muted); margin-bottom: 10px; }
+.qc-check-result { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
+.qc-check-result-label { font-size: 12px; font-weight: 600; color: var(--muted); }
+.qc-check-result-value { font-size: 20px; font-weight: 700; color: var(--teal-dark); font-variant-numeric: tabular-nums; }
+.qc-check-sop { margin-top: 10px; font-size: 13px; }
+.qc-check-sop a { font-weight: 600; }
+/* Quality-check family: same shell, purple fill/title -- QC Check #1 (lot
+   characterization) in Homogenization Output. */
+.qc-check-box.theme-quality { background: #f2eaf9; }
+.qc-check-box.theme-quality .qc-check-title { color: #6b3fa0; }
+/* Sample-point family: same shell, orange fill/title -- Sample Point #1
+   (lot input checklist) in Homogenization Output. */
+.qc-check-box.theme-sample { background: #fbedd9; }
+.qc-check-box.theme-sample .qc-check-title { color: #a1670f; }
+.qc-check-section-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); margin: 12px 0 6px; }
+.qc-check-section-title:first-of-type { margin-top: 0; }
+.form-row-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.form-row-compact { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.form-row-compact .field { flex: 0 0 108px; }
+.qc-check-checklist { width: 100%; border-collapse: collapse; font-size: 13px; }
+.qc-check-checklist th, .qc-check-checklist td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); }
+.qc-check-checklist th { font-size: 11px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted); font-weight: 700; }
+.qc-check-checklist td.checkcol, .qc-check-checklist th.checkcol { width: 28px; text-align: center; padding-left: 4px; padding-right: 4px; }
+@media (max-width: 600px) { .form-row-3 { grid-template-columns: 1fr; } }
+
 .photo-slot img { display: block; width: 100%; max-width: 160px; border-radius: 8px; margin-top: 6px; object-fit: cover; }
 
 .stage-progress { display: flex; gap: 4px; margin-top: 8px; }

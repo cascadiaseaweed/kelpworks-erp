@@ -699,6 +699,21 @@ function toteAttDownloadUrl(tid, aid, dl) {
   return '/api/totes/' + tid + '/attachments/' + aid + '/download?' +
     (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(State.token);
 }
+function sopDownloadUrl(sid, dl) {
+  return '/api/sop-documents/' + sid + '/download?' +
+    (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(State.token);
+}
+// A QC Check's link to its governing SOP, resolved by its stable reference
+// key (not its display name) against the admin-managed list
+// (State.ref.sops) -- so an admin renaming the document in Admin > SOP
+// Documents never breaks this link, and the current name always shows here.
+// Reads sensibly even before an admin has uploaded the file yet, too.
+function sopLinkEl(key) {
+  const sop = (State.ref.sops || []).find(s => s.key === key);
+  if (!sop) return el('div', { class: 'qc-check-sop help' }, '📄 SOP not configured (Admin → SOP Documents)');
+  if (!sop.hasFile) return el('div', { class: 'qc-check-sop help' }, '📄 ' + sop.name + ' — not yet uploaded (Admin → SOP Documents)');
+  return el('div', { class: 'qc-check-sop' }, el('a', { href: sopDownloadUrl(sop.id, false), target: '_blank', rel: 'noopener' }, '📄 ' + sop.name));
+}
 function uploadAtt(rid, file) {
   return new Promise((resolve, reject) => {
     if (file.size > 25 * 1024 * 1024) return reject(new Error(file.name + ' exceeds the 25 MB limit'));
@@ -1128,11 +1143,10 @@ async function openQcForRun(run) {
 
 /* ---- Process-stage building blocks, shared by openRun (pre-finalize) and
    openProcessLog (post-finalize) ---- */
+// Homogenization is bespoke (buildHomogenizationSections, below) -- it's
+// split into Input/Output and Input carries a QC Check -- everything else
+// still uses the generic field-list renderer.
 const STAGE_DEFS = {
-  homogenization: { key: 'homogenization', title: 'Homogenization', fields: [
-    ['startedAt', 'Started at', 'dt'], ['rinsingWaterL', 'Rinsing water (L)', 'num'],
-    ['slurryL', 'Slurry (L)', 'num'], ['dilutionWaterL', 'Dilution water (L)', 'num'],
-    ['outputL', 'Output (L)', 'num']] },
   extraction: { key: 'extraction', title: 'Extraction', fields: [
     ['startedAt', 'Started at', 'dt'], ['amplitudePct', 'Amplitude (%)', 'num'],
     ['flowrateLpm', 'Flow rate (L/min)', 'num'], ['pressurePsi', 'Pressure (psi)', 'num'],
@@ -1181,6 +1195,205 @@ function buildStageSection(getRunId, def, values, bare) {
   if (bare) return content;
   return el('details', { class: 'accordion' }, el('summary', {}, def.title),
     el('div', { class: 'accordion-body' }, content));
+}
+// Homogenization Input (start time, its QC Check, and the water/slurry
+// inputs) and Homogenization Output (just the output volume) as two
+// independent, independently-saving accordions -- same self-saving pattern
+// as buildStageSection, just laid out by hand since a QC Check's calculated
+// field + SOP link don't fit the generic field-list renderer.
+function buildHomogenizationSections(getRunId, values) {
+  values = values || {};
+  const startedAt = el('input', { type: 'datetime-local', value: values.startedAt || '' });
+
+  const rinsingInp = el('input', { inputmode: 'decimal', placeholder: 'Measured using garden hose' }); attachNumericMask(rinsingInp, 2);
+  if (values.rinsingWaterL != null) rinsingInp.value = formatQcValue(values.rinsingWaterL, 2);
+  // Tank level (L) is also the starting volume the dilution-water-target
+  // calc (in the Output section, below) scales up from.
+  const tankInp = el('input', { inputmode: 'decimal', placeholder: 'Measured using level sensor' }); attachNumericMask(tankInp, 2);
+  if (values.slurryL != null) tankInp.value = formatQcValue(values.slurryL, 2);
+  // Process Check #1 (Solids loading): %Wet-Solids, (g/g) = Wet-solids-wt /
+  // (Wet-solids-wt + Liquid-wt) -- shown as a percentage, but kept internally
+  // as the raw 0-1 ratio so the Output section's dilution-target calc (which
+  // reuses this function) can use it directly.
+  const wetInp = el('input', { inputmode: 'decimal', placeholder: 'g' });
+  attachNumericMask(wetInp, 2);
+  if (values.wetSolidsWtG != null) wetInp.value = formatQcValue(values.wetSolidsWtG, 2);
+  const liquidInp = el('input', { inputmode: 'decimal', placeholder: 'g' });
+  attachNumericMask(liquidInp, 2);
+  if (values.liquidWtG != null) liquidInp.value = formatQcValue(values.liquidWtG, 2);
+  function calcPctWetSolids() {
+    const w = wetInp.value.trim() === '' ? null : qcParseValue(wetInp.value);
+    const l = liquidInp.value.trim() === '' ? null : qcParseValue(liquidInp.value);
+    return (w != null && l != null && (w + l) > 0) ? w / (w + l) : null;
+  }
+  function fmtPct1(ratio) { return ratio != null ? (ratio * 100).toFixed(1) + '%' : '—'; }
+  const resultValue = el('span', { class: 'qc-check-result-value' }, fmtPct1(values.pctWetSolids));
+  [wetInp, liquidInp].forEach(inp => inp.addEventListener('input', () => {
+    resultValue.textContent = fmtPct1(calcPctWetSolids());
+    refreshDilutionTarget();
+  }));
+  const processCheck1Box = el('div', { class: 'qc-check-box' },
+    el('div', { class: 'qc-check-title' }, 'Process Check #1'),
+    el('div', { class: 'qc-check-subtitle' }, 'Solids loading'),
+    el('div', { class: 'qc-check-result' },
+      el('span', { class: 'qc-check-result-label' }, '%Wet-Solids, (g/g)'), resultValue),
+    el('div', { class: 'form-row' },
+      field('Wet-solids-wt (g)', wetInp), field('Liquid-wt (g)', liquidInp)),
+    sopLinkEl('wet_solids_sop'));
+
+  const inputStatus = el('span', { class: 'help' });
+  const inputSaveBtn = el('button', { type: 'button', class: 'secondary', onclick: saveInput }, 'Save');
+  async function saveInput() {
+    inputStatus.textContent = ''; inputSaveBtn.disabled = true;
+    try {
+      const rid = await getRunId();
+      await api('PUT', '/production/' + rid + '/stages/homogenization', {
+        startedAt: startedAt.value || null,
+        rinsingWaterL: rinsingInp.value.trim() === '' ? null : qcParseValue(rinsingInp.value),
+        slurryL: tankInp.value.trim() === '' ? null : qcParseValue(tankInp.value),
+        wetSolidsWtG: wetInp.value.trim() === '' ? null : qcParseValue(wetInp.value),
+        liquidWtG: liquidInp.value.trim() === '' ? null : qcParseValue(liquidInp.value),
+        pctWetSolids: calcPctWetSolids(),
+      });
+      inputStatus.textContent = 'Saved.';
+    } catch (e) { inputStatus.textContent = e.message; }
+    inputSaveBtn.disabled = false;
+  }
+  const inputSection = el('details', { class: 'accordion' }, el('summary', {}, 'Homogenization Input'),
+    el('div', { class: 'accordion-body' },
+      el('div', { class: 'form-row' }, field('Started at', startedAt)),
+      el('div', { class: 'form-row' },
+        field('Rinse water (L)', rinsingInp), field('Tank level (L)', tankInp)),
+      processCheck1Box,
+      el('div', { style: 'margin-top:6px' }, inputSaveBtn, inputStatus)));
+
+  // Output: a target %Wet-Solids to dilute the tank down to, and the water
+  // (L) needed to get there from the tank's starting volume/concentration --
+  // standard C1V1=C2V2-style dilution math, assuming density ~1 kg/L so the
+  // Tank level (L) reading above doubles as the starting mass.
+  const targetPctInp = el('input', { inputmode: 'decimal', placeholder: '%' }); attachNumericMask(targetPctInp, 1);
+  targetPctInp.value = values.targetPctWetSolids != null ? formatQcValue(values.targetPctWetSolids, 1) : '50.0';
+  const dilutionTargetValue = el('span', { class: 'help' });
+  function calcDilutionTarget() {
+    const tank = tankInp.value.trim() === '' ? null : qcParseValue(tankInp.value);
+    const initialPct = calcPctWetSolids();
+    const targetPctRaw = targetPctInp.value.trim() === '' ? null : qcParseValue(targetPctInp.value);
+    if (tank == null || initialPct == null || !targetPctRaw) return null;
+    const targetPct = targetPctRaw / 100;
+    const water = tank * (initialPct - targetPct) / targetPct;
+    return water > 0 ? water : 0;
+  }
+  function refreshDilutionTarget() {
+    const v = calcDilutionTarget();
+    dilutionTargetValue.textContent = v != null ? formatQcValue(v, 1) + ' L' : 'Enter Tank level, the QC Check, and Target %Wet-Solids to calculate';
+  }
+  refreshDilutionTarget();
+  targetPctInp.addEventListener('input', refreshDilutionTarget);
+  tankInp.addEventListener('input', refreshDilutionTarget);
+
+  const dilutionInp = el('input', { inputmode: 'decimal', placeholder: 'Measured using dilution totalizer' }); attachNumericMask(dilutionInp, 2);
+  if (values.dilutionWaterL != null) dilutionInp.value = formatQcValue(values.dilutionWaterL, 2);
+
+  // Process Check #2 (pH control): Initial pH, Citric Acid, and Final pH
+  // together on one row -- Initial pH moved here from Homogenization Input.
+  const initialPhInp = el('input', { inputmode: 'decimal', placeholder: 'pH' }); attachNumericMask(initialPhInp, 1);
+  if (values.initialPh != null) initialPhInp.value = formatQcValue(values.initialPh, 1);
+  const citricInp = el('input', { inputmode: 'decimal', placeholder: 'kg' }); attachNumericMask(citricInp, 1);
+  if (values.citricKg != null) citricInp.value = formatQcValue(values.citricKg, 1);
+  const finalPhInp = el('input', { inputmode: 'decimal', placeholder: 'pH' }); attachNumericMask(finalPhInp, 1);
+  if (values.finalPh != null) finalPhInp.value = formatQcValue(values.finalPh, 1);
+  const processCheck2Box = el('div', { class: 'qc-check-box' },
+    el('div', { class: 'qc-check-title' }, 'Process Check #2'),
+    el('div', { class: 'qc-check-subtitle' }, 'pH control'),
+    el('div', { class: 'form-row-3' },
+      field('Initial pH', initialPhInp), field('Citric Acid (kg)', citricInp), field('Final pH', finalPhInp)));
+
+  // QC Check #1 (lot characterization): liquid-phase and slurry/solids-phase
+  // readings, each its own compact wrapping row.
+  function pctInput() { const i = el('input', { inputmode: 'decimal', placeholder: '%' }); attachNumericMask(i, 1); return i; }
+  function densityInput() { const i = el('input', { inputmode: 'decimal', placeholder: 'g/mL' }); attachNumericMask(i, 3); return i; }
+  const tdsInp = pctInput(); if (values.tdsPct != null) tdsInp.value = formatQcValue(values.tdsPct, 1);
+  const brixInp = pctInput(); if (values.brixPct != null) brixInp.value = formatQcValue(values.brixPct, 1);
+  const mannitolInp = pctInput(); if (values.mannitolPct != null) mannitolInp.value = formatQcValue(values.mannitolPct, 1);
+  const tsLiquidInp = pctInput(); if (values.tsLiquidPct != null) tsLiquidInp.value = formatQcValue(values.tsLiquidPct, 1);
+  const rhoLiquidInp = densityInput(); if (values.rhoLiquidGMl != null) rhoLiquidInp.value = formatQcValue(values.rhoLiquidGMl, 3);
+  const tsSlurryInp = pctInput(); if (values.tsSlurryPct != null) tsSlurryInp.value = formatQcValue(values.tsSlurryPct, 1);
+  const rhoSlurryInp = densityInput(); if (values.rhoSlurryGMl != null) rhoSlurryInp.value = formatQcValue(values.rhoSlurryGMl, 3);
+  const tsSolidsInp = pctInput(); if (values.tsSolidsPct != null) tsSolidsInp.value = formatQcValue(values.tsSolidsPct, 1);
+  const qcCheck1Box = el('div', { class: 'qc-check-box theme-quality' },
+    el('div', { class: 'qc-check-title' }, 'QC Check #1'),
+    el('div', { class: 'qc-check-subtitle' }, 'Lot characterization'),
+    el('div', { class: 'qc-check-section-title' }, 'Liquid'),
+    el('div', { class: 'form-row-compact' },
+      field('TDS (%)', tdsInp), field('Brix (%)', brixInp), field('Mannitol (%)', mannitolInp),
+      field('TSliquid (%)', tsLiquidInp), field('ρliquid (g/mL)', rhoLiquidInp)),
+    el('div', { class: 'qc-check-section-title' }, 'Slurry / Solids'),
+    el('div', { class: 'form-row-compact' },
+      field('TSslurry (%)', tsSlurryInp), field('ρslurry (g/mL)', rhoSlurryInp), field('TSsolids (%)', tsSolidsInp)));
+
+  // Sample Point #1 (lot input): a fixed sampling checklist -- each row's
+  // Type/Description/Qty are set SOP requirements, not editable, only the
+  // "collected" checkbox is saved.
+  const SAMPLE_POINT_ROWS = [
+    ['sampleSlurryMicrobial', 'Slurry', 'Microbial', '2x 50 ml'],
+    ['sampleSlurryRetention', 'Slurry', 'Retention', '2x 50 ml'],
+    ['sampleLiquidMetals', 'Liquid', 'Metals & Nutrients', '2x 50 ml'],
+    ['sampleSolidsProximate', 'Solids', 'Proximate Analysis', '100g wet solids - unwashed'],
+  ];
+  const sampleChecks = {};
+  const samplePointBox = el('div', { class: 'qc-check-box theme-sample' },
+    el('div', { class: 'qc-check-title' }, 'Sample Point #1'),
+    el('div', { class: 'qc-check-subtitle' }, 'Lot input'),
+    el('table', { class: 'qc-check-checklist' },
+      el('thead', {}, el('tr', {}, el('th', { class: 'checkcol' }, ''), el('th', {}, 'Type'), el('th', {}, 'Description'), el('th', {}, 'Qty'))),
+      el('tbody', {}, ...SAMPLE_POINT_ROWS.map(([key, type, desc, qty]) => {
+        const cb = el('input', { type: 'checkbox' });
+        cb.checked = !!values[key];
+        sampleChecks[key] = cb;
+        return el('tr', {}, el('td', { class: 'checkcol' }, cb), el('td', {}, type), el('td', {}, desc), el('td', {}, qty));
+      }))));
+
+  const outputStatus = el('span', { class: 'help' });
+  const outputSaveBtn = el('button', { type: 'button', class: 'secondary', onclick: saveOutput }, 'Save');
+  async function saveOutput() {
+    outputStatus.textContent = ''; outputSaveBtn.disabled = true;
+    try {
+      const rid = await getRunId();
+      await api('PUT', '/production/' + rid + '/stages/homogenization', {
+        targetPctWetSolids: targetPctInp.value.trim() === '' ? null : qcParseValue(targetPctInp.value),
+        dilutionWaterTargetL: calcDilutionTarget(),
+        dilutionWaterL: dilutionInp.value.trim() === '' ? null : qcParseValue(dilutionInp.value),
+        initialPh: initialPhInp.value.trim() === '' ? null : qcParseValue(initialPhInp.value),
+        citricKg: citricInp.value.trim() === '' ? null : qcParseValue(citricInp.value),
+        finalPh: finalPhInp.value.trim() === '' ? null : qcParseValue(finalPhInp.value),
+        tdsPct: tdsInp.value.trim() === '' ? null : qcParseValue(tdsInp.value),
+        brixPct: brixInp.value.trim() === '' ? null : qcParseValue(brixInp.value),
+        mannitolPct: mannitolInp.value.trim() === '' ? null : qcParseValue(mannitolInp.value),
+        tsLiquidPct: tsLiquidInp.value.trim() === '' ? null : qcParseValue(tsLiquidInp.value),
+        rhoLiquidGMl: rhoLiquidInp.value.trim() === '' ? null : qcParseValue(rhoLiquidInp.value),
+        tsSlurryPct: tsSlurryInp.value.trim() === '' ? null : qcParseValue(tsSlurryInp.value),
+        rhoSlurryGMl: rhoSlurryInp.value.trim() === '' ? null : qcParseValue(rhoSlurryInp.value),
+        tsSolidsPct: tsSolidsInp.value.trim() === '' ? null : qcParseValue(tsSolidsInp.value),
+        sampleSlurryMicrobial: sampleChecks.sampleSlurryMicrobial.checked,
+        sampleSlurryRetention: sampleChecks.sampleSlurryRetention.checked,
+        sampleLiquidMetals: sampleChecks.sampleLiquidMetals.checked,
+        sampleSolidsProximate: sampleChecks.sampleSolidsProximate.checked,
+      });
+      outputStatus.textContent = 'Saved.';
+    } catch (e) { outputStatus.textContent = e.message; }
+    outputSaveBtn.disabled = false;
+  }
+  const outputSection = el('details', { class: 'accordion' }, el('summary', {}, 'Homogenization Output'),
+    el('div', { class: 'accordion-body' },
+      el('div', { class: 'form-row' }, field('Target %Wet-Solids', targetPctInp)),
+      field('Dilution water (L) target (calculated)', dilutionTargetValue),
+      el('div', { class: 'form-row' }, field('Dilution water (L)', dilutionInp)),
+      processCheck2Box,
+      qcCheck1Box,
+      samplePointBox,
+      el('div', { style: 'margin-top:6px' }, outputSaveBtn, outputStatus)));
+
+  return { inputSection, outputSection };
 }
 
 const ODOUR_INTENSITIES = ['', 'Mild', 'Medium', 'Strong'];
@@ -1626,10 +1839,15 @@ async function openNewRun() {
       toteIds: [], packages: [], feedstockDetails: {}
     });
     toast('Run ' + r.run.processingLot + ' created.');
-    openRun(r.run);
+    openRun(r.run, { fresh: true });
   }, 'Create run');
 }
-async function openRun(draftSummary) {
+async function openRun(draftSummary, opts) {
+  // `fresh` is only true right after openNewRun() just created this draft --
+  // that's the one case that keeps its current default-open Feedstock
+  // section; resuming an existing draft (or reopening any other production
+  // log) always starts with every section collapsed.
+  const fresh = !!(opts && opts.fresh);
   // Re-fetch a resumed draft in full (list snapshots omit stage/solids/dilution detail).
   const draft = (draftSummary && draftSummary.id) ? (await api('GET', '/production/drafts/' + draftSummary.id)).run : draftSummary;
   const totes = (await api('GET', '/totes?status=in_stock'
@@ -1830,7 +2048,8 @@ async function openRun(draftSummary) {
   }
 
   const stages = draft?.stages || {};
-  const homogSection = buildStageSection(ensureRunId, STAGE_DEFS.homogenization, stages.homogenization);
+  const { inputSection: homogInputSection, outputSection: homogOutputSection } =
+    buildHomogenizationSections(ensureRunId, stages.homogenization);
   const extractionSection = buildStageSection(ensureRunId, STAGE_DEFS.extraction, stages.extraction);
   const separationParams = buildStageSection(ensureRunId, STAGE_DEFS.separation, stages.separation, true);
   const sepSolidsSection = buildSepSolidsSection(draft?.separationSolids || [], ensureRunId, attId => attDownloadUrl(draftId, attId, false));
@@ -1863,12 +2082,12 @@ async function openRun(draftSummary) {
           field('Production Location', productionLocationSelect('r_loc', draft?.location)),
           field('Operators', operatorsSelect.el)),
         field('Notes', el('textarea', { id: 'r_notes', rows: '2', placeholder: 'Optional batch notes' }, draft?.notes || '')))),
-    el('details', { class: 'accordion', open: '' }, el('summary', {}, 'Feedstock'),
+    el('details', { class: 'accordion', ...(fresh ? { open: '' } : {}) }, el('summary', {}, 'Feedstock'),
       el('div', { class: 'accordion-body' },
         field('Filter totes', generalFilterInp),
         field('Stabilization method', stabFilterSel), pickHost, summary,
         el('h4', { style: 'margin:14px 0 4px;font-size:13px' }, 'Feedstock characterization'), feedstockHost)),
-    homogSection, extractionSection,
+    homogInputSection, homogOutputSection, extractionSection,
     el('details', { class: 'accordion' }, el('summary', {}, 'Separation'),
       el('div', { class: 'accordion-body' }, separationParams,
         el('h4', { style: 'margin:14px 0 4px;font-size:13px' }, 'Solids collections'), sepSolidsSection)),
@@ -1966,7 +2185,8 @@ async function openProcessLog(run) {
   if (!run.inputs || !run.inputs.length) feedstockHost.append(el('div', { class: 'help' }, 'No feedstock characterization recorded.'));
 
   const getRunId = async () => run.id;
-  const homogSection = buildStageSection(getRunId, STAGE_DEFS.homogenization, stages.homogenization);
+  const { inputSection: homogInputSection, outputSection: homogOutputSection } =
+    buildHomogenizationSections(getRunId, stages.homogenization);
   const extractionSection = buildStageSection(getRunId, STAGE_DEFS.extraction, stages.extraction);
   const separationParams = buildStageSection(getRunId, STAGE_DEFS.separation, stages.separation, true);
   const sepSolidsSection = buildSepSolidsSection(run.separationSolids || [], getRunId, attId => attDownloadUrl(run.id, attId, false));
@@ -1986,9 +2206,9 @@ async function openProcessLog(run) {
   const body = el('div', {},
     el('div', { class: 'summary-line' }, sl('Run', run.processingLot), sl('SKU', skuName(run.sku)),
       el('span', { class: 'muted' }, 'Each section saves independently and can be filled in or corrected any time.')),
-    el('details', { class: 'accordion', open: '' }, el('summary', {}, 'Feedstock characterization'),
+    el('details', { class: 'accordion' }, el('summary', {}, 'Feedstock characterization'),
       el('div', { class: 'accordion-body' }, feedstockHost)),
-    homogSection, extractionSection,
+    homogInputSection, homogOutputSection, extractionSection,
     el('details', { class: 'accordion' }, el('summary', {}, 'Separation'),
       el('div', { class: 'accordion-body' }, separationParams,
         el('h4', { style: 'margin:14px 0 4px;font-size:13px' }, 'Solids collections'), sepSolidsSection)),
@@ -2658,7 +2878,15 @@ function table(headers, rows, numCols = [], rowClick = null) {
 function mono(s) { return el('span', { class: 'mono' }, s); }
 function badge(cls, txt) { return el('span', { class: 'badge ' + cls }, txt); }
 function num(s) { return el('span', { class: 'num' }, s); }
-function rowActions(items) { return el('span', { class: 'row-actions' }, ...items.filter(Boolean).map(([label, fn, cls]) => el('button', { class: (cls || 'secondary') + ' ', onclick: fn }, label))); }
+function rowActions(items) {
+  return el('span', { class: 'row-actions' }, ...items.filter(Boolean).map(([label, fn, cls]) => el('button', {
+    class: (cls || 'secondary') + ' ',
+    // Stops a row-action button from also firing the row's own onclick (e.g.
+    // a table's rowClick, used elsewhere to open a row's history) when both
+    // are present on the same row.
+    onclick: e => { e.stopPropagation(); return fn(e); }
+  }, label)));
+}
 function field(label, control) { return el('div', { class: 'field' }, label ? el('label', {}, label) : null, control); }
 function selectFrom(label, opts, onchange, id) {
   const s = el('select', id ? { id } : {}, ...opts.map(([v, t]) => el('option', { value: v }, t)));
@@ -2743,6 +2971,104 @@ async function pageAdmin(v) {
     ]), [false, false, false, false, false]));
   v.append(el('div', { class: 'help', style: 'margin-top:10px' },
     'New users and password resets require the person to set a new password on next sign-in.'));
+
+  // SOP documents: controlled documents a production-log QC Check links to
+  // by a stable reference key (never the display name, so a rename here is
+  // reflected everywhere that link appears without breaking it) -- admin-only
+  // to add/edit/delete, but the list (and download) is readable by anyone
+  // signed in. Clicking a row (not its action buttons) opens its edit history.
+  v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'SOP Documents'),
+    el('div', { class: 'actions' }, el('button', { onclick: addSop }, '+ Add SOP document'))));
+  const sr = await api('GET', '/sop-documents');
+  if (!sr.sops.length) v.append(el('div', { class: 'empty card' }, 'No SOP documents yet.'));
+  else v.append(table(
+    ['Name', 'File', 'Uploaded', ''],
+    sr.sops.map(s => [
+      s.name,
+      s.hasFile ? el('a', { href: sopDownloadUrl(s.id, false), target: '_blank', rel: 'noopener' }, s.filename || 'Download')
+        : el('span', { class: 'muted' }, 'Not yet uploaded'),
+      s.uploadedAt ? fmtWhen(s.uploadedAt) + (s.uploadedBy ? ' · ' + s.uploadedBy : '') : '—',
+      rowActions([
+        ['Edit', () => editSop(s)],
+        ['Delete', () => deleteSop(s), 'danger'],
+      ])
+    ]), [false, false, false, false], ri => showSopHistory(sr.sops[ri])));
+  v.append(el('div', { class: 'help', style: 'margin-top:10px' },
+    'A QC Check in the production log links to an SOP by its reference key, not its name — renaming a document here is picked up everywhere it’s linked. Click a row to see its change history.'));
+}
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    if (file.size > 25 * 1024 * 1024) return reject(new Error(file.name + ' exceeds the 25 MB limit'));
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(',')[1]);
+    reader.onerror = () => reject(new Error('Could not read ' + file.name));
+    reader.readAsDataURL(file);
+  });
+}
+function addSop() {
+  const nameInp = el('input', { id: 's_name', placeholder: 'e.g. Determining % Wet Solids SOP' });
+  const keyInp = el('input', { id: 's_key', placeholder: 'e.g. wet_solids_sop' });
+  const fileInp = el('input', { type: 'file', id: 's_file' });
+  const body = el('div', {},
+    field('Document name', nameInp),
+    field('Reference key (optional)', keyInp),
+    el('div', { class: 'help', style: 'margin-top:-8px' },
+      'Only needed if a spot in the production log will link to this document — set once and can’t be changed later, so the link keeps working even if the name above is edited afterward.'),
+    field('File (optional — can be added later)', fileInp));
+  modal('Add SOP document', body, async () => {
+    const name = nameInp.value.trim();
+    if (!name) throw new Error('Enter a document name.');
+    const file = fileInp.files[0];
+    const payload = { name, key: keyInp.value.trim() || null };
+    if (file) {
+      payload.filename = file.name; payload.contentType = file.type || 'application/octet-stream';
+      payload.dataB64 = await readFileAsBase64(file);
+    }
+    await api('POST', '/sop-documents', payload);
+    State.ref = await api('GET', '/refdata');
+    toast('SOP document added'); render();
+  }, 'Add');
+}
+function editSop(s) {
+  const nameInp = el('input', { id: 'es_name', value: s.name });
+  const fileInp = el('input', { type: 'file', id: 'es_file' });
+  const body = el('div', {},
+    field('Document name', nameInp),
+    s.key ? el('div', { class: 'help', style: 'margin-top:-8px' }, 'Reference key: ' + s.key + ' (fixed)') : null,
+    field(s.hasFile ? 'Replace file (optional)' : 'Upload file', fileInp),
+    s.hasFile ? el('div', { class: 'help' }, 'Current file: ' + (s.filename || '—')) : null);
+  modal('Edit SOP document', body, async () => {
+    const name = nameInp.value.trim();
+    if (!name) throw new Error('Enter a document name.');
+    const file = fileInp.files[0];
+    const payload = { name };
+    if (file) {
+      payload.filename = file.name; payload.contentType = file.type || 'application/octet-stream';
+      payload.dataB64 = await readFileAsBase64(file);
+    }
+    await api('PUT', '/sop-documents/' + s.id, payload);
+    State.ref = await api('GET', '/refdata');
+    toast('SOP document updated'); render();
+  }, 'Save');
+}
+async function deleteSop(s) {
+  if (!confirm('Delete "' + s.name + '"? This cannot be undone, and any QC Check linking to it will show it as not configured.')) return;
+  await api('DELETE', '/sop-documents/' + s.id);
+  State.ref = await api('GET', '/refdata');
+  toast('SOP document deleted'); render();
+}
+async function showSopHistory(s) {
+  const r = await api('GET', '/sop-documents/' + s.id + '/edits');
+  const body = el('div', {},
+    el('div', { class: 'summary-line' }, sl('Document', s.name)),
+    !r.edits.length ? el('div', { class: 'help' }, 'No changes logged yet.') :
+      el('div', { class: 'tablewrap', style: 'margin-top:6px' }, el('table', {},
+        el('thead', {}, el('tr', {}, el('th', {}, 'When'), el('th', {}, 'Field'), el('th', {}, 'From'), el('th', {}, 'To'), el('th', {}, 'By'))),
+        el('tbody', {}, ...r.edits.map(e => el('tr', {},
+          el('td', { class: 'muted' }, fmtWhen(e.at)), el('td', {}, e.field),
+          el('td', { class: 'muted' }, e.oldValue ?? '—'), el('td', {}, el('b', {}, e.newValue ?? '—')),
+          el('td', {}, e.by || '—')))))));
+  modal('Change history — ' + s.name, body, async () => {}, 'Close', { noCancel: true });
 }
 // Downloads a full, consistent snapshot of the live database (sqlite3's
 // backup API server-side, not a raw file copy) straight to the browser —
