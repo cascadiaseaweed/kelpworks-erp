@@ -38,6 +38,7 @@ Environment variables (optional):
 
 import os
 import io
+import csv
 import json
 import time
 import hmac
@@ -128,7 +129,8 @@ CREATE TABLE IF NOT EXISTS tote_lots (
     site_code     TEXT REFERENCES sites(code),
     species_code  TEXT REFERENCES species(code),
     harvest_year  INTEGER,
-    checkin_date  TEXT,                   -- YYYY-MM-DD
+    checkin_date  TEXT,                   -- YYYY-MM-DD; exposed to the API/UI as "harvestDate"/"Harvest date"
+    received_date TEXT,                   -- YYYY-MM-DD; when the tote was received at the facility (distinct from when it was harvested)
     tote_number   INTEGER,
     volume_l      REAL DEFAULT 1000,
     ph            REAL,
@@ -408,7 +410,8 @@ CREATE TABLE IF NOT EXISTS production_runs (
     homog_target_pct_wet_solids   REAL,  -- Homogenization Output, entered as a percent (e.g. 50.0)
     homog_dilution_water_target_l REAL,  -- calculated: water needed to reach the target from tank_level/pct_wet_solids
     homog_final_ph                REAL,
-    -- Homogenization Output, QC Check #1 (lot characterization)
+    -- Homogenization Output, QC Check (lot characterization)
+    homog_qc_ph              REAL,
     homog_tds_pct            REAL,
     homog_brix_pct           REAL,
     homog_mannitol_pct       REAL,
@@ -417,17 +420,33 @@ CREATE TABLE IF NOT EXISTS production_runs (
     homog_ts_slurry_pct      REAL,
     homog_rho_slurry_g_ml    REAL,
     homog_ts_solids_pct      REAL,
-    -- Homogenization Output, Sample Point #1 checklist (fixed rows, 0/1 collected)
+    -- Homogenization Output, old fixed Sample Point checklist (0/1 collected)
+    -- -- superseded by the repeatable run_sample_points table, columns stay
+    -- (additive-only) but are no longer collected.
     homog_sample_slurry_microbial  INTEGER DEFAULT 0,
     homog_sample_slurry_retention  INTEGER DEFAULT 0,
     homog_sample_liquid_metals     INTEGER DEFAULT 0,
     homog_sample_solids_proximate  INTEGER DEFAULT 0,
+    -- Homogenization Output, Sample Point box: one collection date/time
+    -- shared by every row in the run_sample_points table.
+    homog_sample_collected_at      TEXT,
     -- Extraction stage (singular per run)
     extraction_amplitude_pct     REAL,
     extraction_flowrate_lpm      REAL,
     extraction_pressure_psi      REAL,
     extraction_starting_power_w  REAL,
     extraction_started_at        TEXT,
+    -- Extraction Out, QC Check (subtitle "Extraction Performance") -- same
+    -- Liquid / Slurry-Solids readings as the Homogenization Output QC Check.
+    extraction_qc_ph             REAL,
+    extraction_tds_pct           REAL,
+    extraction_brix_pct          REAL,
+    extraction_mannitol_pct      REAL,
+    extraction_ts_liquid_pct     REAL,
+    extraction_rho_liquid_g_ml   REAL,
+    extraction_ts_slurry_pct     REAL,
+    extraction_rho_slurry_g_ml   REAL,
+    extraction_ts_solids_pct     REAL,
     -- Separation stage parameters (repeatable solids collections live in run_separation_solids)
     separation_flowrate_lpm      REAL,
     separation_mesh_micron       REAL,
@@ -497,6 +516,21 @@ CREATE TABLE IF NOT EXISTS run_dilutions (
     created_at             TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_dilutions_run ON run_dilutions(run_id);
+
+-- Repeatable Sample Point entries (Homogenization Output "Sample Point" box) --
+-- a run may collect any number of samples, each its own row/container. The
+-- box's single "Collection date and time" applies to every row printed from
+-- it, so that lives on production_runs (homog_sample_collected_at) instead.
+CREATE TABLE IF NOT EXISTS run_sample_points (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id        INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+    type          TEXT,     -- Slurry | Liquid | Solid
+    description   TEXT,     -- Microbial | Retention | Metals & Nutrients | Proximate Analysis | R&D | Other
+    qty           INTEGER DEFAULT 1,   -- 1-10; also the number of labels printed for this row
+    container     TEXT,     -- 50 mL falcon tube | 100 g sample bag | 1 L bottle | 2 L bottle
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_samplepoints_run ON run_sample_points(run_id);
 
 -- Finished goods on hand: one row per (run, package size).
 CREATE TABLE IF NOT EXISTS fg_lots (
@@ -595,6 +629,7 @@ def migrate(conn):
     for col, decl in [
         ("stabilization_method", "TEXT DEFAULT 'Citric acid'"), ("storage_unit", "TEXT DEFAULT 'Tote'"),
         ("storage_source", "TEXT"), ("orp", "REAL"), ("orp_updated", "TEXT"), ("notes", "TEXT"),
+        ("received_date", "TEXT"),
     ]:
         if col not in cols:
             conn.execute("ALTER TABLE tote_lots ADD COLUMN %s %s" % (col, decl))
@@ -625,6 +660,7 @@ def migrate(conn):
         ("homog_wet_solids_wt_g", "REAL"), ("homog_liquid_wt_g", "REAL"), ("homog_pct_wet_solids", "REAL"),
         ("homog_initial_ph", "REAL"), ("homog_target_pct_wet_solids", "REAL"),
         ("homog_dilution_water_target_l", "REAL"), ("homog_final_ph", "REAL"),
+        ("homog_qc_ph", "REAL"), ("homog_sample_collected_at", "TEXT"),
         ("homog_tds_pct", "REAL"), ("homog_brix_pct", "REAL"), ("homog_mannitol_pct", "REAL"),
         ("homog_ts_liquid_pct", "REAL"), ("homog_rho_liquid_g_ml", "REAL"),
         ("homog_ts_slurry_pct", "REAL"), ("homog_rho_slurry_g_ml", "REAL"), ("homog_ts_solids_pct", "REAL"),
@@ -635,6 +671,10 @@ def migrate(conn):
         ("extraction_amplitude_pct", "REAL"), ("extraction_flowrate_lpm", "REAL"),
         ("extraction_pressure_psi", "REAL"), ("extraction_starting_power_w", "REAL"),
         ("extraction_started_at", "TEXT"),
+        ("extraction_qc_ph", "REAL"), ("extraction_tds_pct", "REAL"), ("extraction_brix_pct", "REAL"),
+        ("extraction_mannitol_pct", "REAL"), ("extraction_ts_liquid_pct", "REAL"),
+        ("extraction_rho_liquid_g_ml", "REAL"), ("extraction_ts_slurry_pct", "REAL"),
+        ("extraction_rho_slurry_g_ml", "REAL"), ("extraction_ts_solids_pct", "REAL"),
         ("separation_flowrate_lpm", "REAL"), ("separation_mesh_micron", "REAL"),
         ("separation_water_addition_l", "REAL"), ("separation_started_at", "TEXT"),
         ("pasteurization_product_setpoint_c", "REAL"), ("pasteurization_boiler_setpoint_c", "REAL"),
@@ -837,7 +877,8 @@ def read_token(token):
 def tote_public(r):
     return {"id": r["id"], "lot": r["lot_number"], "site": r["site_code"],
             "species": r["species_code"], "harvestYear": r["harvest_year"],
-            "checkinDate": r["checkin_date"], "toteNumber": r["tote_number"],
+            "harvestDate": r["checkin_date"], "receivedDate": r["received_date"],
+            "toteNumber": r["tote_number"],
             "volumeL": r["volume_l"], "ph": r["ph"], "phUpdated": r["ph_updated"],
             "avgWeightKg": r["avg_weight_kg"],
             "location": r["location"], "description": r["description"],
@@ -876,6 +917,7 @@ def run_public(r):
             "targetPctWetSolids": r["homog_target_pct_wet_solids"],
             "dilutionWaterTargetL": r["homog_dilution_water_target_l"],
             "finalPh": r["homog_final_ph"],
+            "qcPh": r["homog_qc_ph"], "sampleCollectedAt": r["homog_sample_collected_at"],
             "tdsPct": r["homog_tds_pct"], "brixPct": r["homog_brix_pct"],
             "mannitolPct": r["homog_mannitol_pct"], "tsLiquidPct": r["homog_ts_liquid_pct"],
             "rhoLiquidGMl": r["homog_rho_liquid_g_ml"], "tsSlurryPct": r["homog_ts_slurry_pct"],
@@ -887,7 +929,12 @@ def run_public(r):
         "extraction": {
             "startedAt": r["extraction_started_at"], "amplitudePct": r["extraction_amplitude_pct"],
             "flowrateLpm": r["extraction_flowrate_lpm"], "pressurePsi": r["extraction_pressure_psi"],
-            "startingPowerW": r["extraction_starting_power_w"]},
+            "startingPowerW": r["extraction_starting_power_w"],
+            "qcPh": r["extraction_qc_ph"], "tdsPct": r["extraction_tds_pct"],
+            "brixPct": r["extraction_brix_pct"], "mannitolPct": r["extraction_mannitol_pct"],
+            "tsLiquidPct": r["extraction_ts_liquid_pct"], "rhoLiquidGMl": r["extraction_rho_liquid_g_ml"],
+            "tsSlurryPct": r["extraction_ts_slurry_pct"], "rhoSlurryGMl": r["extraction_rho_slurry_g_ml"],
+            "tsSolidsPct": r["extraction_ts_solids_pct"]},
         "separation": {
             "startedAt": r["separation_started_at"], "flowrateLpm": r["separation_flowrate_lpm"],
             "meshMicron": r["separation_mesh_micron"], "waterAdditionL": r["separation_water_addition_l"]},
@@ -926,6 +973,7 @@ CONTENT_TYPES = {
     ".svg": "image/svg+xml",
     ".png": "image/png",
     ".ico": "image/x-icon",
+    ".csv": "text/csv; charset=utf-8",
 }
 
 
@@ -1756,7 +1804,8 @@ class Handler(BaseHTTPRequestHandler):
             d = self._body_json()
             site = (d.get("site") or "").strip().upper()
             species = (d.get("species") or "").strip().upper()
-            date = (d.get("checkinDate") or today_iso()).strip()
+            date = (d.get("harvestDate") or today_iso()).strip()
+            received_date = (d.get("receivedDate") or today_iso()).strip() or None
             count = int(num(d.get("toteCount")))
             total_kg = num(d.get("totalKg"))
             ph = numn(d.get("ph"))
@@ -1803,10 +1852,10 @@ class Handler(BaseHTTPRequestHandler):
                 lot = "%s-%s-%s-%03d" % (site, species, datestr, n)
                 conn.execute(
                     "INSERT INTO tote_lots (lot_number,site_code,species_code,harvest_year,"
-                    "checkin_date,tote_number,volume_l,ph,orp,avg_weight_kg,location,description,"
-                    "status,stabilization_method,storage_unit,storage_source,notes,created_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'in_stock',?,?,?,?,?)",
-                    (lot, site, species, int(date[:4]), date, n, 1000, ph, orp, avg, location,
+                    "checkin_date,received_date,tote_number,volume_l,ph,orp,avg_weight_kg,location,"
+                    "description,status,stabilization_method,storage_unit,storage_source,notes,created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'in_stock',?,?,?,?,?)",
+                    (lot, site, species, int(date[:4]), date, received_date, n, 1000, ph, orp, avg, location,
                      "Fresh Stabilized Ground %s" % common, stabilization_method, storage_unit,
                      storage_source, notes, ts))
                 created.append(lot)
@@ -1815,7 +1864,96 @@ class Handler(BaseHTTPRequestHandler):
                               "%s-%s-%s" % (site, species, datestr))
             return {"created": created, "avgWeightKg": avg, "count": len(created),
                     "storageSource": storage_source}
+        if seg == ["api", "harvest", "bulk"] and method == "POST":
+            return self._harvest_bulk(conn)
         raise ApiError(404, "Unknown harvest endpoint")
+
+    # One row per tote -- unlike the batch check-in above (one average weight
+    # shared across a count of totes), each CSV row is its own tote with its
+    # own weight, so rows sharing a site/species/harvest-date still need the
+    # same tote-number continuation logic, tracked in-memory across the file
+    # rather than in one COALESCE(MAX(...)) query per batch.
+    def _harvest_bulk(self, conn):
+        d = self._body_json()
+        csv_text = d.get("csvText") or ""
+        if not csv_text.strip():
+            raise ApiError(400, "No CSV data received")
+        try:
+            reader = csv.DictReader(io.StringIO(csv_text))
+            rows = list(reader)
+        except Exception:
+            raise ApiError(400, "Could not parse the CSV file")
+        if not rows:
+            raise ApiError(400, "The CSV has no data rows")
+        if len(rows) > 500:
+            raise ApiError(400, "Too many rows in one import (max 500)")
+        required = {"site", "species", "harvestDate", "avgWeightKg"}
+        have = {(h or "").strip() for h in (reader.fieldnames or [])}
+        missing = required - have
+        if missing:
+            raise ApiError(400, "CSV is missing required column(s): %s" % ", ".join(sorted(missing)))
+        species_codes = {r["code"] for r in conn.execute("SELECT code FROM species")}
+        counters = {}  # (site,species,date) -> next tote_number
+        ts = now_iso()
+        created = []
+        for i, row in enumerate(rows, start=2):  # row 1 is the header
+            def cell(key):
+                return ((row.get(key) or "").strip())
+            site = cell("site").upper()
+            species = cell("species").upper()
+            date = cell("harvestDate")
+            if not site or not species or not date:
+                raise ApiError(400, "Row %d: site, species and harvestDate are required" % i)
+            try:
+                datetime.date.fromisoformat(date)
+            except ValueError:
+                raise ApiError(400, "Row %d: harvestDate '%s' must be YYYY-MM-DD" % (i, date))
+            received_date = cell("receivedDate") or None
+            if received_date:
+                try:
+                    datetime.date.fromisoformat(received_date)
+                except ValueError:
+                    raise ApiError(400, "Row %d: receivedDate '%s' must be YYYY-MM-DD" % (i, received_date))
+            if species not in species_codes:
+                raise ApiError(400, "Row %d: unknown species code '%s'" % (i, species))
+            try:
+                avg = float(cell("avgWeightKg"))
+            except ValueError:
+                avg = 0
+            if avg <= 0:
+                raise ApiError(400, "Row %d: avgWeightKg must be a number greater than 0" % i)
+            ph = numn(cell("ph"))
+            orp = numn(cell("orp"))
+            location = cell("location") or None
+            stabilization_method = cell("stabilizationMethod") or "Citric acid"
+            storage_unit = cell("storageUnit") or "Tote"
+            storage_source = cell("storageSource") or None
+            notes = cell("notes") or None
+            if not conn.execute("SELECT 1 FROM sites WHERE code=?", (site,)).fetchone():
+                conn.execute("INSERT INTO sites (code,name) VALUES (?,?)", (site, site))
+            if location:
+                conn.execute("INSERT OR IGNORE INTO locations (name) VALUES (?)", (location,))
+            key = (site, species, date)
+            if key not in counters:
+                counters[key] = conn.execute(
+                    "SELECT COALESCE(MAX(tote_number),0) n FROM tote_lots "
+                    "WHERE site_code=? AND species_code=? AND checkin_date=?", key).fetchone()["n"]
+            counters[key] += 1
+            n = counters[key]
+            datestr = date.replace("-", "")
+            lot = "%s-%s-%s-%03d" % (site, species, datestr, n)
+            sp = conn.execute("SELECT common FROM species WHERE code=?", (species,)).fetchone()
+            common = sp["common"] if sp else species
+            conn.execute(
+                "INSERT INTO tote_lots (lot_number,site_code,species_code,harvest_year,"
+                "checkin_date,received_date,tote_number,volume_l,ph,orp,avg_weight_kg,location,"
+                "description,status,stabilization_method,storage_unit,storage_source,notes,created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'in_stock',?,?,?,?,?)",
+                (lot, site, species, int(date[:4]), date, received_date, n, 1000, ph, orp, avg, location,
+                 "Fresh Stabilized Ground %s" % common, stabilization_method, storage_unit,
+                 storage_source, notes, ts))
+            created.append(lot)
+        return {"created": created, "count": len(created)}
 
     # ---- consumables ------------------------------------------------------ #
     def route_consumables(self, method, seg, conn):
@@ -1891,15 +2029,14 @@ class Handler(BaseHTTPRequestHandler):
             ("homog_started_at", "startedAt", "text"),
             ("homog_rinsing_water_l", "rinsingWaterL", "num"),
             ("homog_slurry_l", "slurryL", "num"),
-            ("homog_initial_ph", "initialPh", "num"),
             ("homog_wet_solids_wt_g", "wetSolidsWtG", "num"),
             ("homog_liquid_wt_g", "liquidWtG", "num"),
             ("homog_pct_wet_solids", "pctWetSolids", "num"),
             ("homog_target_pct_wet_solids", "targetPctWetSolids", "num"),
             ("homog_dilution_water_target_l", "dilutionWaterTargetL", "num"),
             ("homog_dilution_water_l", "dilutionWaterL", "num"),
-            ("homog_citric_kg", "citricKg", "num"),
-            ("homog_final_ph", "finalPh", "num"),
+            ("homog_qc_ph", "qcPh", "num"),
+            ("homog_sample_collected_at", "sampleCollectedAt", "text"),
             ("homog_tds_pct", "tdsPct", "num"),
             ("homog_brix_pct", "brixPct", "num"),
             ("homog_mannitol_pct", "mannitolPct", "num"),
@@ -1908,13 +2045,12 @@ class Handler(BaseHTTPRequestHandler):
             ("homog_ts_slurry_pct", "tsSlurryPct", "num"),
             ("homog_rho_slurry_g_ml", "rhoSlurryGMl", "num"),
             ("homog_ts_solids_pct", "tsSolidsPct", "num"),
-            ("homog_sample_slurry_microbial", "sampleSlurryMicrobial", "bool"),
-            ("homog_sample_slurry_retention", "sampleSlurryRetention", "bool"),
-            ("homog_sample_liquid_metals", "sampleLiquidMetals", "bool"),
-            ("homog_sample_solids_proximate", "sampleSolidsProximate", "bool"),
-            # homog_output_l column stays (additive-only) but is no longer
-            # collected -- "Output (L)" was removed from the Homogenization
-            # Output section.
+            # homog_output_l, homog_initial_ph, homog_citric_kg, homog_final_ph
+            # and the fixed sample-checklist columns all stay (additive-only)
+            # but are no longer collected -- "Output (L)" and the whole
+            # "Process Check - pH control" box were removed from the
+            # Homogenization Output section; the checklist was replaced by
+            # the repeatable run_sample_points table.
         ],
         "extraction": [
             ("extraction_started_at", "startedAt", "text"),
@@ -1922,6 +2058,15 @@ class Handler(BaseHTTPRequestHandler):
             ("extraction_flowrate_lpm", "flowrateLpm", "num"),
             ("extraction_pressure_psi", "pressurePsi", "num"),
             ("extraction_starting_power_w", "startingPowerW", "num"),
+            ("extraction_qc_ph", "qcPh", "num"),
+            ("extraction_tds_pct", "tdsPct", "num"),
+            ("extraction_brix_pct", "brixPct", "num"),
+            ("extraction_mannitol_pct", "mannitolPct", "num"),
+            ("extraction_ts_liquid_pct", "tsLiquidPct", "num"),
+            ("extraction_rho_liquid_g_ml", "rhoLiquidGMl", "num"),
+            ("extraction_ts_slurry_pct", "tsSlurryPct", "num"),
+            ("extraction_rho_slurry_g_ml", "rhoSlurryGMl", "num"),
+            ("extraction_ts_solids_pct", "tsSolidsPct", "num"),
         ],
         "separation": [
             ("separation_started_at", "startedAt", "text"),
@@ -1974,6 +2119,13 @@ class Handler(BaseHTTPRequestHandler):
         ("notes", "notes", "text"),
     ]
 
+    SAMPLE_POINT_FIELDS = [
+        ("type", "type", "text"),
+        ("description", "description", "text"),
+        ("qty", "qty", "int"),
+        ("container", "container", "text"),
+    ]
+
     def route_production(self, method, seg, conn, user):
         if seg == ["api", "production"] and method == "GET":
             runs = []
@@ -1991,6 +2143,7 @@ class Handler(BaseHTTPRequestHandler):
                 d["inputs"] = self._run_inputs_public(conn, r["id"])
                 d["separationSolids"] = self._sep_solids_public(conn, r["id"])
                 d["dilutions"] = self._dilutions_public(conn, r["id"])
+                d["samplePoints"] = self._sample_points_public(conn, r["id"])
                 runs.append(d)
             return {"runs": runs}
         if seg == ["api", "production"] and method == "POST":
@@ -2081,6 +2234,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self.update_dilution(conn, rid, did, user)
             if method == "DELETE":
                 return self.delete_dilution(conn, rid, did)
+        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "sample-points":
+            rid = int(seg[2])
+            if not conn.execute("SELECT 1 FROM production_runs WHERE id=?", (rid,)).fetchone():
+                raise ApiError(404, "Production run not found")
+            if method == "GET":
+                return {"samplePoints": self._sample_points_public(conn, rid)}
+            if method == "POST":
+                return self.add_sample_point(conn, rid, user)
+        if len(seg) == 5 and seg[2].isdigit() and seg[3] == "sample-points" and seg[4].isdigit():
+            rid, spid = int(seg[2]), int(seg[4])
+            if method == "PUT":
+                return self.update_sample_point(conn, rid, spid, user)
+            if method == "DELETE":
+                return self.delete_sample_point(conn, rid, spid)
         raise ApiError(404, "Unknown production endpoint")
 
     def _attachments(self, conn, run_id):
@@ -2653,6 +2820,51 @@ class Handler(BaseHTTPRequestHandler):
         conn.execute("DELETE FROM run_dilutions WHERE id=?", (did,))
         return {"dilutions": self._dilutions_public(conn, run_id)}
 
+    # ---- Sample Point: repeatable sample-collection rows -------------------#
+    def _sample_points_public(self, conn, run_id):
+        return [{"id": r["id"], "type": r["type"], "description": r["description"],
+                 "qty": r["qty"], "container": r["container"], "createdAt": r["created_at"]}
+                for r in conn.execute(
+                    "SELECT * FROM run_sample_points WHERE run_id=? ORDER BY created_at, id", (run_id,))]
+
+    def _apply_sample_point_fields(self, conn, spid, d):
+        updates = {}
+        for col, key, kind in self.SAMPLE_POINT_FIELDS:
+            if key not in d:
+                continue
+            if kind == "int":
+                v = d[key]
+                updates[col] = max(1, min(10, int(v))) if v not in (None, "") else None
+            else:
+                updates[col] = (d[key] or "").strip() or None
+        if updates:
+            sets = ", ".join("%s=?" % c for c in updates)
+            conn.execute("UPDATE run_sample_points SET %s WHERE id=?" % sets, (*updates.values(), spid))
+
+    def add_sample_point(self, conn, run_id, user):
+        cur = conn.cursor()
+        cur.execute("INSERT INTO run_sample_points (run_id,qty,created_at) VALUES (?,1,?)",
+                    (run_id, now_iso()))
+        spid = cur.lastrowid
+        self._apply_sample_point_fields(conn, spid, self._body_json())
+        return {"samplePoints": self._sample_points_public(conn, run_id)}
+
+    def update_sample_point(self, conn, run_id, spid, user):
+        row = conn.execute("SELECT * FROM run_sample_points WHERE id=? AND run_id=?",
+                           (spid, run_id)).fetchone()
+        if not row:
+            raise ApiError(404, "Sample point entry not found")
+        self._apply_sample_point_fields(conn, spid, self._body_json())
+        return {"samplePoints": self._sample_points_public(conn, run_id)}
+
+    def delete_sample_point(self, conn, run_id, spid):
+        row = conn.execute("SELECT * FROM run_sample_points WHERE id=? AND run_id=?",
+                           (spid, run_id)).fetchone()
+        if not row:
+            raise ApiError(404, "Sample point entry not found")
+        conn.execute("DELETE FROM run_sample_points WHERE id=?", (spid,))
+        return {"samplePoints": self._sample_points_public(conn, run_id)}
+
     # ---- quality control log ----------------------------------------------- #
     def _qc_public(self, r):
         return {"id": r["id"], "runId": r["run_id"], "sampleLocation": r["sample_location"],
@@ -2940,6 +3152,7 @@ class Handler(BaseHTTPRequestHandler):
             dd["toteLots"] = self._tote_lot_numbers(conn, dd["toteIds"])
             dd["separationSolids"] = self._sep_solids_public(conn, r["id"])
             dd["dilutions"] = self._dilutions_public(conn, r["id"])
+            dd["samplePoints"] = self._sample_points_public(conn, r["id"])
             drafts.append(dd)
         return {"drafts": drafts}
 
@@ -2957,6 +3170,7 @@ class Handler(BaseHTTPRequestHandler):
         d = run_public(r)
         d["separationSolids"] = self._sep_solids_public(conn, rid)
         d["dilutions"] = self._dilutions_public(conn, rid)
+        d["samplePoints"] = self._sample_points_public(conn, rid)
         return {"run": d}
 
     def save_draft(self, conn, rid, user):

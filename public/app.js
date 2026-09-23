@@ -142,7 +142,8 @@ const STAB_COLUMNS = [
     options: () => [...new Set((State.ref.species || []).map(s => s.common || s.name))] },
   { key: 'stabMethod', label: 'Stabilization method', value: t => t.stabilizationMethod || '',
     options: () => ['Citric acid', 'Fresh'] },
-  { key: 'checkin', label: 'Checked in', value: t => t.checkinDate || '' },
+  { key: 'harvestDate', label: 'Harvest date', value: t => t.harvestDate || '' },
+  { key: 'receivedDate', label: 'Received date', value: t => t.receivedDate || '' },
   { key: 'avgKg', label: 'Avg kg', value: t => t.avgWeightKg, numeric: true },
   { key: 'ph', label: 'pH', value: t => t.ph, numeric: true },
   { key: 'orp', label: 'ORP (mV)', value: t => t.orp, numeric: true },
@@ -153,7 +154,9 @@ const STAB_COLUMNS = [
 async function pageStabilized(v) {
   v.append(el('div', { class: 'page-head' },
     el('h2', {}, 'Feedstock Inventory'),
-    el('div', { class: 'actions' }, el('button', { onclick: openHarvest }, '+ Check in harvest'))));
+    el('div', { class: 'actions' },
+      el('button', { class: 'secondary', onclick: openFeedstockImport }, '📤 Bulk import CSV'),
+      el('button', { onclick: openHarvest }, '+ Check in harvest'))));
   const r = await api('GET', '/totes');
   stabCache = r.totes;
   const countEl = el('span', { class: 'muted' });
@@ -242,7 +245,8 @@ async function pageStabilized(v) {
         el('td', { class: 'checkcol' }, rowCheck(t, selected, updateBulk)),
         el('td', { class: 'mono' }, t.lot), el('td', {}, siteName(t.site)), el('td', {}, speciesName(t.species)),
         el('td', {}, t.stabilizationMethod || '—'),
-        el('td', {}, t.checkinDate || '—'), el('td', { class: 'num' }, fmt(t.avgWeightKg, 1)),
+        el('td', {}, t.harvestDate || '—'), el('td', {}, t.receivedDate || '—'),
+        el('td', { class: 'num' }, fmt(t.avgWeightKg, 1)),
         el('td', { class: 'num' }, phCell(t)), el('td', { class: 'num' }, orpCell(t)),
         el('td', {}, t.lastUpdated ? fmtWhen(t.lastUpdated) : '—'),
         el('td', {}, t.location || '—'), el('td', {}, badge(t.status, statusLabel(t.status))),
@@ -335,7 +339,10 @@ function orpCell(t) {
 }
 function stabilityLogTable(log, toteId) {
   if (!log.length) return el('div', { class: 'help' }, 'No changes logged yet.');
-  return el('div', { class: 'tablewrap', style: 'margin-top:6px' },
+  // Every change is kept, but the table itself only shows ~10 rows before
+  // scrolling (sticky header stays visible), same pattern as the QC results
+  // table -- a tote's log can grow long over its lifetime.
+  return el('div', { class: 'tablewrap stability-log-scroll', style: 'margin-top:6px' },
     el('table', {},
       el('thead', {}, el('tr', {}, el('th', {}, 'When'), el('th', {}, 'Field'), el('th', {}, 'From'), el('th', {}, 'To'), el('th', {}, 'Note'), el('th', {}, 'By'))),
       el('tbody', {}, ...log.map(r => {
@@ -371,18 +378,12 @@ async function updateCondition(t) {
   }
   const summary = el('div', { class: 'summary-line' }, ...summaryLines(data));
   const history = el('div', {}, stabilityLogTable(data.stabilityLog, t.id));
-  // The Details card's own Save posts straight to the server (see
-  // characterize_tote) and refreshes this modal's summary/history in place —
-  // it doesn't touch the "New pH/ORP reading" quick-update fields below,
-  // which stay a separate, simpler action via "Log reading".
-  async function refreshDetail() {
-    const fresh = await api('GET', '/totes/' + t.id + '/ph');
-    summary.innerHTML = '';
-    summary.append(...summaryLines(fresh));
-    history.innerHTML = '';
-    history.append(stabilityLogTable(fresh.stabilityLog, t.id));
-    render();
-  }
+  // The Details card has no Save button of its own here -- everything in
+  // this window (the Details fields below plus the New pH/ORP reading
+  // fields above) is saved together by the modal's own "Save & close",
+  // using whatever the card's fields currently hold (tracked via onChange,
+  // seeded with the prefilled values immediately so it's never empty).
+  let detailVals = null;
   const detailCard = buildFeedstockCard({
     label: 'Details',
     // pH/ORP live in the summary + quick-update fields above instead of
@@ -393,11 +394,7 @@ async function updateCondition(t) {
     // everything else) rather than starting blank every time.
     initial: data.latestCharacterization,
     mode: 'draft',
-    onSave: async vals => {
-      const r = await api('POST', '/totes/' + t.id + '/characterize', vals);
-      await refreshDetail();
-      toast(r.rejected ? t.lot + ' rejected — moved to QAQC Hold.' : 'Characterization saved for ' + t.lot);
-    },
+    onChange: vals => { detailVals = vals; },
     uploadPhoto: async (slot, file, b64) => {
       const r = await api('POST', '/totes/' + t.id + '/photo',
         { slot, filename: file.name, contentType: file.type || 'image/jpeg', dataB64: b64 });
@@ -417,14 +414,20 @@ async function updateCondition(t) {
   modal('Update feedstock conditions — ' + t.lot, body, async () => {
     const ph = body.querySelector('#p_ph').value;
     const orp = body.querySelector('#p_orp').value;
-    if (ph === '' && orp === '') throw new Error('Enter a pH and/or ORP value.');
-    await api('POST', '/totes/' + t.id + '/ph', {
-      ph: ph === '' ? null : +ph, orp: orp === '' ? null : +orp,
-      date: body.querySelector('#p_date').value, note: body.querySelector('#p_note').value || null
-    });
-    toast('Condition logged for ' + t.lot);
+    let rejected = false;
+    if (detailVals) {
+      const r = await api('POST', '/totes/' + t.id + '/characterize', detailVals);
+      rejected = r.rejected;
+    }
+    if (ph !== '' || orp !== '') {
+      await api('POST', '/totes/' + t.id + '/ph', {
+        ph: ph === '' ? null : +ph, orp: orp === '' ? null : +orp,
+        date: body.querySelector('#p_date').value, note: body.querySelector('#p_note').value || null
+      });
+    }
+    toast(rejected ? t.lot + ' rejected — moved to QAQC Hold.' : 'Feedstock conditions saved for ' + t.lot);
     render();
-  }, 'Log reading', { wide: true });
+  }, 'Save & close', { wide: true });
 }
 const todayStr = () => new Date().toISOString().slice(0, 10);
 function drawMoveHistory(host, log, showQty) {
@@ -503,9 +506,10 @@ async function openHarvest() {
     el('div', { class: 'form-row' },
       field('Stabilization method', selectFrom('', [['Citric acid', 'Citric acid'], ['Fresh', 'Fresh']], () => onStabChange(), 'h_stab')),
       field('Farm site', selectFrom('', sites, null, 'h_site'))),
-    el('div', { class: 'form-row' },
+    el('div', { class: 'form-row-3' },
       field('Species', selectFrom('', species, null, 'h_species')),
-      field('Check-in date', el('input', { type: 'date', id: 'h_date', value: new Date().toISOString().slice(0, 10) }))),
+      field('Harvest date', el('input', { type: 'date', id: 'h_date', value: new Date().toISOString().slice(0, 10) })),
+      field('Received date', el('input', { type: 'date', id: 'h_received', value: new Date().toISOString().slice(0, 10) }))),
     el('div', { class: 'form-row' },
       field('Storage location', editableSelect(locs, 'h_loc')),
       field('Number of storage units', el('input', { type: 'number', id: 'h_count', min: '1', value: '1' }))),
@@ -531,7 +535,8 @@ async function openHarvest() {
     const isBurlap = sourceSel.value === 'BURLAP';
     const payload = {
       site: body.querySelector('#h_site').value, species: body.querySelector('#h_species').value,
-      checkinDate: body.querySelector('#h_date').value, location: body.querySelector('#h_loc').value,
+      harvestDate: body.querySelector('#h_date').value, receivedDate: body.querySelector('#h_received').value,
+      location: body.querySelector('#h_loc').value,
       toteCount: +body.querySelector('#h_count').value, totalKg: +body.querySelector('#h_kg').value,
       stabilizationMethod: body.querySelector('#h_stab').value, storageUnit: body.querySelector('#h_unit').value,
       ibcConsumableId: isBurlap ? null : (sourceSel.value ? +sourceSel.value : null),
@@ -544,6 +549,49 @@ async function openHarvest() {
     toast(`Created ${r.count} storage unit(s) · ${r.avgWeightKg} kg each` + (r.storageSource ? ` · ${r.count} from ${r.storageSource}` : ''));
     render();
   }, 'Check in');
+}
+// Bulk CSV import: one row per tote (unlike the single-batch Check in
+// harvest form above, which shares one average weight across a count of
+// totes) -- lets many already-known totes be added in one file instead of
+// one form submission each. Parsing/validation/lot-numbering all happen
+// server-side (POST /api/harvest/bulk); this just reads the file as text
+// and shows the row-level error the backend reports if any row is bad.
+async function openFeedstockImport() {
+  let csvText = '';
+  const fileInput = el('input', { type: 'file', accept: '.csv,text/csv' });
+  const status = el('div', { class: 'help' });
+  fileInput.addEventListener('change', () => {
+    csvText = ''; status.textContent = '';
+    const f = fileInput.files[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      csvText = String(reader.result || '');
+      const rows = csvText.split(/\r\n|\r|\n/).filter(l => l.trim() !== '').length - 1;
+      status.textContent = f.name + ' — ' + Math.max(rows, 0) + ' row(s) ready to import.';
+    };
+    reader.onerror = () => { status.textContent = 'Could not read ' + f.name; };
+    reader.readAsText(f);
+  });
+  const body = el('div', {},
+    el('div', { class: 'help' },
+      'Add many feedstock totes at once — one row per tote. Download the template, fill it in, then upload it here.'),
+    el('div', { style: 'margin:10px 0' },
+      el('a', { href: 'templates/feedstock_bulk_import_template.csv', download: 'feedstock_bulk_import_template.csv' },
+        '⬇ Download CSV template')),
+    field('CSV file', fileInput),
+    status,
+    el('div', { class: 'help' },
+      'Required columns: site, species, harvestDate (YYYY-MM-DD), avgWeightKg. ' +
+      'Optional: receivedDate, stabilizationMethod, storageUnit, location, ph, orp, storageSource, notes. ' +
+      'Rows for the same site/species/harvest date are numbered in the order they appear in the file.'));
+  modal('Bulk import feedstock (CSV)', body, async () => {
+    if (!csvText.trim()) throw new Error('Choose a CSV file to import.');
+    const r = await api('POST', '/harvest/bulk', { csvText });
+    State.ref = await api('GET', '/refdata');
+    toast('Imported ' + r.count + ' tote(s).');
+    render();
+  }, 'Import');
 }
 
 /* ---------------- Production ---------------- */
@@ -1143,14 +1191,11 @@ async function openQcForRun(run) {
 
 /* ---- Process-stage building blocks, shared by openRun (pre-finalize) and
    openProcessLog (post-finalize) ---- */
-// Homogenization is bespoke (buildHomogenizationSections, below) -- it's
-// split into Input/Output and Input carries a QC Check -- everything else
-// still uses the generic field-list renderer.
+// Homogenization and Extraction are bespoke (buildHomogenizationSections /
+// buildExtractionSection, below) -- both need a QC Check card and/or custom
+// per-field placeholders/defaults the generic field-list renderer can't do;
+// everything else still uses it.
 const STAGE_DEFS = {
-  extraction: { key: 'extraction', title: 'Extraction', fields: [
-    ['startedAt', 'Started at', 'dt'], ['amplitudePct', 'Amplitude (%)', 'num'],
-    ['flowrateLpm', 'Flow rate (L/min)', 'num'], ['pressurePsi', 'Pressure (psi)', 'num'],
-    ['startingPowerW', 'Starting power (W)', 'num']] },
   separation: { key: 'separation', title: 'Separation parameters', fields: [
     ['startedAt', 'Started at', 'dt'], ['flowrateLpm', 'Flow rate (L/min)', 'num'],
     ['meshMicron', 'Mesh size (micron)', 'num'], ['waterAdditionL', 'Water addition (L)', 'num']] },
@@ -1196,12 +1241,104 @@ function buildStageSection(getRunId, def, values, bare) {
   return el('details', { class: 'accordion' }, el('summary', {}, def.title),
     el('div', { class: 'accordion-body' }, content));
 }
+// The "QC Check" card (purple, Liquid + Slurry/Solids readings): shared
+// verbatim between Homogenization Output and Extraction Out -- only the
+// subtitle and which stage's values it reads/saves differ per caller.
+function buildQualityCheckBox(subtitle, values) {
+  function pctInput() { const i = el('input', { inputmode: 'decimal', placeholder: '%' }); attachNumericMask(i, 1); return i; }
+  function densityInput() { const i = el('input', { inputmode: 'decimal', placeholder: 'g/mL' }); attachNumericMask(i, 3); return i; }
+  const qcPhInp = el('input', { inputmode: 'decimal', placeholder: 'pH' }); attachNumericMask(qcPhInp, 1);
+  if (values.qcPh != null) qcPhInp.value = formatQcValue(values.qcPh, 1);
+  const tdsInp = pctInput(); if (values.tdsPct != null) tdsInp.value = formatQcValue(values.tdsPct, 1);
+  const brixInp = pctInput(); if (values.brixPct != null) brixInp.value = formatQcValue(values.brixPct, 1);
+  const mannitolInp = pctInput(); if (values.mannitolPct != null) mannitolInp.value = formatQcValue(values.mannitolPct, 1);
+  const tsLiquidInp = pctInput(); if (values.tsLiquidPct != null) tsLiquidInp.value = formatQcValue(values.tsLiquidPct, 1);
+  const rhoLiquidInp = densityInput(); if (values.rhoLiquidGMl != null) rhoLiquidInp.value = formatQcValue(values.rhoLiquidGMl, 3);
+  const tsSlurryInp = pctInput(); if (values.tsSlurryPct != null) tsSlurryInp.value = formatQcValue(values.tsSlurryPct, 1);
+  const rhoSlurryInp = densityInput(); if (values.rhoSlurryGMl != null) rhoSlurryInp.value = formatQcValue(values.rhoSlurryGMl, 3);
+  const tsSolidsInp = pctInput(); if (values.tsSolidsPct != null) tsSolidsInp.value = formatQcValue(values.tsSolidsPct, 1);
+  const box = el('div', { class: 'qc-check-box theme-quality' },
+    el('div', { class: 'qc-check-title' }, 'QC Check'),
+    el('div', { class: 'qc-check-subtitle' }, subtitle),
+    el('div', { class: 'qc-check-section-title' }, 'Liquid'),
+    el('div', { class: 'form-row-compact' },
+      field('pH', qcPhInp), field('TDS (%)', tdsInp), field('Brix (%)', brixInp), field('Mannitol (%)', mannitolInp),
+      field('TSliquid (%)', tsLiquidInp), field('ρliquid (g/mL)', rhoLiquidInp)),
+    el('div', { class: 'qc-check-section-title' }, 'Slurry / Solids'),
+    el('div', { class: 'form-row-compact' },
+      field('TSslurry (%)', tsSlurryInp), field('ρslurry (g/mL)', rhoSlurryInp), field('TSsolids (%)', tsSolidsInp)));
+  function getPayload() {
+    return {
+      qcPh: qcPhInp.value.trim() === '' ? null : qcParseValue(qcPhInp.value),
+      tdsPct: tdsInp.value.trim() === '' ? null : qcParseValue(tdsInp.value),
+      brixPct: brixInp.value.trim() === '' ? null : qcParseValue(brixInp.value),
+      mannitolPct: mannitolInp.value.trim() === '' ? null : qcParseValue(mannitolInp.value),
+      tsLiquidPct: tsLiquidInp.value.trim() === '' ? null : qcParseValue(tsLiquidInp.value),
+      rhoLiquidGMl: rhoLiquidInp.value.trim() === '' ? null : qcParseValue(rhoLiquidInp.value),
+      tsSlurryPct: tsSlurryInp.value.trim() === '' ? null : qcParseValue(tsSlurryInp.value),
+      rhoSlurryGMl: rhoSlurryInp.value.trim() === '' ? null : qcParseValue(rhoSlurryInp.value),
+      tsSolidsPct: tsSolidsInp.value.trim() === '' ? null : qcParseValue(tsSolidsInp.value),
+    };
+  }
+  return { box, getPayload };
+}
+// Extraction: "Start Conditions" groups the stage's existing process
+// parameters (compact, with a couple of fields given sensible defaults/
+// placeholders per plant SOP); "Extraction Out" is the same QC Check card
+// used in Homogenization Output, just under its own subtitle. Bespoke like
+// Homogenization for the same reason -- the generic field-list renderer
+// can't do custom defaults/placeholders or a QC Check card.
+function buildExtractionSection(getRunId, values) {
+  values = values || {};
+  const startedAt = el('input', { type: 'datetime-local', value: values.startedAt || '' });
+  const amplitudeInp = el('input', { inputmode: 'decimal', placeholder: 'Amplitude (%)' }); attachNumericMask(amplitudeInp, 2);
+  amplitudeInp.value = values.amplitudePct != null ? formatQcValue(values.amplitudePct, 2) : '100';
+  const flowrateInp = el('input', { inputmode: 'decimal', placeholder: 'Flow rate (L/min)' }); attachNumericMask(flowrateInp, 2);
+  flowrateInp.value = values.flowrateLpm != null ? formatQcValue(values.flowrateLpm, 2) : '15';
+  const pressureInp = el('input', { inputmode: 'decimal', placeholder: 'Target pressure is 20-30psi without exceeding 6000W' });
+  attachNumericMask(pressureInp, 2);
+  if (values.pressurePsi != null) pressureInp.value = formatQcValue(values.pressurePsi, 2);
+  const startingPowerInp = el('input', { inputmode: 'decimal', placeholder: 'Target power is 4000-5000W' });
+  attachNumericMask(startingPowerInp, 2);
+  if (values.startingPowerW != null) startingPowerInp.value = formatQcValue(values.startingPowerW, 2);
+
+  const qcCheck = buildQualityCheckBox('Extraction Performance', values);
+
+  const status = el('span', { class: 'help' });
+  const saveBtn = el('button', { type: 'button', class: 'secondary', onclick: save }, 'Save');
+  async function save() {
+    status.textContent = ''; saveBtn.disabled = true;
+    try {
+      const rid = await getRunId();
+      await api('PUT', '/production/' + rid + '/stages/extraction', {
+        startedAt: startedAt.value || null,
+        amplitudePct: amplitudeInp.value.trim() === '' ? null : qcParseValue(amplitudeInp.value),
+        flowrateLpm: flowrateInp.value.trim() === '' ? null : qcParseValue(flowrateInp.value),
+        pressurePsi: pressureInp.value.trim() === '' ? null : qcParseValue(pressureInp.value),
+        startingPowerW: startingPowerInp.value.trim() === '' ? null : qcParseValue(startingPowerInp.value),
+        ...qcCheck.getPayload(),
+      });
+      status.textContent = 'Saved.';
+    } catch (e) { status.textContent = e.message; }
+    saveBtn.disabled = false;
+  }
+  return el('details', { class: 'accordion' }, el('summary', {}, 'Extraction'),
+    el('div', { class: 'accordion-body' },
+      el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Start Conditions'),
+      el('div', { class: 'form-row' }, field('Started at', startedAt)),
+      el('div', { class: 'form-row-compact' },
+        field('Amplitude (%)', amplitudeInp), field('Flow rate (L/min)', flowrateInp),
+        field('Pressure (psi)', pressureInp), field('Starting power (W)', startingPowerInp)),
+      el('div', { class: 'qc-check-section-title' }, 'Extraction Out'),
+      qcCheck.box,
+      el('div', { style: 'margin-top:6px' }, saveBtn, status)));
+}
 // Homogenization Input (start time, its QC Check, and the water/slurry
 // inputs) and Homogenization Output (just the output volume) as two
 // independent, independently-saving accordions -- same self-saving pattern
 // as buildStageSection, just laid out by hand since a QC Check's calculated
 // field + SOP link don't fit the generic field-list renderer.
-function buildHomogenizationSections(getRunId, values) {
+function buildHomogenizationSections(getRunId, values, samplePoints, processingLot) {
   values = values || {};
   const startedAt = el('input', { type: 'datetime-local', value: values.startedAt || '' });
 
@@ -1211,7 +1348,7 @@ function buildHomogenizationSections(getRunId, values) {
   // calc (in the Output section, below) scales up from.
   const tankInp = el('input', { inputmode: 'decimal', placeholder: 'Measured using level sensor' }); attachNumericMask(tankInp, 2);
   if (values.slurryL != null) tankInp.value = formatQcValue(values.slurryL, 2);
-  // Process Check #1 (Solids loading): %Wet-Solids, (g/g) = Wet-solids-wt /
+  // Process Check (Solids loading): %Wet-Solids, (g/g) = Wet-solids-wt /
   // (Wet-solids-wt + Liquid-wt) -- shown as a percentage, but kept internally
   // as the raw 0-1 ratio so the Output section's dilution-target calc (which
   // reuses this function) can use it directly.
@@ -1233,7 +1370,7 @@ function buildHomogenizationSections(getRunId, values) {
     refreshDilutionTarget();
   }));
   const processCheck1Box = el('div', { class: 'qc-check-box' },
-    el('div', { class: 'qc-check-title' }, 'Process Check #1'),
+    el('div', { class: 'qc-check-title' }, 'Process Check'),
     el('div', { class: 'qc-check-subtitle' }, 'Solids loading'),
     el('div', { class: 'qc-check-result' },
       el('span', { class: 'qc-check-result-label' }, '%Wet-Solids, (g/g)'), resultValue),
@@ -1294,64 +1431,21 @@ function buildHomogenizationSections(getRunId, values) {
   const dilutionInp = el('input', { inputmode: 'decimal', placeholder: 'Measured using dilution totalizer' }); attachNumericMask(dilutionInp, 2);
   if (values.dilutionWaterL != null) dilutionInp.value = formatQcValue(values.dilutionWaterL, 2);
 
-  // Process Check #2 (pH control): Initial pH, Citric Acid, and Final pH
-  // together on one row -- Initial pH moved here from Homogenization Input.
-  const initialPhInp = el('input', { inputmode: 'decimal', placeholder: 'pH' }); attachNumericMask(initialPhInp, 1);
-  if (values.initialPh != null) initialPhInp.value = formatQcValue(values.initialPh, 1);
-  const citricInp = el('input', { inputmode: 'decimal', placeholder: 'kg' }); attachNumericMask(citricInp, 1);
-  if (values.citricKg != null) citricInp.value = formatQcValue(values.citricKg, 1);
-  const finalPhInp = el('input', { inputmode: 'decimal', placeholder: 'pH' }); attachNumericMask(finalPhInp, 1);
-  if (values.finalPh != null) finalPhInp.value = formatQcValue(values.finalPh, 1);
-  const processCheck2Box = el('div', { class: 'qc-check-box' },
-    el('div', { class: 'qc-check-title' }, 'Process Check #2'),
-    el('div', { class: 'qc-check-subtitle' }, 'pH control'),
-    el('div', { class: 'form-row-3' },
-      field('Initial pH', initialPhInp), field('Citric Acid (kg)', citricInp), field('Final pH', finalPhInp)));
+  // QC Check (lot characterization): liquid-phase and slurry/solids-phase
+  // readings, each its own compact wrapping row -- shared with Extraction
+  // Out, which uses the same card under its own subtitle.
+  const qcCheck = buildQualityCheckBox('Lot characterization', values);
+  const qcCheckBox = qcCheck.box;
 
-  // QC Check #1 (lot characterization): liquid-phase and slurry/solids-phase
-  // readings, each its own compact wrapping row.
-  function pctInput() { const i = el('input', { inputmode: 'decimal', placeholder: '%' }); attachNumericMask(i, 1); return i; }
-  function densityInput() { const i = el('input', { inputmode: 'decimal', placeholder: 'g/mL' }); attachNumericMask(i, 3); return i; }
-  const tdsInp = pctInput(); if (values.tdsPct != null) tdsInp.value = formatQcValue(values.tdsPct, 1);
-  const brixInp = pctInput(); if (values.brixPct != null) brixInp.value = formatQcValue(values.brixPct, 1);
-  const mannitolInp = pctInput(); if (values.mannitolPct != null) mannitolInp.value = formatQcValue(values.mannitolPct, 1);
-  const tsLiquidInp = pctInput(); if (values.tsLiquidPct != null) tsLiquidInp.value = formatQcValue(values.tsLiquidPct, 1);
-  const rhoLiquidInp = densityInput(); if (values.rhoLiquidGMl != null) rhoLiquidInp.value = formatQcValue(values.rhoLiquidGMl, 3);
-  const tsSlurryInp = pctInput(); if (values.tsSlurryPct != null) tsSlurryInp.value = formatQcValue(values.tsSlurryPct, 1);
-  const rhoSlurryInp = densityInput(); if (values.rhoSlurryGMl != null) rhoSlurryInp.value = formatQcValue(values.rhoSlurryGMl, 3);
-  const tsSolidsInp = pctInput(); if (values.tsSolidsPct != null) tsSolidsInp.value = formatQcValue(values.tsSolidsPct, 1);
-  const qcCheck1Box = el('div', { class: 'qc-check-box theme-quality' },
-    el('div', { class: 'qc-check-title' }, 'QC Check #1'),
-    el('div', { class: 'qc-check-subtitle' }, 'Lot characterization'),
-    el('div', { class: 'qc-check-section-title' }, 'Liquid'),
-    el('div', { class: 'form-row-compact' },
-      field('TDS (%)', tdsInp), field('Brix (%)', brixInp), field('Mannitol (%)', mannitolInp),
-      field('TSliquid (%)', tsLiquidInp), field('ρliquid (g/mL)', rhoLiquidInp)),
-    el('div', { class: 'qc-check-section-title' }, 'Slurry / Solids'),
-    el('div', { class: 'form-row-compact' },
-      field('TSslurry (%)', tsSlurryInp), field('ρslurry (g/mL)', rhoSlurryInp), field('TSsolids (%)', tsSolidsInp)));
-
-  // Sample Point #1 (lot input): a fixed sampling checklist -- each row's
-  // Type/Description/Qty are set SOP requirements, not editable, only the
-  // "collected" checkbox is saved.
-  const SAMPLE_POINT_ROWS = [
-    ['sampleSlurryMicrobial', 'Slurry', 'Microbial', '2x 50 ml'],
-    ['sampleSlurryRetention', 'Slurry', 'Retention', '2x 50 ml'],
-    ['sampleLiquidMetals', 'Liquid', 'Metals & Nutrients', '2x 50 ml'],
-    ['sampleSolidsProximate', 'Solids', 'Proximate Analysis', '100g wet solids - unwashed'],
-  ];
-  const sampleChecks = {};
+  // Sample Point (lot input): a repeatable table of samples taken at this
+  // point in the process -- see buildSamplePointsSection, below.
+  const collectedInp = el('input', { type: 'datetime-local',
+    value: values.sampleCollectedAt ? values.sampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
   const samplePointBox = el('div', { class: 'qc-check-box theme-sample' },
-    el('div', { class: 'qc-check-title' }, 'Sample Point #1'),
+    el('div', { class: 'qc-check-title' }, 'Sample Point'),
     el('div', { class: 'qc-check-subtitle' }, 'Lot input'),
-    el('table', { class: 'qc-check-checklist' },
-      el('thead', {}, el('tr', {}, el('th', { class: 'checkcol' }, ''), el('th', {}, 'Type'), el('th', {}, 'Description'), el('th', {}, 'Qty'))),
-      el('tbody', {}, ...SAMPLE_POINT_ROWS.map(([key, type, desc, qty]) => {
-        const cb = el('input', { type: 'checkbox' });
-        cb.checked = !!values[key];
-        sampleChecks[key] = cb;
-        return el('tr', {}, el('td', { class: 'checkcol' }, cb), el('td', {}, type), el('td', {}, desc), el('td', {}, qty));
-      }))));
+    field('Collection date and time', collectedInp),
+    buildSamplePointsSection(samplePoints, getRunId, processingLot, () => collectedInp.value));
 
   const outputStatus = el('span', { class: 'help' });
   const outputSaveBtn = el('button', { type: 'button', class: 'secondary', onclick: saveOutput }, 'Save');
@@ -1363,21 +1457,8 @@ function buildHomogenizationSections(getRunId, values) {
         targetPctWetSolids: targetPctInp.value.trim() === '' ? null : qcParseValue(targetPctInp.value),
         dilutionWaterTargetL: calcDilutionTarget(),
         dilutionWaterL: dilutionInp.value.trim() === '' ? null : qcParseValue(dilutionInp.value),
-        initialPh: initialPhInp.value.trim() === '' ? null : qcParseValue(initialPhInp.value),
-        citricKg: citricInp.value.trim() === '' ? null : qcParseValue(citricInp.value),
-        finalPh: finalPhInp.value.trim() === '' ? null : qcParseValue(finalPhInp.value),
-        tdsPct: tdsInp.value.trim() === '' ? null : qcParseValue(tdsInp.value),
-        brixPct: brixInp.value.trim() === '' ? null : qcParseValue(brixInp.value),
-        mannitolPct: mannitolInp.value.trim() === '' ? null : qcParseValue(mannitolInp.value),
-        tsLiquidPct: tsLiquidInp.value.trim() === '' ? null : qcParseValue(tsLiquidInp.value),
-        rhoLiquidGMl: rhoLiquidInp.value.trim() === '' ? null : qcParseValue(rhoLiquidInp.value),
-        tsSlurryPct: tsSlurryInp.value.trim() === '' ? null : qcParseValue(tsSlurryInp.value),
-        rhoSlurryGMl: rhoSlurryInp.value.trim() === '' ? null : qcParseValue(rhoSlurryInp.value),
-        tsSolidsPct: tsSolidsInp.value.trim() === '' ? null : qcParseValue(tsSolidsInp.value),
-        sampleSlurryMicrobial: sampleChecks.sampleSlurryMicrobial.checked,
-        sampleSlurryRetention: sampleChecks.sampleSlurryRetention.checked,
-        sampleLiquidMetals: sampleChecks.sampleLiquidMetals.checked,
-        sampleSolidsProximate: sampleChecks.sampleSolidsProximate.checked,
+        ...qcCheck.getPayload(),
+        sampleCollectedAt: collectedInp.value || null,
       });
       outputStatus.textContent = 'Saved.';
     } catch (e) { outputStatus.textContent = e.message; }
@@ -1388,12 +1469,98 @@ function buildHomogenizationSections(getRunId, values) {
       el('div', { class: 'form-row' }, field('Target %Wet-Solids', targetPctInp)),
       field('Dilution water (L) target (calculated)', dilutionTargetValue),
       el('div', { class: 'form-row' }, field('Dilution water (L)', dilutionInp)),
-      processCheck2Box,
-      qcCheck1Box,
+      qcCheckBox,
       samplePointBox,
       el('div', { style: 'margin-top:6px' }, outputSaveBtn, outputStatus)));
 
   return { inputSection, outputSection };
+}
+
+const SAMPLE_TYPES = ['Slurry', 'Liquid', 'Solid'];
+const SAMPLE_DESCRIPTIONS = ['Microbial', 'Retention', 'Metals & Nutrients', 'Proximate Analysis', 'R&D', 'Other'];
+const SAMPLE_CONTAINERS = ['50 mL falcon tube', '100 g sample bag', '1 L bottle', '2 L bottle'];
+// One printable label per physical container -- a sample row with Qty > 1
+// prints that many copies, each with its own barcode (copy N of Qty) so
+// every physical container is still uniquely identifiable.
+function samplePointLabel(processingLot, row, copyIndex, totalCopies, collectedAt) {
+  const barcode = (processingLot || 'RUN') + '-SP' + row.id + (totalCopies > 1 ? '-' + copyIndex : '');
+  return { kind: 'Sample Point', lot: barcode, barcode, meta: [
+    ['Type', row.type || '—'], ['Description', row.description || '—'], ['Container', row.container || '—'],
+    ['Qty', totalCopies > 1 ? copyIndex + ' of ' + totalCopies : String(row.qty || 1)],
+    ['Collected', collectedAt ? fmtWhen(collectedAt) : '—']] };
+}
+// The Sample Point table itself: a repeatable list of samples (Type/
+// Description/Qty/Container), each row saved immediately on add/edit/remove
+// via its own run_sample_points row (mirrors buildSepSolidsSection/
+// buildDilutionsSection), plus one print-labels button per row that prints
+// Qty copies using the box's single shared "Collection date and time".
+function buildSamplePointsSection(initial, getRunId, processingLot, getCollectedAt) {
+  let items = (initial || []).slice();
+  const tbody = el('tbody', {});
+  const status = el('div', { class: 'help' });
+  function selectCell(options, value, onChange) {
+    const sel = el('select', {}, ...options.map(o => el('option', { value: o }, o)));
+    sel.value = options.includes(value) ? value : (options[0] || '');
+    sel.addEventListener('change', onChange);
+    return sel;
+  }
+  async function patch(id, payload) {
+    try {
+      const rid = await getRunId();
+      const r = await api('PUT', '/production/' + rid + '/sample-points/' + id, payload);
+      items = r.samplePoints;
+      status.textContent = '';
+    } catch (e) { status.textContent = e.message; }
+  }
+  function draw() {
+    tbody.innerHTML = '';
+    if (!items.length) {
+      tbody.append(el('tr', {}, el('td', { colspan: 6, class: 'empty' }, 'No samples added yet.')));
+    }
+    items.forEach(it => {
+      const typeSel = selectCell(SAMPLE_TYPES, it.type, () => patch(it.id, { type: typeSel.value }));
+      const descSel = selectCell(SAMPLE_DESCRIPTIONS, it.description, () => patch(it.id, { description: descSel.value }));
+      const qtyInp = el('input', { type: 'number', min: '1', max: '10', value: String(it.qty || 1) });
+      qtyInp.addEventListener('change', () => {
+        const q = Math.max(1, Math.min(10, +qtyInp.value || 1));
+        qtyInp.value = String(q);
+        patch(it.id, { qty: q });
+      });
+      const containerSel = selectCell(SAMPLE_CONTAINERS, it.container, () => patch(it.id, { container: containerSel.value }));
+      const printBtn = el('button', {
+        type: 'button', class: 'secondary', title: 'Print label(s) for this sample', onclick: () => {
+          const qty = Math.max(1, Math.min(10, +qtyInp.value || 1));
+          const labels = [];
+          for (let i = 1; i <= qty; i++) labels.push(samplePointLabel(processingLot, it, i, qty, getCollectedAt()));
+          printLabels(labels);
+        }
+      }, '🖨');
+      const removeBtn = el('button', {
+        type: 'button', class: 'icon-btn remove', title: 'Remove sample', onclick: async () => {
+          if (!confirm('Remove this sample?')) return;
+          const rid = await getRunId();
+          const r = await api('DELETE', '/production/' + rid + '/sample-points/' + it.id);
+          items = r.samplePoints; draw();
+        }
+      }, '−');
+      tbody.append(el('tr', {},
+        el('td', {}, typeSel), el('td', {}, descSel), el('td', {}, qtyInp), el('td', {}, containerSel),
+        el('td', { style: 'display:flex;gap:6px;justify-content:flex-end' }, printBtn, removeBtn)));
+    });
+  }
+  draw();
+  const addBtn = el('button', {
+    type: 'button', class: 'icon-btn add', title: 'Add sample', onclick: async () => {
+      try { const rid = await getRunId(); const r = await api('POST', '/production/' + rid + '/sample-points', {}); items = r.samplePoints; draw(); }
+      catch (e) { status.textContent = e.message; }
+    }
+  }, '+');
+  return el('div', {},
+    el('table', { class: 'qc-check-checklist' },
+      el('thead', {}, el('tr', {}, el('th', {}, 'Type'), el('th', {}, 'Description'), el('th', {}, 'Qty'),
+        el('th', {}, 'Container'), el('th', {}, ''))),
+      tbody),
+    el('div', { style: 'margin-top:8px' }, addBtn), status);
 }
 
 const ODOUR_INTENSITIES = ['', 'Mild', 'Medium', 'Strong'];
@@ -1642,6 +1809,11 @@ function buildFeedstockCard(opts) {
     }, 'Save');
     bodyEls.push(el('div', { style: 'margin-top:10px' }, saveBtn, status));
   }
+  // Seed the caller's onChange with the initial (possibly prefilled) values
+  // right away, not just on the first edit -- so a caller that saves from
+  // its own outer button (no per-field Save here) always has a current
+  // snapshot to send, even if the user never touches this card at all.
+  if (opts.onChange) notifyChange();
   return el('details', { class: 'accordion feedstock-tote' },
     el('summary', {}, opts.label + (v.decision === 'rejected' ? '  ⚠ Rejected' : '')),
     el('div', { class: 'accordion-body' }, ...bodyEls));
@@ -2049,8 +2221,8 @@ async function openRun(draftSummary, opts) {
 
   const stages = draft?.stages || {};
   const { inputSection: homogInputSection, outputSection: homogOutputSection } =
-    buildHomogenizationSections(ensureRunId, stages.homogenization);
-  const extractionSection = buildStageSection(ensureRunId, STAGE_DEFS.extraction, stages.extraction);
+    buildHomogenizationSections(ensureRunId, stages.homogenization, draft?.samplePoints || [], draft?.processingLot);
+  const extractionSection = buildExtractionSection(ensureRunId, stages.extraction);
   const separationParams = buildStageSection(ensureRunId, STAGE_DEFS.separation, stages.separation, true);
   const sepSolidsSection = buildSepSolidsSection(draft?.separationSolids || [], ensureRunId, attId => attDownloadUrl(draftId, attId, false));
   const pasteurizationSection = buildStageSection(ensureRunId, STAGE_DEFS.pasteurization, stages.pasteurization);
@@ -2186,8 +2358,8 @@ async function openProcessLog(run) {
 
   const getRunId = async () => run.id;
   const { inputSection: homogInputSection, outputSection: homogOutputSection } =
-    buildHomogenizationSections(getRunId, stages.homogenization);
-  const extractionSection = buildStageSection(getRunId, STAGE_DEFS.extraction, stages.extraction);
+    buildHomogenizationSections(getRunId, stages.homogenization, run.samplePoints || [], run.processingLot);
+  const extractionSection = buildExtractionSection(getRunId, stages.extraction);
   const separationParams = buildStageSection(getRunId, STAGE_DEFS.separation, stages.separation, true);
   const sepSolidsSection = buildSepSolidsSection(run.separationSolids || [], getRunId, attId => attDownloadUrl(run.id, attId, false));
   const pasteurizationSection = buildStageSection(getRunId, STAGE_DEFS.pasteurization, stages.pasteurization);
@@ -2824,7 +2996,7 @@ function doPrint(host) {
 function toteLabel(t) {
   return { kind: 'Stabilized Tote', lot: t.lot, barcode: t.lot, meta: [
     ['Species', speciesName(t.species)], ['Site', t.site], ['Avg wt', fmt(t.avgWeightKg, 1) + ' kg'],
-    ['pH', t.ph ?? '—'], ['Checked in', t.checkinDate || '—'], ['Loc', t.location || '—']] };
+    ['pH', t.ph ?? '—'], ['Harvest date', t.harvestDate || '—'], ['Loc', t.location || '—']] };
 }
 function fgLabel(f, run) {
   return { kind: 'Finished Good — LKE', lot: f.lot, barcode: f.lot, meta: [

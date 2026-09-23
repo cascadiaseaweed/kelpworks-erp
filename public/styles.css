@@ -131,6 +131,9 @@ th { background: #eef3f2; color: var(--teal-dark); font-weight: 600; position: s
 tbody tr:hover { background: #f6faf9; }
 /* QC log entries: show ~5 rows before scrolling (sticky header stays visible). */
 .qc-results-scroll .tablewrap { max-height: 264px; overflow-y: auto; }
+/* Feedstock Stability log: show ~10 rows before scrolling (sticky header
+   stays visible) -- a tote's log can grow long over its lifetime. */
+.tablewrap.stability-log-scroll { max-height: 395px; overflow-y: auto; }
 /* Feedstock Inventory can list hundreds of totes. Without a height cap the
    table (and its horizontal scrollbar, needed for the many columns) just
    grows to fit every row, pushing that scrollbar thousands of pixels below
@@ -312,7 +315,19 @@ th.sortable:hover { background: #e2ece9; }
 .qc-check-checklist th, .qc-check-checklist td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); }
 .qc-check-checklist th { font-size: 11px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted); font-weight: 700; }
 .qc-check-checklist td.checkcol, .qc-check-checklist th.checkcol { width: 28px; text-align: center; padding-left: 4px; padding-right: 4px; }
+.qc-check-checklist td select, .qc-check-checklist td input { width: 100%; padding: 5px 6px; font-size: 12.5px; border-radius: 6px; }
 @media (max-width: 600px) { .form-row-3 { grid-template-columns: 1fr; } }
+
+/* Small round icon buttons for adding/removing a row from a repeatable
+   table (Sample Point), instead of the "+ Add …" / "Remove" text-button
+   pattern used elsewhere -- this table's rows are compact enough that a
+   full-width text button per row would be visually heavy. */
+.icon-btn {
+  width: 26px; height: 26px; padding: 0; border-radius: 50%; font-size: 15px; line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+}
+.icon-btn.add { background: var(--teal); color: #fff; }
+.icon-btn.remove { background: var(--danger); color: #fff; }
 
 .photo-slot img { display: block; width: 100%; max-width: 160px; border-radius: 8px; margin-top: 6px; object-fit: cover; }
 

@@ -1,0 +1,2 @@
+site,species,harvestDate,avgWeightKg,receivedDate,stabilizationMethod,storageUnit,location,ph,orp,storageSource,notes
+JAM,SL,2026-09-23,180.5,2026-09-24,Citric acid,Tote,Port Edward Facility,3.7,-150,Empty IBC Tote,Example row - delete before importing
