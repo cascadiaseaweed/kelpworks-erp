@@ -20,6 +20,17 @@ admin panel.
 3. **Keep `print()` ASCII-only** — the Windows dev console is cp1252 and chokes
    on non-ASCII. (File/HTTP content is UTF-8 and fine.)
 4. **Verify in the browser preview** after changes, then restart the server.
+5. **Keep the Calculations page in sync.** `CALCULATIONS` in `app.js`
+   (rendered by `pageCalculations`) documents every calculated field in the
+   app. Whenever you add, change, or remove a calculated field (a value
+   derived from other fields via a formula — not a report SUM/COUNT total),
+   update its `CALCULATIONS` entry to match; remove the entry if the field is
+   deleted. Any new hardcoded constant a calculation depends on (a threshold,
+   default, conversion factor) belongs in `SETTINGS_DEFAULTS`
+   (`kelp_erp_server.py`) as an admin-editable `settings` row instead of a
+   bare literal — read it via `get_setting_value(conn, key, default)`
+   server-side or `settingValue(key, fallback)` client-side, and list its key
+   in the calculation's `settings` array so it shows up on that page.
 
 ## Run it
 

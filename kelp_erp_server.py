@@ -85,12 +85,63 @@ INITIAL_USERS = [
 INITIAL_USER_PASSWORD = os.environ.get("KELP_ERP_INITIAL_PASSWORD", "Cascadia123!")
 MIN_PASSWORD_LEN = 8
 
-PACKAGE_SIZES = {            # litres per unit of each package type
-    "IBC": 1000.0,
-    "4L": 4.0,
-    "1L": 1.0,
+PACKAGE_SIZES = {            # litres per unit of each package type -- seed
+    "IBC": 1000.0,            # defaults for the admin-editable settings table
+    "4L": 4.0,                # below; runtime lookups go through
+    "1L": 1.0,                # package_sizes(conn), never this dict directly.
     "250ml": 0.25,
 }
+
+# (key, default value, label, description) -- seeded into the `settings`
+# table on every boot (INSERT OR IGNORE, so an admin's edited value is never
+# overwritten). Every constant a calculated field depends on belongs here,
+# not as a bare literal in the formula -- see the Calculations page.
+SETTINGS_DEFAULTS = [
+    ("orp_spoiled_below", -200, "ORP \"Spoiled\" threshold (mV)",
+     "ORP readings below this value are classified \"Spoiled\"."),
+    ("orp_spoilage_underway_below", -50, "ORP \"Spoilage underway\" threshold (mV)",
+     "ORP readings at or above \"Spoiled\" but below this value are classified \"Spoilage underway\"."),
+    ("orp_watch_closely_below", 0, "ORP \"Watch closely\" threshold (mV)",
+     "ORP readings at or above \"Spoilage underway\" but below this value are classified \"Watch closely\";"
+     " at or above it, \"Stable / safe zone\"."),
+    ("homog_tank_2ab_max_level_l", 5000, "Tank 2A/B max level (L)",
+     "Maximum working volume of Tank 2A/B -- used by Homogenization's Target fill level (L) calculation."),
+    ("extraction_default_amplitude_pct", 100, "Extraction default Amplitude (%)",
+     "Pre-filled value for a new run's Extraction Amplitude (%) field."),
+    ("extraction_default_flowrate_lpm", 15, "Extraction default Flow rate (L/min)",
+     "Pre-filled value for a new run's Extraction Flow rate (L/min) field."),
+    ("homog_default_target_pct_wet_solids", 50.0, "Homogenization default Target %Wet-Solids",
+     "Pre-filled value for a new run's Target %Wet-Solids field."),
+    ("separation_default_flowrate_lpm", 40, "Separation default Flow rate (L/min)",
+     "Pre-filled value for a new run's Separation Flow rate (L/min) field."),
+    ("separation_default_mesh_micron", 74, "Separation default Mesh size (micron)",
+     "Pre-filled value for a new run's Separation Mesh size (micron) field."),
+    ("package_size_ibc_l", PACKAGE_SIZES["IBC"], "IBC package size (L)", "Litres per IBC package/unit."),
+    ("package_size_4l_l", PACKAGE_SIZES["4L"], "4L package size (L)", "Litres per 4L package/unit."),
+    ("package_size_1l_l", PACKAGE_SIZES["1L"], "1L package size (L)", "Litres per 1L package/unit."),
+    ("package_size_250ml_l", PACKAGE_SIZES["250ml"], "250ml package size (L)", "Litres per 250ml package/unit."),
+]
+
+
+def get_settings(conn):
+    return {r["key"]: {"value": r["value"], "label": r["label"], "description": r["description"]}
+            for r in conn.execute("SELECT * FROM settings ORDER BY key")}
+
+
+def get_setting_value(conn, key, default=None):
+    r = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return r["value"] if r else default
+
+
+def package_sizes(conn):
+    """Live package-size lookup -- always read this instead of the
+    PACKAGE_SIZES dict, which only supplies seed defaults."""
+    return {
+        "IBC": get_setting_value(conn, "package_size_ibc_l", PACKAGE_SIZES["IBC"]),
+        "4L": get_setting_value(conn, "package_size_4l_l", PACKAGE_SIZES["4L"]),
+        "1L": get_setting_value(conn, "package_size_1l_l", PACKAGE_SIZES["1L"]),
+        "250ml": get_setting_value(conn, "package_size_250ml_l", PACKAGE_SIZES["250ml"]),
+    }
 
 # --------------------------------------------------------------------------- #
 # Database
@@ -447,11 +498,29 @@ CREATE TABLE IF NOT EXISTS production_runs (
     extraction_ts_slurry_pct     REAL,
     extraction_rho_slurry_g_ml   REAL,
     extraction_ts_solids_pct     REAL,
-    -- Separation stage parameters (repeatable solids collections live in run_separation_solids)
+    -- Separation stage parameters. run_separation_solids stays defined
+    -- (additive-only) but is no longer used -- the repeatable solids
+    -- collection feature was removed in favor of the single Total
+    -- wet-solids weight field below, and separation_water_addition_l stays
+    -- defined but uncollected -- "Water addition (L)" was removed.
     separation_flowrate_lpm      REAL,
     separation_mesh_micron       REAL,
     separation_water_addition_l  REAL,
     separation_started_at        TEXT,
+    -- Separation, Solids Out
+    separation_wet_solids_wt_kg  REAL,
+    separation_pct_moisture      REAL,
+    -- Separation, Liquid Out QC Check (subtitle "Filtrate characterization")
+    -- -- Liquid-only fields, no Slurry/Solids section.
+    separation_liquid_qc_ph            REAL,
+    separation_liquid_tds_pct          REAL,
+    separation_liquid_brix_pct         REAL,
+    separation_liquid_mannitol_pct     REAL,
+    separation_liquid_ts_liquid_pct    REAL,
+    separation_liquid_rho_liquid_g_ml  REAL,
+    -- Separation, Solids Out Sample Point box: one collection date/time
+    -- shared by every row in that box's run_sample_points rows.
+    separation_solids_sample_collected_at  TEXT,
     -- Pasteurization stage (singular per run)
     pasteurization_product_setpoint_c  REAL,
     pasteurization_boiler_setpoint_c   REAL,
@@ -524,6 +593,9 @@ CREATE INDEX IF NOT EXISTS idx_dilutions_run ON run_dilutions(run_id);
 CREATE TABLE IF NOT EXISTS run_sample_points (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id        INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+    stage         TEXT,     -- which Sample Point box this row belongs to, e.g.
+                            -- 'homogenization', 'separation_solids' (a run can
+                            -- have more than one Sample Point box)
     type          TEXT,     -- Slurry | Liquid | Solid
     description   TEXT,     -- Microbial | Retention | Metals & Nutrients | Proximate Analysis | R&D | Other
     qty           INTEGER DEFAULT 1,   -- 1-10; also the number of labels printed for this row
@@ -531,6 +603,19 @@ CREATE TABLE IF NOT EXISTS run_sample_points (
     created_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_samplepoints_run ON run_sample_points(run_id);
+
+-- Admin-editable numeric constants used by calculated fields throughout the
+-- app (see the Calculations page) -- e.g. ORP classification thresholds,
+-- package litre sizes, calculation defaults. Never read a "magic number"
+-- straight from code for a calculation the Calculations page documents;
+-- add a row here instead so an admin can tune it without a redeploy.
+CREATE TABLE IF NOT EXISTS settings (
+    key         TEXT PRIMARY KEY,
+    value       REAL NOT NULL,
+    label       TEXT NOT NULL,
+    description TEXT,
+    updated_at  TEXT
+);
 
 -- Finished goods on hand: one row per (run, package size).
 CREATE TABLE IF NOT EXISTS fg_lots (
@@ -677,12 +762,23 @@ def migrate(conn):
         ("extraction_rho_slurry_g_ml", "REAL"), ("extraction_ts_solids_pct", "REAL"),
         ("separation_flowrate_lpm", "REAL"), ("separation_mesh_micron", "REAL"),
         ("separation_water_addition_l", "REAL"), ("separation_started_at", "TEXT"),
+        ("separation_wet_solids_wt_kg", "REAL"), ("separation_pct_moisture", "REAL"),
+        ("separation_liquid_qc_ph", "REAL"), ("separation_liquid_tds_pct", "REAL"),
+        ("separation_liquid_brix_pct", "REAL"), ("separation_liquid_mannitol_pct", "REAL"),
+        ("separation_liquid_ts_liquid_pct", "REAL"), ("separation_liquid_rho_liquid_g_ml", "REAL"),
+        ("separation_solids_sample_collected_at", "TEXT"),
         ("pasteurization_product_setpoint_c", "REAL"), ("pasteurization_boiler_setpoint_c", "REAL"),
         ("pasteurization_total_volume_l", "REAL"), ("pasteurization_started_at", "TEXT"),
         ("packaging_started_at", "TEXT"), ("rejected_feedstock_json", "TEXT"),
     ]:
         if col not in prcols:
             conn.execute("ALTER TABLE production_runs ADD COLUMN %s %s" % (col, decl))
+    spcols = {r["name"] for r in conn.execute("PRAGMA table_info(run_sample_points)")}
+    if "stage" not in spcols:
+        conn.execute("ALTER TABLE run_sample_points ADD COLUMN stage TEXT")
+    # Every Sample Point row created before this column existed belongs to
+    # the (only, at the time) Homogenization Sample Point box.
+    conn.execute("UPDATE run_sample_points SET stage='homogenization' WHERE stage IS NULL")
     ricols = {r["name"] for r in conn.execute("PRAGMA table_info(run_inputs)")}
     for col, decl in [
         ("loaded_at", "TEXT"), ("surface_photo", "TEXT"), ("striation_photo", "TEXT"),
@@ -780,6 +876,18 @@ def migrate(conn):
                  ("Determining % Wet Solids SOP", "wet_solids_sop", now_iso()))
     conn.execute("UPDATE sop_documents SET key='wet_solids_sop'"
                  " WHERE name='Determining % Wet Solids SOP' AND key IS NULL")
+    # Seed every known calculation constant -- INSERT OR IGNORE so an admin's
+    # already-edited value is never overwritten, but a newly-added constant
+    # (from a later code update) still appears for existing deployments.
+    for key, value, label, desc in SETTINGS_DEFAULTS:
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key,value,label,description,updated_at)"
+            " VALUES (?,?,?,?,?)", (key, value, label, desc, now_iso()))
+    # homog_dilution_density_kg_per_l was replaced by homog_tank_2ab_max_level_l
+    # when the dilution-target formula changed to solve for a fill level
+    # instead of a water-to-add amount -- no formula reads it anymore, so
+    # drop the row rather than leave a stale constant in the admin table.
+    conn.execute("DELETE FROM settings WHERE key='homog_dilution_density_kg_per_l'")
 
 
 def ensure_users(conn):
@@ -937,7 +1045,14 @@ def run_public(r):
             "tsSolidsPct": r["extraction_ts_solids_pct"]},
         "separation": {
             "startedAt": r["separation_started_at"], "flowrateLpm": r["separation_flowrate_lpm"],
-            "meshMicron": r["separation_mesh_micron"], "waterAdditionL": r["separation_water_addition_l"]},
+            "meshMicron": r["separation_mesh_micron"], "waterAdditionL": r["separation_water_addition_l"],
+            "wetSolidsWtKg": r["separation_wet_solids_wt_kg"], "pctMoisture": r["separation_pct_moisture"],
+            "liquidQcPh": r["separation_liquid_qc_ph"], "liquidTdsPct": r["separation_liquid_tds_pct"],
+            "liquidBrixPct": r["separation_liquid_brix_pct"],
+            "liquidMannitolPct": r["separation_liquid_mannitol_pct"],
+            "liquidTsLiquidPct": r["separation_liquid_ts_liquid_pct"],
+            "liquidRhoLiquidGMl": r["separation_liquid_rho_liquid_g_ml"],
+            "solidsSampleCollectedAt": r["separation_solids_sample_collected_at"]},
         "pasteurization": {
             "startedAt": r["pasteurization_started_at"],
             "productSetpointC": r["pasteurization_product_setpoint_c"],
@@ -1264,6 +1379,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.route_users(method, seg, conn, user)
         if method == "GET" and seg == ["api", "refdata"]:
             return self.refdata(conn)
+        if seg[:2] == ["api", "settings"]:
+            return self.route_settings(method, seg, conn, user)
         if seg[:2] == ["api", "sop-documents"]:
             return self.route_sop_documents(method, seg, conn, user)
         if method == "GET" and seg == ["api", "dashboard"]:
@@ -1415,7 +1532,27 @@ class Handler(BaseHTTPRequestHandler):
         sops = [dict(id=r["id"], name=r["name"], key=r["key"], hasFile=bool(r["stored_name"]))
                 for r in conn.execute("SELECT id, name, key, stored_name FROM sop_documents ORDER BY name")]
         return {"species": species, "sites": sites, "locations": locations,
-                "skus": skus, "packageSizes": PACKAGE_SIZES, "customers": customers, "sops": sops}
+                "skus": skus, "packageSizes": package_sizes(conn), "customers": customers, "sops": sops,
+                "settings": get_settings(conn)}
+
+    # ---- settings: admin-editable constants used by calculated fields ----- #
+    def route_settings(self, method, seg, conn, user):
+        if seg == ["api", "settings"] and method == "GET":
+            return {"settings": get_settings(conn)}
+        if len(seg) == 3 and seg[2] and method == "PUT":
+            self._require_admin(user)
+            key = seg[2]
+            row = conn.execute("SELECT * FROM settings WHERE key=?", (key,)).fetchone()
+            if not row:
+                raise ApiError(404, "Unknown setting")
+            d = self._body_json()
+            value = numn(d.get("value"))
+            if value is None:
+                raise ApiError(400, "Enter a numeric value")
+            conn.execute("UPDATE settings SET value=?, updated_at=? WHERE key=?",
+                         (value, now_iso(), key))
+            return {"settings": get_settings(conn)}
+        raise ApiError(404, "Unknown settings endpoint")
 
     # ---- SOP documents (controlled documents, admin-managed) -------------- #
     def _sop_public(self, r):
@@ -2072,7 +2209,17 @@ class Handler(BaseHTTPRequestHandler):
             ("separation_started_at", "startedAt", "text"),
             ("separation_flowrate_lpm", "flowrateLpm", "num"),
             ("separation_mesh_micron", "meshMicron", "num"),
-            ("separation_water_addition_l", "waterAdditionL", "num"),
+            ("separation_wet_solids_wt_kg", "wetSolidsWtKg", "num"),
+            ("separation_pct_moisture", "pctMoisture", "num"),
+            ("separation_liquid_qc_ph", "liquidQcPh", "num"),
+            ("separation_liquid_tds_pct", "liquidTdsPct", "num"),
+            ("separation_liquid_brix_pct", "liquidBrixPct", "num"),
+            ("separation_liquid_mannitol_pct", "liquidMannitolPct", "num"),
+            ("separation_liquid_ts_liquid_pct", "liquidTsLiquidPct", "num"),
+            ("separation_liquid_rho_liquid_g_ml", "liquidRhoLiquidGMl", "num"),
+            ("separation_solids_sample_collected_at", "solidsSampleCollectedAt", "text"),
+            # separation_water_addition_l column stays (additive-only) but is
+            # no longer collected -- "Water addition (L)" was removed.
         ],
         "pasteurization": [
             ("pasteurization_started_at", "startedAt", "text"),
@@ -2141,7 +2288,6 @@ class Handler(BaseHTTPRequestHandler):
                 d["attachments"] = self._attachments(conn, r["id"])
                 d["qc"] = self._qc_entries(conn, r["id"])
                 d["inputs"] = self._run_inputs_public(conn, r["id"])
-                d["separationSolids"] = self._sep_solids_public(conn, r["id"])
                 d["dilutions"] = self._dilutions_public(conn, r["id"])
                 d["samplePoints"] = self._sample_points_public(conn, r["id"])
                 runs.append(d)
@@ -2203,23 +2349,6 @@ class Handler(BaseHTTPRequestHandler):
             return self.upload_input_photo(conn, int(seg[2]), int(seg[4]), user)
         if len(seg) == 5 and seg[2].isdigit() and seg[3] == "stages" and method == "PUT":
             return self.save_stage(conn, int(seg[2]), seg[4], user)
-        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "separation-solids":
-            rid = int(seg[2])
-            if not conn.execute("SELECT 1 FROM production_runs WHERE id=?", (rid,)).fetchone():
-                raise ApiError(404, "Production run not found")
-            if method == "GET":
-                return {"separationSolids": self._sep_solids_public(conn, rid)}
-            if method == "POST":
-                return self.add_sep_solids(conn, rid, user)
-        if len(seg) == 5 and seg[2].isdigit() and seg[3] == "separation-solids" and seg[4].isdigit():
-            rid, sid = int(seg[2]), int(seg[4])
-            if method == "PUT":
-                return self.update_sep_solids(conn, rid, sid, user)
-            if method == "DELETE":
-                return self.delete_sep_solids(conn, rid, sid)
-        if (len(seg) == 6 and seg[2].isdigit() and seg[3] == "separation-solids" and seg[4].isdigit()
-                and seg[5] == "photo" and method == "POST"):
-            return self.upload_sep_solids_photo(conn, int(seg[2]), int(seg[4]), user)
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "dilutions":
             rid = int(seg[2])
             if not conn.execute("SELECT 1 FROM production_runs WHERE id=?", (rid,)).fetchone():
@@ -2706,66 +2835,6 @@ class Handler(BaseHTTPRequestHandler):
         return {"run": run_public(conn.execute(
             "SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone())}
 
-    # ---- Separation: repeatable solids collections -------------------------#
-    def _sep_solids_public(self, conn, run_id):
-        return [{"id": r["id"], "weightKg": r["weight_kg"], "photo": r["photo"],
-                 "notes": r["notes"], "loggedAt": r["logged_at"]}
-                for r in conn.execute(
-                    "SELECT * FROM run_separation_solids WHERE run_id=? ORDER BY logged_at, id",
-                    (run_id,))]
-
-    def add_sep_solids(self, conn, run_id, user):
-        d = self._body_json()
-        conn.execute(
-            "INSERT INTO run_separation_solids (run_id,weight_kg,photo,notes,logged_at)"
-            " VALUES (?,?,?,?,?)",
-            (run_id, numn(d.get("weightKg")), None, (d.get("notes") or "").strip() or None,
-             (d.get("loggedAt") or "").strip() or now_iso()))
-        return {"separationSolids": self._sep_solids_public(conn, run_id)}
-
-    def update_sep_solids(self, conn, run_id, sid, user):
-        row = conn.execute("SELECT * FROM run_separation_solids WHERE id=? AND run_id=?",
-                           (sid, run_id)).fetchone()
-        if not row:
-            raise ApiError(404, "Separation solids entry not found")
-        d = self._body_json()
-        updates = {}
-        if "weightKg" in d:
-            updates["weight_kg"] = numn(d["weightKg"])
-        if "notes" in d:
-            updates["notes"] = (d["notes"] or "").strip() or None
-        if "loggedAt" in d:
-            updates["logged_at"] = (d["loggedAt"] or "").strip() or row["logged_at"]
-        if updates:
-            sets = ", ".join("%s=?" % c for c in updates)
-            conn.execute("UPDATE run_separation_solids SET %s WHERE id=?" % sets,
-                         (*updates.values(), sid))
-        return {"separationSolids": self._sep_solids_public(conn, run_id)}
-
-    def delete_sep_solids(self, conn, run_id, sid):
-        row = conn.execute("SELECT * FROM run_separation_solids WHERE id=? AND run_id=?",
-                           (sid, run_id)).fetchone()
-        if not row:
-            raise ApiError(404, "Separation solids entry not found")
-        if row["photo"]:
-            self._delete_attachment_row(conn, row["photo"])
-        conn.execute("DELETE FROM run_separation_solids WHERE id=?", (sid,))
-        return {"separationSolids": self._sep_solids_public(conn, run_id)}
-
-    def upload_sep_solids_photo(self, conn, run_id, sid, user):
-        row = conn.execute("SELECT * FROM run_separation_solids WHERE id=? AND run_id=?",
-                           (sid, run_id)).fetchone()
-        if not row:
-            raise ApiError(404, "Separation solids entry not found")
-        d = self._body_json()
-        new_id = self._store_attachment(conn, run_id, d.get("filename") or "solids.jpg",
-                                        d.get("contentType"), d.get("dataB64") or "",
-                                        user["name"] if user else None)
-        if row["photo"]:
-            self._delete_attachment_row(conn, row["photo"])
-        conn.execute("UPDATE run_separation_solids SET photo=? WHERE id=?", (new_id, sid))
-        return {"separationSolids": self._sep_solids_public(conn, run_id)}
-
     # ---- Dilution & Preservation: repeatable tank entries ------------------#
     def _dilutions_public(self, conn, run_id):
         out = []
@@ -2822,7 +2891,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Sample Point: repeatable sample-collection rows -------------------#
     def _sample_points_public(self, conn, run_id):
-        return [{"id": r["id"], "type": r["type"], "description": r["description"],
+        return [{"id": r["id"], "stage": r["stage"], "type": r["type"], "description": r["description"],
                  "qty": r["qty"], "container": r["container"], "createdAt": r["created_at"]}
                 for r in conn.execute(
                     "SELECT * FROM run_sample_points WHERE run_id=? ORDER BY created_at, id", (run_id,))]
@@ -2842,11 +2911,13 @@ class Handler(BaseHTTPRequestHandler):
             conn.execute("UPDATE run_sample_points SET %s WHERE id=?" % sets, (*updates.values(), spid))
 
     def add_sample_point(self, conn, run_id, user):
+        d = self._body_json()
+        stage = (d.get("stage") or "").strip() or None
         cur = conn.cursor()
-        cur.execute("INSERT INTO run_sample_points (run_id,qty,created_at) VALUES (?,1,?)",
-                    (run_id, now_iso()))
+        cur.execute("INSERT INTO run_sample_points (run_id,qty,stage,created_at) VALUES (?,1,?,?)",
+                    (run_id, stage, now_iso()))
         spid = cur.lastrowid
-        self._apply_sample_point_fields(conn, spid, self._body_json())
+        self._apply_sample_point_fields(conn, spid, d)
         return {"samplePoints": self._sample_points_public(conn, run_id)}
 
     def update_sample_point(self, conn, run_id, spid, user):
@@ -3035,14 +3106,15 @@ class Handler(BaseHTTPRequestHandler):
         input_kg = round(sum((r["avg_weight_kg"] or 0) for r in accepted_rows), 2)
 
         # Output litres = sum of packaged litres.
+        pkg_sizes = package_sizes(conn)
         output_litres = 0.0
         ibc_used = 0
         for p in packages:
             size = p.get("size")
             qty = num(p.get("qty"))
-            if size not in PACKAGE_SIZES or qty <= 0:
+            if size not in pkg_sizes or qty <= 0:
                 continue
-            output_litres += PACKAGE_SIZES[size] * qty
+            output_litres += pkg_sizes[size] * qty
             if size == "IBC":
                 ibc_used += int(qty)
         output_litres = round(output_litres, 2)
@@ -3130,14 +3202,14 @@ class Handler(BaseHTTPRequestHandler):
         for p in packages:
             size = p.get("size")
             qty = num(p.get("qty"))
-            if size not in PACKAGE_SIZES or qty <= 0:
+            if size not in pkg_sizes or qty <= 0:
                 continue
             fg_lot = "%s-%s" % (lot, size)
             cur.execute(
                 "INSERT INTO fg_lots (fg_lot_number,sku_code,run_id,package_size,qty,litres_each,"
                 "produced_date,tds,location,status,created_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?, 'on_hand', ?)",
-                (fg_lot, sku, run_id, size, qty, PACKAGE_SIZES[size], run_date,
+                (fg_lot, sku, run_id, size, qty, pkg_sizes[size], run_date,
                  target_tds, location, ts))
             fg_created.append(fg_lot)
 
@@ -3150,7 +3222,6 @@ class Handler(BaseHTTPRequestHandler):
         for r in conn.execute("SELECT * FROM production_runs WHERE status='draft' ORDER BY id DESC"):
             dd = run_public(r)
             dd["toteLots"] = self._tote_lot_numbers(conn, dd["toteIds"])
-            dd["separationSolids"] = self._sep_solids_public(conn, r["id"])
             dd["dilutions"] = self._dilutions_public(conn, r["id"])
             dd["samplePoints"] = self._sample_points_public(conn, r["id"])
             drafts.append(dd)
@@ -3168,7 +3239,6 @@ class Handler(BaseHTTPRequestHandler):
         if not r:
             raise ApiError(404, "Draft not found")
         d = run_public(r)
-        d["separationSolids"] = self._sep_solids_public(conn, rid)
         d["dilutions"] = self._dilutions_public(conn, rid)
         d["samplePoints"] = self._sample_points_public(conn, rid)
         return {"run": d}
@@ -3198,7 +3268,7 @@ class Handler(BaseHTTPRequestHandler):
         notes = d.get("notes")
         operators = (d.get("operators") or "").strip() or None
         tote_ids = [int(x) for x in (d.get("toteIds") or [])]
-        packages = [p for p in (d.get("packages") or []) if p.get("size") in PACKAGE_SIZES]
+        packages = [p for p in (d.get("packages") or []) if p.get("size") in package_sizes(conn)]
         feedstock_details = d.get("feedstockDetails") or {}
 
         if rid is None:
