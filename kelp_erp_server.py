@@ -51,7 +51,7 @@ import tempfile
 import datetime
 from xml.sax.saxutils import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -85,13 +85,6 @@ INITIAL_USERS = [
 INITIAL_USER_PASSWORD = os.environ.get("KELP_ERP_INITIAL_PASSWORD", "Cascadia123!")
 MIN_PASSWORD_LEN = 8
 
-PACKAGE_SIZES = {            # litres per unit of each package type -- seed
-    "IBC": 1000.0,            # defaults for the admin-editable settings table
-    "4L": 4.0,                # below; runtime lookups go through
-    "1L": 1.0,                # package_sizes(conn), never this dict directly.
-    "250ml": 0.25,
-}
-
 # (key, default value, label, description) -- seeded into the `settings`
 # table on every boot (INSERT OR IGNORE, so an admin's edited value is never
 # overwritten). Every constant a calculated field depends on belongs here,
@@ -105,21 +98,25 @@ SETTINGS_DEFAULTS = [
      "ORP readings at or above \"Spoilage underway\" but below this value are classified \"Watch closely\";"
      " at or above it, \"Stable / safe zone\"."),
     ("homog_tank_2ab_max_level_l", 5000, "Tank 2A/B max level (L)",
-     "Maximum working volume of Tank 2A/B -- used by Homogenization's Target fill level (L) calculation."),
+     "Maximum working volume of Tank 2A/B -- used by Homogenization's Target fill level, Tank 2A/B (L) calculation."),
+    ("dilution_tank_6ab_max_level_l", 5000, "Tank 6A/B max level (L)",
+     "Maximum working volume of Tank 6A/B -- used by Dilution & Preservation's Target fill level, Tank 6A/B (L) calculation."),
     ("extraction_default_amplitude_pct", 100, "Extraction default Amplitude (%)",
      "Pre-filled value for a new run's Extraction Amplitude (%) field."),
     ("extraction_default_flowrate_lpm", 15, "Extraction default Flow rate (L/min)",
      "Pre-filled value for a new run's Extraction Flow rate (L/min) field."),
     ("homog_default_target_pct_wet_solids", 50.0, "Homogenization default Target %Wet-Solids",
      "Pre-filled value for a new run's Target %Wet-Solids field."),
+    ("ksorbate_stock_concentration_default_pct", 25.0, "Ksorbate stock concentration default (w/v %)",
+     "Pre-filled value for a new run's Ksorbate stock concentration (w/v) field."),
     ("separation_default_flowrate_lpm", 40, "Separation default Flow rate (L/min)",
      "Pre-filled value for a new run's Separation Flow rate (L/min) field."),
     ("separation_default_mesh_micron", 74, "Separation default Mesh size (micron)",
      "Pre-filled value for a new run's Separation Mesh size (micron) field."),
-    ("package_size_ibc_l", PACKAGE_SIZES["IBC"], "IBC package size (L)", "Litres per IBC package/unit."),
-    ("package_size_4l_l", PACKAGE_SIZES["4L"], "4L package size (L)", "Litres per 4L package/unit."),
-    ("package_size_1l_l", PACKAGE_SIZES["1L"], "1L package size (L)", "Litres per 1L package/unit."),
-    ("package_size_250ml_l", PACKAGE_SIZES["250ml"], "250ml package size (L)", "Litres per 250ml package/unit."),
+    ("pasteurization_default_product_setpoint_c", 80, "Pasteurization default Product set-point (°C)",
+     "Pre-filled value for a new run's Pasteurization Product set-point (°C) field."),
+    ("pasteurization_default_boiler_setpoint_c", 90, "Pasteurization default Boiler set-point (°C)",
+     "Pre-filled value for a new run's Pasteurization Boiler set-point (°C) field."),
 ]
 
 
@@ -133,15 +130,18 @@ def get_setting_value(conn, key, default=None):
     return r["value"] if r else default
 
 
-def package_sizes(conn):
-    """Live package-size lookup -- always read this instead of the
-    PACKAGE_SIZES dict, which only supplies seed defaults."""
-    return {
-        "IBC": get_setting_value(conn, "package_size_ibc_l", PACKAGE_SIZES["IBC"]),
-        "4L": get_setting_value(conn, "package_size_4l_l", PACKAGE_SIZES["4L"]),
-        "1L": get_setting_value(conn, "package_size_1l_l", PACKAGE_SIZES["1L"]),
-        "250ml": get_setting_value(conn, "package_size_250ml_l", PACKAGE_SIZES["250ml"]),
-    }
+def get_container_units(conn, include_inactive=False):
+    q = "SELECT * FROM container_units" + ("" if include_inactive else " WHERE active=1") \
+        + " ORDER BY sort_order, code"
+    return [{"code": r["code"], "litresEach": r["litres_each"], "active": bool(r["active"])}
+            for r in conn.execute(q)]
+
+
+def container_unit_litres_map(conn):
+    """Live code -> litres-each lookup for every container unit (active or
+    not, so a finalized run's existing FG lots keep resolving even after a
+    unit is deactivated)."""
+    return {r["code"]: r["litres_each"] for r in conn.execute("SELECT code, litres_each FROM container_units")}
 
 # --------------------------------------------------------------------------- #
 # Database
@@ -526,8 +526,37 @@ CREATE TABLE IF NOT EXISTS production_runs (
     pasteurization_boiler_setpoint_c   REAL,
     pasteurization_total_volume_l      REAL,
     pasteurization_started_at          TEXT,
-    -- Packaging stage
+    -- Pasteurization's two Sample Point boxes (pre/post), each with its own
+    -- collection date/time shared by every row in that box's run_sample_points rows.
+    pasteurization_pre_sample_collected_at   TEXT,
+    pasteurization_post_sample_collected_at  TEXT,
+    -- Pasteurization In, Process Check (subtitle "Dilution requirements")
+    pasteurization_tds_pct  REAL,
+    -- Dilution & Preservation, "Dilution" -> Process Check (subtitle
+    -- "pH control") and "Preservatives" -- singular per run, independent of
+    -- the repeatable run_dilutions tank list below.
+    dilution_fill_level_tank_6ab_l  REAL,
+    dilution_measured_ph            REAL,
+    dilution_citric_kg              REAL,
+    dilution_ksorbate_stock_pct     REAL,
+    dilution_ksorbate_added_l       REAL,
+    -- Packaging stage. packaging_started_at stays defined (additive-only)
+    -- but is no longer collected -- "Packaging started at" was removed in
+    -- favor of packaging_packaged_at, the repeatable table's shared
+    -- "Packaging date and time" (see run_packaging_entries above).
     packaging_started_at          TEXT,
+    packaging_packaged_at         TEXT,
+    -- Packaging, Quality Check (subtitle "LKE characterization") -- Liquid-only fields.
+    packaging_qc_ph               REAL,
+    packaging_tds_pct             REAL,
+    packaging_brix_pct            REAL,
+    packaging_mannitol_pct        REAL,
+    packaging_ts_liquid_pct       REAL,
+    packaging_rho_liquid_g_ml     REAL,
+    -- Packaging, Sample Point box (subtitle "LKE characterization"): one
+    -- collection date/time shared by every row in that box's
+    -- run_sample_points rows.
+    packaging_sample_collected_at TEXT,
     rejected_feedstock_json       TEXT,  -- JSON [{toteLot, reason, at}] for inspected-but-rejected totes
     created_at     TEXT NOT NULL
 );
@@ -603,6 +632,36 @@ CREATE TABLE IF NOT EXISTS run_sample_points (
     created_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_samplepoints_run ON run_sample_points(run_id);
+
+-- Repeatable Packaging entries (Packaging "table" -- add/remove rows, same
+-- format as Sample Point): one row per container-unit/qty logged during
+-- bottling. The box's single "Packaging date and time" applies to every row,
+-- so that lives on production_runs (packaging_packaged_at) instead -- same
+-- shared-timestamp pattern as the Sample Point boxes.
+CREATE TABLE IF NOT EXISTS run_packaging_entries (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id         INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+    container_unit TEXT,
+    qty            REAL,
+    created_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_packagingentries_run ON run_packaging_entries(run_id);
+
+-- Admin-editable options for the Packaging table's "Container unit" dropdown,
+-- each mapped to a fixed litres-per-unit conversion (e.g. IBC = 1000 L) --
+-- distinct from the fixed IBC/4L/1L/250ml package_size_*_l settings used by
+-- the Bottling/packaging output grid at finalize.
+CREATE TABLE IF NOT EXISTS container_units (
+    code        TEXT PRIMARY KEY,
+    litres_each REAL NOT NULL,
+    sort_order  INTEGER NOT NULL DEFAULT 0,
+    active      INTEGER NOT NULL DEFAULT 1,
+    is_ibc      INTEGER NOT NULL DEFAULT 0  -- internal only, never exposed/settable via
+                                            -- the API -- flags the unit finalize treats as
+                                            -- an IBC (Empty New/Used IBC consumable
+                                            -- tracking), stays true across a rename so
+                                            -- renaming "IBC" can't silently break it
+);
 
 -- Admin-editable numeric constants used by calculated fields throughout the
 -- app (see the Calculations page) -- e.g. ORP classification thresholds,
@@ -769,10 +828,23 @@ def migrate(conn):
         ("separation_solids_sample_collected_at", "TEXT"),
         ("pasteurization_product_setpoint_c", "REAL"), ("pasteurization_boiler_setpoint_c", "REAL"),
         ("pasteurization_total_volume_l", "REAL"), ("pasteurization_started_at", "TEXT"),
-        ("packaging_started_at", "TEXT"), ("rejected_feedstock_json", "TEXT"),
+        ("pasteurization_pre_sample_collected_at", "TEXT"), ("pasteurization_post_sample_collected_at", "TEXT"),
+        ("pasteurization_tds_pct", "REAL"),
+        ("dilution_fill_level_tank_6ab_l", "REAL"), ("dilution_measured_ph", "REAL"),
+        ("dilution_citric_kg", "REAL"), ("dilution_ksorbate_stock_pct", "REAL"),
+        ("dilution_ksorbate_added_l", "REAL"),
+        ("packaging_started_at", "TEXT"), ("packaging_packaged_at", "TEXT"),
+        ("packaging_qc_ph", "REAL"), ("packaging_tds_pct", "REAL"), ("packaging_brix_pct", "REAL"),
+        ("packaging_mannitol_pct", "REAL"), ("packaging_ts_liquid_pct", "REAL"),
+        ("packaging_rho_liquid_g_ml", "REAL"), ("packaging_sample_collected_at", "TEXT"),
+        ("rejected_feedstock_json", "TEXT"),
     ]:
         if col not in prcols:
             conn.execute("ALTER TABLE production_runs ADD COLUMN %s %s" % (col, decl))
+    cucols = {r["name"] for r in conn.execute("PRAGMA table_info(container_units)")}
+    if "is_ibc" not in cucols:
+        conn.execute("ALTER TABLE container_units ADD COLUMN is_ibc INTEGER NOT NULL DEFAULT 0")
+        conn.execute("UPDATE container_units SET is_ibc=1 WHERE code='IBC'")
     spcols = {r["name"] for r in conn.execute("PRAGMA table_info(run_sample_points)")}
     if "stage" not in spcols:
         conn.execute("ALTER TABLE run_sample_points ADD COLUMN stage TEXT")
@@ -888,6 +960,18 @@ def migrate(conn):
     # instead of a water-to-add amount -- no formula reads it anymore, so
     # drop the row rather than leave a stale constant in the admin table.
     conn.execute("DELETE FROM settings WHERE key='homog_dilution_density_kg_per_l'")
+    # package_size_*_l were replaced by the container_units table (admin can
+    # now add/rename/remove units, not just tweak 4 fixed sizes) when FG-lot
+    # creation at finalize switched from the old Bottling/packaging output
+    # grid to the Packaging table -- no formula reads them anymore.
+    for key in ("package_size_ibc_l", "package_size_4l_l", "package_size_1l_l", "package_size_250ml_l"):
+        conn.execute("DELETE FROM settings WHERE key=?", (key,))
+    # Seed the Packaging table's Container unit options -- INSERT OR IGNORE
+    # so an admin's already-edited litres value is never overwritten.
+    for code, litres, order, is_ibc in [("IBC", 1000, 0, 1), ("2 L", 2, 1, 0), ("1 L", 1, 2, 0)]:
+        conn.execute(
+            "INSERT OR IGNORE INTO container_units (code,litres_each,sort_order,active,is_ibc)"
+            " VALUES (?,?,?,1,?)", (code, litres, order, is_ibc))
 
 
 def ensure_users(conn):
@@ -1057,8 +1141,22 @@ def run_public(r):
             "startedAt": r["pasteurization_started_at"],
             "productSetpointC": r["pasteurization_product_setpoint_c"],
             "boilerSetpointC": r["pasteurization_boiler_setpoint_c"],
-            "totalVolumeL": r["pasteurization_total_volume_l"]},
-        "packaging": {"startedAt": r["packaging_started_at"]},
+            "totalVolumeL": r["pasteurization_total_volume_l"],
+            "preSampleCollectedAt": r["pasteurization_pre_sample_collected_at"],
+            "postSampleCollectedAt": r["pasteurization_post_sample_collected_at"],
+            "tdsPct": r["pasteurization_tds_pct"]},
+        "dilution": {
+            "fillLevelTank6abL": r["dilution_fill_level_tank_6ab_l"],
+            "measuredPh": r["dilution_measured_ph"],
+            "citricKg": r["dilution_citric_kg"],
+            "ksorbateStockPct": r["dilution_ksorbate_stock_pct"],
+            "ksorbateAddedL": r["dilution_ksorbate_added_l"]},
+        "packaging": {
+            "packagedAt": r["packaging_packaged_at"],
+            "qcPh": r["packaging_qc_ph"], "tdsPct": r["packaging_tds_pct"],
+            "brixPct": r["packaging_brix_pct"], "mannitolPct": r["packaging_mannitol_pct"],
+            "tsLiquidPct": r["packaging_ts_liquid_pct"], "rhoLiquidGMl": r["packaging_rho_liquid_g_ml"],
+            "sampleCollectedAt": r["packaging_sample_collected_at"]},
     }
     if r["status"] == "draft":
         try:
@@ -1066,7 +1164,6 @@ def run_public(r):
         except ValueError:
             dd = {}
         d["toteIds"] = dd.get("toteIds") or []
-        d["packages"] = dd.get("packages") or []
         d["feedstockDetails"] = dd.get("feedstockDetails") or {}
     return d
 
@@ -1381,6 +1478,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.refdata(conn)
         if seg[:2] == ["api", "settings"]:
             return self.route_settings(method, seg, conn, user)
+        if seg[:2] == ["api", "container-units"]:
+            return self.route_container_units(method, seg, conn, user)
         if seg[:2] == ["api", "sop-documents"]:
             return self.route_sop_documents(method, seg, conn, user)
         if method == "GET" and seg == ["api", "dashboard"]:
@@ -1532,8 +1631,8 @@ class Handler(BaseHTTPRequestHandler):
         sops = [dict(id=r["id"], name=r["name"], key=r["key"], hasFile=bool(r["stored_name"]))
                 for r in conn.execute("SELECT id, name, key, stored_name FROM sop_documents ORDER BY name")]
         return {"species": species, "sites": sites, "locations": locations,
-                "skus": skus, "packageSizes": package_sizes(conn), "customers": customers, "sops": sops,
-                "settings": get_settings(conn)}
+                "skus": skus, "customers": customers, "sops": sops,
+                "settings": get_settings(conn), "containerUnits": get_container_units(conn)}
 
     # ---- settings: admin-editable constants used by calculated fields ----- #
     def route_settings(self, method, seg, conn, user):
@@ -1553,6 +1652,55 @@ class Handler(BaseHTTPRequestHandler):
                          (value, now_iso(), key))
             return {"settings": get_settings(conn)}
         raise ApiError(404, "Unknown settings endpoint")
+
+    # ---- container units: admin-editable Packaging table dropdown options - #
+    def route_container_units(self, method, seg, conn, user):
+        if seg == ["api", "container-units"] and method == "GET":
+            self._require_admin(user)
+            return {"containerUnits": get_container_units(conn, include_inactive=True)}
+        if seg == ["api", "container-units"] and method == "POST":
+            self._require_admin(user)
+            d = self._body_json()
+            code = (d.get("code") or "").strip()
+            litres = numn(d.get("litresEach"))
+            if not code:
+                raise ApiError(400, "Enter a container unit name")
+            if litres is None or litres <= 0:
+                raise ApiError(400, "Enter a positive litres-per-unit value")
+            if conn.execute("SELECT 1 FROM container_units WHERE code=?", (code,)).fetchone():
+                raise ApiError(400, "That container unit already exists")
+            order = conn.execute("SELECT COALESCE(MAX(sort_order),-1)+1 n FROM container_units").fetchone()["n"]
+            conn.execute("INSERT INTO container_units (code,litres_each,sort_order,active) VALUES (?,?,?,1)",
+                         (code, litres, order))
+            return {"containerUnits": get_container_units(conn, include_inactive=True)}
+        if len(seg) == 3 and seg[2] and method == "PUT":
+            self._require_admin(user)
+            code = unquote(seg[2])
+            row = conn.execute("SELECT * FROM container_units WHERE code=?", (code,)).fetchone()
+            if not row:
+                raise ApiError(404, "Unknown container unit")
+            d = self._body_json()
+            new_code = (d.get("code") or code).strip() if "code" in d else code
+            if not new_code:
+                raise ApiError(400, "Enter a container unit name")
+            if new_code != code and conn.execute(
+                    "SELECT 1 FROM container_units WHERE code=?", (new_code,)).fetchone():
+                raise ApiError(400, "That container unit already exists")
+            litres = numn(d.get("litresEach")) if "litresEach" in d else row["litres_each"]
+            if litres is None or litres <= 0:
+                raise ApiError(400, "Enter a positive litres-per-unit value")
+            active = 1 if d.get("active", bool(row["active"])) else 0
+            conn.execute("UPDATE container_units SET code=?, litres_each=?, active=? WHERE code=?",
+                         (new_code, litres, active, code))
+            if new_code != code:
+                # A rename is reflected everywhere the old code was already
+                # recorded -- in-progress Packaging table rows and past
+                # Finished Goods lots alike.
+                conn.execute("UPDATE run_packaging_entries SET container_unit=? WHERE container_unit=?",
+                             (new_code, code))
+                conn.execute("UPDATE fg_lots SET package_size=? WHERE package_size=?", (new_code, code))
+            return {"containerUnits": get_container_units(conn, include_inactive=True)}
+        raise ApiError(404, "Unknown container-units endpoint")
 
     # ---- SOP documents (controlled documents, admin-managed) -------------- #
     def _sop_public(self, r):
@@ -2225,10 +2373,30 @@ class Handler(BaseHTTPRequestHandler):
             ("pasteurization_started_at", "startedAt", "text"),
             ("pasteurization_product_setpoint_c", "productSetpointC", "num"),
             ("pasteurization_boiler_setpoint_c", "boilerSetpointC", "num"),
-            ("pasteurization_total_volume_l", "totalVolumeL", "num"),
+            ("pasteurization_pre_sample_collected_at", "preSampleCollectedAt", "text"),
+            ("pasteurization_post_sample_collected_at", "postSampleCollectedAt", "text"),
+            ("pasteurization_tds_pct", "tdsPct", "num"),
+            # pasteurization_total_volume_l column stays (additive-only) but
+            # is no longer collected -- "Total volume (L)" was removed.
+        ],
+        "dilution": [
+            ("dilution_fill_level_tank_6ab_l", "fillLevelTank6abL", "num"),
+            ("dilution_measured_ph", "measuredPh", "num"),
+            ("dilution_citric_kg", "citricKg", "num"),
+            ("dilution_ksorbate_stock_pct", "ksorbateStockPct", "num"),
+            ("dilution_ksorbate_added_l", "ksorbateAddedL", "num"),
         ],
         "packaging": [
-            ("packaging_started_at", "startedAt", "text"),
+            # packaging_started_at removed -- see the schema comment above.
+            ("packaging_packaged_at", "packagedAt", "text"),
+            # Quality Check (subtitle "LKE characterization"), Liquid-only fields.
+            ("packaging_qc_ph", "qcPh", "num"),
+            ("packaging_tds_pct", "tdsPct", "num"),
+            ("packaging_brix_pct", "brixPct", "num"),
+            ("packaging_mannitol_pct", "mannitolPct", "num"),
+            ("packaging_ts_liquid_pct", "tsLiquidPct", "num"),
+            ("packaging_rho_liquid_g_ml", "rhoLiquidGMl", "num"),
+            ("packaging_sample_collected_at", "sampleCollectedAt", "text"),
         ],
     }
 
@@ -2273,6 +2441,12 @@ class Handler(BaseHTTPRequestHandler):
         ("container", "container", "text"),
     ]
 
+    # Packaging table entries: (db column, json key, kind)
+    PACKAGING_ENTRY_FIELDS = [
+        ("container_unit", "containerUnit", "text"),
+        ("qty", "qty", "num"),
+    ]
+
     def route_production(self, method, seg, conn, user):
         if seg == ["api", "production"] and method == "GET":
             runs = []
@@ -2290,6 +2464,7 @@ class Handler(BaseHTTPRequestHandler):
                 d["inputs"] = self._run_inputs_public(conn, r["id"])
                 d["dilutions"] = self._dilutions_public(conn, r["id"])
                 d["samplePoints"] = self._sample_points_public(conn, r["id"])
+                d["packagingEntries"] = self._packaging_entries_public(conn, r["id"])
                 runs.append(d)
             return {"runs": runs}
         if seg == ["api", "production"] and method == "POST":
@@ -2377,6 +2552,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self.update_sample_point(conn, rid, spid, user)
             if method == "DELETE":
                 return self.delete_sample_point(conn, rid, spid)
+        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "packaging-entries":
+            rid = int(seg[2])
+            if not conn.execute("SELECT 1 FROM production_runs WHERE id=?", (rid,)).fetchone():
+                raise ApiError(404, "Production run not found")
+            if method == "GET":
+                return {"packagingEntries": self._packaging_entries_public(conn, rid)}
+            if method == "POST":
+                return self.add_packaging_entry(conn, rid, user)
+        if len(seg) == 5 and seg[2].isdigit() and seg[3] == "packaging-entries" and seg[4].isdigit():
+            rid, peid = int(seg[2]), int(seg[4])
+            if method == "PUT":
+                return self.update_packaging_entry(conn, rid, peid, user)
+            if method == "DELETE":
+                return self.delete_packaging_entry(conn, rid, peid)
         raise ApiError(404, "Unknown production endpoint")
 
     def _attachments(self, conn, run_id):
@@ -2936,6 +3125,52 @@ class Handler(BaseHTTPRequestHandler):
         conn.execute("DELETE FROM run_sample_points WHERE id=?", (spid,))
         return {"samplePoints": self._sample_points_public(conn, run_id)}
 
+    # ---- Packaging: repeatable container-unit/qty rows --------------------#
+    def _packaging_entries_public(self, conn, run_id):
+        return [{"id": r["id"], "containerUnit": r["container_unit"], "qty": r["qty"],
+                 "createdAt": r["created_at"]}
+                for r in conn.execute(
+                    "SELECT * FROM run_packaging_entries WHERE run_id=? ORDER BY created_at, id", (run_id,))]
+
+    def _apply_packaging_entry_fields(self, conn, peid, d):
+        updates = {}
+        for col, key, kind in self.PACKAGING_ENTRY_FIELDS:
+            if key not in d:
+                continue
+            if kind == "num":
+                updates[col] = numn(d[key])
+            else:
+                updates[col] = (d[key] or "").strip() or None
+        if updates:
+            sets = ", ".join("%s=?" % c for c in updates)
+            conn.execute("UPDATE run_packaging_entries SET %s WHERE id=?" % sets, (*updates.values(), peid))
+
+    def add_packaging_entry(self, conn, run_id, user):
+        d = self._body_json()
+        default_unit = next(iter(get_container_units(conn)), {}).get("code")
+        cur = conn.cursor()
+        cur.execute("INSERT INTO run_packaging_entries (run_id,container_unit,qty,created_at) VALUES (?,?,1,?)",
+                    (run_id, default_unit, now_iso()))
+        peid = cur.lastrowid
+        self._apply_packaging_entry_fields(conn, peid, d)
+        return {"packagingEntries": self._packaging_entries_public(conn, run_id)}
+
+    def update_packaging_entry(self, conn, run_id, peid, user):
+        row = conn.execute("SELECT * FROM run_packaging_entries WHERE id=? AND run_id=?",
+                           (peid, run_id)).fetchone()
+        if not row:
+            raise ApiError(404, "Packaging entry not found")
+        self._apply_packaging_entry_fields(conn, peid, self._body_json())
+        return {"packagingEntries": self._packaging_entries_public(conn, run_id)}
+
+    def delete_packaging_entry(self, conn, run_id, peid):
+        row = conn.execute("SELECT * FROM run_packaging_entries WHERE id=? AND run_id=?",
+                           (peid, run_id)).fetchone()
+        if not row:
+            raise ApiError(404, "Packaging entry not found")
+        conn.execute("DELETE FROM run_packaging_entries WHERE id=?", (peid,))
+        return {"packagingEntries": self._packaging_entries_public(conn, run_id)}
+
     # ---- quality control log ----------------------------------------------- #
     def _qc_public(self, r):
         return {"id": r["id"], "runId": r["run_id"], "sampleLocation": r["sample_location"],
@@ -3071,7 +3306,15 @@ class Handler(BaseHTTPRequestHandler):
         sku_species = [r["species_code"] for r in conn.execute(
             "SELECT species_code FROM fg_sku_species WHERE sku_code=?", (sku,))]
         species = sku_species[0] if len(sku_species) == 1 else None
-        packages = d.get("packages") or []   # [{size, qty}]
+        # Packaging entries are saved incrementally to their own table (like
+        # Sample Point), not part of this request body -- read whatever's
+        # already there for this run. A brand-new one-shot run (no `existing`
+        # draft) has no run_id yet to have attached any to, so it's simply
+        # empty in that path.
+        packaging_entries = []
+        if existing:
+            packaging_entries = [dict(r) for r in conn.execute(
+                "SELECT container_unit, qty FROM run_packaging_entries WHERE run_id=?", (existing["id"],))]
         target_tds = sku_row["tds_target"]  # fixed product spec, not user-entered
         citric = num(d.get("citricKg"))
         sorbate = num(d.get("sorbateKg"))
@@ -3106,16 +3349,17 @@ class Handler(BaseHTTPRequestHandler):
         input_kg = round(sum((r["avg_weight_kg"] or 0) for r in accepted_rows), 2)
 
         # Output litres = sum of packaged litres.
-        pkg_sizes = package_sizes(conn)
+        unit_litres = container_unit_litres_map(conn)
+        ibc_units = {r["code"] for r in conn.execute("SELECT code FROM container_units WHERE is_ibc=1")}
         output_litres = 0.0
         ibc_used = 0
-        for p in packages:
-            size = p.get("size")
-            qty = num(p.get("qty"))
-            if size not in pkg_sizes or qty <= 0:
+        for pe in packaging_entries:
+            unit = pe["container_unit"]
+            qty = num(pe["qty"])
+            if unit not in unit_litres or qty <= 0:
                 continue
-            output_litres += pkg_sizes[size] * qty
-            if size == "IBC":
+            output_litres += unit_litres[unit] * qty
+            if unit in ibc_units:
                 ibc_used += int(qty)
         output_litres = round(output_litres, 2)
 
@@ -3197,19 +3441,19 @@ class Handler(BaseHTTPRequestHandler):
         if used_row and accepted_rows:
             self._consume(conn, used_row["id"], len(accepted_rows), "Emptied by processing", lot)
 
-        # Create FG lots, one per package size.
+        # Create FG lots, one per packaging entry (container unit).
         fg_created = []
-        for p in packages:
-            size = p.get("size")
-            qty = num(p.get("qty"))
-            if size not in pkg_sizes or qty <= 0:
+        for pe in packaging_entries:
+            unit = pe["container_unit"]
+            qty = num(pe["qty"])
+            if unit not in unit_litres or qty <= 0:
                 continue
-            fg_lot = "%s-%s" % (lot, size)
+            fg_lot = "%s-%s" % (lot, unit)
             cur.execute(
                 "INSERT INTO fg_lots (fg_lot_number,sku_code,run_id,package_size,qty,litres_each,"
                 "produced_date,tds,location,status,created_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?, 'on_hand', ?)",
-                (fg_lot, sku, run_id, size, qty, pkg_sizes[size], run_date,
+                (fg_lot, sku, run_id, unit, qty, unit_litres[unit], run_date,
                  target_tds, location, ts))
             fg_created.append(fg_lot)
 
@@ -3224,6 +3468,7 @@ class Handler(BaseHTTPRequestHandler):
             dd["toteLots"] = self._tote_lot_numbers(conn, dd["toteIds"])
             dd["dilutions"] = self._dilutions_public(conn, r["id"])
             dd["samplePoints"] = self._sample_points_public(conn, r["id"])
+            dd["packagingEntries"] = self._packaging_entries_public(conn, r["id"])
             drafts.append(dd)
         return {"drafts": drafts}
 
@@ -3241,6 +3486,7 @@ class Handler(BaseHTTPRequestHandler):
         d = run_public(r)
         d["dilutions"] = self._dilutions_public(conn, rid)
         d["samplePoints"] = self._sample_points_public(conn, rid)
+        d["packagingEntries"] = self._packaging_entries_public(conn, rid)
         return {"run": d}
 
     def save_draft(self, conn, rid, user):
@@ -3268,7 +3514,6 @@ class Handler(BaseHTTPRequestHandler):
         notes = d.get("notes")
         operators = (d.get("operators") or "").strip() or None
         tote_ids = [int(x) for x in (d.get("toteIds") or [])]
-        packages = [p for p in (d.get("packages") or []) if p.get("size") in package_sizes(conn)]
         feedstock_details = d.get("feedstockDetails") or {}
 
         if rid is None:
@@ -3309,8 +3554,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 kept_ids.append(tid)
         feedstock_details = {k: v for k, v in feedstock_details.items() if int(k) not in rejected_ids}
-        draft_data = json.dumps({"toteIds": kept_ids, "packages": packages,
-                                  "feedstockDetails": feedstock_details})
+        draft_data = json.dumps({"toteIds": kept_ids, "feedstockDetails": feedstock_details})
         conn.execute("UPDATE production_runs SET draft_data=? WHERE id=?", (draft_data, rid))
         return {"run": run_public(conn.execute(
             "SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()),

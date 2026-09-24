@@ -1191,52 +1191,116 @@ async function openQcForRun(run) {
 
 /* ---- Process-stage building blocks, shared by openRun (pre-finalize) and
    openProcessLog (post-finalize) ---- */
-// Homogenization and Extraction are bespoke (buildHomogenizationSection /
-// buildExtractionSection, below) -- both need a QC Check card and/or custom
-// per-field placeholders/defaults the generic field-list renderer can't do;
-// everything else still uses it.
-const STAGE_DEFS = {
-  pasteurization: { key: 'pasteurization', title: 'Pasteurization', fields: [
-    ['startedAt', 'Started at', 'dt'], ['productSetpointC', 'Product set-point (°C)', 'num'],
-    ['boilerSetpointC', 'Boiler set-point (°C)', 'num'], ['totalVolumeL', 'Total volume (L)', 'num']] },
-};
-// A stage section is self-saving (its own small "Save" button, nothing required)
-// so it never blocks finalizing a run and can be revisited at any time.
-// `bare` skips the outer <details> wrapper, for stages folded into a bigger section.
-function buildStageSection(getRunId, def, values, bare) {
-  const inputs = {};
-  const rows = def.fields.map(([key, label, kind]) => {
-    let inp;
-    if (kind === 'dt') { inp = el('input', { type: 'datetime-local', value: values?.[key] || '' }); }
-    else {
-      inp = el('input', { inputmode: 'decimal', placeholder: label });
-      attachNumericMask(inp, 2);
-      if (values && values[key] != null) inp.value = formatQcValue(values[key], 2);
-    }
-    inputs[key] = { inp, kind };
-    return field(label, inp);
-  });
+// Every stage (Homogenization, Extraction, Separation, Pasteurization) is
+// bespoke -- each needs a QC Check/Sample Point card and/or custom per-field
+// placeholders/defaults a generic field-list renderer can't do.
+// Pasteurization: "Start Conditions" groups the stage's process parameters
+// (Total volume (L) was removed), a Sample Point box subtitled
+// "Pre-pasteurization microbial check" follows, then "Pasteurization Out"
+// holds a second, independent Sample Point box subtitled "Post-
+// pasteurization microbial check". Same one-accordion/section-title/
+// single-Save formatting as Extraction/Separation. Pasteurization In's
+// Process Check ("Dilution requirements") also holds the run's TDS target
+// and Tank 6A/B max level (both display-only) and the calculated Target
+// fill level, Tank 6A/B (L) -- same mass-conservation math as
+// Homogenization's Target fill level, Tank 2A/B (L) -- so `getTdsTarget` is
+// a getter (not a plain value): a caller with a live-changing SKU (the
+// picker in a draft still being edited) can call the returned `refresh()`
+// again after that changes.
+function buildPasteurizationSection(getRunId, values, samplePoints, processingLot, getTdsTarget) {
+  values = values || {};
+  const startedAt = el('input', { type: 'datetime-local', value: values.startedAt || '' });
+  const productSetpointInp = el('input', { inputmode: 'decimal', placeholder: 'Product set-point (°C)' }); attachNumericMask(productSetpointInp, 2);
+  productSetpointInp.value = values.productSetpointC != null ? formatQcValue(values.productSetpointC, 2)
+    : String(settingValue('pasteurization_default_product_setpoint_c', 80));
+  const boilerSetpointInp = el('input', { inputmode: 'decimal', placeholder: 'Boiler set-point (°C)' }); attachNumericMask(boilerSetpointInp, 2);
+  boilerSetpointInp.value = values.boilerSetpointC != null ? formatQcValue(values.boilerSetpointC, 2)
+    : String(settingValue('pasteurization_default_boiler_setpoint_c', 90));
+
+  // Pasteurization In: a Process Check for the dilution TDS reading used to
+  // work out the fill level in Tanks 6A/B, followed by the pre-
+  // pasteurization microbial Sample Point.
+  const dilutionTdsInp = el('input', { inputmode: 'decimal', placeholder: 'Used to calculate fill level in Tanks 6A/B' });
+  attachNumericMask(dilutionTdsInp, 1);
+  if (values.tdsPct != null) dilutionTdsInp.value = formatQcValue(values.tdsPct, 1);
+  const dilutionReqContent = el('div', {});
+  function refreshDilutionReq() {
+    dilutionReqContent.innerHTML = '';
+    const tdsIn = dilutionTdsInp.value.trim() === '' ? null : qcParseValue(dilutionTdsInp.value);
+    const tdsTarget = getTdsTarget();
+    const tankMax = settingValue('dilution_tank_6ab_max_level_l', 5000);
+    const fillLevelRaw = (tdsIn != null && tdsIn > 0 && tdsTarget != null) ? tankMax * tdsTarget / tdsIn : null;
+    lastFillLevel = fillLevelRaw != null ? Math.round(fillLevelRaw / 10) * 10 : null;
+    dilutionReqContent.append(
+      el('div', { class: 'summary-line' },
+        sl('TDS target', tdsTarget != null ? formatQcValue(tdsTarget, 1) + '%' : '—'),
+        sl('Tank 6A/B max level (L)', fmt(tankMax, 0) + ' L')),
+      field('Target fill level, Tank 6A/B (L)',
+        el('span', { class: lastFillLevel != null ? 'qc-check-result-value' : 'help' },
+          lastFillLevel != null ? fmt(lastFillLevel, 0) + ' L'
+            : 'Enter the TDS concentrated (%) and select a SKU with a target TDS to calculate')));
+  }
+  let lastFillLevel = null;
+  dilutionTdsInp.addEventListener('input', refreshDilutionReq);
+  const dilutionProcessCheckBox = el('div', { class: 'qc-check-box' },
+    el('div', { class: 'qc-check-title' }, 'Process Check'),
+    el('div', { class: 'qc-check-subtitle' }, 'Dilution requirements'),
+    field('TDS concentrated (%)', dilutionTdsInp),
+    dilutionReqContent);
+
+  const preCollectedInp = el('input', { type: 'datetime-local',
+    value: values.preSampleCollectedAt ? values.preSampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
+  const preSamplePointBox = el('div', { class: 'qc-check-box theme-sample' },
+    el('div', { class: 'qc-check-title' }, 'Sample Point'),
+    el('div', { class: 'qc-check-subtitle' }, 'Pre-pasteurization microbial check'),
+    field('Collection date and time', preCollectedInp),
+    buildSamplePointsSection(samplePoints, getRunId, processingLot, () => preCollectedInp.value, 'pasteurization_pre'));
+
+  const postCollectedInp = el('input', { type: 'datetime-local',
+    value: values.postSampleCollectedAt ? values.postSampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
+  const postSamplePointBox = el('div', { class: 'qc-check-box theme-sample' },
+    el('div', { class: 'qc-check-title' }, 'Sample Point'),
+    el('div', { class: 'qc-check-subtitle' }, 'Post-pasteurization microbial check'),
+    field('Collection date and time', postCollectedInp),
+    buildSamplePointsSection(samplePoints, getRunId, processingLot, () => postCollectedInp.value, 'pasteurization_post'));
+
   const status = el('span', { class: 'help' });
   const saveBtn = el('button', { type: 'button', class: 'secondary', onclick: save }, 'Save');
   async function save() {
     status.textContent = ''; saveBtn.disabled = true;
     try {
       const rid = await getRunId();
-      const payload = {};
-      for (const key in inputs) {
-        const { inp, kind } = inputs[key];
-        payload[key] = kind === 'num' ? (inp.value.trim() === '' ? null : qcParseValue(inp.value)) : (inp.value || null);
-      }
-      await api('PUT', '/production/' + rid + '/stages/' + def.key, payload);
+      await api('PUT', '/production/' + rid + '/stages/pasteurization', {
+        startedAt: startedAt.value || null,
+        productSetpointC: productSetpointInp.value.trim() === '' ? null : qcParseValue(productSetpointInp.value),
+        boilerSetpointC: boilerSetpointInp.value.trim() === '' ? null : qcParseValue(boilerSetpointInp.value),
+        preSampleCollectedAt: preCollectedInp.value || null,
+        postSampleCollectedAt: postCollectedInp.value || null,
+        tdsPct: dilutionTdsInp.value.trim() === '' ? null : qcParseValue(dilutionTdsInp.value),
+      });
       status.textContent = 'Saved.';
     } catch (e) { status.textContent = e.message; }
     saveBtn.disabled = false;
   }
-  const content = el('div', {}, el('div', { class: 'form-row' }, ...rows),
-    el('div', { style: 'margin-top:6px' }, saveBtn, status));
-  if (bare) return content;
-  return el('details', { class: 'accordion' }, el('summary', {}, def.title),
-    el('div', { class: 'accordion-body' }, content));
+  refreshDilutionReq();
+  return {
+    box: el('details', { class: 'accordion' }, el('summary', {}, 'Pasteurization'),
+      el('div', { class: 'accordion-body' },
+        el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Start Conditions'),
+        el('div', { class: 'form-row' }, field('Started at', startedAt)),
+        // Standard 2-column form-row (not the compact 108px fields) so both
+        // labels fit on one line and the two input boxes stay level.
+        el('div', { class: 'form-row' },
+          field('Product set-point (°C)', productSetpointInp), field('Boiler set-point (°C)', boilerSetpointInp)),
+        el('div', { class: 'qc-check-section-title' }, 'Pasteurization In'),
+        dilutionProcessCheckBox,
+        preSamplePointBox,
+        el('div', { class: 'qc-check-section-title' }, 'Pasteurization Out'),
+        postSamplePointBox,
+        el('div', { style: 'margin-top:6px' }, saveBtn, status))),
+    refresh: refreshDilutionReq,
+    getTargetFillLevel: () => lastFillLevel
+  };
 }
 // The "QC Check" card (purple, Liquid + Slurry/Solids readings): shared
 // between Homogenization Output, Extraction Out and Separation Liquid Out
@@ -1553,7 +1617,7 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
       processCheck1Box,
       el('div', { class: 'qc-check-section-title' }, 'Homogenization Out'),
       el('div', { class: 'form-row' },
-        field('Target %Wet-Solids', targetPctField), field('Target fill level (L)', dilutionTargetValue)),
+        field('Target %Wet-Solids', targetPctField), field('Target fill level, Tank 2A/B (L)', dilutionTargetValue)),
       el('div', { class: 'form-row' }, field('Dilution water added (L)', dilutionInp)),
       qcCheckBox,
       samplePointBox,
@@ -1653,6 +1717,77 @@ function buildSamplePointsSection(initial, getRunId, processingLot, getCollected
         el('th', {}, 'Container'), el('th', {}, ''))),
       tbody),
     el('div', { style: 'margin-top:8px' }, addBtn), status);
+}
+
+// Packaging: a run may package output across several container units and
+// quantities -- same add/remove-row format as Sample Point, but with just a
+// "Container unit"/Qty pair per row (no type/description, no print). The
+// box's single "Packaging date and time" applies to the whole table and
+// lives on production_runs (packaging_packaged_at) instead, saved alongside
+// it by the Packaging accordion's own Save button. "Container unit" options
+// are admin-editable (Admin -- Container units), each mapped to a fixed
+// litres-per-unit conversion (e.g. IBC = 1000 L) -- this table's entries are
+// also what finalize reads to create this run's Finished Goods lots (see
+// `hasEntries`, used for the "enter at least one packaged output quantity"
+// check at finalize).
+function buildPackagingEntriesSection(initial, getRunId) {
+  let items = (initial || []).slice();
+  const tbody = el('tbody', {});
+  const status = el('div', { class: 'help' });
+  function unitOptions() {
+    const codes = (State.ref.containerUnits || []).map(u => u.code);
+    return codes.length ? codes : [''];
+  }
+  async function patch(id, payload) {
+    try {
+      const rid = await getRunId();
+      const r = await api('PUT', '/production/' + rid + '/packaging-entries/' + id, payload);
+      items = r.packagingEntries;
+      status.textContent = '';
+    } catch (e) { status.textContent = e.message; }
+  }
+  function draw() {
+    tbody.innerHTML = '';
+    if (!items.length) {
+      tbody.append(el('tr', {}, el('td', { colspan: 3, class: 'empty' }, 'No packaging entries added yet.')));
+    }
+    items.forEach(it => {
+      const options = unitOptions();
+      const unitSel = el('select', {}, ...options.map(o => el('option', { value: o }, o)));
+      unitSel.value = options.includes(it.containerUnit) ? it.containerUnit : (options[0] || '');
+      unitSel.addEventListener('change', () => patch(it.id, { containerUnit: unitSel.value }));
+      const qtyInp = el('input', { type: 'number', min: '0', step: 'any', value: String(it.qty ?? 1) });
+      qtyInp.addEventListener('change', () => patch(it.id, { qty: +qtyInp.value || 0 }));
+      const removeBtn = el('button', {
+        type: 'button', class: 'icon-btn remove', title: 'Remove entry', onclick: async () => {
+          if (!confirm('Remove this packaging entry?')) return;
+          const rid = await getRunId();
+          const r = await api('DELETE', '/production/' + rid + '/packaging-entries/' + it.id);
+          items = r.packagingEntries; draw();
+        }
+      }, '−');
+      tbody.append(el('tr', {}, el('td', {}, unitSel), el('td', {}, qtyInp),
+        el('td', { style: 'text-align:right' }, removeBtn)));
+    });
+  }
+  draw();
+  const addBtn = el('button', {
+    type: 'button', class: 'icon-btn add', title: 'Add packaging entry', onclick: async () => {
+      try {
+        const rid = await getRunId();
+        const r = await api('POST', '/production/' + rid + '/packaging-entries', {});
+        items = r.packagingEntries; draw();
+      } catch (e) { status.textContent = e.message; }
+    }
+  }, '+');
+  return {
+    box: el('div', {},
+      el('table', { class: 'qc-check-checklist' },
+        el('thead', {}, el('tr', {}, el('th', {}, 'Container unit'), el('th', {}, 'Qty'), el('th', {}, ''))),
+        tbody),
+      el('div', { style: 'margin-top:8px' }, addBtn), status),
+    hasEntries: () => items.some(it => (it.qty || 0) > 0)
+  };
 }
 
 const ODOUR_INTENSITIES = ['', 'Mild', 'Medium', 'Strong'];
@@ -1921,7 +2056,143 @@ function buildFeedstockCard(opts) {
     el('div', { class: 'accordion-body' }, ...bodyEls));
 }
 
+// Dilution & Preservation -> "Dilution" and "Preservatives". The Dilution
+// requirements Process Check (TDS concentrated/target, Tank 6A/B max level,
+// Target fill level) now lives entirely in Pasteurization In (see
+// buildPasteurizationSection) -- this box only holds the run's actual
+// measured fill level/pH and the citric acid added to correct it, plain
+// (unboxed) fields, against the SKU's fixed Target pH; and "Preservatives",
+// the potassium sorbate stock-solution dosing fields, including a
+// calculated estimate of how much stock solution to add (never persisted
+// itself, same convention as every other calculated field in KelpWorks).
+// Everything here saves together through the "dilution" stage endpoint; the
+// repeatable tank list below (buildDilutionsSection) is unrelated and saves
+// independently per row. `getTargetPh`/`getKsorbateTarget`/`getTargetFillLevel`
+// are getters (not plain values) so a caller with a live-changing SKU (e.g.
+// the picker in a draft still being edited) can call `refresh()` again after
+// that changes; `getTargetFillLevel` also changes live as the operator types
+// into Pasteurization In's TDS concentrated (%) field.
+function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsorbateTarget, getTargetFillLevel) {
+  values = values || {};
+
+  const fillLevelInp = el('input', { inputmode: 'decimal', placeholder: 'Measured using level sensor' });
+  attachNumericMask(fillLevelInp, 2);
+  if (values.fillLevelTank6abL != null) fillLevelInp.value = formatQcValue(values.fillLevelTank6abL, 2);
+  const measuredPhInp = el('input', { inputmode: 'decimal', placeholder: 'pH' }); attachNumericMask(measuredPhInp, 1);
+  if (values.measuredPh != null) measuredPhInp.value = formatQcValue(values.measuredPh, 1);
+  const citricInp = el('input', { inputmode: 'decimal', placeholder: 'kg' }); attachNumericMask(citricInp, 2);
+  if (values.citricKg != null) citricInp.value = formatQcValue(values.citricKg, 2);
+  const targetPhValue = el('span', { class: 'help' });
+  function refreshTargetPh() {
+    const targetPh = getTargetPh();
+    targetPhValue.textContent = targetPh != null ? formatQcValue(targetPh, 1) : '—';
+  }
+
+  // Dilution water added, TDS: how much dilution water was actually added,
+  // found by comparing the tank's measured Fill level against the planned
+  // (pre-dilution) Target fill level, Tank 6A/B (L) from Pasteurization In.
+  const dilutionWaterAddedValue = el('span', { class: 'help' });
+  function calcDilutionWaterAddedTds() {
+    const fillLevel = fillLevelInp.value.trim() === '' ? null : qcParseValue(fillLevelInp.value);
+    const targetFillLevel = getTargetFillLevel();
+    if (fillLevel == null || targetFillLevel == null) return null;
+    return Math.round((fillLevel - targetFillLevel) / 10) * 10;
+  }
+  function refreshDilutionWaterAdded() {
+    const v = calcDilutionWaterAddedTds();
+    dilutionWaterAddedValue.className = v != null ? 'qc-check-result-value' : 'help';
+    dilutionWaterAddedValue.textContent = v != null ? fmt(v, 0) + ' L'
+      : 'Enter the Fill level, Tank 6A/B to calculate';
+  }
+  fillLevelInp.addEventListener('input', refreshDilutionWaterAdded);
+
+  const ksorbateStockInp = el('input', { inputmode: 'decimal', placeholder: '%' }); attachNumericMask(ksorbateStockInp, 1);
+  ksorbateStockInp.value = values.ksorbateStockPct != null ? formatQcValue(values.ksorbateStockPct, 1)
+    : formatQcValue(settingValue('ksorbate_stock_concentration_default_pct', 25), 1);
+  const ksorbateStockField = el('div', { style: 'display:flex;align-items:center;gap:6px' },
+    ksorbateStockInp, el('span', { class: 'help' }, '%'));
+
+  // Ksorbate, calculated (L): the volume of stock solution needed to reach
+  // the SKU's target Ksorbate dose in the tank's current (actual) fill
+  // volume -- same mass-conservation shape as Target fill level, Tank 6A/B
+  // (L), solved for volume instead of level.
+  const ksorbateCalculatedLValue = el('span', { class: 'help' });
+  function calcKsorbateCalculatedL() {
+    const fillLevel = fillLevelInp.value.trim() === '' ? null : qcParseValue(fillLevelInp.value);
+    const stockPct = ksorbateStockInp.value.trim() === '' ? null : qcParseValue(ksorbateStockInp.value);
+    const ksorbateTarget = getKsorbateTarget();
+    if (fillLevel == null || !stockPct || ksorbateTarget == null) return null;
+    return fillLevel * ksorbateTarget * 100 / stockPct;
+  }
+  function refreshKsorbateCalculatedL() {
+    const v = calcKsorbateCalculatedL();
+    ksorbateCalculatedLValue.className = v != null ? 'qc-check-result-value' : 'help';
+    ksorbateCalculatedLValue.textContent = v != null ? formatQcValue(v, 2) + ' L'
+      : 'Enter the Fill level, Tank 6A/B and Ksorbate stock concentration, and select a SKU with a Ksorbate target to calculate';
+  }
+
+  const ksorbateAddedLInp = el('input', { inputmode: 'decimal', placeholder: 'L' }); attachNumericMask(ksorbateAddedLInp, 2);
+  if (values.ksorbateAddedL != null) ksorbateAddedLInp.value = formatQcValue(values.ksorbateAddedL, 2);
+  const ksorbateAddedKgValue = el('span', { class: 'help' });
+  function calcKsorbateAddedKg() {
+    const stockPct = ksorbateStockInp.value.trim() === '' ? null : qcParseValue(ksorbateStockInp.value);
+    const addedL = ksorbateAddedLInp.value.trim() === '' ? null : qcParseValue(ksorbateAddedLInp.value);
+    if (stockPct == null || addedL == null) return null;
+    return addedL * stockPct / 100;
+  }
+  function refreshKsorbateAddedKg() {
+    const v = calcKsorbateAddedKg();
+    ksorbateAddedKgValue.className = v != null ? 'qc-check-result-value' : 'help';
+    ksorbateAddedKgValue.textContent = v != null ? formatQcValue(v, 2) + ' kg' : 'Enter the stock concentration and volume added to calculate';
+  }
+  fillLevelInp.addEventListener('input', refreshKsorbateCalculatedL);
+  ksorbateStockInp.addEventListener('input', () => { refreshKsorbateCalculatedL(); refreshKsorbateAddedKg(); });
+  ksorbateAddedLInp.addEventListener('input', refreshKsorbateAddedKg);
+
+  const status = el('span', { class: 'help' });
+  const saveBtn = el('button', { type: 'button', class: 'secondary', onclick: save }, 'Save');
+  async function save() {
+    status.textContent = ''; saveBtn.disabled = true;
+    try {
+      const rid = await getRunId();
+      await api('PUT', '/production/' + rid + '/stages/dilution', {
+        fillLevelTank6abL: fillLevelInp.value.trim() === '' ? null : qcParseValue(fillLevelInp.value),
+        measuredPh: measuredPhInp.value.trim() === '' ? null : qcParseValue(measuredPhInp.value),
+        citricKg: citricInp.value.trim() === '' ? null : qcParseValue(citricInp.value),
+        ksorbateStockPct: ksorbateStockInp.value.trim() === '' ? null : qcParseValue(ksorbateStockInp.value),
+        ksorbateAddedL: ksorbateAddedLInp.value.trim() === '' ? null : qcParseValue(ksorbateAddedLInp.value),
+      });
+      status.textContent = 'Saved.';
+    } catch (e) { status.textContent = e.message; }
+    saveBtn.disabled = false;
+  }
+
+  refreshTargetPh();
+  refreshDilutionWaterAdded();
+  refreshKsorbateCalculatedL();
+  refreshKsorbateAddedKg();
+  return {
+    box: el('div', {},
+      el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Dilution'),
+      el('div', { class: 'form-row' },
+        field('Fill level, Tank 6A/B (L)', fillLevelInp),
+        field('Dilution water added, TDS', dilutionWaterAddedValue)),
+      el('div', { class: 'form-row-3' },
+        field('Measured pH', measuredPhInp), field('Target pH', targetPhValue),
+        field('Citric acid added (kg)', citricInp)),
+      el('div', { class: 'qc-check-section-title' }, 'Preservatives'),
+      el('div', { class: 'form-row' },
+        field('Ksorbate stock concentration (w/v)', ksorbateStockField),
+        field('Ksorbate, calculated (L)', ksorbateCalculatedLValue)),
+      field('Ksorbate added (L)', ksorbateAddedLInp),
+      field('Ksorbate added (kg)', ksorbateAddedKgValue),
+      el('div', { style: 'margin-top:6px' }, saveBtn, status)),
+    refresh: () => { refreshTargetPh(); refreshDilutionWaterAdded(); refreshKsorbateCalculatedL(); }
+  };
+}
 // Dilution & Preservation: a run may split its output across several tanks.
+// Existing entries can still be edited/saved/removed, but new ones can no
+// longer be added from KelpWorks -- there is no "+ Add tank" control.
 function buildDilutionsSection(initial, getRunId) {
   let items = (initial || []).slice();
   const listHost = el('div', {});
@@ -1988,13 +2259,7 @@ function buildDilutionsSection(initial, getRunId) {
     });
   }
   draw();
-  const addBtn = el('button', {
-    type: 'button', class: 'secondary', onclick: async () => {
-      try { const rid = await getRunId(); const r = await api('POST', '/production/' + rid + '/dilutions', {}); items = r.dilutions; draw(); }
-      catch (e) { status.textContent = e.message; }
-    }
-  }, '+ Add tank');
-  return el('div', {}, listHost, addBtn, status);
+  return el('div', {}, listHost, status);
 }
 
 // Step 1 of creating a run: Initiation only. Every field but Notes is
@@ -2057,7 +2322,8 @@ async function openRun(draftSummary, opts) {
   const totes = (await api('GET', '/totes?status=in_stock'
     + (draft && draft.id ? '&includeRunId=' + draft.id : ''))).totes;
   const skus = State.ref.skus.filter(s => s.active);
-  const skuSel = selectFrom('', skus.map(s => [s.code, s.name]), () => { filterTotes(); renderSpecPanel(); }, 'r_sku');
+  const skuSel = selectFrom('', skus.map(s => [s.code, s.name]),
+    () => { filterTotes(); renderSpecPanel(); pasteurizationSection.refresh(); dilutionSummary.refresh(); }, 'r_sku');
   if (draft && draft.sku) skuSel.value = draft.sku;
   const specPanel = el('div', { class: 'summary-line' });
   function renderSpecPanel() {
@@ -2082,14 +2348,6 @@ async function openRun(draftSummary, opts) {
   const summary = el('div', { class: 'summary-line' });
   let pickFilteredCount = 0;
   const feedstockHost = el('div', {});
-  const pkgInputs = {};
-  const draftQty = {};
-  (draft?.packages || []).forEach(p => { draftQty[p.size] = p.qty; });
-  const pkgGrid = el('div', { class: 'pkg-grid' }, ...Object.keys(State.ref.packageSizes).map(sz => {
-    const inp = el('input', { type: 'number', min: '0', value: String(draftQty[sz] || 0), oninput: recompute });
-    pkgInputs[sz] = inp;
-    return field(sz + ' units', inp);
-  }));
   let selected = new Set(draft?.toteIds || []);
   let draftId = draft ? draft.id : null;
   let feedstockState = Object.assign({}, draft?.feedstockDetails || {});
@@ -2257,21 +2515,45 @@ async function openRun(draftSummary, opts) {
   const extractionSection = buildExtractionSection(ensureRunId, stages.extraction);
   const separationSection =
     buildSeparationSection(ensureRunId, stages.separation, draft?.samplePoints || [], draft?.processingLot);
-  const pasteurizationSection = buildStageSection(ensureRunId, STAGE_DEFS.pasteurization, stages.pasteurization);
+  // TDS/pH/Ksorbate targets follow the currently-selected SKU (which can
+  // still change in this draft), so they're refreshed alongside the spec
+  // panel below.
+  const pasteurizationSection = buildPasteurizationSection(
+    ensureRunId, stages.pasteurization, draft?.samplePoints || [], draft?.processingLot,
+    () => skus.find(x => x.code === skuSel.value)?.tdsTarget);
+  const dilutionSummary = buildDilutionAndPreservativesBox(
+    ensureRunId, stages.dilution,
+    () => skus.find(x => x.code === skuSel.value)?.phTarget,
+    () => skus.find(x => x.code === skuSel.value)?.ksorbateTarget,
+    () => pasteurizationSection.getTargetFillLevel());
   const dilutionsSection = buildDilutionsSection(draft?.dilutions || [], ensureRunId);
-  const packagingStartedInp = el('input', { type: 'datetime-local', value: stages.packaging?.startedAt || '' });
+  const packagingEntriesSection = buildPackagingEntriesSection(draft?.packagingEntries || [], ensureRunId);
+  const packagingPackagedInp = el('input', { type: 'datetime-local', value: stages.packaging?.packagedAt || '' });
+  const packagingQcCheck = buildQualityCheckBox('LKE characterization', stages.packaging || {}, { omitSlurrySolids: true });
+  const packagingSampleCollectedInp = el('input', { type: 'datetime-local',
+    value: stages.packaging?.sampleCollectedAt ? stages.packaging.sampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
+  const packagingSamplePointBox = el('div', { class: 'qc-check-box theme-sample' },
+    el('div', { class: 'qc-check-title' }, 'Sample Point'),
+    el('div', { class: 'qc-check-subtitle' }, 'LKE characterization'),
+    field('Collection date and time', packagingSampleCollectedInp),
+    buildSamplePointsSection(draft?.samplePoints || [], ensureRunId, draft?.processingLot,
+      () => packagingSampleCollectedInp.value, 'packaging'));
   const packagingStatus = el('span', { class: 'help' });
   const packagingSaveBtn = el('button', {
     type: 'button', class: 'secondary', onclick: async () => {
       packagingStatus.textContent = ''; packagingSaveBtn.disabled = true;
       try {
         const rid = await ensureRunId();
-        await api('PUT', '/production/' + rid + '/stages/packaging', { startedAt: packagingStartedInp.value || null });
+        await api('PUT', '/production/' + rid + '/stages/packaging', {
+          packagedAt: packagingPackagedInp.value || null,
+          ...packagingQcCheck.getPayload(),
+          sampleCollectedAt: packagingSampleCollectedInp.value || null,
+        });
         packagingStatus.textContent = 'Saved.';
       } catch (e) { packagingStatus.textContent = e.message; }
       packagingSaveBtn.disabled = false;
     }
-  }, 'Save timestamp');
+  }, 'Save');
 
   const body = el('div', {},
     draft ? el('div', { class: 'summary-line', style: 'margin-bottom:10px' },
@@ -2292,29 +2574,26 @@ async function openRun(draftSummary, opts) {
         field('Stabilization method', stabFilterSel), pickHost, summary,
         el('h4', { style: 'margin:14px 0 4px;font-size:13px' }, 'Feedstock characterization'), feedstockHost)),
     homogenizationSection, extractionSection, separationSection,
-    pasteurizationSection,
+    pasteurizationSection.box,
     el('details', { class: 'accordion' }, el('summary', {}, 'Dilution & Preservation'),
-      el('div', { class: 'accordion-body' }, dilutionsSection)),
+      el('div', { class: 'accordion-body' }, dilutionSummary.box, dilutionsSection)),
     el('details', { class: 'accordion' }, el('summary', {}, 'Packaging'),
       el('div', { class: 'accordion-body' },
-        el('h4', { style: 'margin:0 0 8px;font-size:13px' }, 'Bottling / packaging output'), pkgGrid,
-        el('div', { class: 'form-row' },
-          field('Citric acid (kg)', el('input', { type: 'number', step: '0.1', min: '0', id: 'r_citric', value: draft?.citricKg ?? 0 })),
-          field('Potassium sorbate (kg)', el('input', { type: 'number', step: '0.1', min: '0', id: 'r_sorbate', value: draft?.sorbateKg ?? 0 }))),
-        field('Packaging started at', packagingStartedInp),
+        field('Packaging date and time', packagingPackagedInp),
+        packagingEntriesSection.box,
+        packagingQcCheck.box,
+        packagingSamplePointBox,
         el('div', { style: 'margin-top:6px' }, packagingSaveBtn, packagingStatus))));
   filterTotes();
   renderFeedstockCards();
   renderSpecPanel();
 
   function buildPayload() {
-    const packages = Object.keys(pkgInputs).map(sz => ({ size: sz, qty: +pkgInputs[sz].value || 0 })).filter(p => p.qty > 0);
     return {
       sku: skuSel.value, toteIds: [...selected],
-      citricKg: +body.querySelector('#r_citric').value || 0, sorbateKg: +body.querySelector('#r_sorbate').value || 0,
       runDate: body.querySelector('#r_date').value, location: body.querySelector('#r_loc').value,
       operators: operatorsSelect.value,
-      notes: body.querySelector('#r_notes').value, packages,
+      notes: body.querySelector('#r_notes').value,
       feedstockDetails: feedstockState
     };
   }
@@ -2350,7 +2629,7 @@ async function openRun(draftSummary, opts) {
   async function finalizeRun() {
     const payload = buildPayload();
     if (!payload.toteIds.length) throw new Error('Select at least one tote.');
-    if (!payload.packages.length) throw new Error('Enter at least one packaged output quantity.');
+    if (!packagingEntriesSection.hasEntries()) throw new Error('Enter at least one packaged output quantity in the Packaging table.');
     const r = draftId
       ? await api('POST', '/production/drafts/' + draftId + '/finalize', payload)
       : await api('POST', '/production', payload);
@@ -2391,18 +2670,44 @@ async function openProcessLog(run) {
   const extractionSection = buildExtractionSection(getRunId, stages.extraction);
   const separationSection =
     buildSeparationSection(getRunId, stages.separation, run.samplePoints || [], run.processingLot);
-  const pasteurizationSection = buildStageSection(getRunId, STAGE_DEFS.pasteurization, stages.pasteurization);
+  // SKU is fixed once a run is finalized, so TDS/pH/Ksorbate targets need no
+  // refresh wiring here.
+  const pasteurizationSection = buildPasteurizationSection(
+    getRunId, stages.pasteurization, run.samplePoints || [], run.processingLot,
+    () => run.targetTds);
+  const dilutionSummary = buildDilutionAndPreservativesBox(
+    getRunId, stages.dilution,
+    () => State.ref.skus.find(s => s.code === run.sku)?.phTarget,
+    () => State.ref.skus.find(s => s.code === run.sku)?.ksorbateTarget,
+    () => pasteurizationSection.getTargetFillLevel());
   const dilutionsSection = buildDilutionsSection(run.dilutions || [], getRunId);
-  const packagingStartedInp = el('input', { type: 'datetime-local', value: stages.packaging?.startedAt || '' });
+  const packagingEntriesSection = buildPackagingEntriesSection(run.packagingEntries || [], getRunId);
+  const packagingPackagedInp = el('input', { type: 'datetime-local', value: stages.packaging?.packagedAt || '' });
+  const packagingQcCheck = buildQualityCheckBox('LKE characterization', stages.packaging || {}, { omitSlurrySolids: true });
+  const packagingSampleCollectedInp = el('input', { type: 'datetime-local',
+    value: stages.packaging?.sampleCollectedAt ? stages.packaging.sampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
+  const packagingSamplePointBox = el('div', { class: 'qc-check-box theme-sample' },
+    el('div', { class: 'qc-check-title' }, 'Sample Point'),
+    el('div', { class: 'qc-check-subtitle' }, 'LKE characterization'),
+    field('Collection date and time', packagingSampleCollectedInp),
+    buildSamplePointsSection(run.samplePoints || [], getRunId, run.processingLot,
+      () => packagingSampleCollectedInp.value, 'packaging'));
   const packagingStatus = el('span', { class: 'help' });
   const packagingSaveBtn = el('button', {
     type: 'button', class: 'secondary', onclick: async () => {
       packagingStatus.textContent = ''; packagingSaveBtn.disabled = true;
-      try { await api('PUT', '/production/' + run.id + '/stages/packaging', { startedAt: packagingStartedInp.value || null }); packagingStatus.textContent = 'Saved.'; }
+      try {
+        await api('PUT', '/production/' + run.id + '/stages/packaging', {
+          packagedAt: packagingPackagedInp.value || null,
+          ...packagingQcCheck.getPayload(),
+          sampleCollectedAt: packagingSampleCollectedInp.value || null,
+        });
+        packagingStatus.textContent = 'Saved.';
+      }
       catch (e) { packagingStatus.textContent = e.message; }
       packagingSaveBtn.disabled = false;
     }
-  }, 'Save timestamp');
+  }, 'Save');
 
   const body = el('div', {},
     el('div', { class: 'summary-line' }, sl('Run', run.processingLot), sl('SKU', skuName(run.sku)),
@@ -2410,11 +2715,15 @@ async function openProcessLog(run) {
     el('details', { class: 'accordion' }, el('summary', {}, 'Feedstock characterization'),
       el('div', { class: 'accordion-body' }, feedstockHost)),
     homogenizationSection, extractionSection, separationSection,
-    pasteurizationSection,
+    pasteurizationSection.box,
     el('details', { class: 'accordion' }, el('summary', {}, 'Dilution & Preservation'),
-      el('div', { class: 'accordion-body' }, dilutionsSection)),
+      el('div', { class: 'accordion-body' }, dilutionSummary.box, dilutionsSection)),
     el('details', { class: 'accordion' }, el('summary', {}, 'Packaging'),
-      el('div', { class: 'accordion-body' }, field('Packaging started at', packagingStartedInp),
+      el('div', { class: 'accordion-body' },
+        field('Packaging date and time', packagingPackagedInp),
+        packagingEntriesSection.box,
+        packagingQcCheck.box,
+        packagingSamplePointBox,
         el('div', { style: 'margin-top:6px' }, packagingSaveBtn, packagingStatus))));
 
   modal('Process log — ' + run.processingLot, body, async () => { render(); }, 'Done', { wide: true });
@@ -3000,11 +3309,32 @@ const CALCULATIONS = [
     settings: [],
   },
   {
-    title: 'Target fill level (L)',
-    formula: 'Target fill level (L) = Tank 2A/B max level (L) × Target %Wet-Solids / %Wet-Solids',
+    title: 'Target fill level, Tank 2A/B (L)',
+    formula: 'Target fill level, Tank 2A/B (L) = Tank 2A/B max level (L) × Target %Wet-Solids / %Wet-Solids',
     description: 'The initial fill volume the tank should be loaded to so that topping it up to the target %Wet-Solids with dilution water lands it exactly at Tank 2A/B’s max level (mass-conservation dilution math).',
     location: 'Production → Process log → Homogenization → Homogenization Out',
     settings: ['homog_tank_2ab_max_level_l'],
+  },
+  {
+    title: 'Target fill level, Tank 6A/B (L)',
+    formula: 'Target fill level, Tank 6A/B (L) = Tank 6A/B max level (L) × TDS target / TDS concentrated (%)',
+    description: 'The largest initial volume that, once diluted from the measured TDS concentrated (%) down to the SKU’s TDS target, still fits Tank 6A/B’s max level (mass-conservation dilution math).',
+    location: 'Production → Process log → Pasteurization → Pasteurization In → Process Check (Dilution requirements)',
+    settings: ['dilution_tank_6ab_max_level_l'],
+  },
+  {
+    title: 'Ksorbate, calculated (L)',
+    formula: 'Ksorbate, calculated (L) = Fill level, Tank 6A/B (L) × Ksorbate target (w/v) / Ksorbate stock concentration (w/v)',
+    description: 'The estimated volume of stock Ksorbate solution needed to reach the product SKU’s target Ksorbate dose in the tank’s current fill volume (mass-conservation dilution math).',
+    location: 'Production → Process log → Dilution & Preservation → Preservatives',
+    settings: [],
+  },
+  {
+    title: 'Ksorbate added (kg)',
+    formula: 'Ksorbate added (kg) = Ksorbate added (L) × Ksorbate stock concentration (w/v) / 100',
+    description: 'The mass of potassium sorbate added to the batch, from the volume of stock solution added and its %w/v concentration.',
+    location: 'Production → Process log → Dilution & Preservation → Preservatives',
+    settings: [],
   },
   {
     title: 'Density (calculated)',
@@ -3029,10 +3359,10 @@ const CALCULATIONS = [
   },
   {
     title: 'Output (L) / New IBCs filled',
-    formula: 'Output (L) = Σ (package qty × litres per package size)   ·   New IBCs filled = Σ qty where package size = IBC',
-    description: 'A run’s total bottled output and IBC usage, computed from the packages entered at finalization using each package size’s litre value below.',
+    formula: 'Output (L) = Σ (entry qty × container unit’s litres each)   ·   New IBCs filled = Σ qty where the container unit is IBC',
+    description: 'A run’s total bottled output and IBC usage, computed from the Packaging table’s entries at finalization using each container unit’s litres-each value (Admin → Container Units).',
     location: 'Production → Packaging section, applied when a run is finalized',
-    settings: ['package_size_ibc_l', 'package_size_4l_l', 'package_size_1l_l', 'package_size_250ml_l'],
+    settings: [],
   },
   {
     title: 'Finished Goods Litres',
@@ -3056,23 +3386,14 @@ function settingLabel(key) {
 async function pageCalculations(v) {
   v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Calculations'),
     el('div', { class: 'muted' }, 'Every calculated field in KelpWorks, and the constants behind them.')));
-  CALCULATIONS.forEach(c => {
-    v.append(el('div', { class: 'card' },
-      el('h3', {}, c.title),
-      el('div', { class: 'mono', style: 'background:#f6faf9;border-radius:8px;padding:10px 12px;margin-bottom:10px;white-space:pre-wrap;font-size:13px' }, c.formula),
-      el('div', { style: 'margin-bottom:6px' }, c.description),
-      el('div', { class: 'muted', style: 'font-size:12px' }, 'Found in: ' + c.location),
-      c.settings.length ? el('div', { class: 'muted', style: 'font-size:12px;margin-top:4px' },
-        'Uses: ' + c.settings.map(settingLabel).join('  ·  ')) : null));
-  });
 
   const isAdmin = State.user.role === 'admin';
   const settingsHost = el('div', {});
   v.append(el('div', { class: 'card' },
     el('h3', {}, 'Variables and values'),
     el('div', { class: 'muted', style: 'font-size:12px;margin-bottom:10px' },
-      isAdmin ? 'Edit a value and click Save — every calculation above using it picks up the change immediately.'
-        : 'These constants feed the calculations above. Only an admin can edit them.'),
+      isAdmin ? 'Edit a value and click Save — every calculation below using it picks up the change immediately.'
+        : 'These constants feed the calculations below. Only an admin can edit them.'),
     settingsHost));
   function drawSettings() {
     settingsHost.innerHTML = '';
@@ -3100,6 +3421,16 @@ async function pageCalculations(v) {
     settingsHost.append(table(['Variable', 'Value', 'Description'], rows, [false, false, false]));
   }
   drawSettings();
+
+  CALCULATIONS.forEach(c => {
+    v.append(el('div', { class: 'card' },
+      el('h3', {}, c.title),
+      el('div', { class: 'mono', style: 'background:#f6faf9;border-radius:8px;padding:10px 12px;margin-bottom:10px;white-space:pre-wrap;font-size:13px' }, c.formula),
+      el('div', { style: 'margin-bottom:6px' }, c.description),
+      el('div', { class: 'muted', style: 'font-size:12px' }, 'Found in: ' + c.location),
+      c.settings.length ? el('div', { class: 'muted', style: 'font-size:12px;margin-top:4px' },
+        'Uses: ' + c.settings.map(settingLabel).join('  ·  ')) : null));
+  });
 }
 
 /* ---------------- Labels ---------------- */
@@ -3312,6 +3643,63 @@ async function pageAdmin(v) {
     ]), [false, false, false, false], ri => showSopHistory(sr.sops[ri])));
   v.append(el('div', { class: 'help', style: 'margin-top:10px' },
     'A QC Check in the production log links to an SOP by its reference key, not its name — renaming a document here is picked up everywhere it’s linked. Click a row to see its change history.'));
+
+  // Container units: the Packaging table's "Container unit" dropdown
+  // options, each mapped to a fixed litres-per-unit conversion (e.g.
+  // IBC = 1000 L) -- distinct from the fixed IBC/4L/1L/250ml package sizes
+  // (Calculations page) used by the Bottling/packaging output grid.
+  v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Container Units'),
+    el('div', { class: 'actions' }, el('button', { onclick: addContainerUnit }, '+ Add container unit'))));
+  const cur = await api('GET', '/container-units');
+  v.append(table(
+    ['Container unit', 'Litres each', 'Status', ''],
+    cur.containerUnits.map(u => [
+      u.code, fmt(u.litresEach, u.litresEach % 1 ? 2 : 0) + ' L',
+      badge(u.active ? 'on_hand' : 'disposed', u.active ? 'Active' : 'Inactive'),
+      rowActions([
+        ['Edit', () => editContainerUnit(u)],
+        u.active ? ['Deactivate', () => setContainerUnitActive(u, false), 'danger']
+          : ['Activate', () => setContainerUnitActive(u, true)]
+      ])
+    ]), [false, false, false, false]));
+  v.append(el('div', { class: 'help', style: 'margin-top:10px' },
+    'Deactivating a container unit removes it from the Packaging table\'s picker without deleting past entries that used it.'));
+}
+function addContainerUnit() {
+  const codeInp = el('input', { placeholder: 'e.g. 4 L' });
+  const litresInp = el('input', { type: 'number', step: 'any', min: '0', placeholder: 'Litres per unit' });
+  const body = el('div', {}, field('Container unit name', codeInp), field('Litres per unit', litresInp));
+  modal('Add container unit', body, async () => {
+    const code = codeInp.value.trim();
+    if (!code) throw new Error('Enter a container unit name.');
+    const litres = +litresInp.value;
+    if (!litres || litres <= 0) throw new Error('Enter a positive litres-per-unit value.');
+    await api('POST', '/container-units', { code, litresEach: litres });
+    State.ref = await api('GET', '/refdata');
+    toast('Container unit added'); render();
+  }, 'Add');
+}
+function editContainerUnit(u) {
+  const codeInp = el('input', { value: u.code });
+  const litresInp = el('input', { type: 'number', step: 'any', min: '0', value: u.litresEach });
+  const body = el('div', {}, field('Container unit name', codeInp), field('Litres per unit', litresInp),
+    el('div', { class: 'help' }, 'Renaming updates every in-progress Packaging table entry and past Finished Goods lot that used it.'));
+  modal('Edit ' + u.code, body, async () => {
+    const code = codeInp.value.trim();
+    if (!code) throw new Error('Enter a container unit name.');
+    const litres = +litresInp.value;
+    if (!litres || litres <= 0) throw new Error('Enter a positive litres-per-unit value.');
+    await api('PUT', '/container-units/' + encodeURIComponent(u.code), { code, litresEach: litres });
+    State.ref = await api('GET', '/refdata');
+    toast('Container unit updated'); render();
+  }, 'Save');
+}
+async function setContainerUnitActive(u, active) {
+  if (!confirm((active ? 'Reactivate ' : 'Deactivate ') + u.code + '?')) return;
+  await api('PUT', '/container-units/' + encodeURIComponent(u.code), { active });
+  State.ref = await api('GET', '/refdata');
+  toast('Container unit ' + (active ? 'reactivated' : 'deactivated'));
+  render();
 }
 function readFileAsBase64(file) {
   return new Promise((resolve, reject) => {
