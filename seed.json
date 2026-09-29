@@ -70,14 +70,14 @@
       "cost_per_unit": 8.0
     },
     {
-      "name": "Empty New IBC Tote",
+      "name": "New 1,000 L IBC Tote",
       "unit": "tote",
       "on_hand": 72,
       "reorder_level": 20,
       "cost_per_unit": 338.14
     },
     {
-      "name": "Empty Used IBC Tote",
+      "name": "Used 1,000 L IBC Tote",
       "unit": "tote",
       "on_hand": 61,
       "reorder_level": 10,

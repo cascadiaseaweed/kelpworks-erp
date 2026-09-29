@@ -266,9 +266,14 @@ async function pageStabilized(v) {
 }
 function rowCheck(item, selected, onChange) {
   if (item.status === 'consumed' || item.status === 'sold' || item.status === 'disposed') return '';
-  const cb = el('input', { type: 'checkbox', class: 'rowcheck', onchange: () => {
-    cb.checked ? selected.add(item.id) : selected.delete(item.id); onChange();
-  } });
+  const cb = el('input', {
+    type: 'checkbox', class: 'rowcheck',
+    // Stops a checkbox click from also firing the row's own onclick (e.g. a
+    // table's rowClick, used elsewhere to open a row's history) when both
+    // are present on the same row -- same reasoning as rowActions below.
+    onclick: e => e.stopPropagation(),
+    onchange: () => { cb.checked ? selected.add(item.id) : selected.delete(item.id); onChange(); }
+  });
   cb.checked = selected.has(item.id);
   return cb;
 }
@@ -1626,7 +1631,13 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
 
 const SAMPLE_TYPES = ['Slurry', 'Liquid', 'Solid'];
 const SAMPLE_DESCRIPTIONS = ['Microbial', 'Retention', 'Metals & Nutrients', 'Proximate Analysis', 'R&D', 'Other'];
-const SAMPLE_CONTAINERS = ['50 mL falcon tube', '100 g sample bag', '1 L bottle', '2 L bottle'];
+// Sample Point container options are the container consumables flagged
+// isSampleContainer (Consumables & Packaging -> Packaging); picking one here
+// live-adjusts that container's on-hand stock (see update_sample_point).
+function sampleContainerOptions() {
+  const names = (State.ref.containers || []).filter(c => c.isSampleContainer).map(c => c.name);
+  return names.length ? names : [''];
+}
 // One printable label per physical container -- a sample row with Qty > 1
 // prints that many copies, each with its own barcode (copy N of Qty) so
 // every physical container is still uniquely identifiable.
@@ -1679,7 +1690,7 @@ function buildSamplePointsSection(initial, getRunId, processingLot, getCollected
         qtyInp.value = String(q);
         patch(it.id, { qty: q });
       });
-      const containerSel = selectCell(SAMPLE_CONTAINERS, it.container, () => patch(it.id, { container: containerSel.value }));
+      const containerSel = selectCell(sampleContainerOptions(), it.container, () => patch(it.id, { container: containerSel.value }));
       const printBtn = el('button', {
         type: 'button', class: 'secondary', title: 'Print label(s) for this sample', onclick: () => {
           const qty = Math.max(1, Math.min(10, +qtyInp.value || 1));
@@ -1725,18 +1736,22 @@ function buildSamplePointsSection(initial, getRunId, processingLot, getCollected
 // box's single "Packaging date and time" applies to the whole table and
 // lives on production_runs (packaging_packaged_at) instead, saved alongside
 // it by the Packaging accordion's own Save button. "Container unit" options
-// are admin-editable (Admin -- Container units), each mapped to a fixed
-// litres-per-unit conversion (e.g. IBC = 1000 L) -- this table's entries are
-// also what finalize reads to create this run's Finished Goods lots (see
-// `hasEntries`, used for the "enter at least one packaged output quantity"
-// check at finalize).
+// are the container consumables (Consumables & Packaging -> Packaging) that
+// have a litres-each value, e.g. IBC = 1000 L. Freely adding/editing/
+// removing rows here never touches container stock by itself -- only
+// clicking the Packaging accordion's own Save button (or finalize) commits
+// the *net* change per container as a single ledger entry (see the backend's
+// _commit_packaging_stock); a container whose total is unchanged since the
+// last save needs no entry at all. This table's entries are also what
+// finalize reads to create this run's Finished Goods lots (see `hasEntries`,
+// used for the "enter at least one packaged output quantity" check).
 function buildPackagingEntriesSection(initial, getRunId) {
   let items = (initial || []).slice();
   const tbody = el('tbody', {});
   const status = el('div', { class: 'help' });
   function unitOptions() {
-    const codes = (State.ref.containerUnits || []).map(u => u.code);
-    return codes.length ? codes : [''];
+    const names = (State.ref.containers || []).filter(c => c.litresEach != null).map(c => c.name);
+    return names.length ? names : [''];
   }
   async function patch(id, payload) {
     try {
@@ -2603,6 +2618,12 @@ async function openRun(draftSummary, opts) {
       ? await api('PUT', '/production/drafts/' + draftId, payload)
       : await api('POST', '/production/drafts', payload);
     draftId = r.run.id;
+    // "Save & close" is the prominent, most-used save action, so it also
+    // commits the Packaging table's net container changes (empty body --
+    // this only triggers the commit side effect, leaving packagedAt/QC/
+    // Sample Point fields untouched) rather than leaving that silently
+    // stuck until someone finds the Packaging accordion's own Save button.
+    await api('PUT', '/production/' + draftId + '/stages/packaging', {});
     // Every selected tote gets the same lock-in treatment here as the
     // characterization card's own Save button: accepted totes move to WIP
     // (so they drop out of every pick table until this run finishes or is
@@ -3010,6 +3031,7 @@ function custForm(c, after) {
 
 /* ---------------- Consumables ---------------- */
 async function pageConsumables(v) {
+  const isAdmin = State.user.role === 'admin';
   v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Consumables & Packaging'),
     el('div', { class: 'actions' }, el('button', { onclick: addConsumable }, '+ Add item'))));
   const r = await api('GET', '/consumables');
@@ -3027,21 +3049,45 @@ async function pageConsumables(v) {
       el('button', { class: 'danger', onclick: () => disposeConsumables(r.consumables.filter(c => selected.has(c.id))) }, 'Dispose / write off'),
       el('button', { class: 'secondary', onclick: () => { selected.clear(); draw(); } }, 'Clear'));
   }
-  function draw() {
-    host.innerHTML = '';
+  function itemsTable(items, opts) {
+    opts = opts || {};
     const allCb = el('input', { type: 'checkbox', title: 'Select all', onchange: () => {
-      r.consumables.forEach(c => allCb.checked ? selected.add(c.id) : selected.delete(c.id)); draw();
+      items.forEach(c => allCb.checked ? selected.add(c.id) : selected.delete(c.id)); draw();
     } });
-    allCb.checked = r.consumables.length > 0 && r.consumables.every(c => selected.has(c.id));
-    host.append(table(
-      [allCb, 'Item', 'Location', 'On hand', 'Reorder at', 'Cost/unit', '', 'Actions'],
-      r.consumables.map(c => [
-        rowCheck(c, selected, updateBulk),
-        c.name, c.location || '—', fmt(c.onHand, 1) + ' ' + c.unit, fmt(c.reorderLevel, 1), c.costPerUnit != null ? '$' + fmt(c.costPerUnit, 2) : '—',
+    allCb.checked = items.length > 0 && items.every(c => selected.has(c.id));
+    const headers = [allCb, 'Item'];
+    const bools = [false, false];
+    if (opts.showVolume) { headers.push('Volume (L)'); bools.push(true); }
+    headers.push('Location', 'On hand', 'Reorder at', 'Cost/unit', '', 'Actions');
+    bools.push(false, true, true, true, false, false);
+    return table(headers, items.map(c => {
+      const row = [rowCheck(c, selected, updateBulk), c.name];
+      if (opts.showVolume) row.push(c.litresEach != null ? fmt(c.litresEach, c.litresEach % 1 ? 2 : 0) : '—');
+      // Packaging items are counted in whole units (totes, bottles, ...),
+      // so their on-hand quantity displays with no decimals; general
+      // consumables (kg of Citric Acid, etc.) keep their fractional display.
+      row.push(c.location || '—', fmt(c.onHand, opts.showVolume ? 0 : 1) + ' ' + c.unit, fmt(c.reorderLevel, 1),
+        c.costPerUnit != null ? '$' + fmt(c.costPerUnit, 2) : '—',
         badge(c.low ? 'low' : 'ok', c.low ? 'LOW' : 'OK'),
         rowActions([['Receive', () => adjustC(c, 1)], ['Use', () => adjustC(c, -1)],
-          ['Dispose', () => disposeConsumables([c]), 'danger'], ['Edit', () => editC(c)]])
-      ]), [false, false, false, true, true, true, false, false]));
+          ['Dispose', () => disposeConsumables([c]), 'danger'], ['Edit', () => editC(c)]]));
+      return row;
+    }), bools, opts.showVolume ? (ri => showConsumableHistory(items[ri])) : null);
+  }
+  function draw() {
+    host.innerHTML = '';
+    const general = r.consumables.filter(c => !c.isContainer);
+    const containers = r.consumables.filter(c => c.isContainer);
+    host.append(itemsTable(general));
+    host.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Packaging'),
+      el('div', { class: 'actions' },
+        isAdmin ? el('button', { class: 'secondary', onclick: openContainerBulkImport }, '📤 Bulk import CSV') : null,
+        isAdmin ? el('button', { onclick: addContainerType }, '+ Add container type') : null)));
+    host.append(el('div', { class: 'help', style: 'margin-bottom:10px' },
+      'Every container Production uses -- Packaging table output units and Sample Point vessels alike -- with its own on-hand inventory. '
+      + (isAdmin ? 'Only an admin can bulk-upload counts or add a new container type; anyone can receive/use/edit an existing one.'
+        : 'Ask an admin to bulk-upload counts or add a new container type.')));
+    host.append(itemsTable(containers, { showVolume: true }));
     updateBulk();
   }
   draw();
@@ -3060,17 +3106,56 @@ function adjustC(c, sign) {
 }
 function editC(c) {
   const locs = State.ref.locations.map(l => [l, l]);
+  const litresInp = c.isContainer
+    ? el('input', { type: 'number', min: '0', step: 'any', value: c.litresEach ?? '', placeholder: 'blank if not an FG package' })
+    : null;
+  const sampleCb = c.isContainer ? el('input', { type: 'checkbox' }) : null;
+  if (sampleCb) sampleCb.checked = !!c.isSampleContainer;
   const body = el('div', {},
     el('div', { class: 'form-row' },
       field('Reorder level', el('input', { type: 'number', id: 'c_re', value: c.reorderLevel, step: '0.1' })),
       field('Cost per unit', el('input', { type: 'number', id: 'c_cost', value: c.costPerUnit ?? '', step: '0.01' }))),
-    field('Warehouse location', editableSelect(locs, 'c_loc')));
+    field('Warehouse location', editableSelect(locs, 'c_loc')),
+    c.isContainer ? el('div', { class: 'form-row' },
+      field('Volume (L, blank if not an FG package)', litresInp),
+      field('Used for Sample Point', sampleCb)) : null);
   body.querySelector('#c_loc').value = c.location || '';
   modal('Edit ' + c.name, body, async () => {
-    await api('PUT', '/consumables/' + c.id, { reorderLevel: +body.querySelector('#c_re').value, costPerUnit: body.querySelector('#c_cost').value || null, location: body.querySelector('#c_loc').value });
+    const payload = { reorderLevel: +body.querySelector('#c_re').value, costPerUnit: body.querySelector('#c_cost').value || null, location: body.querySelector('#c_loc').value };
+    if (c.isContainer) {
+      payload.litresEach = litresInp.value.trim() === '' ? null : +litresInp.value;
+      payload.isSampleContainer = sampleCb.checked;
+    }
+    await api('PUT', '/consumables/' + c.id, payload);
     State.ref = await api('GET', '/refdata');
     toast('Updated'); render();
   }, 'Save');
+}
+// Every receive/use/bulk-import/live Packaging-Sample Point deduction against
+// a container logs a consumable_txns row -- clicking its line in the
+// Packaging table opens the full trail, timestamped and attributed to
+// whoever made each change (blank for the rare change made with no signed-in
+// user, e.g. a very old row from before user_name was tracked).
+function consumableHistoryTable(log) {
+  if (!log.length) return el('div', { class: 'help' }, 'No changes logged yet.');
+  // Same "~10 rows then scroll" pattern as the Feedstock Stability log.
+  return el('div', { class: 'tablewrap stability-log-scroll', style: 'margin-top:6px' },
+    el('table', {},
+      el('thead', {}, el('tr', {}, el('th', {}, 'When'), el('th', { class: 'num' }, 'Change'),
+        el('th', {}, 'Reason'), el('th', {}, 'Reference'), el('th', {}, 'By'))),
+      el('tbody', {}, ...log.map(r => el('tr', {},
+        el('td', { class: 'muted' }, fmtWhen(r.createdAt)),
+        el('td', { class: 'num' }, el('b', {}, (r.delta > 0 ? '+' : '') + fmt(r.delta, r.delta % 1 ? 1 : 0))),
+        el('td', {}, r.reason || '—'),
+        el('td', { class: 'muted' }, r.ref || '—'),
+        el('td', {}, r.userName || '—'))))));
+}
+async function showConsumableHistory(c) {
+  const data = await api('GET', '/consumables/' + c.id + '/history');
+  const body = el('div', {},
+    el('div', { class: 'summary-line' }, sl('Item', c.name), sl('On hand', fmt(c.onHand, 0) + ' ' + c.unit)),
+    consumableHistoryTable(data.history));
+  modal('Transaction history — ' + c.name, body, async () => {}, 'Close', { noCancel: true });
 }
 function addConsumable() {
   const locs = State.ref.locations.map(l => [l, l]);
@@ -3080,11 +3165,77 @@ function addConsumable() {
       field('Reorder level', el('input', { type: 'number', id: 'n_re', value: '0' }))),
     el('div', { class: 'form-row' }, field('Cost per unit', el('input', { type: 'number', id: 'n_cost', step: '0.01' })),
       field('Warehouse location', editableSelect(locs, 'n_loc'))));
-  modal('Add consumable / packaging', body, async () => {
+  modal('Add consumable', body, async () => {
     await api('POST', '/consumables', { name: body.querySelector('#n_name').value, unit: body.querySelector('#n_unit').value, onHand: +body.querySelector('#n_oh').value, reorderLevel: +body.querySelector('#n_re').value, costPerUnit: body.querySelector('#n_cost').value || null, location: body.querySelector('#n_loc').value });
     State.ref = await api('GET', '/refdata');
     toast('Added'); render();
   }, 'Add');
+}
+// Admin-only: introduces a brand-new container type (Packaging output unit
+// and/or Sample Point vessel) -- editing/receiving/using an existing one is
+// open to everyone via editC/adjustC above.
+function addContainerType() {
+  const locs = State.ref.locations.map(l => [l, l]);
+  const litresInp = el('input', { type: 'number', min: '0', step: 'any', placeholder: 'e.g. 1000 for IBC -- blank if not an FG package' });
+  const sampleCb = el('input', { type: 'checkbox' });
+  const body = el('div', {},
+    el('div', { class: 'form-row' }, field('Name', el('input', { id: 'n_name', placeholder: 'e.g. 4 L' })),
+      field('Unit', el('input', { id: 'n_unit', value: 'ea' }))),
+    el('div', { class: 'form-row' }, field('On hand', el('input', { type: 'number', id: 'n_oh', value: '0' })),
+      field('Reorder level', el('input', { type: 'number', id: 'n_re', value: '0' }))),
+    el('div', { class: 'form-row' }, field('Cost per unit', el('input', { type: 'number', id: 'n_cost', step: '0.01' })),
+      field('Warehouse location', editableSelect(locs, 'n_loc'))),
+    el('div', { class: 'form-row' }, field('Volume (L, blank if not an FG package)', litresInp),
+      field('Used for Sample Point', sampleCb)));
+  modal('Add container type', body, async () => {
+    await api('POST', '/consumables', {
+      name: body.querySelector('#n_name').value, unit: body.querySelector('#n_unit').value,
+      onHand: +body.querySelector('#n_oh').value, reorderLevel: +body.querySelector('#n_re').value,
+      costPerUnit: body.querySelector('#n_cost').value || null, location: body.querySelector('#n_loc').value,
+      isContainer: true, litresEach: litresInp.value.trim() === '' ? null : +litresInp.value,
+      isSampleContainer: sampleCb.checked
+    });
+    State.ref = await api('GET', '/refdata');
+    toast('Container type added'); render();
+  }, 'Add');
+}
+// Admin-only bulk stock-count import (e.g. after a physical stocktake) --
+// same CSV-upload UX as openFeedstockImport, but sets an absolute on-hand
+// count per row rather than creating new records.
+function openContainerBulkImport() {
+  let csvText = '';
+  const fileInput = el('input', { type: 'file', accept: '.csv,text/csv' });
+  const status = el('div', { class: 'help' });
+  fileInput.addEventListener('change', () => {
+    csvText = ''; status.textContent = '';
+    const f = fileInput.files[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      csvText = String(reader.result || '');
+      const rows = csvText.split(/\r\n|\r|\n/).filter(l => l.trim() !== '').length - 1;
+      status.textContent = f.name + ' — ' + Math.max(rows, 0) + ' row(s) ready to import.';
+    };
+    reader.onerror = () => { status.textContent = 'Could not read ' + f.name; };
+    reader.readAsText(f);
+  });
+  const body = el('div', {},
+    el('div', { class: 'help' },
+      'Set an absolute on-hand count for many consumables/containers at once, by name — e.g. after a physical stocktake. Download the template, fill it in, then upload it here.'),
+    el('div', { style: 'margin:10px 0' },
+      el('a', { href: 'templates/consumables_bulk_import_template.csv', download: 'consumables_bulk_import_template.csv' },
+        '⬇ Download CSV template')),
+    field('CSV file', fileInput),
+    status,
+    el('div', { class: 'help' },
+      'Required columns: name (must exactly match an existing item — quote it if the name itself contains a comma), onHand. Optional: reason.'));
+  modal('Bulk import inventory counts (CSV)', body, async () => {
+    if (!csvText.trim()) throw new Error('Choose a CSV file to import.');
+    const r = await api('POST', '/consumables/bulk', { csvText });
+    State.ref = await api('GET', '/refdata');
+    toast('Updated ' + r.updated + ' item(s).');
+    render();
+  }, 'Import');
 }
 
 /* ---------------- Reports ---------------- */
@@ -3360,7 +3511,7 @@ const CALCULATIONS = [
   {
     title: 'Output (L) / New IBCs filled',
     formula: 'Output (L) = Σ (entry qty × container unit’s litres each)   ·   New IBCs filled = Σ qty where the container unit is IBC',
-    description: 'A run’s total bottled output and IBC usage, computed from the Packaging table’s entries at finalization using each container unit’s litres-each value (Admin → Container Units).',
+    description: 'A run’s total bottled output and IBC usage, computed from the Packaging table’s entries at finalization using each container’s litres-each value (Consumables & Packaging → Packaging).',
     location: 'Production → Packaging section, applied when a run is finalized',
     settings: [],
   },
@@ -3643,63 +3794,6 @@ async function pageAdmin(v) {
     ]), [false, false, false, false], ri => showSopHistory(sr.sops[ri])));
   v.append(el('div', { class: 'help', style: 'margin-top:10px' },
     'A QC Check in the production log links to an SOP by its reference key, not its name — renaming a document here is picked up everywhere it’s linked. Click a row to see its change history.'));
-
-  // Container units: the Packaging table's "Container unit" dropdown
-  // options, each mapped to a fixed litres-per-unit conversion (e.g.
-  // IBC = 1000 L) -- distinct from the fixed IBC/4L/1L/250ml package sizes
-  // (Calculations page) used by the Bottling/packaging output grid.
-  v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Container Units'),
-    el('div', { class: 'actions' }, el('button', { onclick: addContainerUnit }, '+ Add container unit'))));
-  const cur = await api('GET', '/container-units');
-  v.append(table(
-    ['Container unit', 'Litres each', 'Status', ''],
-    cur.containerUnits.map(u => [
-      u.code, fmt(u.litresEach, u.litresEach % 1 ? 2 : 0) + ' L',
-      badge(u.active ? 'on_hand' : 'disposed', u.active ? 'Active' : 'Inactive'),
-      rowActions([
-        ['Edit', () => editContainerUnit(u)],
-        u.active ? ['Deactivate', () => setContainerUnitActive(u, false), 'danger']
-          : ['Activate', () => setContainerUnitActive(u, true)]
-      ])
-    ]), [false, false, false, false]));
-  v.append(el('div', { class: 'help', style: 'margin-top:10px' },
-    'Deactivating a container unit removes it from the Packaging table\'s picker without deleting past entries that used it.'));
-}
-function addContainerUnit() {
-  const codeInp = el('input', { placeholder: 'e.g. 4 L' });
-  const litresInp = el('input', { type: 'number', step: 'any', min: '0', placeholder: 'Litres per unit' });
-  const body = el('div', {}, field('Container unit name', codeInp), field('Litres per unit', litresInp));
-  modal('Add container unit', body, async () => {
-    const code = codeInp.value.trim();
-    if (!code) throw new Error('Enter a container unit name.');
-    const litres = +litresInp.value;
-    if (!litres || litres <= 0) throw new Error('Enter a positive litres-per-unit value.');
-    await api('POST', '/container-units', { code, litresEach: litres });
-    State.ref = await api('GET', '/refdata');
-    toast('Container unit added'); render();
-  }, 'Add');
-}
-function editContainerUnit(u) {
-  const codeInp = el('input', { value: u.code });
-  const litresInp = el('input', { type: 'number', step: 'any', min: '0', value: u.litresEach });
-  const body = el('div', {}, field('Container unit name', codeInp), field('Litres per unit', litresInp),
-    el('div', { class: 'help' }, 'Renaming updates every in-progress Packaging table entry and past Finished Goods lot that used it.'));
-  modal('Edit ' + u.code, body, async () => {
-    const code = codeInp.value.trim();
-    if (!code) throw new Error('Enter a container unit name.');
-    const litres = +litresInp.value;
-    if (!litres || litres <= 0) throw new Error('Enter a positive litres-per-unit value.');
-    await api('PUT', '/container-units/' + encodeURIComponent(u.code), { code, litresEach: litres });
-    State.ref = await api('GET', '/refdata');
-    toast('Container unit updated'); render();
-  }, 'Save');
-}
-async function setContainerUnitActive(u, active) {
-  if (!confirm((active ? 'Reactivate ' : 'Deactivate ') + u.code + '?')) return;
-  await api('PUT', '/container-units/' + encodeURIComponent(u.code), { active });
-  State.ref = await api('GET', '/refdata');
-  toast('Container unit ' + (active ? 'reactivated' : 'deactivated'));
-  render();
 }
 function readFileAsBase64(file) {
   return new Promise((resolve, reject) => {

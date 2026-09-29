@@ -51,7 +51,7 @@ import tempfile
 import datetime
 from xml.sax.saxutils import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -130,18 +130,11 @@ def get_setting_value(conn, key, default=None):
     return r["value"] if r else default
 
 
-def get_container_units(conn, include_inactive=False):
-    q = "SELECT * FROM container_units" + ("" if include_inactive else " WHERE active=1") \
-        + " ORDER BY sort_order, code"
-    return [{"code": r["code"], "litresEach": r["litres_each"], "active": bool(r["active"])}
-            for r in conn.execute(q)]
-
-
-def container_unit_litres_map(conn):
-    """Live code -> litres-each lookup for every container unit (active or
-    not, so a finalized run's existing FG lots keep resolving even after a
-    unit is deactivated)."""
-    return {r["code"]: r["litres_each"] for r in conn.execute("SELECT code, litres_each FROM container_units")}
+def packaging_container_litres_map(conn):
+    """Live name -> litres-each lookup for every container consumable valid
+    as a Packaging table / FG-output option (litres_each set)."""
+    return {r["name"]: r["litres_each"] for r in
+            conn.execute("SELECT name, litres_each FROM consumables WHERE is_container=1 AND litres_each IS NOT NULL")}
 
 # --------------------------------------------------------------------------- #
 # Database
@@ -392,14 +385,26 @@ CREATE TABLE IF NOT EXISTS disposals (
 CREATE INDEX IF NOT EXISTS idx_disposals_date ON disposals(disposed_date);
 
 -- Consumables & packaging (citric acid, potassium sorbate, empty IBCs ...).
+-- A container type (New 1,000 L IBC Tote, 2 L, 1 L, a Sample Point vessel
+-- like a falcon tube, ...) is just a row here with is_container=1 -- same
+-- on-hand/reorder/cost/location fields as any other consumable, shown in
+-- the Consumables & Packaging page's "Packaging" section instead of the
+-- general "Consumables" one. litres_each is set only for containers used
+-- in Packaging's FG-output math (New 1,000 L IBC Tote/2 L/1 L); left null
+-- for containers that are never an FG package (Used 1,000 L IBC Tote) or
+-- that are only a Sample Point vessel (is_sample_container=1) -- a
+-- container can be neither, either, or both.
 CREATE TABLE IF NOT EXISTS consumables (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    name          TEXT NOT NULL UNIQUE,
-    unit          TEXT NOT NULL,
-    on_hand       REAL NOT NULL DEFAULT 0,
-    reorder_level REAL NOT NULL DEFAULT 0,
-    cost_per_unit REAL,
-    location      TEXT
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                TEXT NOT NULL UNIQUE,
+    unit                TEXT NOT NULL,
+    on_hand             REAL NOT NULL DEFAULT 0,
+    reorder_level       REAL NOT NULL DEFAULT 0,
+    cost_per_unit       REAL,
+    location            TEXT,
+    is_container        INTEGER NOT NULL DEFAULT 0,
+    litres_each         REAL,
+    is_sample_container INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS consumable_txns (
@@ -408,6 +413,7 @@ CREATE TABLE IF NOT EXISTS consumable_txns (
     delta         REAL NOT NULL,          -- + receipt, - usage
     reason        TEXT,
     ref           TEXT,                   -- e.g. processing lot
+    user_name     TEXT,                   -- who made the change, if known
     created_at    TEXT NOT NULL
 );
 
@@ -647,20 +653,36 @@ CREATE TABLE IF NOT EXISTS run_packaging_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_packagingentries_run ON run_packaging_entries(run_id);
 
+-- Freely adding/editing/removing Packaging table rows never touches
+-- container stock by itself -- only committing (the Packaging section's
+-- Save button, or finalize) does, and only for the *net* change per
+-- container since the last commit, as one consumable_txns line each (see
+-- _commit_packaging_stock). This table remembers what was last committed
+-- per (run, container) so that net change can be computed; a container
+-- untouched since the last commit needs no new entry at all.
+CREATE TABLE IF NOT EXISTS run_packaging_commits (
+    run_id         INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+    container_unit TEXT NOT NULL,
+    committed_qty  REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, container_unit)
+);
+
 -- Admin-editable options for the Packaging table's "Container unit" dropdown,
 -- each mapped to a fixed litres-per-unit conversion (e.g. IBC = 1000 L) --
 -- distinct from the fixed IBC/4L/1L/250ml package_size_*_l settings used by
 -- the Bottling/packaging output grid at finalize.
+-- Superseded by the consumables.is_container/litres_each/is_sample_container
+-- columns above -- container types now live entirely in consumables (the
+-- Packaging section), so an admin can track on-hand/reorder/cost/location
+-- for them like any other consumable. This table stays defined (additive-
+-- only) purely so migrate() can copy any rows an admin already added here
+-- into consumables on upgrade; nothing else reads or writes it anymore.
 CREATE TABLE IF NOT EXISTS container_units (
     code        TEXT PRIMARY KEY,
     litres_each REAL NOT NULL,
     sort_order  INTEGER NOT NULL DEFAULT 0,
     active      INTEGER NOT NULL DEFAULT 1,
-    is_ibc      INTEGER NOT NULL DEFAULT 0  -- internal only, never exposed/settable via
-                                            -- the API -- flags the unit finalize treats as
-                                            -- an IBC (Empty New/Used IBC consumable
-                                            -- tracking), stays true across a rename so
-                                            -- renaming "IBC" can't silently break it
+    is_ibc      INTEGER NOT NULL DEFAULT 0
 );
 
 -- Admin-editable numeric constants used by calculated fields throughout the
@@ -763,6 +785,44 @@ def init_db():
     conn.close()
 
 
+def _rename_consumable(conn, old_name, new_name):
+    """One-time, idempotent rename of a consumable, propagated to every place
+    that stores its name by value instead of by id (Packaging table entries,
+    Sample Point containers, past FG lots). A no-op if old_name doesn't exist
+    or new_name is already taken (e.g. an admin renamed it there first)."""
+    if (old_name != new_name
+            and conn.execute("SELECT 1 FROM consumables WHERE name=?", (old_name,)).fetchone()
+            and not conn.execute("SELECT 1 FROM consumables WHERE name=?", (new_name,)).fetchone()):
+        conn.execute("UPDATE consumables SET name=? WHERE name=?", (new_name, old_name))
+        conn.execute("UPDATE run_packaging_entries SET container_unit=? WHERE container_unit=?",
+                     (new_name, old_name))
+        conn.execute("UPDATE run_sample_points SET container=? WHERE container=?", (new_name, old_name))
+        conn.execute("UPDATE fg_lots SET package_size=? WHERE package_size=?", (new_name, old_name))
+
+
+def _merge_consumable(conn, from_name, into_name):
+    """One-time, idempotent merge of two consumable rows that turned out to
+    be the same physical item -- sums on-hand, keeps whichever
+    litres_each/is_container/is_sample_container value is set on either row,
+    re-points every reference and past ledger entry from from_name's row to
+    into_name's, then drops the duplicate. A no-op if either name is missing
+    (e.g. already merged, or from_name never existed here)."""
+    src = conn.execute("SELECT * FROM consumables WHERE name=?", (from_name,)).fetchone()
+    dst = conn.execute("SELECT * FROM consumables WHERE name=?", (into_name,)).fetchone()
+    if not src or not dst:
+        return
+    conn.execute(
+        "UPDATE consumables SET on_hand=on_hand+?, litres_each=COALESCE(litres_each,?),"
+        " is_sample_container=MAX(is_sample_container,?), is_container=MAX(is_container,?) WHERE id=?",
+        (src["on_hand"], src["litres_each"], src["is_sample_container"], src["is_container"], dst["id"]))
+    conn.execute("UPDATE consumable_txns SET consumable_id=? WHERE consumable_id=?", (dst["id"], src["id"]))
+    conn.execute("UPDATE run_packaging_entries SET container_unit=? WHERE container_unit=?",
+                 (into_name, from_name))
+    conn.execute("UPDATE run_sample_points SET container=? WHERE container=?", (into_name, from_name))
+    conn.execute("UPDATE fg_lots SET package_size=? WHERE package_size=?", (into_name, from_name))
+    conn.execute("DELETE FROM consumables WHERE id=?", (src["id"],))
+
+
 def migrate(conn):
     """Idempotent schema migrations for databases created before a column existed."""
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(tote_lots)")}
@@ -845,6 +905,14 @@ def migrate(conn):
     if "is_ibc" not in cucols:
         conn.execute("ALTER TABLE container_units ADD COLUMN is_ibc INTEGER NOT NULL DEFAULT 0")
         conn.execute("UPDATE container_units SET is_ibc=1 WHERE code='IBC'")
+    ccols = {r["name"] for r in conn.execute("PRAGMA table_info(consumables)")}
+    for col, decl in [("is_container", "INTEGER NOT NULL DEFAULT 0"), ("litres_each", "REAL"),
+                       ("is_sample_container", "INTEGER NOT NULL DEFAULT 0")]:
+        if col not in ccols:
+            conn.execute("ALTER TABLE consumables ADD COLUMN %s %s" % (col, decl))
+    ctcols = {r["name"] for r in conn.execute("PRAGMA table_info(consumable_txns)")}
+    if "user_name" not in ctcols:
+        conn.execute("ALTER TABLE consumable_txns ADD COLUMN user_name TEXT")
     spcols = {r["name"] for r in conn.execute("PRAGMA table_info(run_sample_points)")}
     if "stage" not in spcols:
         conn.execute("ALTER TABLE run_sample_points ADD COLUMN stage TEXT")
@@ -960,18 +1028,50 @@ def migrate(conn):
     # instead of a water-to-add amount -- no formula reads it anymore, so
     # drop the row rather than leave a stale constant in the admin table.
     conn.execute("DELETE FROM settings WHERE key='homog_dilution_density_kg_per_l'")
-    # package_size_*_l were replaced by the container_units table (admin can
-    # now add/rename/remove units, not just tweak 4 fixed sizes) when FG-lot
-    # creation at finalize switched from the old Bottling/packaging output
-    # grid to the Packaging table -- no formula reads them anymore.
+    # package_size_*_l were replaced by container types living in consumables
+    # (admin can now add/rename/remove them like any other consumable, with
+    # real on-hand/reorder/cost tracking) when FG-lot creation at finalize
+    # switched from the old Bottling/packaging output grid to the Packaging
+    # table -- no formula reads them anymore.
     for key in ("package_size_ibc_l", "package_size_4l_l", "package_size_1l_l", "package_size_250ml_l"):
         conn.execute("DELETE FROM settings WHERE key=?", (key,))
-    # Seed the Packaging table's Container unit options -- INSERT OR IGNORE
-    # so an admin's already-edited litres value is never overwritten.
-    for code, litres, order, is_ibc in [("IBC", 1000, 0, 1), ("2 L", 2, 1, 0), ("1 L", 1, 2, 0)]:
-        conn.execute(
-            "INSERT OR IGNORE INTO container_units (code,litres_each,sort_order,active,is_ibc)"
-            " VALUES (?,?,?,1,?)", (code, litres, order, is_ibc))
+    # "Empty New IBC Tote" (or "1000 L IBC", if an earlier boot already
+    # renamed it to match a customized Container Units entry) *is* the
+    # Packaging table's IBC container option (the pool of empty totes ready
+    # to be filled) -- both are renamed to "New 1,000 L IBC Tote" here, and
+    # "Empty Used IBC Tote" to "Used 1,000 L IBC Tote", for clearer names in
+    # the new Packaging section. Renaming is purely cosmetic (consumable_txns/
+    # reports key off the row's id, not its name) and only runs once, so an
+    # admin renaming either again later sticks.
+    _rename_consumable(conn, "Empty New IBC Tote", "New 1,000 L IBC Tote")
+    _rename_consumable(conn, "1000 L IBC", "New 1,000 L IBC Tote")
+    _rename_consumable(conn, "Empty Used IBC Tote", "Used 1,000 L IBC Tote")
+    conn.execute("UPDATE consumables SET is_container=1, litres_each=1000"
+                 " WHERE name='New 1,000 L IBC Tote' AND litres_each IS NULL")
+    conn.execute("UPDATE consumables SET is_container=1 WHERE name='Used 1,000 L IBC Tote'")
+    # Carry over any OTHER container units an admin already added/edited in
+    # the now-retired Container Units table before this round's rework (the
+    # is_ibc-flagged one, whatever it's named, was just handled above).
+    for r in conn.execute("SELECT code, litres_each FROM container_units WHERE is_ibc=0"):
+        if not conn.execute("SELECT 1 FROM consumables WHERE name=?", (r["code"],)).fetchone():
+            conn.execute(
+                "INSERT INTO consumables (name,unit,on_hand,reorder_level,is_container,litres_each)"
+                " VALUES (?,'unit',0,0,1,?)", (r["code"], r["litres_each"]))
+    # Seed the Sample Point boxes' container options -- INSERT OR IGNORE so an
+    # admin's already-edited counts are never overwritten. On-hand starts at 0
+    # since these are being tracked for the first time; the plant enters its
+    # real starting counts via Consumables & Packaging -> Packaging.
+    for name in ("50 mL falcon tube", "100 g sample bag", "1 L bottle", "2 L bottle"):
+        if not conn.execute("SELECT 1 FROM consumables WHERE name=?", (name,)).fetchone():
+            conn.execute(
+                "INSERT INTO consumables (name,unit,on_hand,reorder_level,is_container,is_sample_container)"
+                " VALUES (?,'ea',0,0,1,1)", (name,))
+    # "1 L Bottle"/"2 L Bottle" (Packaging output units, carried over above
+    # from the old Container Units table) turned out to be the exact same
+    # physical item as "1 L bottle"/"2 L bottle" (Sample Point vessels) --
+    # merge each pair into one container valid for both purposes.
+    _merge_consumable(conn, "1 L Bottle", "1 L bottle")
+    _merge_consumable(conn, "2 L Bottle", "2 L bottle")
 
 
 def ensure_users(conn):
@@ -1478,8 +1578,6 @@ class Handler(BaseHTTPRequestHandler):
             return self.refdata(conn)
         if seg[:2] == ["api", "settings"]:
             return self.route_settings(method, seg, conn, user)
-        if seg[:2] == ["api", "container-units"]:
-            return self.route_container_units(method, seg, conn, user)
         if seg[:2] == ["api", "sop-documents"]:
             return self.route_sop_documents(method, seg, conn, user)
         if method == "GET" and seg == ["api", "dashboard"]:
@@ -1489,7 +1587,7 @@ class Handler(BaseHTTPRequestHandler):
         if seg[:2] == ["api", "harvest"]:
             return self.route_harvest(method, seg, conn)
         if seg[:2] == ["api", "consumables"]:
-            return self.route_consumables(method, seg, conn)
+            return self.route_consumables(method, seg, conn, user)
         if seg[:2] == ["api", "production"]:
             return self.route_production(method, seg, conn, user)
         if seg[:2] == ["api", "fg"]:
@@ -1630,9 +1728,19 @@ class Handler(BaseHTTPRequestHandler):
         # admin CRUD view fetches /api/sop-documents itself.
         sops = [dict(id=r["id"], name=r["name"], key=r["key"], hasFile=bool(r["stored_name"]))
                 for r in conn.execute("SELECT id, name, key, stored_name FROM sop_documents ORDER BY name")]
+        # Every container type (Packaging output units and Sample Point
+        # vessels alike) is just a consumable with is_container=1 -- exposed
+        # here (not just via /api/consumables) so the production log's
+        # Packaging/Sample Point dropdowns have it without an extra fetch.
+        containers = [dict(id=r["id"], name=r["name"], unit=r["unit"], onHand=r["on_hand"],
+                          reorderLevel=r["reorder_level"], costPerUnit=r["cost_per_unit"],
+                          location=r["location"], litresEach=r["litres_each"],
+                          isSampleContainer=bool(r["is_sample_container"]),
+                          low=(r["on_hand"] <= r["reorder_level"]))
+                     for r in conn.execute("SELECT * FROM consumables WHERE is_container=1 ORDER BY name")]
         return {"species": species, "sites": sites, "locations": locations,
                 "skus": skus, "customers": customers, "sops": sops,
-                "settings": get_settings(conn), "containerUnits": get_container_units(conn)}
+                "settings": get_settings(conn), "containers": containers}
 
     # ---- settings: admin-editable constants used by calculated fields ----- #
     def route_settings(self, method, seg, conn, user):
@@ -1652,55 +1760,6 @@ class Handler(BaseHTTPRequestHandler):
                          (value, now_iso(), key))
             return {"settings": get_settings(conn)}
         raise ApiError(404, "Unknown settings endpoint")
-
-    # ---- container units: admin-editable Packaging table dropdown options - #
-    def route_container_units(self, method, seg, conn, user):
-        if seg == ["api", "container-units"] and method == "GET":
-            self._require_admin(user)
-            return {"containerUnits": get_container_units(conn, include_inactive=True)}
-        if seg == ["api", "container-units"] and method == "POST":
-            self._require_admin(user)
-            d = self._body_json()
-            code = (d.get("code") or "").strip()
-            litres = numn(d.get("litresEach"))
-            if not code:
-                raise ApiError(400, "Enter a container unit name")
-            if litres is None or litres <= 0:
-                raise ApiError(400, "Enter a positive litres-per-unit value")
-            if conn.execute("SELECT 1 FROM container_units WHERE code=?", (code,)).fetchone():
-                raise ApiError(400, "That container unit already exists")
-            order = conn.execute("SELECT COALESCE(MAX(sort_order),-1)+1 n FROM container_units").fetchone()["n"]
-            conn.execute("INSERT INTO container_units (code,litres_each,sort_order,active) VALUES (?,?,?,1)",
-                         (code, litres, order))
-            return {"containerUnits": get_container_units(conn, include_inactive=True)}
-        if len(seg) == 3 and seg[2] and method == "PUT":
-            self._require_admin(user)
-            code = unquote(seg[2])
-            row = conn.execute("SELECT * FROM container_units WHERE code=?", (code,)).fetchone()
-            if not row:
-                raise ApiError(404, "Unknown container unit")
-            d = self._body_json()
-            new_code = (d.get("code") or code).strip() if "code" in d else code
-            if not new_code:
-                raise ApiError(400, "Enter a container unit name")
-            if new_code != code and conn.execute(
-                    "SELECT 1 FROM container_units WHERE code=?", (new_code,)).fetchone():
-                raise ApiError(400, "That container unit already exists")
-            litres = numn(d.get("litresEach")) if "litresEach" in d else row["litres_each"]
-            if litres is None or litres <= 0:
-                raise ApiError(400, "Enter a positive litres-per-unit value")
-            active = 1 if d.get("active", bool(row["active"])) else 0
-            conn.execute("UPDATE container_units SET code=?, litres_each=?, active=? WHERE code=?",
-                         (new_code, litres, active, code))
-            if new_code != code:
-                # A rename is reflected everywhere the old code was already
-                # recorded -- in-progress Packaging table rows and past
-                # Finished Goods lots alike.
-                conn.execute("UPDATE run_packaging_entries SET container_unit=? WHERE container_unit=?",
-                             (new_code, code))
-                conn.execute("UPDATE fg_lots SET package_size=? WHERE package_size=?", (new_code, code))
-            return {"containerUnits": get_container_units(conn, include_inactive=True)}
-        raise ApiError(404, "Unknown container-units endpoint")
 
     # ---- SOP documents (controlled documents, admin-managed) -------------- #
     def _sop_public(self, r):
@@ -2241,28 +2300,53 @@ class Handler(BaseHTTPRequestHandler):
         return {"created": created, "count": len(created)}
 
     # ---- consumables ------------------------------------------------------ #
-    def route_consumables(self, method, seg, conn):
+    def _consumable_public(self, r):
+        return dict(id=r["id"], name=r["name"], unit=r["unit"], onHand=r["on_hand"],
+                    reorderLevel=r["reorder_level"], costPerUnit=r["cost_per_unit"],
+                    location=r["location"], isContainer=bool(r["is_container"]),
+                    litresEach=r["litres_each"], isSampleContainer=bool(r["is_sample_container"]),
+                    low=(r["on_hand"] <= r["reorder_level"]))
+
+    def route_consumables(self, method, seg, conn, user):
         if seg == ["api", "consumables"]:
             if method == "GET":
                 rows = conn.execute("SELECT * FROM consumables ORDER BY name").fetchall()
-                return {"consumables": [
-                    dict(id=r["id"], name=r["name"], unit=r["unit"], onHand=r["on_hand"],
-                         reorderLevel=r["reorder_level"], costPerUnit=r["cost_per_unit"],
-                         location=r["location"], low=(r["on_hand"] <= r["reorder_level"]))
-                    for r in rows]}
+                return {"consumables": [self._consumable_public(r) for r in rows]}
             if method == "POST":
                 d = self._body_json()
                 name = (d.get("name") or "").strip()
                 if not name:
                     raise ApiError(400, "Name is required")
+                is_container = bool(d.get("isContainer"))
+                # Anyone can add a general consumable (unchanged); only an
+                # admin can introduce a new container type (Packaging output
+                # unit or Sample Point vessel) -- editing/receiving/using an
+                # existing one stays open to everyone below.
+                if is_container:
+                    self._require_admin(user)
                 if conn.execute("SELECT 1 FROM consumables WHERE name=?", (name,)).fetchone():
                     raise ApiError(409, "That consumable already exists")
                 location = self._ensure_location(conn, d.get("location"))
-                conn.execute("INSERT INTO consumables (name,unit,on_hand,reorder_level,cost_per_unit,location)"
-                             " VALUES (?,?,?,?,?,?)",
-                             (name, (d.get("unit") or "unit").strip(), num(d.get("onHand")),
-                              num(d.get("reorderLevel")), numn(d.get("costPerUnit")), location))
+                litres_each = numn(d.get("litresEach")) if is_container else None
+                is_sample = 1 if (is_container and d.get("isSampleContainer")) else 0
+                conn.execute(
+                    "INSERT INTO consumables (name,unit,on_hand,reorder_level,cost_per_unit,location,"
+                    "is_container,litres_each,is_sample_container) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (name, (d.get("unit") or "unit").strip(), num(d.get("onHand")),
+                     num(d.get("reorderLevel")), numn(d.get("costPerUnit")), location,
+                     1 if is_container else 0, litres_each, is_sample))
                 return {"ok": True}
+        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "history" and method == "GET":
+            cid = int(seg[2])
+            if not conn.execute("SELECT 1 FROM consumables WHERE id=?", (cid,)).fetchone():
+                raise ApiError(404, "Consumable not found")
+            return {"history": self._consumable_history(conn, cid)}
+        if seg == ["api", "consumables", "bulk"] and method == "POST":
+            # Bulk inventory update (physical stocktake corrections, receiving
+            # a large shipment, etc.) -- admin-only, matching the "bulk upload
+            # ... and/or create new container types" restriction.
+            self._require_admin(user)
+            return self._consumables_bulk(conn, user)
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "adjust" and method == "POST":
             cid = int(seg[2])
             c = conn.execute("SELECT * FROM consumables WHERE id=?", (cid,)).fetchone()
@@ -2272,7 +2356,8 @@ class Handler(BaseHTTPRequestHandler):
             delta = num(d.get("delta"))
             if delta == 0:
                 raise ApiError(400, "Adjustment delta must be non-zero")
-            self._consume(conn, cid, delta, d.get("reason") or "Manual adjustment", d.get("ref"))
+            self._consume(conn, cid, delta, d.get("reason") or "Manual adjustment", d.get("ref"),
+                          user["name"] if user else None)
             return {"onHand": conn.execute(
                 "SELECT on_hand FROM consumables WHERE id=?", (cid,)).fetchone()["on_hand"]}
         if len(seg) == 3 and seg[2].isdigit() and method == "PUT":
@@ -2282,20 +2367,115 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(404, "Consumable not found")
             d = self._body_json()
             location = self._ensure_location(conn, d["location"]) if "location" in d else c["location"]
-            conn.execute("UPDATE consumables SET reorder_level=?, cost_per_unit=?, location=? WHERE id=?",
-                         (num(d["reorderLevel"]) if "reorderLevel" in d else c["reorder_level"],
-                          numn(d["costPerUnit"]) if "costPerUnit" in d else c["cost_per_unit"],
-                          location, cid))
+            conn.execute(
+                "UPDATE consumables SET reorder_level=?, cost_per_unit=?, location=?, litres_each=?,"
+                " is_sample_container=? WHERE id=?",
+                (num(d["reorderLevel"]) if "reorderLevel" in d else c["reorder_level"],
+                 numn(d["costPerUnit"]) if "costPerUnit" in d else c["cost_per_unit"],
+                 location,
+                 (numn(d["litresEach"]) if "litresEach" in d else c["litres_each"]) if c["is_container"] else None,
+                 (1 if d.get("isSampleContainer") else 0) if "isSampleContainer" in d
+                 else c["is_sample_container"],
+                 cid))
             return {"ok": True}
         raise ApiError(404, "Unknown consumables endpoint")
 
-    def _consume(self, conn, consumable_id, delta, reason, ref):
+    def _consumables_bulk(self, conn, user):
+        d = self._body_json()
+        csv_text = d.get("csvText") or ""
+        if not csv_text.strip():
+            raise ApiError(400, "No CSV data received")
+        try:
+            reader = csv.DictReader(io.StringIO(csv_text))
+            rows = list(reader)
+        except Exception:
+            raise ApiError(400, "Could not parse the CSV file")
+        if not rows:
+            raise ApiError(400, "The CSV has no data rows")
+        if len(rows) > 500:
+            raise ApiError(400, "Too many rows in one import (max 500)")
+        have = {(h or "").strip() for h in (reader.fieldnames or [])}
+        if "name" not in have or "onHand" not in have:
+            raise ApiError(400, "CSV is missing required column(s): name, onHand")
+        updated = 0
+        for i, row in enumerate(rows, start=2):  # row 1 is the header
+            name = (row.get("name") or "").strip()
+            if not name:
+                raise ApiError(400, "Row %d: name is required" % i)
+            c = conn.execute("SELECT * FROM consumables WHERE name=?", (name,)).fetchone()
+            if not c:
+                raise ApiError(400, "Row %d: unknown consumable '%s'" % (i, name))
+            try:
+                new_on_hand = float((row.get("onHand") or "").strip())
+            except ValueError:
+                raise ApiError(400, "Row %d: onHand must be a number" % i)
+            if new_on_hand < 0:
+                raise ApiError(400, "Row %d: onHand cannot be negative" % i)
+            delta = new_on_hand - c["on_hand"]
+            if delta:
+                self._consume(conn, c["id"], delta, (row.get("reason") or "").strip() or "Bulk import",
+                              "Bulk import", user["name"] if user else None)
+                updated += 1
+        return {"updated": updated}
+
+    def _consume(self, conn, consumable_id, delta, reason, ref, user_name=None):
         conn.execute("UPDATE consumables SET on_hand = on_hand + ? WHERE id=?", (delta, consumable_id))
-        conn.execute("INSERT INTO consumable_txns (consumable_id,delta,reason,ref,created_at)"
-                     " VALUES (?,?,?,?,?)", (consumable_id, delta, reason, ref, now_iso()))
+        conn.execute("INSERT INTO consumable_txns (consumable_id,delta,reason,ref,user_name,created_at)"
+                     " VALUES (?,?,?,?,?,?)", (consumable_id, delta, reason, ref, user_name, now_iso()))
 
     def _consumable_by_name(self, conn, name):
         return conn.execute("SELECT * FROM consumables WHERE name=?", (name,)).fetchone()
+
+    def _consumable_history(self, conn, cid):
+        return [{"delta": r["delta"], "reason": r["reason"], "ref": r["ref"],
+                 "userName": r["user_name"], "createdAt": r["created_at"]}
+                for r in conn.execute(
+                    "SELECT * FROM consumable_txns WHERE consumable_id=? ORDER BY created_at DESC, id DESC", (cid,))]
+
+    def _adjust_container_stock(self, conn, name, delta, reason, ref, user_name=None):
+        """Consume/refund a container consumable's on-hand stock by name, for
+        the live Sample Point deduction (add a row -> -qty, delete it -> +qty
+        back, edit qty/container -> the difference) and for the Packaging
+        table's own net-change commit (see _commit_packaging_stock). A no-op
+        if name is blank or doesn't match any consumable (e.g. a Sample Point
+        row whose container hasn't been picked yet). Raises rather than let
+        on-hand go negative -- refunds (delta > 0) never fail this check."""
+        if not name or not delta:
+            return
+        row = self._consumable_by_name(conn, name)
+        if not row:
+            return
+        if delta < 0 and row["on_hand"] + delta < 0:
+            raise ApiError(400, "Not enough %s on hand (%.1f < %.1f)" % (name, row["on_hand"], -delta))
+        self._consume(conn, row["id"], delta, reason, ref, user_name)
+
+    def _commit_packaging_stock(self, conn, run_id, user_name=None):
+        """Nets the Packaging table's container/qty edits since the last
+        commit into at most one consumable_txns line per container -- adding
+        rows, bumping a qty a few times, then settling on a final number all
+        collapse into a single "Packaging saved" entry reflecting the total
+        change; a container whose total qty is unchanged since the last
+        commit is skipped entirely (no entry, no on-hand touch)."""
+        lot_row = conn.execute("SELECT processing_lot FROM production_runs WHERE id=?", (run_id,)).fetchone()
+        lot = lot_row["processing_lot"] if lot_row else None
+        current = {r["container_unit"]: (r["total"] or 0) for r in conn.execute(
+            "SELECT container_unit, SUM(qty) total FROM run_packaging_entries"
+            " WHERE run_id=? AND container_unit IS NOT NULL GROUP BY container_unit", (run_id,))}
+        committed = {r["container_unit"]: r["committed_qty"] for r in conn.execute(
+            "SELECT container_unit, committed_qty FROM run_packaging_commits WHERE run_id=?", (run_id,))}
+        for unit in set(current) | set(committed):
+            new_total = current.get(unit, 0)
+            old_total = committed.get(unit, 0)
+            if new_total == old_total:
+                continue
+            self._adjust_container_stock(conn, unit, old_total - new_total, "Packaging saved (net change)",
+                                          lot, user_name)
+            if unit in committed:
+                conn.execute("UPDATE run_packaging_commits SET committed_qty=? WHERE run_id=? AND container_unit=?",
+                             (new_total, run_id, unit))
+            else:
+                conn.execute("INSERT INTO run_packaging_commits (run_id,container_unit,committed_qty)"
+                             " VALUES (?,?,?)", (run_id, unit, new_total))
 
     # ---- production ------------------------------------------------------- #
     # Fields a run edit may touch: (db column, json key, label, kind)
@@ -2468,7 +2648,7 @@ class Handler(BaseHTTPRequestHandler):
                 runs.append(d)
             return {"runs": runs}
         if seg == ["api", "production"] and method == "POST":
-            return self.create_run(conn)
+            return self.create_run(conn, user)
         if seg == ["api", "production", "drafts"] and method == "GET":
             return self.list_drafts(conn)
         if seg == ["api", "production", "drafts"] and method == "POST":
@@ -2482,7 +2662,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "DELETE":
                 return self.delete_draft(conn, rid, user)
         if len(seg) == 5 and seg[2] == "drafts" and seg[3].isdigit() and seg[4] == "finalize" and method == "POST":
-            return self.finalize_draft(conn, int(seg[3]))
+            return self.finalize_draft(conn, int(seg[3]), user)
         if seg == ["api", "production", "qc"] and method == "GET":
             return self.list_qc_all(conn)
         if len(seg) >= 4 and seg[2].isdigit() and seg[3] == "qc":
@@ -2551,7 +2731,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "PUT":
                 return self.update_sample_point(conn, rid, spid, user)
             if method == "DELETE":
-                return self.delete_sample_point(conn, rid, spid)
+                return self.delete_sample_point(conn, rid, spid, user)
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "packaging-entries":
             rid = int(seg[2])
             if not conn.execute("SELECT 1 FROM production_runs WHERE id=?", (rid,)).fetchone():
@@ -2565,7 +2745,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "PUT":
                 return self.update_packaging_entry(conn, rid, peid, user)
             if method == "DELETE":
-                return self.delete_packaging_entry(conn, rid, peid)
+                return self.delete_packaging_entry(conn, rid, peid, user)
         raise ApiError(404, "Unknown production endpoint")
 
     def _attachments(self, conn, run_id):
@@ -3021,6 +3201,12 @@ class Handler(BaseHTTPRequestHandler):
         if updates:
             sets = ", ".join("%s=?" % c for c in updates)
             conn.execute("UPDATE production_runs SET %s WHERE id=?" % sets, (*updates.values(), rid))
+        # The Packaging section's one Save button covers the packagedAt/QC/
+        # Sample Point fields above *and* commits the Packaging table's net
+        # container changes -- this is the "once changes have been saved"
+        # moment the ledger reflects.
+        if stage == "packaging":
+            self._commit_packaging_stock(conn, rid, user["name"] if user else None)
         return {"run": run_public(conn.execute(
             "SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone())}
 
@@ -3100,6 +3286,10 @@ class Handler(BaseHTTPRequestHandler):
             conn.execute("UPDATE run_sample_points SET %s WHERE id=?" % sets, (*updates.values(), spid))
 
     def add_sample_point(self, conn, run_id, user):
+        # No container is assigned yet (the operator picks one from the
+        # dropdown after adding the row), so nothing to consume here --
+        # consumption starts the moment a container is actually picked, in
+        # update_sample_point below.
         d = self._body_json()
         stage = (d.get("stage") or "").strip() or None
         cur = conn.cursor()
@@ -3114,14 +3304,32 @@ class Handler(BaseHTTPRequestHandler):
                            (spid, run_id)).fetchone()
         if not row:
             raise ApiError(404, "Sample point entry not found")
-        self._apply_sample_point_fields(conn, spid, self._body_json())
+        d = self._body_json()
+        old_container, old_qty = row["container"], row["qty"] or 0
+        new_container = ((d["container"] or "").strip() or None) if "container" in d else old_container
+        if "qty" in d:
+            v = d["qty"]
+            new_qty = max(1, min(10, int(v))) if v not in (None, "") else old_qty
+        else:
+            new_qty = old_qty
+        lot = conn.execute("SELECT processing_lot FROM production_runs WHERE id=?", (run_id,)).fetchone()["processing_lot"]
+        uname = user["name"] if user else None
+        if new_container == old_container:
+            self._adjust_container_stock(conn, new_container, old_qty - new_qty, "Sample point updated", lot, uname)
+        else:
+            self._adjust_container_stock(conn, old_container, old_qty, "Sample point updated (container changed)", lot, uname)
+            self._adjust_container_stock(conn, new_container, -new_qty, "Sample point updated (container changed)", lot, uname)
+        self._apply_sample_point_fields(conn, spid, d)
         return {"samplePoints": self._sample_points_public(conn, run_id)}
 
-    def delete_sample_point(self, conn, run_id, spid):
+    def delete_sample_point(self, conn, run_id, spid, user):
         row = conn.execute("SELECT * FROM run_sample_points WHERE id=? AND run_id=?",
                            (spid, run_id)).fetchone()
         if not row:
             raise ApiError(404, "Sample point entry not found")
+        lot = conn.execute("SELECT processing_lot FROM production_runs WHERE id=?", (run_id,)).fetchone()["processing_lot"]
+        self._adjust_container_stock(conn, row["container"], row["qty"] or 0, "Sample point removed", lot,
+                                      user["name"] if user else None)
         conn.execute("DELETE FROM run_sample_points WHERE id=?", (spid,))
         return {"samplePoints": self._sample_points_public(conn, run_id)}
 
@@ -3146,8 +3354,15 @@ class Handler(BaseHTTPRequestHandler):
             conn.execute("UPDATE run_packaging_entries SET %s WHERE id=?" % sets, (*updates.values(), peid))
 
     def add_packaging_entry(self, conn, run_id, user):
+        # Freely add/edit/remove rows here -- none of it touches container
+        # stock. Only committing (the Packaging section's Save button, or
+        # finalize) nets the total per container against what was last
+        # committed and logs/adjusts once (see _commit_packaging_stock).
         d = self._body_json()
-        default_unit = next(iter(get_container_units(conn)), {}).get("code")
+        default_unit = conn.execute(
+            "SELECT name FROM consumables WHERE is_container=1 AND litres_each IS NOT NULL"
+            " ORDER BY name LIMIT 1").fetchone()
+        default_unit = default_unit["name"] if default_unit else None
         cur = conn.cursor()
         cur.execute("INSERT INTO run_packaging_entries (run_id,container_unit,qty,created_at) VALUES (?,?,1,?)",
                     (run_id, default_unit, now_iso()))
@@ -3160,10 +3375,11 @@ class Handler(BaseHTTPRequestHandler):
                            (peid, run_id)).fetchone()
         if not row:
             raise ApiError(404, "Packaging entry not found")
-        self._apply_packaging_entry_fields(conn, peid, self._body_json())
+        d = self._body_json()
+        self._apply_packaging_entry_fields(conn, peid, d)
         return {"packagingEntries": self._packaging_entries_public(conn, run_id)}
 
-    def delete_packaging_entry(self, conn, run_id, peid):
+    def delete_packaging_entry(self, conn, run_id, peid, user):
         row = conn.execute("SELECT * FROM run_packaging_entries WHERE id=? AND run_id=?",
                            (peid, run_id)).fetchone()
         if not row:
@@ -3264,16 +3480,17 @@ class Handler(BaseHTTPRequestHandler):
             return {"run": run_public(run), "edits": self._run_edits(conn, rid), "changed": 0}
 
         # Keep consumable stock consistent when preservative amounts are corrected.
+        uname = user["name"] if user else None
         if "citric_kg" in updates:
             delta = (updates["citric_kg"] or 0) - (run["citric_kg"] or 0)
             row = self._consumable_by_name(conn, "Citric Acid")
             if delta and row:
-                self._consume(conn, row["id"], -delta, "Production run edit", run["processing_lot"])
+                self._consume(conn, row["id"], -delta, "Production run edit", run["processing_lot"], uname)
         if "sorbate_kg" in updates:
             delta = (updates["sorbate_kg"] or 0) - (run["sorbate_kg"] or 0)
             row = self._consumable_by_name(conn, "Potassium Sorbate")
             if delta and row:
-                self._consume(conn, row["id"], -delta, "Production run edit", run["processing_lot"])
+                self._consume(conn, row["id"], -delta, "Production run edit", run["processing_lot"], uname)
 
         sets = ", ".join("%s=?" % c for c in updates)
         conn.execute("UPDATE production_runs SET %s WHERE id=?" % sets,
@@ -3288,10 +3505,10 @@ class Handler(BaseHTTPRequestHandler):
             "SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()),
             "edits": self._run_edits(conn, rid), "changed": len(changes)}
 
-    def create_run(self, conn):
-        return self._finalize_run(conn, self._body_json())
+    def create_run(self, conn, user):
+        return self._finalize_run(conn, self._body_json(), user=user)
 
-    def _finalize_run(self, conn, d, existing=None):
+    def _finalize_run(self, conn, d, existing=None, user=None):
         """Validate a run's inputs/outputs and apply the tote-consumption,
         consumable-deduction and FG-lot side effects. With `existing` (a draft
         row), converts it to status='completed' in place; otherwise inserts a
@@ -3315,6 +3532,10 @@ class Handler(BaseHTTPRequestHandler):
         if existing:
             packaging_entries = [dict(r) for r in conn.execute(
                 "SELECT container_unit, qty FROM run_packaging_entries WHERE run_id=?", (existing["id"],))]
+            # Finalizing implicitly "saves" the Packaging table too, in case
+            # the operator never clicked its Save button -- the ledger still
+            # only gets one net-change line per container, same as a normal save.
+            self._commit_packaging_stock(conn, existing["id"], user["name"] if user else None)
         target_tds = sku_row["tds_target"]  # fixed product spec, not user-entered
         citric = num(d.get("citricKg"))
         sorbate = num(d.get("sorbateKg"))
@@ -3348,9 +3569,12 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "At least one accepted tote is required to process a run")
         input_kg = round(sum((r["avg_weight_kg"] or 0) for r in accepted_rows), 2)
 
-        # Output litres = sum of packaged litres.
-        unit_litres = container_unit_litres_map(conn)
-        ibc_units = {r["code"] for r in conn.execute("SELECT code FROM container_units WHERE is_ibc=1")}
+        # Output litres = sum of packaged litres. The container stock itself
+        # (including the "IBC" pool) was already deducted live as each
+        # packaging entry was added/edited (see add/update/delete_packaging_
+        # entry) -- ibc_used here is purely the display stat on the run
+        # summary card, not a second consumption.
+        unit_litres = packaging_container_litres_map(conn)
         output_litres = 0.0
         ibc_used = 0
         for pe in packaging_entries:
@@ -3359,11 +3583,11 @@ class Handler(BaseHTTPRequestHandler):
             if unit not in unit_litres or qty <= 0:
                 continue
             output_litres += unit_litres[unit] * qty
-            if unit in ibc_units:
+            if unit == "IBC":
                 ibc_used += int(qty)
         output_litres = round(output_litres, 2)
 
-        # Check consumable availability (citric, sorbate, empty IBCs).
+        # Check consumable availability (citric, sorbate).
         citric_row = self._consumable_by_name(conn, "Citric Acid")
         sorbate_row = self._consumable_by_name(conn, "Potassium Sorbate")
         if citric and citric_row and citric_row["on_hand"] < citric:
@@ -3372,10 +3596,6 @@ class Handler(BaseHTTPRequestHandler):
         if sorbate and sorbate_row and sorbate_row["on_hand"] < sorbate:
             raise ApiError(400, "Not enough Potassium Sorbate on hand (%.1f < %.1f)"
                            % (sorbate_row["on_hand"], sorbate))
-        ibc_row = self._consumable_by_name(conn, "Empty New IBC Tote")
-        if ibc_used and ibc_row and ibc_row["on_hand"] < ibc_used:
-            raise ApiError(400, "Not enough empty IBC totes on hand (%d < %d)"
-                           % (int(ibc_row["on_hand"]), ibc_used))
 
         # Processing lot number: reserved at draft creation (or, for a direct
         # one-shot run, right here) from the row's own id — see lot_number_for.
@@ -3427,19 +3647,17 @@ class Handler(BaseHTTPRequestHandler):
                 cur.execute("UPDATE tote_lots SET status='consumed', run_id=? WHERE id=?", (run_id, r["id"]))
 
         # Deduct consumables.
+        uname = user["name"] if user else None
         if citric and citric_row:
-            self._consume(conn, citric_row["id"], -citric, "Production run", lot)
+            self._consume(conn, citric_row["id"], -citric, "Production run", lot, uname)
         if sorbate and sorbate_row:
-            self._consume(conn, sorbate_row["id"], -sorbate, "Production run", lot)
-        # Finished goods go into NEW clean IBCs (consume from the new-IBC pool).
-        if ibc_used and ibc_row:
-            self._consume(conn, ibc_row["id"], -ibc_used, "Production run (FG into new IBCs)", lot)
+            self._consume(conn, sorbate_row["id"], -sorbate, "Production run", lot, uname)
         # The IBC totes the stabilized kelp was stored in are now emptied by
         # processing and return to the USED-IBC pool (one per tote actually
         # processed — a rejected tote's IBC was never emptied).
-        used_row = self._consumable_by_name(conn, "Empty Used IBC Tote")
+        used_row = self._consumable_by_name(conn, "Used 1,000 L IBC Tote")
         if used_row and accepted_rows:
-            self._consume(conn, used_row["id"], len(accepted_rows), "Emptied by processing", lot)
+            self._consume(conn, used_row["id"], len(accepted_rows), "Emptied by processing", lot, uname)
 
         # Create FG lots, one per packaging entry (container unit).
         fg_created = []
@@ -3570,16 +3788,29 @@ class Handler(BaseHTTPRequestHandler):
         for t in conn.execute("SELECT * FROM tote_lots WHERE run_id=? AND status='wip'", (rid,)):
             self._log_stability(conn, t["id"], user, "Status", "wip", "in_stock", note, run_id=rid)
             conn.execute("UPDATE tote_lots SET status='in_stock', run_id=NULL WHERE id=?", (t["id"],))
+        # Any container stock this draft already consumed is refunded --
+        # otherwise it'd stay consumed forever against a run that no longer
+        # exists. Sample Point containers deduct live, so every current row
+        # is refunded; the Packaging table only ever commits (deducts) a net
+        # amount on Save/finalize, so only what's actually in
+        # run_packaging_commits needs refunding -- any not-yet-saved edits in
+        # run_packaging_entries never touched stock in the first place.
+        uname = user["name"] if user else None
+        for pc in conn.execute("SELECT container_unit, committed_qty FROM run_packaging_commits WHERE run_id=?", (rid,)):
+            self._adjust_container_stock(conn, pc["container_unit"], pc["committed_qty"] or 0, note,
+                                          r["processing_lot"], uname)
+        for sp in conn.execute("SELECT container, qty FROM run_sample_points WHERE run_id=?", (rid,)):
+            self._adjust_container_stock(conn, sp["container"], sp["qty"] or 0, note, r["processing_lot"], uname)
         conn.execute("DELETE FROM production_runs WHERE id=?", (rid,))
         return {"ok": True}
 
-    def finalize_draft(self, conn, rid):
+    def finalize_draft(self, conn, rid, user):
         existing = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
         if not existing:
             raise ApiError(404, "Draft not found")
         if existing["status"] != "draft":
             raise ApiError(409, "This run has already been finalized")
-        return self._finalize_run(conn, self._body_json(), existing=existing)
+        return self._finalize_run(conn, self._body_json(), existing=existing, user=user)
 
     # ---- finished goods --------------------------------------------------- #
     def route_fg(self, method, seg, query, conn):
@@ -4197,7 +4428,7 @@ class Handler(BaseHTTPRequestHandler):
                 if qty > c["on_hand"]:
                     raise ApiError(400, "Cannot dispose %g %s of %s — only %g on hand"
                                    % (qty, c["unit"], c["name"], c["on_hand"]))
-                self._consume(conn, c["id"], -qty, "Disposal: " + reason, None)
+                self._consume(conn, c["id"], -qty, "Disposal: " + reason, None, user["name"] if user else None)
                 log("consumable", c["id"], c["name"], qty, c["unit"])
                 disposed += 1
             if not any_qty:
