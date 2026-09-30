@@ -119,6 +119,50 @@ SETTINGS_DEFAULTS = [
      "Pre-filled value for a new run's Pasteurization Boiler set-point (°C) field."),
 ]
 
+# The fixed catalog of "QC Check" fields on the production log -- only fields
+# inside a box whose qc-check-title is literally "QC Check" (not "Process
+# Check", not "Sample Point"). field_id is the production_runs column name
+# itself (already unique across the schema), doubling as this field's stable
+# identity for qc_field_log. (field_id, stage, stage_label, subtitle, label, unit)
+QC_FIELD_REGISTRY = [
+    # Homogenization -- "Lot characterization"
+    ("homog_qc_ph",           "homogenization", "Homogenization", "Lot characterization", "pH", ""),
+    ("homog_tds_pct",         "homogenization", "Homogenization", "Lot characterization", "TDS (%)", "%"),
+    ("homog_brix_pct",        "homogenization", "Homogenization", "Lot characterization", "Brix (%)", "%"),
+    ("homog_mannitol_pct",    "homogenization", "Homogenization", "Lot characterization", "Mannitol (%)", "%"),
+    ("homog_ts_liquid_pct",   "homogenization", "Homogenization", "Lot characterization", "TSliquid (%)", "%"),
+    ("homog_rho_liquid_g_ml", "homogenization", "Homogenization", "Lot characterization", "ρliquid (g/mL)", "g/mL"),
+    ("homog_ts_slurry_pct",   "homogenization", "Homogenization", "Lot characterization", "TSslurry (%)", "%"),
+    ("homog_rho_slurry_g_ml", "homogenization", "Homogenization", "Lot characterization", "ρslurry (g/mL)", "g/mL"),
+    ("homog_ts_solids_pct",   "homogenization", "Homogenization", "Lot characterization", "TSsolids (%)", "%"),
+    # Extraction -- "Extraction Performance"
+    ("extraction_qc_ph",           "extraction", "Extraction", "Extraction Performance", "pH", ""),
+    ("extraction_tds_pct",         "extraction", "Extraction", "Extraction Performance", "TDS (%)", "%"),
+    ("extraction_brix_pct",        "extraction", "Extraction", "Extraction Performance", "Brix (%)", "%"),
+    ("extraction_mannitol_pct",    "extraction", "Extraction", "Extraction Performance", "Mannitol (%)", "%"),
+    ("extraction_ts_liquid_pct",   "extraction", "Extraction", "Extraction Performance", "TSliquid (%)", "%"),
+    ("extraction_rho_liquid_g_ml", "extraction", "Extraction", "Extraction Performance", "ρliquid (g/mL)", "g/mL"),
+    ("extraction_ts_slurry_pct",   "extraction", "Extraction", "Extraction Performance", "TSslurry (%)", "%"),
+    ("extraction_rho_slurry_g_ml", "extraction", "Extraction", "Extraction Performance", "ρslurry (g/mL)", "g/mL"),
+    ("extraction_ts_solids_pct",   "extraction", "Extraction", "Extraction Performance", "TSsolids (%)", "%"),
+    # Separation -- "Solids characterization"
+    ("separation_pct_moisture", "separation", "Separation", "Solids characterization", "%Moisture", "%"),
+    # Separation -- "Filtrate characterization"
+    ("separation_liquid_qc_ph",           "separation", "Separation", "Filtrate characterization", "pH", ""),
+    ("separation_liquid_tds_pct",         "separation", "Separation", "Filtrate characterization", "TDS (%)", "%"),
+    ("separation_liquid_brix_pct",        "separation", "Separation", "Filtrate characterization", "Brix (%)", "%"),
+    ("separation_liquid_mannitol_pct",    "separation", "Separation", "Filtrate characterization", "Mannitol (%)", "%"),
+    ("separation_liquid_ts_liquid_pct",   "separation", "Separation", "Filtrate characterization", "TSliquid (%)", "%"),
+    ("separation_liquid_rho_liquid_g_ml", "separation", "Separation", "Filtrate characterization", "ρliquid (g/mL)", "g/mL"),
+    # Packaging -- "LKE characterization"
+    ("packaging_qc_ph",           "packaging", "Packaging", "LKE characterization", "pH", ""),
+    ("packaging_tds_pct",         "packaging", "Packaging", "LKE characterization", "TDS (%)", "%"),
+    ("packaging_brix_pct",        "packaging", "Packaging", "LKE characterization", "Brix (%)", "%"),
+    ("packaging_mannitol_pct",    "packaging", "Packaging", "LKE characterization", "Mannitol (%)", "%"),
+    ("packaging_ts_liquid_pct",   "packaging", "Packaging", "LKE characterization", "TSliquid (%)", "%"),
+    ("packaging_rho_liquid_g_ml", "packaging", "Packaging", "LKE characterization", "ρliquid (g/mL)", "g/mL"),
+]
+
 
 def get_settings(conn):
     return {r["key"]: {"value": r["value"], "label": r["label"], "description": r["description"]}
@@ -324,6 +368,24 @@ CREATE TABLE IF NOT EXISTS qc_logs (
     recorded_at     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_qc_run ON qc_logs(run_id);
+
+-- Per-field audit trail for the fixed "QC Check" fields on production_runs
+-- (see QC_FIELD_REGISTRY) -- replaces qc_logs (which stays, unused, for
+-- historical data) as the write path's companion ledger. One row per
+-- (run, field): last-write-wins, updated only when the field's *value*
+-- actually changes (see save_stage/_log_qc_field_changes). field_id is the
+-- production_runs column name for that field, already unique across the
+-- schema. No row = "not yet recorded".
+CREATE TABLE IF NOT EXISTS qc_field_log (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id        INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+    field_id      TEXT NOT NULL,
+    value         REAL NOT NULL,
+    recorded_by   TEXT,
+    recorded_at   TEXT NOT NULL,
+    UNIQUE (run_id, field_id)
+);
+CREATE INDEX IF NOT EXISTS idx_qcfieldlog_run ON qc_field_log(run_id);
 
 CREATE TABLE IF NOT EXISTS customers (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1006,6 +1068,22 @@ def migrate(conn):
                           " WHERE status='draft' AND processing_lot LIKE 'DRAFT-%'"):
         conn.execute("UPDATE production_runs SET processing_lot=? WHERE id=?",
                      (lot_number_for(r["created_at"], r["id"]), r["id"]))
+    # Backfill qc_field_log for QC Check values that already existed before
+    # this table did -- one row per (run, field) with a non-null value today.
+    # recorded_by is left NULL (unknown who entered historical data);
+    # recorded_at falls back to the run's created_at, the only timestamp
+    # production_runs has that applies regardless of draft/completed status.
+    # INSERT OR IGNORE + the UNIQUE(run_id, field_id) constraint make this a
+    # no-op after the first boot that runs it.
+    qc_cols = ", ".join(f[0] for f in QC_FIELD_REGISTRY)
+    for r in conn.execute("SELECT id, created_at, %s FROM production_runs" % qc_cols):
+        for field_id, _stage, _stage_label, _subtitle, _label, _unit in QC_FIELD_REGISTRY:
+            val = r[field_id]
+            if val is None:
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO qc_field_log (run_id, field_id, value, recorded_by, recorded_at)"
+                " VALUES (?,?,?,?,?)", (r["id"], field_id, val, None, r["created_at"]))
     sopcols = {r["name"] for r in conn.execute("PRAGMA table_info(sop_documents)")}
     if "key" not in sopcols:
         conn.execute("ALTER TABLE sop_documents ADD COLUMN key TEXT")
@@ -1738,9 +1816,12 @@ class Handler(BaseHTTPRequestHandler):
                           isSampleContainer=bool(r["is_sample_container"]),
                           low=(r["on_hand"] <= r["reorder_level"]))
                      for r in conn.execute("SELECT * FROM consumables WHERE is_container=1 ORDER BY name")]
+        qc_fields = [dict(id=f[0], stage=f[1], stageLabel=f[2], subtitle=f[3], label=f[4], unit=f[5])
+                     for f in QC_FIELD_REGISTRY]
         return {"species": species, "sites": sites, "locations": locations,
                 "skus": skus, "customers": customers, "sops": sops,
-                "settings": get_settings(conn), "containers": containers}
+                "settings": get_settings(conn), "containers": containers,
+                "qcFields": qc_fields}
 
     # ---- settings: admin-editable constants used by calculated fields ----- #
     def route_settings(self, method, seg, conn, user):
@@ -2477,6 +2558,60 @@ class Handler(BaseHTTPRequestHandler):
                 conn.execute("INSERT INTO run_packaging_commits (run_id,container_unit,committed_qty)"
                              " VALUES (?,?,?)", (run_id, unit, new_total))
 
+    # Stages that actually contain a "QC Check" container (Pasteurization and
+    # Dilution & Preservation only have Process Check/Sample Point boxes).
+    QC_CHECK_STAGES = {"homogenization", "extraction", "separation", "packaging"}
+
+    def _log_qc_field_changes(self, conn, run_id, stage, updates, user_name=None):
+        """After save_stage's column UPDATE, diffs the QC-Check subset of
+        `updates` (col -> new value, as just applied to production_runs)
+        against qc_field_log and upserts only the ones that changed -- a
+        reading resubmitted unchanged touches nothing, stamping user_name/now
+        only on a real change. A field cleared back to None deletes its log
+        row (no value -> nothing to attribute -> matches the read side's
+        "not yet recorded" state)."""
+        if stage not in self.QC_CHECK_STAGES:
+            return
+        cols = {f[0] for f in QC_FIELD_REGISTRY if f[1] == stage}
+        touched = {c: v for c, v in updates.items() if c in cols}
+        if not touched:
+            return
+        existing = {r["field_id"]: r["value"] for r in conn.execute(
+            "SELECT field_id, value FROM qc_field_log WHERE run_id=? AND field_id IN (%s)"
+            % ",".join("?" * len(touched)), (run_id, *touched.keys()))}
+        now = now_iso()
+        for field_id, val in touched.items():
+            if val is None:
+                if field_id in existing:
+                    conn.execute("DELETE FROM qc_field_log WHERE run_id=? AND field_id=?", (run_id, field_id))
+                continue
+            if field_id in existing and existing[field_id] == val:
+                continue
+            conn.execute(
+                "INSERT INTO qc_field_log (run_id, field_id, value, recorded_by, recorded_at)"
+                " VALUES (?,?,?,?,?)"
+                " ON CONFLICT(run_id, field_id) DO UPDATE SET"
+                " value=excluded.value, recorded_by=excluded.recorded_by, recorded_at=excluded.recorded_at",
+                (run_id, field_id, val, user_name, now))
+
+    def _qc_checks_public(self, conn, run_id):
+        run = conn.execute("SELECT * FROM production_runs WHERE id=?", (run_id,)).fetchone()
+        if not run:
+            raise ApiError(404, "Production run not found")
+        audit = {r["field_id"]: r for r in conn.execute(
+            "SELECT * FROM qc_field_log WHERE run_id=?", (run_id,))}
+        out = []
+        for field_id, stage, stage_label, subtitle, label, unit in QC_FIELD_REGISTRY:
+            a = audit.get(field_id)
+            out.append({
+                "fieldId": field_id, "stage": stage, "stageLabel": stage_label,
+                "subtitle": subtitle, "label": label, "unit": unit,
+                "value": run[field_id],
+                "recordedBy": a["recorded_by"] if a else None,
+                "recordedAt": a["recorded_at"] if a else None,
+            })
+        return out
+
     # ---- production ------------------------------------------------------- #
     # Fields a run edit may touch: (db column, json key, label, kind)
     RUN_EDIT_FIELDS = [
@@ -2640,7 +2775,10 @@ class Handler(BaseHTTPRequestHandler):
                     "SELECT * FROM fg_lots WHERE run_id=? ORDER BY package_size", (r["id"],))]
                 d["edits"] = self._run_edits(conn, r["id"])
                 d["attachments"] = self._attachments(conn, r["id"])
-                d["qc"] = self._qc_entries(conn, r["id"])
+                d["qcSummary"] = {
+                    "recorded": sum(1 for f in QC_FIELD_REGISTRY if r[f[0]] is not None),
+                    "total": len(QC_FIELD_REGISTRY),
+                }
                 d["inputs"] = self._run_inputs_public(conn, r["id"])
                 d["dilutions"] = self._dilutions_public(conn, r["id"])
                 d["samplePoints"] = self._sample_points_public(conn, r["id"])
@@ -2663,18 +2801,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.delete_draft(conn, rid, user)
         if len(seg) == 5 and seg[2] == "drafts" and seg[3].isdigit() and seg[4] == "finalize" and method == "POST":
             return self.finalize_draft(conn, int(seg[3]), user)
-        if seg == ["api", "production", "qc"] and method == "GET":
-            return self.list_qc_all(conn)
-        if len(seg) >= 4 and seg[2].isdigit() and seg[3] == "qc":
-            rid = int(seg[2])
-            if not conn.execute("SELECT 1 FROM production_runs WHERE id=?", (rid,)).fetchone():
-                raise ApiError(404, "Production run not found")
-            if len(seg) == 4 and method == "GET":
-                return {"qc": self._qc_entries(conn, rid)}
-            if len(seg) == 4 and method == "POST":
-                return self.add_qc(conn, rid, user)
-            if len(seg) == 5 and seg[4].isdigit() and method == "DELETE":
-                return self.delete_qc(conn, rid, int(seg[4]), user)
+        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "qc-checks" and method == "GET":
+            return {"qcChecks": self._qc_checks_public(conn, int(seg[2]))}
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "edits" and method == "GET":
             return {"edits": self._run_edits(conn, int(seg[2]))}
         if len(seg) == 3 and seg[2].isdigit() and method == "PUT":
@@ -3201,6 +3329,7 @@ class Handler(BaseHTTPRequestHandler):
         if updates:
             sets = ", ".join("%s=?" % c for c in updates)
             conn.execute("UPDATE production_runs SET %s WHERE id=?" % sets, (*updates.values(), rid))
+            self._log_qc_field_changes(conn, rid, stage, updates, user["name"] if user else None)
         # The Packaging section's one Save button covers the packagedAt/QC/
         # Sample Point fields above *and* commits the Packaging table's net
         # container changes -- this is the "once changes have been saved"
@@ -3386,66 +3515,6 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(404, "Packaging entry not found")
         conn.execute("DELETE FROM run_packaging_entries WHERE id=?", (peid,))
         return {"packagingEntries": self._packaging_entries_public(conn, run_id)}
-
-    # ---- quality control log ----------------------------------------------- #
-    def _qc_public(self, r):
-        return {"id": r["id"], "runId": r["run_id"], "sampleLocation": r["sample_location"],
-                "sampleType": r["sample_type"], "metric": r["metric"], "value": r["value"],
-                "unit": r["unit"], "notes": r["notes"], "recordedBy": r["recorded_by"],
-                "recordedAt": r["recorded_at"]}
-
-    def _qc_entries(self, conn, run_id):
-        return [self._qc_public(r) for r in conn.execute(
-            "SELECT * FROM qc_logs WHERE run_id=? ORDER BY recorded_at DESC, id DESC", (run_id,))]
-
-    def list_qc_all(self, conn):
-        out = []
-        for r in conn.execute(
-                "SELECT q.*, r.processing_lot, r.run_date, r.sku_code FROM qc_logs q "
-                "JOIN production_runs r ON r.id=q.run_id "
-                "WHERE r.status='completed' ORDER BY q.recorded_at DESC, q.id DESC"):
-            d = self._qc_public(r)
-            d["processingLot"] = r["processing_lot"]
-            d["runDate"] = r["run_date"]
-            d["sku"] = r["sku_code"]
-            out.append(d)
-        return {"qc": out}
-
-    def _qc_fields(self, d):
-        sample_location = (d.get("sampleLocation") or "").strip()
-        sample_type = (d.get("sampleType") or "").strip() or None  # retained for old rows; no longer collected
-        metric = (d.get("metric") or "").strip()
-        if not sample_location:
-            raise ApiError(400, "Choose a sample location")
-        if not metric:
-            raise ApiError(400, "Choose or enter a measurement")
-        raw_value = d.get("value")
-        if raw_value in (None, ""):
-            raise ApiError(400, "Enter a value")
-        try:
-            value = float(raw_value)
-        except (TypeError, ValueError):
-            raise ApiError(400, "Enter a numeric value")
-        unit = (d.get("unit") or "").strip() or None
-        notes = (d.get("notes") or "").strip() or None
-        return sample_location, sample_type, metric, value, unit, notes
-
-    def add_qc(self, conn, run_id, user):
-        sample_location, sample_type, metric, value, unit, notes = self._qc_fields(self._body_json())
-        conn.execute(
-            "INSERT INTO qc_logs (run_id,sample_location,sample_type,metric,value,unit,notes,"
-            "recorded_by,recorded_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (run_id, sample_location, sample_type, metric, value, unit, notes,
-             user["name"] if user else None, now_iso()))
-        return {"qc": self._qc_entries(conn, run_id)}
-
-    def delete_qc(self, conn, run_id, qid, user):
-        self._require_admin(user)
-        r = conn.execute("SELECT * FROM qc_logs WHERE id=? AND run_id=?", (qid, run_id)).fetchone()
-        if not r:
-            raise ApiError(404, "QC entry not found")
-        conn.execute("DELETE FROM qc_logs WHERE id=?", (qid,))
-        return {"qc": self._qc_entries(conn, run_id)}
 
     def _run_edits(self, conn, run_id):
         return [{"user": r["user_name"], "field": r["field"], "old": r["old_value"],
