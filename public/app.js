@@ -865,6 +865,42 @@ async function pageQC(v) {
     'QC data now lives on each production run’s Process Log — open a run’s 🧪 QC button (Production tab) to view it.'));
 }
 
+// Two-line stacked single-select dropdown (native <select> can't render
+// multi-line option text) -- shows each option's title + optional subtitle
+// stacked, both in the closed button and the open list of choices.
+function buildStackedSelect(options, initialValue, onChange) {
+  let value = options.some(o => o.value === initialValue) ? initialValue : options[0].value;
+  const btn = el('button', { type: 'button', class: 'qc-loc-select-btn' });
+  const panel = el('div', { class: 'qc-loc-panel hidden' });
+  const wrap = el('div', { class: 'qc-loc-select' }, btn, panel);
+  function labelFor(o) {
+    return el('span', { class: 'qc-group-label' },
+      el('span', { class: 'qc-group-title' }, o.title),
+      o.subtitle ? el('span', { class: 'qc-group-subtitle' }, o.subtitle) : null);
+  }
+  function onDocClick(e) { if (!wrap.contains(e.target)) close(); }
+  function open() {
+    panel.innerHTML = '';
+    options.forEach(o => panel.append(el('div', {
+      class: 'qc-loc-option' + (o.value === value ? ' selected' : ''),
+      onclick: () => { value = o.value; renderBtn(); close(); onChange(value); }
+    }, labelFor(o))));
+    panel.classList.remove('hidden');
+    document.addEventListener('click', onDocClick, true);
+  }
+  function close() {
+    panel.classList.add('hidden');
+    document.removeEventListener('click', onDocClick, true);
+  }
+  function renderBtn() {
+    btn.innerHTML = '';
+    btn.append(labelFor(options.find(o => o.value === value)), el('span', { class: 'qc-loc-caret' }, '▾'));
+  }
+  btn.addEventListener('click', () => { panel.classList.contains('hidden') ? open() : close(); });
+  renderBtn();
+  return { el: wrap, get value() { return value; } };
+}
+
 // Read-only: every "QC Check" field's current value, grouped by production-log
 // section + QC Check subtitle (State.ref.qcFields, in registry order — see
 // QC_FIELD_REGISTRY, kelp_erp_server.py). Editing only happens on the Process
@@ -875,9 +911,12 @@ async function openQcForRun(run) {
   const seen = new Set();
   for (const f of State.ref.qcFields) {
     const key = f.stage + '|' + f.subtitle;
-    if (!seen.has(key)) { seen.add(key); groups.push({ key, stage: f.stage, subtitle: f.subtitle, label: f.stageLabel + ' — ' + f.subtitle }); }
+    if (!seen.has(key)) { seen.add(key); groups.push({ key, stage: f.stage, stageLabel: f.stageLabel, subtitle: f.subtitle }); }
   }
-  const groupSel = selectFrom('', [['all', 'All groups'], ...groups.map(g => [g.key, g.label])], () => draw());
+  const groupSel = buildStackedSelect(
+    [{ value: 'all', title: 'All groups' },
+     ...groups.map(g => ({ value: g.key, title: g.stageLabel, subtitle: g.subtitle }))],
+    'all', () => draw());
   const listHost = el('div', {});
   const { qcChecks } = await api('GET', '/production/' + run.id + '/qc-checks');
   function draw() {
@@ -887,8 +926,8 @@ async function openQcForRun(run) {
       if (filter !== 'all' && filter !== g.key) return;
       const fields = qcChecks.filter(e => e.stage === g.stage && e.subtitle === g.subtitle);
       const box = el('div', { class: 'qc-check-box theme-quality' },
-        el('div', { class: 'qc-check-title' }, 'QC Check'),
-        el('div', { class: 'qc-check-subtitle' }, g.label));
+        el('div', { class: 'qc-check-title' }, g.stageLabel),
+        el('div', { class: 'qc-check-subtitle' }, g.subtitle));
       fields.forEach(e => {
         const recorded = e.value != null;
         const valueText = recorded
@@ -905,8 +944,8 @@ async function openQcForRun(run) {
   draw();
   const body = el('div', {},
     el('div', { class: 'summary-line' }, sl('Run', run.processingLot), sl('SKU', skuName(run.sku))),
-    field('Group', groupSel), listHost);
-  modal('Quality Control Log — ' + run.processingLot, body, async () => {}, 'Close', { noCancel: true });
+    field('Group', groupSel.el), listHost);
+  modal('Quality Control Log — ' + run.processingLot, body, async () => {}, 'Close', { noCancel: true, closeX: true });
 }
 
 /* ---- Process-stage building blocks, shared by openRun (pre-finalize) and
@@ -3429,7 +3468,9 @@ function modal(title, body, onSubmit, submitLabel = 'Save', opts = {}) {
     actions.append(extraBtn);
   }
   actions.append(submitBtn);
-  const card = el('div', { class: 'modal' + (opts.wide ? ' wide' : '') }, el('h3', {}, title), body, errBox, actions);
+  const card = el('div', { class: 'modal' + (opts.wide ? ' wide' : '') },
+    opts.closeX ? el('button', { type: 'button', class: 'modal-close-x', 'aria-label': 'Close', onclick: () => close() }, '×') : null,
+    el('h3', {}, title), body, errBox, actions);
   // Backdrop clicks do NOT close the dialog — only Cancel or completing the
   // action does, so a stray click off the popup can't discard your input.
   const bg = el('div', { class: 'modal-bg' }, card);

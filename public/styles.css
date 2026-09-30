@@ -193,9 +193,14 @@ th.sortable:hover { background: #e2ece9; }
 
 /* ---------- Modal ---------- */
 .modal-bg { position: fixed; inset: 0; background: rgba(12,43,39,.5); display:flex; align-items:flex-start; justify-content:center; padding: 40px 16px; z-index: 50; overflow:auto; }
-.modal { background: var(--card); border-radius: 16px; padding: 22px; width: 100%; max-width: 620px; box-shadow: 0 24px 60px rgba(0,0,0,.3); }
+.modal { position: relative; background: var(--card); border-radius: 16px; padding: 22px; width: 100%; max-width: 620px; box-shadow: 0 24px 60px rgba(0,0,0,.3); }
 .modal.wide { max-width: 960px; }
-.modal h3 { margin: 0 0 14px; color: var(--teal-dark); }
+.modal h3 { margin: 0 24px 14px 0; color: var(--teal-dark); }
+.modal-close-x {
+  position: absolute; top: 14px; right: 14px; background: none; border: none;
+  font-size: 22px; line-height: 1; color: var(--muted); cursor: pointer; padding: 4px;
+}
+.modal-close-x:hover { color: var(--ink); }
 .modal .form-row { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .modal .modal-actions { display:flex; justify-content:flex-end; gap: 8px; margin-top: 18px; }
 .field { margin-bottom: 6px; }
@@ -232,6 +237,12 @@ th.sortable:hover { background: #e2ece9; }
 .qc-loc-option:last-child { border-bottom: none; }
 .qc-loc-option:hover { background: #f6faf9; }
 .qc-loc-option.selected { background: #eef3f2; }
+/* Stacked title + subtitle label (buildStackedSelect: the QC modal's Group
+   filter) -- the descriptor rides on its own quieter line under the section
+   name, both in the closed button and the open list of choices. */
+.qc-group-label { display: block; }
+.qc-group-title { display: block; font-size: 14px; color: var(--ink); }
+.qc-group-subtitle { display: block; font-size: 11px; color: var(--muted); font-style: italic; margin-top: 1px; }
 
 /* selectable tote list */
 .tote-pick { max-height: 260px; overflow:auto; border:1px solid var(--line); border-radius:10px; }
