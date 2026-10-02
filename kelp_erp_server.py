@@ -134,7 +134,8 @@ QC_FIELD_REGISTRY = [
     ("homog_rho_liquid_g_ml", "homogenization", "Homogenization", "Lot characterization", "ρliquid (g/mL)", "g/mL"),
     ("homog_ts_slurry_pct",   "homogenization", "Homogenization", "Lot characterization", "TSslurry (%)", "%"),
     ("homog_rho_slurry_g_ml", "homogenization", "Homogenization", "Lot characterization", "ρslurry (g/mL)", "g/mL"),
-    ("homog_ts_solids_pct",   "homogenization", "Homogenization", "Lot characterization", "TSsolids (%)", "%"),
+    ("homog_ts_solids_pct",   "homogenization", "Homogenization", "Lot characterization", "%Moisture<sub>solids</sub>", "%"),
+    ("homog_solids_loading_pct", "homogenization", "Homogenization", "Lot characterization", "Solids Loading (%)", "%"),
     # Extraction -- "Extraction Performance"
     ("extraction_qc_ph",           "extraction", "Extraction", "Extraction Performance", "pH", ""),
     ("extraction_tds_pct",         "extraction", "Extraction", "Extraction Performance", "TDS (%)", "%"),
@@ -144,9 +145,10 @@ QC_FIELD_REGISTRY = [
     ("extraction_rho_liquid_g_ml", "extraction", "Extraction", "Extraction Performance", "ρliquid (g/mL)", "g/mL"),
     ("extraction_ts_slurry_pct",   "extraction", "Extraction", "Extraction Performance", "TSslurry (%)", "%"),
     ("extraction_rho_slurry_g_ml", "extraction", "Extraction", "Extraction Performance", "ρslurry (g/mL)", "g/mL"),
-    ("extraction_ts_solids_pct",   "extraction", "Extraction", "Extraction Performance", "TSsolids (%)", "%"),
+    ("extraction_ts_solids_pct",   "extraction", "Extraction", "Extraction Performance", "%Moisture<sub>solids</sub>", "%"),
     # Separation -- "Solids characterization"
-    ("separation_pct_moisture", "separation", "Separation", "Solids characterization", "%Moisture", "%"),
+    ("separation_pct_moisture", "separation", "Separation", "Solids characterization", "%Moisture<sub>centrifuge_solids</sub>", "%"),
+    ("separation_pct_moisture_screw", "separation", "Separation", "Solids characterization", "%Moisture<sub>screw_solids</sub>", "%"),
     # Separation -- "Filtrate characterization"
     ("separation_liquid_qc_ph",           "separation", "Separation", "Filtrate characterization", "pH", ""),
     ("separation_liquid_tds_pct",         "separation", "Separation", "Filtrate characterization", "TDS (%)", "%"),
@@ -539,6 +541,7 @@ CREATE TABLE IF NOT EXISTS production_runs (
     homog_ts_slurry_pct      REAL,
     homog_rho_slurry_g_ml    REAL,
     homog_ts_solids_pct      REAL,
+    homog_solids_loading_pct REAL,
     -- Homogenization Output, old fixed Sample Point checklist (0/1 collected)
     -- -- superseded by the repeatable run_sample_points table, columns stay
     -- (additive-only) but are no longer collected.
@@ -578,6 +581,7 @@ CREATE TABLE IF NOT EXISTS production_runs (
     -- Separation, Solids Out
     separation_wet_solids_wt_kg  REAL,
     separation_pct_moisture      REAL,
+    separation_pct_moisture_screw REAL,
     -- Separation, Liquid Out QC Check (subtitle "Filtrate characterization")
     -- -- Liquid-only fields, no Slurry/Solids section.
     separation_liquid_qc_ph            REAL,
@@ -930,6 +934,7 @@ def migrate(conn):
         ("homog_tds_pct", "REAL"), ("homog_brix_pct", "REAL"), ("homog_mannitol_pct", "REAL"),
         ("homog_ts_liquid_pct", "REAL"), ("homog_rho_liquid_g_ml", "REAL"),
         ("homog_ts_slurry_pct", "REAL"), ("homog_rho_slurry_g_ml", "REAL"), ("homog_ts_solids_pct", "REAL"),
+        ("homog_solids_loading_pct", "REAL"),
         ("homog_sample_slurry_microbial", "INTEGER DEFAULT 0"),
         ("homog_sample_slurry_retention", "INTEGER DEFAULT 0"),
         ("homog_sample_liquid_metals", "INTEGER DEFAULT 0"),
@@ -944,6 +949,7 @@ def migrate(conn):
         ("separation_flowrate_lpm", "REAL"), ("separation_mesh_micron", "REAL"),
         ("separation_water_addition_l", "REAL"), ("separation_started_at", "TEXT"),
         ("separation_wet_solids_wt_kg", "REAL"), ("separation_pct_moisture", "REAL"),
+        ("separation_pct_moisture_screw", "REAL"),
         ("separation_liquid_qc_ph", "REAL"), ("separation_liquid_tds_pct", "REAL"),
         ("separation_liquid_brix_pct", "REAL"), ("separation_liquid_mannitol_pct", "REAL"),
         ("separation_liquid_ts_liquid_pct", "REAL"), ("separation_liquid_rho_liquid_g_ml", "REAL"),
@@ -1292,6 +1298,7 @@ def run_public(r):
             "mannitolPct": r["homog_mannitol_pct"], "tsLiquidPct": r["homog_ts_liquid_pct"],
             "rhoLiquidGMl": r["homog_rho_liquid_g_ml"], "tsSlurryPct": r["homog_ts_slurry_pct"],
             "rhoSlurryGMl": r["homog_rho_slurry_g_ml"], "tsSolidsPct": r["homog_ts_solids_pct"],
+            "solidsLoadingPct": r["homog_solids_loading_pct"],
             "sampleSlurryMicrobial": bool(r["homog_sample_slurry_microbial"]),
             "sampleSlurryRetention": bool(r["homog_sample_slurry_retention"]),
             "sampleLiquidMetals": bool(r["homog_sample_liquid_metals"]),
@@ -1309,6 +1316,7 @@ def run_public(r):
             "startedAt": r["separation_started_at"], "flowrateLpm": r["separation_flowrate_lpm"],
             "meshMicron": r["separation_mesh_micron"], "waterAdditionL": r["separation_water_addition_l"],
             "wetSolidsWtKg": r["separation_wet_solids_wt_kg"], "pctMoisture": r["separation_pct_moisture"],
+            "pctMoistureScrew": r["separation_pct_moisture_screw"],
             "liquidQcPh": r["separation_liquid_qc_ph"], "liquidTdsPct": r["separation_liquid_tds_pct"],
             "liquidBrixPct": r["separation_liquid_brix_pct"],
             "liquidMannitolPct": r["separation_liquid_mannitol_pct"],
@@ -2645,6 +2653,7 @@ class Handler(BaseHTTPRequestHandler):
             ("homog_ts_slurry_pct", "tsSlurryPct", "num"),
             ("homog_rho_slurry_g_ml", "rhoSlurryGMl", "num"),
             ("homog_ts_solids_pct", "tsSolidsPct", "num"),
+            ("homog_solids_loading_pct", "solidsLoadingPct", "num"),
             # homog_output_l, homog_initial_ph, homog_citric_kg, homog_final_ph
             # and the fixed sample-checklist columns all stay (additive-only)
             # but are no longer collected -- "Output (L)" and the whole
@@ -2674,6 +2683,7 @@ class Handler(BaseHTTPRequestHandler):
             ("separation_mesh_micron", "meshMicron", "num"),
             ("separation_wet_solids_wt_kg", "wetSolidsWtKg", "num"),
             ("separation_pct_moisture", "pctMoisture", "num"),
+            ("separation_pct_moisture_screw", "pctMoistureScrew", "num"),
             ("separation_liquid_qc_ph", "liquidQcPh", "num"),
             ("separation_liquid_tds_pct", "liquidTdsPct", "num"),
             ("separation_liquid_brix_pct", "liquidBrixPct", "num"),
@@ -2688,11 +2698,12 @@ class Handler(BaseHTTPRequestHandler):
             ("pasteurization_started_at", "startedAt", "text"),
             ("pasteurization_product_setpoint_c", "productSetpointC", "num"),
             ("pasteurization_boiler_setpoint_c", "boilerSetpointC", "num"),
-            ("pasteurization_pre_sample_collected_at", "preSampleCollectedAt", "text"),
             ("pasteurization_post_sample_collected_at", "postSampleCollectedAt", "text"),
             ("pasteurization_tds_pct", "tdsPct", "num"),
-            # pasteurization_total_volume_l column stays (additive-only) but
-            # is no longer collected -- "Total volume (L)" was removed.
+            # pasteurization_pre_sample_collected_at and pasteurization_total_volume_l
+            # columns stay (additive-only) but are no longer collected -- the
+            # "Pre-pasteurization microbial check" box and "Total volume (L)"
+            # field were both removed.
         ],
         "dilution": [
             ("dilution_fill_level_tank_6ab_l", "fillLevelTank6abL", "num"),
