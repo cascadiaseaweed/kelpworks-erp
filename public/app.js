@@ -905,7 +905,10 @@ function buildStackedSelect(options, initialValue, onChange) {
 // section + QC Check subtitle (State.ref.qcFields, in registry order — see
 // QC_FIELD_REGISTRY, kelp_erp_server.py). Editing only happens on the Process
 // Log's own QC Check fields (save_stage) — this modal just displays what's
-// already been recorded there, plus who/when last changed it.
+// already been recorded there, plus who/when last changed it. Labels are
+// rendered as html, not text -- QC_FIELD_REGISTRY is a fixed, code-authored
+// list (never user input), and a couple of labels embed a real <sub> (e.g.
+// "%Moisture<sub>solids</sub>") that plain text would print literally.
 async function openQcForRun(run) {
   const groups = [];
   const seen = new Set();
@@ -934,7 +937,7 @@ async function openQcForRun(run) {
           ? formatQcValue(e.value, qcMaxDecimals(e.unit)) + (e.unit ? ' ' + e.unit : '')
           : 'Not yet recorded';
         box.append(el('div', { class: 'qc-row' },
-          el('span', { class: 'qc-row-label' }, el('b', {}, e.label)),
+          el('span', { class: 'qc-row-label' }, el('b', { html: e.label })),
           el('span', { class: recorded ? 'qc-check-result-value' : 'help' }, valueText),
           recorded ? el('span', { class: 'help' }, (e.recordedBy || 'Unknown') + '  ·  ' + fmtWhen(e.recordedAt)) : null));
       });
@@ -954,11 +957,12 @@ async function openQcForRun(run) {
 // bespoke -- each needs a QC Check/Sample Point card and/or custom per-field
 // placeholders/defaults a generic field-list renderer can't do.
 // Pasteurization: "Start Conditions" groups the stage's process parameters
-// (Total volume (L) was removed), a Sample Point box subtitled
-// "Pre-pasteurization microbial check" follows, then "Pasteurization Out"
-// holds a second, independent Sample Point box subtitled "Post-
-// pasteurization microbial check". Same one-accordion/section-title/
-// single-Save formatting as Extraction/Separation. Pasteurization In's
+// (Total volume (L) was removed); "Pasteurization Out" holds a Sample Point
+// box subtitled "Post-pasteurization microbial check" (the matching
+// "Pre-pasteurization microbial check" box was removed -- its backend column/
+// historical run_sample_points rows stay, additive-only, just no longer
+// collected). Same one-accordion/section-title/single-Save formatting as
+// Extraction/Separation. Pasteurization In's
 // Process Check ("Dilution requirements") also holds the run's TDS target
 // and Tank 6A/B max level (both display-only) and the calculated Target
 // fill level, Tank 6A/B (L) -- same mass-conservation math as
@@ -966,7 +970,7 @@ async function openQcForRun(run) {
 // a getter (not a plain value): a caller with a live-changing SKU (the
 // picker in a draft still being edited) can call the returned `refresh()`
 // again after that changes.
-function buildPasteurizationSection(getRunId, values, samplePoints, processingLot, getTdsTarget) {
+function buildPasteurizationSection(getRunId, values, samplePoints, processingLot, getTdsTarget, getExtractionTds) {
   values = values || {};
   const startedAt = el('input', { type: 'datetime-local', value: values.startedAt || '' });
   const productSetpointInp = el('input', { inputmode: 'decimal', placeholder: 'Product set-point (°C)' }); attachNumericMask(productSetpointInp, 2);
@@ -979,16 +983,32 @@ function buildPasteurizationSection(getRunId, values, samplePoints, processingLo
   // Pasteurization In: a Process Check for the dilution TDS reading used to
   // work out the fill level in Tanks 6A/B, followed by the pre-
   // pasteurization microbial Sample Point.
-  const dilutionTdsInp = el('input', { inputmode: 'decimal', placeholder: 'Used to calculate fill level in Tanks 6A/B' });
-  attachNumericMask(dilutionTdsInp, 1);
-  if (values.tdsPct != null) dilutionTdsInp.value = formatQcValue(values.tdsPct, 1);
+  // TDS concentrated (%) is read-only here -- it always mirrors Extraction's
+  // own QC Check TDS reading, never a separately-typed value. refreshTds()
+  // re-reads getExtractionTds() and is called both on initial render and
+  // externally (refreshExtractionTds, below) right after Extraction's Save
+  // succeeds, so this display updates immediately in the same session --
+  // no reload needed. currentTds is what actually gets snapshotted into
+  // pasteurization_tds_pct on Save (see save(), below).
+  const dilutionTdsValue = el('span', {});
+  let currentTds = null;
+  function refreshTds() {
+    currentTds = getExtractionTds ? getExtractionTds() : null;
+    if (currentTds != null) {
+      dilutionTdsValue.className = 'qc-check-result-value';
+      dilutionTdsValue.textContent = formatQcValue(currentTds, 1) + '%';
+    } else {
+      dilutionTdsValue.className = 'help';
+      dilutionTdsValue.textContent = 'Please enter a %TDS value in Extraction -> QC Check';
+    }
+    refreshDilutionReq();
+  }
   const dilutionReqContent = el('div', {});
   function refreshDilutionReq() {
     dilutionReqContent.innerHTML = '';
-    const tdsIn = dilutionTdsInp.value.trim() === '' ? null : qcParseValue(dilutionTdsInp.value);
     const tdsTarget = getTdsTarget();
     const tankMax = settingValue('dilution_tank_6ab_max_level_l', 5000);
-    const fillLevelRaw = (tdsIn != null && tdsIn > 0 && tdsTarget != null) ? tankMax * tdsTarget / tdsIn : null;
+    const fillLevelRaw = (currentTds != null && currentTds > 0 && tdsTarget != null) ? tankMax * tdsTarget / currentTds : null;
     lastFillLevel = fillLevelRaw != null ? Math.round(fillLevelRaw / 10) * 10 : null;
     dilutionReqContent.append(
       el('div', { class: 'summary-line' },
@@ -1000,20 +1020,11 @@ function buildPasteurizationSection(getRunId, values, samplePoints, processingLo
             : 'Enter the TDS concentrated (%) and select a SKU with a target TDS to calculate')));
   }
   let lastFillLevel = null;
-  dilutionTdsInp.addEventListener('input', refreshDilutionReq);
   const dilutionProcessCheckBox = el('div', { class: 'qc-check-box' },
     el('div', { class: 'qc-check-title' }, 'Process Check'),
     el('div', { class: 'qc-check-subtitle' }, 'Dilution requirements'),
-    field('TDS concentrated (%)', dilutionTdsInp),
+    field('TDS concentrated (%)', dilutionTdsValue),
     dilutionReqContent);
-
-  const preCollectedInp = el('input', { type: 'datetime-local',
-    value: values.preSampleCollectedAt ? values.preSampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
-  const preSamplePointBox = el('div', { class: 'qc-check-box theme-sample' },
-    el('div', { class: 'qc-check-title' }, 'Sample Point'),
-    el('div', { class: 'qc-check-subtitle' }, 'Pre-pasteurization microbial check'),
-    field('Collection date and time', preCollectedInp),
-    buildSamplePointsSection(samplePoints, getRunId, processingLot, () => preCollectedInp.value, 'pasteurization_pre'));
 
   const postCollectedInp = el('input', { type: 'datetime-local',
     value: values.postSampleCollectedAt ? values.postSampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
@@ -1033,16 +1044,16 @@ function buildPasteurizationSection(getRunId, values, samplePoints, processingLo
         startedAt: startedAt.value || null,
         productSetpointC: productSetpointInp.value.trim() === '' ? null : qcParseValue(productSetpointInp.value),
         boilerSetpointC: boilerSetpointInp.value.trim() === '' ? null : qcParseValue(boilerSetpointInp.value),
-        preSampleCollectedAt: preCollectedInp.value || null,
         postSampleCollectedAt: postCollectedInp.value || null,
-        tdsPct: dilutionTdsInp.value.trim() === '' ? null : qcParseValue(dilutionTdsInp.value),
+        tdsPct: currentTds,
       });
       status.textContent = 'Saved.';
     } catch (e) { status.textContent = e.message; }
     saveBtn.disabled = false;
   }
-  refreshDilutionReq();
+  refreshTds();
   return {
+    refreshExtractionTds: refreshTds,
     box: el('details', { class: 'accordion' }, el('summary', {}, 'Pasteurization'),
       el('div', { class: 'accordion-body' },
         el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Start Conditions'),
@@ -1053,13 +1064,22 @@ function buildPasteurizationSection(getRunId, values, samplePoints, processingLo
           field('Product set-point (°C)', productSetpointInp), field('Boiler set-point (°C)', boilerSetpointInp)),
         el('div', { class: 'qc-check-section-title' }, 'Pasteurization In'),
         dilutionProcessCheckBox,
-        preSamplePointBox,
         el('div', { class: 'qc-check-section-title' }, 'Pasteurization Out'),
         postSamplePointBox,
         el('div', { style: 'margin-top:6px' }, saveBtn, status))),
     refresh: refreshDilutionReq,
     getTargetFillLevel: () => lastFillLevel
   };
+}
+// "solids" renders as a subscript -- Unicode has no subscript i/d, so this
+// needs a real <sub>, unlike the H/2 swap above which a plain Unicode
+// subscript digit could handle. Shared by Homogenization/Extraction's Total
+// Solids group (Separation's Solids characterization box has its own two
+// distinctly-subscripted labels -- centrifuge_solids/screw_solids -- not
+// this one). A fresh node is returned each call since a DOM node can't be
+// reused across multiple boxes.
+function moistureSolidsLabel() {
+  return el('span', { html: '%Moisture<sub>solids</sub>' });
 }
 // The "QC Check" card (purple, Liquid + Slurry/Solids readings): shared
 // between Homogenization Output, Extraction Out and Separation Liquid Out
@@ -1077,24 +1097,35 @@ function buildQualityCheckBox(subtitle, values, opts) {
   const mannitolInp = pctInput(); if (values.mannitolPct != null) mannitolInp.value = formatQcValue(values.mannitolPct, 1);
   const tsLiquidInp = pctInput(); if (values.tsLiquidPct != null) tsLiquidInp.value = formatQcValue(values.tsLiquidPct, 1);
   const rhoLiquidInp = densityInput(); if (values.rhoLiquidGMl != null) rhoLiquidInp.value = formatQcValue(values.rhoLiquidGMl, 3);
-  const boxChildren = [
-    el('div', { class: 'qc-check-title' }, 'QC Check'),
-    el('div', { class: 'qc-check-subtitle' }, subtitle),
-    el('div', { class: 'qc-check-section-title' }, 'Liquid'),
-    el('div', { class: 'form-row-compact' },
-      field('pH', qcPhInp), field('TDS (%)', tdsInp), field('Brix (%)', brixInp), field('Mannitol (%)', mannitolInp),
-      field('TSliquid (%)', tsLiquidInp), field('ρliquid (g/mL)', rhoLiquidInp)),
-  ];
   let tsSlurryInp, rhoSlurryInp, tsSolidsInp;
   if (!opts.omitSlurrySolids) {
     tsSlurryInp = pctInput(); if (values.tsSlurryPct != null) tsSlurryInp.value = formatQcValue(values.tsSlurryPct, 1);
     rhoSlurryInp = densityInput(); if (values.rhoSlurryGMl != null) rhoSlurryInp.value = formatQcValue(values.rhoSlurryGMl, 3);
     tsSolidsInp = pctInput(); if (values.tsSolidsPct != null) tsSolidsInp.value = formatQcValue(values.tsSolidsPct, 1);
-    boxChildren.push(
-      el('div', { class: 'qc-check-section-title' }, 'Slurry / Solids'),
-      el('div', { class: 'form-row-compact' },
-        field('TSslurry (%)', tsSlurryInp), field('ρslurry (g/mL)', rhoSlurryInp), field('TSsolids (%)', tsSolidsInp)));
   }
+  // Solids Loading (%) -- Homogenization only (opts.showSolidsLoading), sits
+  // right next to %Moisturesolids in the Total Solids group.
+  let solidsLoadingInp;
+  if (opts.showSolidsLoading) {
+    solidsLoadingInp = pctInput();
+    if (values.solidsLoadingPct != null) solidsLoadingInp.value = formatQcValue(values.solidsLoadingPct, 1);
+  }
+  const boxChildren = [
+    el('div', { class: 'qc-check-title' }, 'QC Check'),
+    el('div', { class: 'qc-check-subtitle' }, subtitle),
+    el('div', { class: 'qc-check-section-title' }, 'Liquid'),
+    el('div', { class: 'form-row-compact' },
+      field('pH', qcPhInp), field('TDS (%)', tdsInp), field('Brix (%)', brixInp), field('Mannitol (%)', mannitolInp)),
+    el('div', { class: 'qc-check-section-title' }, 'Total Solids'),
+    el('div', { class: 'form-row-compact' },
+      field('TSliquid (%)', tsLiquidInp),
+      ...(opts.omitSlurrySolids ? [] : [field('TSslurry (%)', tsSlurryInp), field(moistureSolidsLabel(), tsSolidsInp)]),
+      ...(opts.showSolidsLoading ? [field('Solids Loading (%)', solidsLoadingInp)] : [])),
+    el('div', { class: 'qc-check-section-title' }, 'Density'),
+    el('div', { class: 'form-row-compact' },
+      ...(opts.omitSlurrySolids ? [] : [field('ρslurry (g/mL)', rhoSlurryInp)]),
+      field('ρliquid (g/mL)', rhoLiquidInp)),
+  ];
   const box = el('div', { class: 'qc-check-box theme-quality' }, ...boxChildren);
   function getPayload() {
     const payload = {
@@ -1110,6 +1141,9 @@ function buildQualityCheckBox(subtitle, values, opts) {
       payload.rhoSlurryGMl = rhoSlurryInp.value.trim() === '' ? null : qcParseValue(rhoSlurryInp.value);
       payload.tsSolidsPct = tsSolidsInp.value.trim() === '' ? null : qcParseValue(tsSolidsInp.value);
     }
+    if (opts.showSolidsLoading) {
+      payload.solidsLoadingPct = solidsLoadingInp.value.trim() === '' ? null : qcParseValue(solidsLoadingInp.value);
+    }
     return payload;
   }
   return { box, getPayload };
@@ -1120,7 +1154,7 @@ function buildQualityCheckBox(subtitle, values, opts) {
 // used in Homogenization Output, just under its own subtitle. Bespoke like
 // Homogenization for the same reason -- the generic field-list renderer
 // can't do custom defaults/placeholders or a QC Check card.
-function buildExtractionSection(getRunId, values) {
+function buildExtractionSection(getRunId, values, onSaved) {
   values = values || {};
   const startedAt = el('input', { type: 'datetime-local', value: values.startedAt || '' });
   const amplitudeInp = el('input', { inputmode: 'decimal', placeholder: 'Amplitude (%)' }); attachNumericMask(amplitudeInp, 2);
@@ -1144,14 +1178,21 @@ function buildExtractionSection(getRunId, values) {
     status.textContent = ''; saveBtn.disabled = true;
     try {
       const rid = await getRunId();
-      await api('PUT', '/production/' + rid + '/stages/extraction', {
+      const payload = {
         startedAt: startedAt.value || null,
         amplitudePct: amplitudeInp.value.trim() === '' ? null : qcParseValue(amplitudeInp.value),
         flowrateLpm: flowrateInp.value.trim() === '' ? null : qcParseValue(flowrateInp.value),
         pressurePsi: pressureInp.value.trim() === '' ? null : qcParseValue(pressureInp.value),
         startingPowerW: startingPowerInp.value.trim() === '' ? null : qcParseValue(startingPowerInp.value),
         ...qcCheck.getPayload(),
-      });
+      };
+      await api('PUT', '/production/' + rid + '/stages/extraction', payload);
+      // Keep the shared stages.extraction object (the same object `values`
+      // already is) in sync with what was just saved, then let Pasteurization
+      // know its mirrored TDS display may need to change right now -- not
+      // just next time the modal is reopened.
+      Object.assign(values, payload);
+      if (onSaved) onSaved();
       status.textContent = 'Saved.';
     } catch (e) { status.textContent = e.message; }
     saveBtn.disabled = false;
@@ -1192,15 +1233,22 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot) {
   if (values.wetSolidsWtKg != null) wetSolidsWtInp.value = formatQcValue(values.wetSolidsWtKg, 2);
   const moistureInp = el('input', { inputmode: 'decimal', placeholder: '%' }); attachNumericMask(moistureInp, 1);
   if (values.pctMoisture != null) moistureInp.value = formatQcValue(values.pctMoisture, 1);
+  // Two separate dewatering mechanisms, each with its own moisture reading --
+  // "centrifuge" is the original/existing field (just relabeled), "screw" is
+  // new, on its own line below it (two direct field() children, no
+  // form-row-compact wrapper, so each stacks on its own row).
+  const moistureScrewInp = el('input', { inputmode: 'decimal', placeholder: '%' }); attachNumericMask(moistureScrewInp, 1);
+  if (values.pctMoistureScrew != null) moistureScrewInp.value = formatQcValue(values.pctMoistureScrew, 1);
   const solidsQcBox = el('div', { class: 'qc-check-box theme-quality' },
     el('div', { class: 'qc-check-title' }, 'QC Check'),
     el('div', { class: 'qc-check-subtitle' }, 'Solids characterization'),
-    field('%Moisture', moistureInp));
+    field(el('span', { html: '%Moisture<sub>centrifuge_solids</sub>' }), moistureInp),
+    field(el('span', { html: '%Moisture<sub>screw_solids</sub>' }), moistureScrewInp));
   const solidsCollectedInp = el('input', { type: 'datetime-local',
     value: values.solidsSampleCollectedAt ? values.solidsSampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
   const solidsSamplePointBox = el('div', { class: 'qc-check-box theme-sample' },
     el('div', { class: 'qc-check-title' }, 'Sample Point'),
-    el('div', { class: 'qc-check-subtitle' }, 'Solids Characterization'),
+    el('div', { class: 'qc-check-subtitle' }, 'Separation Characterization'),
     field('Collection date and time', solidsCollectedInp),
     buildSamplePointsSection(samplePoints, getRunId, processingLot, () => solidsCollectedInp.value, 'separation_solids'));
 
@@ -1224,6 +1272,7 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot) {
         meshMicron: meshInp.value.trim() === '' ? null : qcParseValue(meshInp.value),
         wetSolidsWtKg: wetSolidsWtInp.value.trim() === '' ? null : qcParseValue(wetSolidsWtInp.value),
         pctMoisture: moistureInp.value.trim() === '' ? null : qcParseValue(moistureInp.value),
+        pctMoistureScrew: moistureScrewInp.value.trim() === '' ? null : qcParseValue(moistureScrewInp.value),
         liquidQcPh: liquidPayload.qcPh, liquidTdsPct: liquidPayload.tdsPct,
         liquidBrixPct: liquidPayload.brixPct, liquidMannitolPct: liquidPayload.mannitolPct,
         liquidTsLiquidPct: liquidPayload.tsLiquidPct, liquidRhoLiquidGMl: liquidPayload.rhoLiquidGMl,
@@ -1331,7 +1380,7 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
   // QC Check (lot characterization): liquid-phase and slurry/solids-phase
   // readings, each its own compact wrapping row -- shared with Extraction
   // Out, which uses the same card under its own subtitle.
-  const qcCheck = buildQualityCheckBox('Lot characterization', values);
+  const qcCheck = buildQualityCheckBox('Lot characterization', values, { showSolidsLoading: true });
   const qcCheckBox = qcCheck.box;
 
   // Sample Point (lot input): a repeatable table of samples taken at this
@@ -2281,7 +2330,13 @@ async function openRun(draftSummary, opts) {
   const stages = draft?.stages || {};
   const homogenizationSection =
     buildHomogenizationSection(ensureRunId, stages.homogenization, draft?.samplePoints || [], draft?.processingLot);
-  const extractionSection = buildExtractionSection(ensureRunId, stages.extraction);
+  // Extraction's Save needs to tell Pasteurization to refresh its mirrored
+  // TDS display right away -- pasteurizationSection doesn't exist yet at
+  // this point, so the callback looks it up lazily (it's only actually
+  // invoked later, after Save is clicked, by which time it's assigned below).
+  let pasteurizationSectionRef;
+  const extractionSection = buildExtractionSection(ensureRunId, stages.extraction,
+    () => pasteurizationSectionRef?.refreshExtractionTds());
   const separationSection =
     buildSeparationSection(ensureRunId, stages.separation, draft?.samplePoints || [], draft?.processingLot);
   // TDS/pH/Ksorbate targets follow the currently-selected SKU (which can
@@ -2289,7 +2344,9 @@ async function openRun(draftSummary, opts) {
   // panel below.
   const pasteurizationSection = buildPasteurizationSection(
     ensureRunId, stages.pasteurization, draft?.samplePoints || [], draft?.processingLot,
-    () => skus.find(x => x.code === skuSel.value)?.tdsTarget);
+    () => skus.find(x => x.code === skuSel.value)?.tdsTarget,
+    () => stages.extraction?.tdsPct);
+  pasteurizationSectionRef = pasteurizationSection;
   const dilutionSummary = buildDilutionAndPreservativesBox(
     ensureRunId, stages.dilution,
     () => skus.find(x => x.code === skuSel.value)?.phTarget,
@@ -2298,6 +2355,10 @@ async function openRun(draftSummary, opts) {
   const dilutionsSection = buildDilutionsSection(draft?.dilutions || [], ensureRunId);
   const packagingEntriesSection = buildPackagingEntriesSection(draft?.packagingEntries || [], ensureRunId);
   const packagingPackagedInp = el('input', { type: 'datetime-local', value: stages.packaging?.packagedAt || '' });
+  // QC Check + Sample Point ("LKE characterization") moved to the bottom of
+  // Dilution & Preservation -- still packaging-stage columns/endpoints under
+  // the hood (unchanged), just relocated in the UI, so they get their own
+  // Save action separate from packagedAt's.
   const packagingQcCheck = buildQualityCheckBox('LKE characterization', stages.packaging || {}, { omitSlurrySolids: true });
   const packagingSampleCollectedInp = el('input', { type: 'datetime-local',
     value: stages.packaging?.sampleCollectedAt ? stages.packaging.sampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
@@ -2307,6 +2368,21 @@ async function openRun(draftSummary, opts) {
     field('Collection date and time', packagingSampleCollectedInp),
     buildSamplePointsSection(draft?.samplePoints || [], ensureRunId, draft?.processingLot,
       () => packagingSampleCollectedInp.value, 'packaging'));
+  const packagingQcStatus = el('span', { class: 'help' });
+  const packagingQcSaveBtn = el('button', {
+    type: 'button', class: 'secondary', onclick: async () => {
+      packagingQcStatus.textContent = ''; packagingQcSaveBtn.disabled = true;
+      try {
+        const rid = await ensureRunId();
+        await api('PUT', '/production/' + rid + '/stages/packaging', {
+          ...packagingQcCheck.getPayload(),
+          sampleCollectedAt: packagingSampleCollectedInp.value || null,
+        });
+        packagingQcStatus.textContent = 'Saved.';
+      } catch (e) { packagingQcStatus.textContent = e.message; }
+      packagingQcSaveBtn.disabled = false;
+    }
+  }, 'Save');
   const packagingStatus = el('span', { class: 'help' });
   const packagingSaveBtn = el('button', {
     type: 'button', class: 'secondary', onclick: async () => {
@@ -2315,8 +2391,6 @@ async function openRun(draftSummary, opts) {
         const rid = await ensureRunId();
         await api('PUT', '/production/' + rid + '/stages/packaging', {
           packagedAt: packagingPackagedInp.value || null,
-          ...packagingQcCheck.getPayload(),
-          sampleCollectedAt: packagingSampleCollectedInp.value || null,
         });
         packagingStatus.textContent = 'Saved.';
       } catch (e) { packagingStatus.textContent = e.message; }
@@ -2345,13 +2419,15 @@ async function openRun(draftSummary, opts) {
     homogenizationSection, extractionSection, separationSection,
     pasteurizationSection.box,
     el('details', { class: 'accordion' }, el('summary', {}, 'Dilution & Preservation'),
-      el('div', { class: 'accordion-body' }, dilutionSummary.box, dilutionsSection)),
+      el('div', { class: 'accordion-body' },
+        dilutionSummary.box, dilutionsSection,
+        packagingQcCheck.box,
+        packagingSamplePointBox,
+        el('div', { style: 'margin-top:6px' }, packagingQcSaveBtn, packagingQcStatus))),
     el('details', { class: 'accordion' }, el('summary', {}, 'Packaging'),
       el('div', { class: 'accordion-body' },
         field('Packaging date and time', packagingPackagedInp),
         packagingEntriesSection.box,
-        packagingQcCheck.box,
-        packagingSamplePointBox,
         el('div', { style: 'margin-top:6px' }, packagingSaveBtn, packagingStatus))));
   filterTotes();
   renderFeedstockCards();
@@ -2442,14 +2518,20 @@ async function openProcessLog(run) {
   const getRunId = async () => run.id;
   const homogenizationSection =
     buildHomogenizationSection(getRunId, stages.homogenization, run.samplePoints || [], run.processingLot);
-  const extractionSection = buildExtractionSection(getRunId, stages.extraction);
+  // See openRun's identical comment: extractionSection's Save needs to poke
+  // pasteurizationSection, which isn't built yet at this point.
+  let pasteurizationSectionRef;
+  const extractionSection = buildExtractionSection(getRunId, stages.extraction,
+    () => pasteurizationSectionRef?.refreshExtractionTds());
   const separationSection =
     buildSeparationSection(getRunId, stages.separation, run.samplePoints || [], run.processingLot);
   // SKU is fixed once a run is finalized, so TDS/pH/Ksorbate targets need no
   // refresh wiring here.
   const pasteurizationSection = buildPasteurizationSection(
     getRunId, stages.pasteurization, run.samplePoints || [], run.processingLot,
-    () => run.targetTds);
+    () => run.targetTds,
+    () => stages.extraction?.tdsPct);
+  pasteurizationSectionRef = pasteurizationSection;
   const dilutionSummary = buildDilutionAndPreservativesBox(
     getRunId, stages.dilution,
     () => State.ref.skus.find(s => s.code === run.sku)?.phTarget,
@@ -2458,6 +2540,10 @@ async function openProcessLog(run) {
   const dilutionsSection = buildDilutionsSection(run.dilutions || [], getRunId);
   const packagingEntriesSection = buildPackagingEntriesSection(run.packagingEntries || [], getRunId);
   const packagingPackagedInp = el('input', { type: 'datetime-local', value: stages.packaging?.packagedAt || '' });
+  // QC Check + Sample Point ("LKE characterization") moved to the bottom of
+  // Dilution & Preservation -- still packaging-stage columns/endpoints under
+  // the hood (unchanged), just relocated in the UI, so they get their own
+  // Save action separate from packagedAt's.
   const packagingQcCheck = buildQualityCheckBox('LKE characterization', stages.packaging || {}, { omitSlurrySolids: true });
   const packagingSampleCollectedInp = el('input', { type: 'datetime-local',
     value: stages.packaging?.sampleCollectedAt ? stages.packaging.sampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
@@ -2467,6 +2553,21 @@ async function openProcessLog(run) {
     field('Collection date and time', packagingSampleCollectedInp),
     buildSamplePointsSection(run.samplePoints || [], getRunId, run.processingLot,
       () => packagingSampleCollectedInp.value, 'packaging'));
+  const packagingQcStatus = el('span', { class: 'help' });
+  const packagingQcSaveBtn = el('button', {
+    type: 'button', class: 'secondary', onclick: async () => {
+      packagingQcStatus.textContent = ''; packagingQcSaveBtn.disabled = true;
+      try {
+        await api('PUT', '/production/' + run.id + '/stages/packaging', {
+          ...packagingQcCheck.getPayload(),
+          sampleCollectedAt: packagingSampleCollectedInp.value || null,
+        });
+        packagingQcStatus.textContent = 'Saved.';
+      }
+      catch (e) { packagingQcStatus.textContent = e.message; }
+      packagingQcSaveBtn.disabled = false;
+    }
+  }, 'Save');
   const packagingStatus = el('span', { class: 'help' });
   const packagingSaveBtn = el('button', {
     type: 'button', class: 'secondary', onclick: async () => {
@@ -2474,8 +2575,6 @@ async function openProcessLog(run) {
       try {
         await api('PUT', '/production/' + run.id + '/stages/packaging', {
           packagedAt: packagingPackagedInp.value || null,
-          ...packagingQcCheck.getPayload(),
-          sampleCollectedAt: packagingSampleCollectedInp.value || null,
         });
         packagingStatus.textContent = 'Saved.';
       }
@@ -2492,13 +2591,15 @@ async function openProcessLog(run) {
     homogenizationSection, extractionSection, separationSection,
     pasteurizationSection.box,
     el('details', { class: 'accordion' }, el('summary', {}, 'Dilution & Preservation'),
-      el('div', { class: 'accordion-body' }, dilutionSummary.box, dilutionsSection)),
+      el('div', { class: 'accordion-body' },
+        dilutionSummary.box, dilutionsSection,
+        packagingQcCheck.box,
+        packagingSamplePointBox,
+        el('div', { style: 'margin-top:6px' }, packagingQcSaveBtn, packagingQcStatus))),
     el('details', { class: 'accordion' }, el('summary', {}, 'Packaging'),
       el('div', { class: 'accordion-body' },
         field('Packaging date and time', packagingPackagedInp),
         packagingEntriesSection.box,
-        packagingQcCheck.box,
-        packagingSamplePointBox,
         el('div', { style: 'margin-top:6px' }, packagingSaveBtn, packagingStatus))));
 
   modal('Process log — ' + run.processingLot, body, async () => { render(); }, 'Done', { wide: true });
