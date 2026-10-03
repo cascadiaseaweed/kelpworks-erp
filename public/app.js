@@ -97,7 +97,7 @@ async function boot() {
 /* ---------------- Router ---------------- */
 function render() {
   const v = $('#view'); v.innerHTML = '';
-  ({ dashboard: pageDashboard, stabilized: pageStabilized, production: pageProduction,
+  ({ dashboard: pageDashboard, stabilized: pageStabilized, production: pageProduction, cip: pageCIP,
      qc: pageQC, fg: pageFG, shipping: pageShipping, consumables: pageConsumables, reports: pageReports,
      calculations: pageCalculations, labels: pageLabels, admin: pageAdmin }[State.tab])(v);
 }
@@ -110,7 +110,7 @@ async function pageDashboard(v) {
     tile('Stabilized totes', fmt(d.stabilized.totes), 'in stock', true),
     tile('Stabilized kelp', fmt(d.stabilized.kg, 0), 'kg on hand'),
     tile('Finished goods', fmt(d.finishedGoods.litres, 0), 'litres on hand'),
-    tile('Low stock alerts', fmt(d.lowStock.length), 'consumables')
+    tile('Low stock alerts', fmt(d.lowStock.length), 'reagents & packaging')
   ));
   const left = el('div', { class: 'card' }, el('h3', {}, 'Stabilized inventory by species'),
     table(['Species', 'Totes', 'Kg'], d.stabilized.bySpecies.map(r => [speciesName(r.species), fmt(r.totes), num(fmt(r.kg, 0))]), [false, true, true]));
@@ -120,7 +120,7 @@ async function pageDashboard(v) {
   v.append(el('div', { class: 'grid2' }, left, right));
 
   const consRows = d.consumables.map(c => [c.name, fmt(c.onHand, 1) + ' ' + c.unit, badge(c.low ? 'low' : 'ok', c.low ? 'LOW' : 'OK')]);
-  const cons = el('div', { class: 'card' }, el('h3', {}, 'Consumables'), table(['Item', 'On hand', ''], consRows, [false, true, false]));
+  const cons = el('div', { class: 'card' }, el('h3', {}, 'Reagents & packaging'), table(['Item', 'On hand', ''], consRows, [false, true, false]));
   const runRows = d.recentRuns.map(r => [mono(r.processingLot), r.runDate, skuName(r.sku), fmt(r.outputLitres, 0) + ' L']);
   const runs = el('div', { class: 'card' }, el('h3', {}, 'Recent production runs'),
     runRows.length ? table(['Processing lot', 'Date', 'SKU', 'Output'], runRows, [false, false, false, true]) : el('div', { class: 'empty' }, 'No runs yet.'));
@@ -304,7 +304,7 @@ function disposeConsumables(items) {
     field('Reason / description (required)', el('textarea', { id: 'dz_reason', rows: '2', placeholder: 'e.g. expired, spilled, contaminated' })),
     field('Date', el('input', { type: 'date', id: 'dz_date', value: todayStr() })),
     el('h3', { style: 'margin:14px 0 6px;font-size:14px' }, 'Quantities to write off'), grid);
-  modal('Dispose / write off consumables', body, async () => {
+  modal('Dispose / write off items', body, async () => {
     const reason = body.querySelector('#dz_reason').value.trim();
     if (!reason) throw new Error('A reason / description is required.');
     const lines = items.map(c => ({ id: c.id, qty: +qty[c.id].value || 0 })).filter(l => l.qty > 0);
@@ -630,6 +630,7 @@ async function pageProduction(v) {
         sl('Conversion factor', run.inputKg ? (run.outputLitres / run.inputKg).toFixed(2) + ' L/kg' : '—'),
         sl('Target TDS', run.targetTds != null ? run.targetTds + '%' : '—'),
         sl('Citric', fmt(run.citricKg, 1) + ' kg'), sl('Sorbate', fmt(run.sorbateKg, 1) + ' kg'),
+        sl('Na benzoate', fmt(run.nabenzoateKg, 1) + ' kg'),
         sl('New IBCs filled', fmt(run.ibcUsed)), sl('Used IBCs freed', fmt(run.inputTotes.length)),
         sl('Packaged', fgList), run.operators ? sl('Operators', run.operators) : null),
       stageProgress(run),
@@ -712,15 +713,17 @@ async function editRun(run) {
       field('Citric acid (kg)', el('input', { type: 'number', step: '0.1', id: 'e_citric', value: run.citricKg ?? 0 }))),
     el('div', { class: 'form-row' },
       field('Potassium sorbate (kg)', el('input', { type: 'number', step: '0.1', id: 'e_sorbate', value: run.sorbateKg ?? 0 })),
-      field('Production Location', productionLocationSelect('e_loc', run.location))),
+      field('Sodium benzoate (kg)', el('input', { type: 'number', step: '0.1', id: 'e_nabenzoate', value: run.nabenzoateKg ?? 0 }))),
+    field('Production Location', productionLocationSelect('e_loc', run.location)),
     field('Operators', operatorsSelect.el),
     field('Notes', el('textarea', { id: 'e_notes', rows: '2' }, run.notes || '')),
-    el('div', { class: 'help' }, 'Changing citric / sorbate adjusts consumable stock by the difference. Every change is logged with your name.'));
+    el('div', { class: 'help' }, 'These kg totals include what was logged under Dilution & Preservation. Changing citric / sorbate / benzoate adjusts reagent stock by the difference. Every change is logged with your name.'));
   modal('Edit run — ' + run.processingLot, body, async () => {
     const r = await api('PUT', '/production/' + run.id, {
       runDate: body.querySelector('#e_date').value,
       citricKg: body.querySelector('#e_citric').value || 0,
       sorbateKg: body.querySelector('#e_sorbate').value || 0,
+      nabenzoateKg: body.querySelector('#e_nabenzoate').value || 0,
       location: body.querySelector('#e_loc').value,
       operators: operatorsSelect.value,
       notes: body.querySelector('#e_notes').value
@@ -1435,7 +1438,7 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
 const SAMPLE_TYPES = ['Slurry', 'Liquid', 'Solid'];
 const SAMPLE_DESCRIPTIONS = ['Microbial', 'Retention', 'Metals & Nutrients', 'Proximate Analysis', 'R&D', 'Other'];
 // Sample Point container options are the container consumables flagged
-// isSampleContainer (Consumables & Packaging -> Packaging); picking one here
+// isSampleContainer (Inventory Items -> Packaging); picking one here
 // live-adjusts that container's on-hand stock (see update_sample_point).
 function sampleContainerOptions() {
   const names = (State.ref.containers || []).filter(c => c.isSampleContainer).map(c => c.name);
@@ -1539,7 +1542,7 @@ function buildSamplePointsSection(initial, getRunId, processingLot, getCollected
 // box's single "Packaging date and time" applies to the whole table and
 // lives on production_runs (packaging_packaged_at) instead, saved alongside
 // it by the Packaging accordion's own Save button. "Container unit" options
-// are the container consumables (Consumables & Packaging -> Packaging) that
+// are the container consumables (Inventory Items -> Packaging) that
 // have a litres-each value, e.g. IBC = 1000 L. Freely adding/editing/
 // removing rows here never touches container stock by itself -- only
 // clicking the Packaging accordion's own Save button (or finalize) commits
@@ -1890,7 +1893,7 @@ function buildFeedstockCard(opts) {
 // the picker in a draft still being edited) can call `refresh()` again after
 // that changes; `getTargetFillLevel` also changes live as the operator types
 // into Pasteurization In's TDS concentrated (%) field.
-function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsorbateTarget, getTargetFillLevel) {
+function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsorbateTarget, getTargetFillLevel, getNabenzoateTarget) {
   values = values || {};
 
   const fillLevelInp = el('input', { inputmode: 'decimal', placeholder: 'Measured using level sensor' });
@@ -1967,6 +1970,47 @@ function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsor
   ksorbateStockInp.addEventListener('input', () => { refreshKsorbateCalculatedL(); refreshKsorbateAddedKg(); });
   ksorbateAddedLInp.addEventListener('input', refreshKsorbateAddedKg);
 
+  // Sodium benzoate: identical stock-solution mechanics to Ksorbate above --
+  // a stock concentration (w/v), the volume needed to reach the SKU's
+  // Nabenzoate target in the current fill, the volume actually added, and
+  // the resulting kg (which is what Save deducts from Sodium Benzoate stock).
+  const nabenzoateStockInp = el('input', { inputmode: 'decimal', placeholder: '%' }); attachNumericMask(nabenzoateStockInp, 1);
+  nabenzoateStockInp.value = values.nabenzoateStockPct != null ? formatQcValue(values.nabenzoateStockPct, 1)
+    : formatQcValue(settingValue('nabenzoate_stock_concentration_default_pct', 25), 1);
+  const nabenzoateStockField = el('div', { style: 'display:flex;align-items:center;gap:6px' },
+    nabenzoateStockInp, el('span', { class: 'help' }, '%'));
+  const nabenzoateCalculatedLValue = el('span', { class: 'help' });
+  function calcNabenzoateCalculatedL() {
+    const fillLevel = fillLevelInp.value.trim() === '' ? null : qcParseValue(fillLevelInp.value);
+    const stockPct = nabenzoateStockInp.value.trim() === '' ? null : qcParseValue(nabenzoateStockInp.value);
+    const nabenzoateTarget = getNabenzoateTarget ? getNabenzoateTarget() : null;
+    if (fillLevel == null || !stockPct || nabenzoateTarget == null) return null;
+    return fillLevel * nabenzoateTarget * 100 / stockPct;
+  }
+  function refreshNabenzoateCalculatedL() {
+    const v = calcNabenzoateCalculatedL();
+    nabenzoateCalculatedLValue.className = v != null ? 'qc-check-result-value' : 'help';
+    nabenzoateCalculatedLValue.textContent = v != null ? formatQcValue(v, 2) + ' L'
+      : 'Enter the Fill level, Tank 6A/B and Nabenzoate stock concentration, and select a SKU with a Nabenzoate target to calculate';
+  }
+  const nabenzoateAddedLInp = el('input', { inputmode: 'decimal', placeholder: 'L' }); attachNumericMask(nabenzoateAddedLInp, 2);
+  if (values.nabenzoateAddedL != null) nabenzoateAddedLInp.value = formatQcValue(values.nabenzoateAddedL, 2);
+  const nabenzoateAddedKgValue = el('span', { class: 'help' });
+  function calcNabenzoateAddedKg() {
+    const stockPct = nabenzoateStockInp.value.trim() === '' ? null : qcParseValue(nabenzoateStockInp.value);
+    const addedL = nabenzoateAddedLInp.value.trim() === '' ? null : qcParseValue(nabenzoateAddedLInp.value);
+    if (stockPct == null || addedL == null) return null;
+    return addedL * stockPct / 100;
+  }
+  function refreshNabenzoateAddedKg() {
+    const v = calcNabenzoateAddedKg();
+    nabenzoateAddedKgValue.className = v != null ? 'qc-check-result-value' : 'help';
+    nabenzoateAddedKgValue.textContent = v != null ? formatQcValue(v, 2) + ' kg' : 'Enter the stock concentration and volume added to calculate';
+  }
+  fillLevelInp.addEventListener('input', refreshNabenzoateCalculatedL);
+  nabenzoateStockInp.addEventListener('input', () => { refreshNabenzoateCalculatedL(); refreshNabenzoateAddedKg(); });
+  nabenzoateAddedLInp.addEventListener('input', refreshNabenzoateAddedKg);
+
   const status = el('span', { class: 'help' });
   const saveBtn = el('button', { type: 'button', class: 'secondary', onclick: save }, 'Save');
   async function save() {
@@ -1979,6 +2023,8 @@ function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsor
         citricKg: citricInp.value.trim() === '' ? null : qcParseValue(citricInp.value),
         ksorbateStockPct: ksorbateStockInp.value.trim() === '' ? null : qcParseValue(ksorbateStockInp.value),
         ksorbateAddedL: ksorbateAddedLInp.value.trim() === '' ? null : qcParseValue(ksorbateAddedLInp.value),
+        nabenzoateStockPct: nabenzoateStockInp.value.trim() === '' ? null : qcParseValue(nabenzoateStockInp.value),
+        nabenzoateAddedL: nabenzoateAddedLInp.value.trim() === '' ? null : qcParseValue(nabenzoateAddedLInp.value),
       });
       status.textContent = 'Saved.';
     } catch (e) { status.textContent = e.message; }
@@ -1989,6 +2035,8 @@ function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsor
   refreshDilutionWaterAdded();
   refreshKsorbateCalculatedL();
   refreshKsorbateAddedKg();
+  refreshNabenzoateCalculatedL();
+  refreshNabenzoateAddedKg();
   return {
     box: el('div', {},
       el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Dilution'),
@@ -2004,8 +2052,13 @@ function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsor
         field('Ksorbate, calculated (L)', ksorbateCalculatedLValue)),
       field('Ksorbate added (L)', ksorbateAddedLInp),
       field('Ksorbate added (kg)', ksorbateAddedKgValue),
+      el('div', { class: 'form-row' },
+        field('Nabenzoate stock concentration (w/v)', nabenzoateStockField),
+        field('Nabenzoate, calculated (L)', nabenzoateCalculatedLValue)),
+      field('Sodium benzoate added (L)', nabenzoateAddedLInp),
+      field('Sodium benzoate added (kg)', nabenzoateAddedKgValue),
       el('div', { style: 'margin-top:6px' }, saveBtn, status)),
-    refresh: () => { refreshTargetPh(); refreshDilutionWaterAdded(); refreshKsorbateCalculatedL(); }
+    refresh: () => { refreshTargetPh(); refreshDilutionWaterAdded(); refreshKsorbateCalculatedL(); refreshNabenzoateCalculatedL(); }
   };
 }
 // Dilution & Preservation: a run may split its output across several tanks.
@@ -2351,7 +2404,8 @@ async function openRun(draftSummary, opts) {
     ensureRunId, stages.dilution,
     () => skus.find(x => x.code === skuSel.value)?.phTarget,
     () => skus.find(x => x.code === skuSel.value)?.ksorbateTarget,
-    () => pasteurizationSection.getTargetFillLevel());
+    () => pasteurizationSection.getTargetFillLevel(),
+    () => skus.find(x => x.code === skuSel.value)?.nabenzoateTarget);
   const dilutionsSection = buildDilutionsSection(draft?.dilutions || [], ensureRunId);
   const packagingEntriesSection = buildPackagingEntriesSection(draft?.packagingEntries || [], ensureRunId);
   const packagingPackagedInp = el('input', { type: 'datetime-local', value: stages.packaging?.packagedAt || '' });
@@ -2536,7 +2590,8 @@ async function openProcessLog(run) {
     getRunId, stages.dilution,
     () => State.ref.skus.find(s => s.code === run.sku)?.phTarget,
     () => State.ref.skus.find(s => s.code === run.sku)?.ksorbateTarget,
-    () => pasteurizationSection.getTargetFillLevel());
+    () => pasteurizationSection.getTargetFillLevel(),
+    () => State.ref.skus.find(s => s.code === run.sku)?.nabenzoateTarget);
   const dilutionsSection = buildDilutionsSection(run.dilutions || [], getRunId);
   const packagingEntriesSection = buildPackagingEntriesSection(run.packagingEntries || [], getRunId);
   const packagingPackagedInp = el('input', { type: 'datetime-local', value: stages.packaging?.packagedAt || '' });
@@ -2884,11 +2939,178 @@ function custForm(c, after) {
   }, 'Save');
 }
 
-/* ---------------- Consumables ---------------- */
+/* ---------------- CIP (Clean In Place) log ---------------- */
+// One record per cleaning event; the chemical lines on it are what deduct the
+// CIP agents' stock (backend _apply_cip_stock), so this log is the single
+// source of truth for both the cleaning record and reagent consumption.
+const CIP_EQUIPMENT = ['Homogenization / Tank 2A/B', 'Extraction', 'Separation', 'Pasteurization',
+  'Tank 5A/B', 'Tank 6A/B', 'Packaging / filling'];
+const CIP_PURPOSES = ['Post-run', 'Pre-run', 'Changeover', 'Scheduled', 'Other'];
+function cipWhen(s) { return s ? s.replace('T', ' ').slice(0, 16) : '—'; }
+// Duration (min) = End - Start (see CALCULATIONS); blank until both are set.
+function cipDurationMin(e) {
+  if (!e.startedAt || !e.endedAt) return null;
+  const m = Math.round((new Date(e.endedAt) - new Date(e.startedAt)) / 60000);
+  return Number.isNaN(m) || m < 0 ? null : m;
+}
+function cipDurationText(e) {
+  const m = cipDurationMin(e);
+  return m == null ? '—' : (m >= 60 ? Math.floor(m / 60) + ' h ' + (m % 60) + ' min' : m + ' min');
+}
+function cipChemicalsText(e) {
+  return (e.chemicals || []).map(c => c.name.replace(/^CIP /, '') + ' ' + fmt(c.qty, 2) + ' ' + c.unit).join(' · ') || '—';
+}
+async function pageCIP(v) {
+  const isAdmin = State.user.role === 'admin';
+  let events = [];
+  v.append(el('div', { class: 'page-head' }, el('h2', {}, 'CIP Log'),
+    el('div', { class: 'actions' }, el('button', { onclick: () => openCipModal(null, events) }, '+ Log CIP'))));
+  events = (await api('GET', '/cip')).events;
+  v.append(el('div', { class: 'help', style: 'margin-bottom:10px' },
+    'Every Clean In Place on the plant’s equipment. The chemicals logged here are deducted from the CIP agents in Inventory Items.'));
+  const lastHost = el('div', {});
+  const search = el('input', { placeholder: 'Filter by ref, equipment, chemical, operator or run…', style: 'max-width:340px' });
+  const eqSel = el('select', {});
+  const listHost = el('div', {});
+  v.append(lastHost,
+    el('div', { class: 'form-row', style: 'margin:14px 0 8px' }, field('Search', search), field('Equipment', eqSel)),
+    listHost);
+
+  // Last cleaned, one row per equipment (the standard areas even if never
+  // cleaned yet, so a gap is visible at a glance).
+  function drawLast() {
+    const latest = new Map();   // events are newest-first, so first seen = last cleaned
+    events.forEach(e => { if (!latest.has(e.equipment)) latest.set(e.equipment, e); });
+    const names = [...CIP_EQUIPMENT, ...[...latest.keys()].filter(n => !CIP_EQUIPMENT.includes(n))];
+    lastHost.innerHTML = '';
+    lastHost.append(el('div', { class: 'card' }, el('h3', {}, 'Last cleaned'),
+      table(['Equipment', 'Last cleaned', 'Days since', 'Result', 'By'],
+        names.map(n => {
+          const e = latest.get(n);
+          if (!e) return [n, el('span', { class: 'muted' }, 'Never logged'), '—', '—', '—'];
+          const days = Math.max(0, Math.floor((Date.now() - new Date(e.startedAt)) / 86400000));
+          return [n, cipWhen(e.startedAt), String(days),
+            e.result ? badge(e.result === 'pass' ? 'ok' : 'low', e.result.toUpperCase()) : '—',
+            e.createdBy || '—'];
+        }), [false, false, true, false, false])));
+  }
+  function drawEqOptions() {
+    const names = [...new Set(events.map(e => e.equipment))].sort();
+    const cur = eqSel.value;
+    eqSel.innerHTML = '';
+    eqSel.append(el('option', { value: '' }, 'All equipment'), ...names.map(n => el('option', { value: n }, n)));
+    eqSel.value = names.includes(cur) ? cur : '';
+  }
+  function drawList() {
+    const q = search.value.trim().toLowerCase();
+    const rows = events.filter(e => (!eqSel.value || e.equipment === eqSel.value) && (!q ||
+      [e.ref, e.equipment, e.purpose, e.operators, e.processingLot, cipChemicalsText(e)].join(' ').toLowerCase().includes(q)));
+    listHost.innerHTML = '';
+    if (!rows.length) {
+      listHost.append(el('div', { class: 'empty card' }, events.length ? 'No CIP entries match that filter.'
+        : 'No CIP cleanings logged yet. Click “+ Log CIP” to record one.'));
+      return;
+    }
+    listHost.append(table(['Ref', 'Started', 'Duration', 'Equipment', 'Purpose', 'Chemicals used', 'Result', 'Operators', 'Run', ''],
+      rows.map(e => [mono(e.ref), cipWhen(e.startedAt), cipDurationText(e), e.equipment, e.purpose || '—',
+        cipChemicalsText(e),
+        e.result ? badge(e.result === 'pass' ? 'ok' : 'low', e.result.toUpperCase()) : '—',
+        e.operators || '—', e.processingLot ? mono(e.processingLot) : '—',
+        rowActions([['Edit', () => openCipModal(e, events)],
+          isAdmin ? ['Delete', async () => {
+            if (!confirm('Delete ' + e.ref + '? Its chemicals are refunded to stock.')) return;
+            await api('DELETE', '/cip/' + e.id);
+            toast('CIP entry deleted'); render();
+          }, 'danger'] : null])]),
+      [false, false, false, false, false, false, false, false, false, false]));
+  }
+  search.addEventListener('input', drawList);
+  eqSel.addEventListener('change', drawList);
+  drawLast(); drawEqOptions(); drawList();
+}
+// Create (ev == null) or edit a CIP entry. Chemical lines are edited in the
+// form and saved together with the rest in the one submit.
+async function openCipModal(ev, events) {
+  const agents = (await api('GET', '/consumables')).consumables.filter(c => c.isCipAgent);
+  const runs = (await api('GET', '/production')).runs.slice(0, 40);
+  const nowLocal = new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  const startedInp = el('input', { type: 'datetime-local', value: ev ? (ev.startedAt || '').slice(0, 16) : nowLocal });
+  const endedInp = el('input', { type: 'datetime-local', value: ev ? (ev.endedAt || '').slice(0, 16) : '' });
+  const eqNames = [...new Set([...CIP_EQUIPMENT, ...(events || []).map(e => e.equipment)])];
+  const eqField = editableSelect(eqNames.map(n => [n]), 'cip_eq');
+  const purposeSel = selectFrom('', [['', '—'], ...CIP_PURPOSES.map(p => [p, p])]);
+  purposeSel.value = ev?.purpose || '';
+  const operatorsSelect = buildOperatorsSelect(ev?.operators || '');
+  const runSel = selectFrom('', [['', 'None'], ...runs.map(r => [String(r.id), r.processingLot + ' — ' + skuName(r.sku) + ' (' + r.runDate + ')'])]);
+  runSel.value = ev?.runId ? String(ev.runId) : '';
+  const resultSel = selectFrom('', [['', '—'], ['pass', 'Pass'], ['fail', 'Fail']]);
+  resultSel.value = ev?.result || '';
+  const notesInp = el('textarea', { rows: '2', placeholder: 'Optional notes' }, ev?.notes || '');
+
+  const rowsHost = el('div', {});
+  const rowCtls = [];
+  function numInp(ph, val, dec) {
+    const i = el('input', { inputmode: 'decimal', placeholder: ph }); attachNumericMask(i, dec);
+    if (val != null) i.value = formatQcValue(val, dec);
+    return i;
+  }
+  function addRow(line) {
+    const sel = selectFrom('', agents.map(a => [String(a.id), a.name + ' (' + fmt(a.onHand, 1) + ' ' + a.unit + ' on hand)']));
+    if (line) sel.value = String(line.consumableId);
+    const ctl = { sel, qty: numInp('L', line?.qty, 2), conc: numInp('%', line?.concentrationPct, 2),
+      temp: numInp('°C', line?.tempC, 1), contact: numInp('min', line?.contactMin, 1) };
+    // Agent gets its own full-width line (its label includes the on-hand
+    // count, too long for the compact 108px fields); the readings sit below.
+    const row = el('div', { class: 'qc-check-box', style: 'margin:6px 0' },
+      field('CIP agent', sel),
+      el('div', { class: 'form-row-compact' },
+        field('Qty (L)', ctl.qty), field('Conc. (%)', ctl.conc),
+        field('Temp (°C)', ctl.temp), field('Contact (min)', ctl.contact)),
+      el('button', { type: 'button', class: 'icon-btn remove', title: 'Remove chemical', onclick: () => {
+        row.remove(); rowCtls.splice(rowCtls.indexOf(ctl), 1);
+      } }, '−'));
+    rowCtls.push(ctl); rowsHost.append(row);
+  }
+  (ev?.chemicals || []).forEach(addRow);
+
+  const body = el('div', {},
+    el('div', { class: 'form-row' }, field('Started', startedInp), field('Ended', endedInp)),
+    el('div', { class: 'form-row' }, field('Equipment cleaned', eqField), field('Purpose', purposeSel)),
+    el('div', { class: 'form-row' }, field('Operators', operatorsSelect.el), field('Linked production run (optional)', runSel)),
+    el('div', { class: 'qc-check-section-title' }, 'Chemicals used'),
+    agents.length ? rowsHost : el('div', { class: 'help' }, 'No CIP agents are set up -- an admin can add one under Inventory Items.'),
+    agents.length ? el('div', { style: 'margin:6px 0 10px' },
+      el('button', { type: 'button', class: 'icon-btn add', title: 'Add chemical', onclick: () => addRow(null) }, '+')) : null,
+    el('div', { class: 'qc-check-section-title' }, 'Final-rinse verification'),
+    field('Result', resultSel),
+    field('Notes', notesInp));
+  body.querySelector('#cip_eq').value = ev?.equipment || '';
+  modal(ev ? 'Edit CIP — ' + ev.ref : 'Log CIP', body, async () => {
+    const chemicals = rowCtls.filter(c => c.qty.value.trim() !== '').map(c => ({
+      consumableId: +c.sel.value, qty: qcParseValue(c.qty.value),
+      concentrationPct: c.conc.value.trim() === '' ? null : qcParseValue(c.conc.value),
+      tempC: c.temp.value.trim() === '' ? null : qcParseValue(c.temp.value),
+      contactMin: c.contact.value.trim() === '' ? null : qcParseValue(c.contact.value) }));
+    const payload = {
+      startedAt: startedInp.value, endedAt: endedInp.value || null,
+      equipment: body.querySelector('#cip_eq').value, purpose: purposeSel.value || null,
+      operators: operatorsSelect.value, runId: runSel.value || null, chemicals,
+      result: resultSel.value || null, notes: notesInp.value };
+    const r = ev ? await api('PUT', '/cip/' + ev.id, payload) : await api('POST', '/cip', payload);
+    if (r.warnings && r.warnings.length) toast(r.warnings.join(' · '), true);
+    else toast(ev ? 'CIP entry updated' : 'CIP logged');
+    render();
+  }, ev ? 'Save changes' : 'Log CIP', { wide: true });
+}
+
+/* ---------------- Reagents, packaging & finished-good labels ---------------- */
+// (Internally still "consumables" -- table, route, tab key -- only the
+// user-facing wording changed.) Three groups share the one inventory table:
+// reagents (neither a container nor a label), packaging (isContainer) and
+// finished-good labels (labelSku set -- one item per SKU + package type).
 async function pageConsumables(v) {
   const isAdmin = State.user.role === 'admin';
-  v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Consumables & Packaging'),
-    el('div', { class: 'actions' }, el('button', { onclick: addConsumable }, '+ Add item'))));
+  v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Inventory Items')));
   const r = await api('GET', '/consumables');
   const bulkBar = el('div', { class: 'bulkbar hidden' });
   const host = el('div', {});
@@ -2910,30 +3132,35 @@ async function pageConsumables(v) {
       items.forEach(c => allCb.checked ? selected.add(c.id) : selected.delete(c.id)); draw();
     } });
     allCb.checked = items.length > 0 && items.every(c => selected.has(c.id));
-    const headers = [allCb, 'Item'];
-    const bools = [false, false];
+    const headers = [allCb, 'Item #', 'Item'];
+    const bools = [false, false, false];
     if (opts.showVolume) { headers.push('Volume (L)'); bools.push(true); }
+    if (opts.showLabelMap) { headers.push('SKU', 'Package'); bools.push(false, false); }
     headers.push('Location', 'On hand', 'Reorder at', 'Cost/unit', '', 'Actions');
     bools.push(false, true, true, true, false, false);
     return table(headers, items.map(c => {
-      const row = [rowCheck(c, selected, updateBulk), c.name];
+      const row = [rowCheck(c, selected, updateBulk), c.itemNumber || '—', c.name];
       if (opts.showVolume) row.push(c.litresEach != null ? fmt(c.litresEach, c.litresEach % 1 ? 2 : 0) : '—');
-      // Packaging items are counted in whole units (totes, bottles, ...),
-      // so their on-hand quantity displays with no decimals; general
-      // consumables (kg of Citric Acid, etc.) keep their fractional display.
-      row.push(c.location || '—', fmt(c.onHand, opts.showVolume ? 0 : 1) + ' ' + c.unit, fmt(c.reorderLevel, 1),
+      if (opts.showLabelMap) row.push(skuName(c.labelSku), c.labelPackage || '—');
+      // Packaging items and labels are counted in whole units (totes,
+      // bottles, labels ...), so their on-hand quantity displays with no
+      // decimals; reagents (kg of Citric Acid, etc.) keep their fractional display.
+      row.push(c.location || '—', fmt(c.onHand, opts.wholeUnits ? 0 : 1) + ' ' + c.unit, fmt(c.reorderLevel, 1),
         c.costPerUnit != null ? '$' + fmt(c.costPerUnit, 2) : '—',
         badge(c.low ? 'low' : 'ok', c.low ? 'LOW' : 'OK'),
         rowActions([['Receive', () => adjustC(c, 1)], ['Use', () => adjustC(c, -1)],
           ['Dispose', () => disposeConsumables([c]), 'danger'], ['Edit', () => editC(c)]]));
       return row;
-    }), bools, opts.showVolume ? (ri => showConsumableHistory(items[ri])) : null);
+    }), bools, opts.history ? (ri => showConsumableHistory(items[ri])) : null);
   }
   function draw() {
     host.innerHTML = '';
-    const general = r.consumables.filter(c => !c.isContainer);
+    const labels = r.consumables.filter(c => c.labelSku);
     const containers = r.consumables.filter(c => c.isContainer);
-    host.append(itemsTable(general));
+    const reagents = r.consumables.filter(c => !c.isContainer && !c.labelSku);
+    host.append(el('div', { class: 'page-head' }, el('h2', {}, 'Reagents'),
+      el('div', { class: 'actions' }, el('button', { onclick: addConsumable }, '+ Add reagent'))));
+    host.append(itemsTable(reagents));
     host.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Packaging'),
       el('div', { class: 'actions' },
         isAdmin ? el('button', { class: 'secondary', onclick: openContainerBulkImport }, '📤 Bulk import CSV') : null,
@@ -2942,7 +3169,16 @@ async function pageConsumables(v) {
       'Every container Production uses -- Packaging table output units and Sample Point vessels alike -- with its own on-hand inventory. '
       + (isAdmin ? 'Only an admin can bulk-upload counts or add a new container type; anyone can receive/use/edit an existing one.'
         : 'Ask an admin to bulk-upload counts or add a new container type.')));
-    host.append(itemsTable(containers, { showVolume: true }));
+    host.append(itemsTable(containers, { showVolume: true, wholeUnits: true, history: true }));
+    // Finished-good labels are the physical labels stuck on each finished
+    // package -- not the internal barcode labels printed from the Labels tab.
+    host.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Finished-good labels'),
+      el('div', { class: 'actions' },
+        isAdmin ? el('button', { onclick: addFgLabel }, '+ Add FG label') : null)));
+    host.append(el('div', { class: 'help', style: 'margin-bottom:10px' },
+      'One label item per product SKU + package type, with its own on-hand inventory. Finalizing a production run deducts one label per finished unit '
+      + 'from the matching item. ' + (isAdmin ? '' : 'Ask an admin to add a new FG label.')));
+    host.append(itemsTable(labels, { showLabelMap: true, wholeUnits: true, history: true }));
     updateBulk();
   }
   draw();
@@ -2967,6 +3203,7 @@ function editC(c) {
   const sampleCb = c.isContainer ? el('input', { type: 'checkbox' }) : null;
   if (sampleCb) sampleCb.checked = !!c.isSampleContainer;
   const body = el('div', {},
+    field('Item #', el('input', { id: 'c_itemno', value: c.itemNumber ?? '', placeholder: 'optional stock / part number' })),
     el('div', { class: 'form-row' },
       field('Reorder level', el('input', { type: 'number', id: 'c_re', value: c.reorderLevel, step: '0.1' })),
       field('Cost per unit', el('input', { type: 'number', id: 'c_cost', value: c.costPerUnit ?? '', step: '0.01' }))),
@@ -2976,7 +3213,8 @@ function editC(c) {
       field('Used for Sample Point', sampleCb)) : null);
   body.querySelector('#c_loc').value = c.location || '';
   modal('Edit ' + c.name, body, async () => {
-    const payload = { reorderLevel: +body.querySelector('#c_re').value, costPerUnit: body.querySelector('#c_cost').value || null, location: body.querySelector('#c_loc').value };
+    const payload = { reorderLevel: +body.querySelector('#c_re').value, costPerUnit: body.querySelector('#c_cost').value || null, location: body.querySelector('#c_loc').value,
+      itemNumber: body.querySelector('#c_itemno').value };
     if (c.isContainer) {
       payload.litresEach = litresInp.value.trim() === '' ? null : +litresInp.value;
       payload.isSampleContainer = sampleCb.checked;
@@ -3014,14 +3252,19 @@ async function showConsumableHistory(c) {
 }
 function addConsumable() {
   const locs = State.ref.locations.map(l => [l, l]);
+  // Admin-only: a CIP cleaning agent is offered on CIP Log chemical lines.
+  const cipCb = State.user.role === 'admin' ? el('input', { type: 'checkbox' }) : null;
   const body = el('div', {},
     el('div', { class: 'form-row' }, field('Name', el('input', { id: 'n_name' })), field('Unit', el('input', { id: 'n_unit', value: 'kg' }))),
+    field('Item #', el('input', { id: 'n_itemno', placeholder: 'optional stock / part number' })),
     el('div', { class: 'form-row' }, field('On hand', el('input', { type: 'number', id: 'n_oh', value: '0' })),
       field('Reorder level', el('input', { type: 'number', id: 'n_re', value: '0' }))),
     el('div', { class: 'form-row' }, field('Cost per unit', el('input', { type: 'number', id: 'n_cost', step: '0.01' })),
-      field('Warehouse location', editableSelect(locs, 'n_loc'))));
-  modal('Add consumable', body, async () => {
-    await api('POST', '/consumables', { name: body.querySelector('#n_name').value, unit: body.querySelector('#n_unit').value, onHand: +body.querySelector('#n_oh').value, reorderLevel: +body.querySelector('#n_re').value, costPerUnit: body.querySelector('#n_cost').value || null, location: body.querySelector('#n_loc').value });
+      field('Warehouse location', editableSelect(locs, 'n_loc'))),
+    cipCb ? field('CIP cleaning agent (offered on CIP Log lines)', cipCb) : null);
+  modal('Add reagent', body, async () => {
+    await api('POST', '/consumables', { name: body.querySelector('#n_name').value, unit: body.querySelector('#n_unit').value, onHand: +body.querySelector('#n_oh').value, reorderLevel: +body.querySelector('#n_re').value, costPerUnit: body.querySelector('#n_cost').value || null, location: body.querySelector('#n_loc').value,
+      itemNumber: body.querySelector('#n_itemno').value, isCipAgent: cipCb ? cipCb.checked : false });
     State.ref = await api('GET', '/refdata');
     toast('Added'); render();
   }, 'Add');
@@ -3036,6 +3279,7 @@ function addContainerType() {
   const body = el('div', {},
     el('div', { class: 'form-row' }, field('Name', el('input', { id: 'n_name', placeholder: 'e.g. 4 L' })),
       field('Unit', el('input', { id: 'n_unit', value: 'ea' }))),
+    field('Item #', el('input', { id: 'n_itemno', placeholder: 'optional stock / part number' })),
     el('div', { class: 'form-row' }, field('On hand', el('input', { type: 'number', id: 'n_oh', value: '0' })),
       field('Reorder level', el('input', { type: 'number', id: 'n_re', value: '0' }))),
     el('div', { class: 'form-row' }, field('Cost per unit', el('input', { type: 'number', id: 'n_cost', step: '0.01' })),
@@ -3048,10 +3292,37 @@ function addContainerType() {
       onHand: +body.querySelector('#n_oh').value, reorderLevel: +body.querySelector('#n_re').value,
       costPerUnit: body.querySelector('#n_cost').value || null, location: body.querySelector('#n_loc').value,
       isContainer: true, litresEach: litresInp.value.trim() === '' ? null : +litresInp.value,
-      isSampleContainer: sampleCb.checked
+      isSampleContainer: sampleCb.checked, itemNumber: body.querySelector('#n_itemno').value
     });
     State.ref = await api('GET', '/refdata');
     toast('Container type added'); render();
+  }, 'Add');
+}
+// Admin-only: a finished-good label item, mapped to one product SKU + one
+// package type (a packaging container with a volume). Named automatically
+// ("FG Label - <SKU> - <package>"); deducted 1 per finished unit when a run
+// is finalized. Unrelated to the Labels tab (internal barcode printing).
+function addFgLabel() {
+  const locs = State.ref.locations.map(l => [l, l]);
+  const skuSel = selectFrom('', (State.ref.skus || []).filter(s => s.active).map(s => [s.code, s.name]));
+  const pkgSel = selectFrom('', (State.ref.containers || []).filter(c => c.litresEach != null).map(c => [c.name, c.name]));
+  const body = el('div', {},
+    el('div', { class: 'form-row' }, field('Product SKU', skuSel), field('Package type', pkgSel)),
+    field('Item #', el('input', { id: 'n_itemno', placeholder: 'optional stock / part number' })),
+    el('div', { class: 'form-row' }, field('On hand', el('input', { type: 'number', id: 'n_oh', value: '0' })),
+      field('Reorder level', el('input', { type: 'number', id: 'n_re', value: '0' }))),
+    el('div', { class: 'form-row' }, field('Cost per unit', el('input', { type: 'number', id: 'n_cost', step: '0.01' })),
+      field('Warehouse location', editableSelect(locs, 'n_loc'))),
+    el('div', { class: 'help' }, 'One label item per SKU + package type. Counted in labels (ea).'));
+  modal('Add finished-good label', body, async () => {
+    await api('POST', '/consumables', {
+      labelSku: skuSel.value, labelPackage: pkgSel.value,
+      onHand: +body.querySelector('#n_oh').value, reorderLevel: +body.querySelector('#n_re').value,
+      costPerUnit: body.querySelector('#n_cost').value || null, location: body.querySelector('#n_loc').value,
+      itemNumber: body.querySelector('#n_itemno').value
+    });
+    State.ref = await api('GET', '/refdata');
+    toast('FG label added'); render();
   }, 'Add');
 }
 // Admin-only bulk stock-count import (e.g. after a physical stocktake) --
@@ -3076,7 +3347,7 @@ function openContainerBulkImport() {
   });
   const body = el('div', {},
     el('div', { class: 'help' },
-      'Set an absolute on-hand count for many consumables/containers at once, by name — e.g. after a physical stocktake. Download the template, fill it in, then upload it here.'),
+      'Set an absolute on-hand count for many reagents/containers/labels at once, by name — e.g. after a physical stocktake. Download the template, fill it in, then upload it here.'),
     el('div', { style: 'margin:10px 0' },
       el('a', { href: 'templates/consumables_bulk_import_template.csv', download: 'consumables_bulk_import_template.csv' },
         '⬇ Download CSV template')),
@@ -3094,6 +3365,11 @@ function openContainerBulkImport() {
 }
 
 /* ---------------- Reports ---------------- */
+// disposals.entity_type is stored as 'tote' | 'fg' | 'consumable' (the table
+// keeps its original name) -- show a readable label instead of the raw value.
+function disposalTypeLabel(t) {
+  return { tote: 'Tote', fg: 'Finished good', consumable: 'Reagent / packaging' }[t] || t;
+}
 function monthLabel(m) {
   const [y, mo] = m.split('-');
   return new Date(y, mo - 1, 1).toLocaleString(undefined, { month: 'long', year: 'numeric' });
@@ -3158,7 +3434,8 @@ function renderReport(host, d) {
       sl('Runs', fmt(pr.runs)), sl('Input', fmt(pr.inputKg, 0) + ' kg'),
       sl('Output', fmt(pr.outputLitres, 0) + ' L'),
       sl('Yield', pr.yield != null ? pr.yield.toFixed(2) + ' L/kg' : '—'),
-      sl('Citric', fmt(pr.citricKg, 1) + ' kg'), sl('Sorbate', fmt(pr.sorbateKg, 1) + ' kg')),
+      sl('Citric', fmt(pr.citricKg, 1) + ' kg'), sl('Sorbate', fmt(pr.sorbateKg, 1) + ' kg'),
+      sl('Na benzoate', fmt(pr.nabenzoateKg, 1) + ' kg')),
     pr.bySku.length ? table(['SKU', 'Runs', 'Litres produced'],
       pr.bySku.map(r => [skuName(r.sku), fmt(r.runs), num(fmt(r.litres, 0))]), [false, true, true],
       i => openLedger('sku', pr.bySku[i].sku)) : null));
@@ -3172,10 +3449,10 @@ function renderReport(host, d) {
         i => openLedger('sku', fg.onHand[i].sku)))));
 
   host.append(el('div', { class: 'grid2' },
-    el('div', { class: 'card' }, el('h3', {}, 'Consumables — received / used (' + d.period + ')'),
+    el('div', { class: 'card' }, el('h3', {}, 'Reagents — received / used (' + d.period + ')'),
       table(['Item', 'Received', 'Used'], d.consumables.inMonth.map(r => [r.name + ' (' + r.unit + ')', num(fmt(r.received, 1)), num(fmt(r.used, 1))]), [false, true, true],
         i => openLedger('consumable', d.consumables.inMonth[i].name))),
-    el('div', { class: 'card' }, el('h3', {}, 'Consumables on hand — ' + d.asOf),
+    el('div', { class: 'card' }, el('h3', {}, 'Reagents on hand — ' + d.asOf),
       table(['Item', 'On hand'], d.consumables.onHand.map(r => [r.name, fmt(r.onHand, 1) + ' ' + r.unit]), [false, true],
         i => openLedger('consumable', d.consumables.onHand[i].name)))));
 
@@ -3187,7 +3464,7 @@ function renderReport(host, d) {
       el('div', { class: 'card' }, el('h3', {}, 'Finished goods by location'),
         table(['Location', 'Units', 'Litres'], bl.finishedGoods.map(r => [r.location, fmt(r.units), num(fmt(r.litres, 0))]), [false, true, true]))));
     host.append(el('div', { class: 'card' },
-      el('h3', {}, 'Consumables / packaging by location'),
+      el('h3', {}, 'Reagents / packaging by location'),
       el('div', { class: 'help', style: 'margin:-6px 0 8px' }, 'Current on-hand location of inventory.'),
       table(['Location', 'Item', 'On hand'], bl.consumables.map(r => [r.location, r.name, fmt(r.onHand, 1) + ' ' + r.unit]), [false, false, true],
         i => openLedger('consumable', bl.consumables[i].name))));
@@ -3199,10 +3476,10 @@ function renderReport(host, d) {
       el('div', { class: 'summary-line' },
         sl('Totes', fmt(dz.totes) + ' (' + fmt(dz.toteKg, 0) + ' kg)'),
         sl('FG lots', fmt(dz.fgLots) + ' (' + fmt(dz.fgLitres, 0) + ' L)'),
-        sl('Consumable write-offs', fmt(dz.consumableEvents))),
+        sl('Reagent / packaging write-offs', fmt(dz.consumableEvents))),
       (dz.lines && dz.lines.length)
         ? table(['Date', 'Type', 'Item', 'Qty', 'Reason', 'By'],
-          dz.lines.map(l => [l.date, l.type, mono(l.ref), fmt(l.qty, 1) + ' ' + (l.unit || ''), l.reason, l.by || '—']),
+          dz.lines.map(l => [l.date, disposalTypeLabel(l.type), mono(l.ref), fmt(l.qty, 1) + ' ' + (l.unit || ''), l.reason, l.by || '—']),
           [false, false, false, true, false, false])
         : el('div', { class: 'help' }, 'No write-offs this month.')));
   }
@@ -3235,12 +3512,12 @@ function printReport(d) {
     ${sec('Production by SKU', ['SKU', 'Runs', 'Litres'], d.production.bySku.map(r => [skuName(r.sku), fmt(r.runs), fmt(r.litres, 0)]), [0, 1, 1])}
     ${sec('Finished goods shipped by customer', ['Customer', 'Units', 'Litres'], d.finishedGoods.shippedByCustomer.map(r => [r.customer, fmt(r.units), fmt(r.litres, 0)]), [0, 1, 1])}
     ${sec('Finished goods on hand (' + d.asOf + ')', ['SKU', 'Litres'], d.finishedGoods.onHand.map(r => [skuName(r.sku), fmt(r.litres, 0)]), [0, 1])}
-    ${sec('Consumables received / used', ['Item', 'Received', 'Used'], d.consumables.inMonth.map(r => [r.name + ' (' + r.unit + ')', fmt(r.received, 1), fmt(r.used, 1)]), [0, 1, 1])}
-    ${sec('Consumables on hand (' + d.asOf + ')', ['Item', 'On hand'], d.consumables.onHand.map(r => [r.name, fmt(r.onHand, 1) + ' ' + r.unit]), [0, 0])}
+    ${sec('Reagents received / used',['Item', 'Received', 'Used'], d.consumables.inMonth.map(r => [r.name + ' (' + r.unit + ')', fmt(r.received, 1), fmt(r.used, 1)]), [0, 1, 1])}
+    ${sec('Reagents on hand (' + d.asOf + ')', ['Item', 'On hand'], d.consumables.onHand.map(r => [r.name, fmt(r.onHand, 1) + ' ' + r.unit]), [0, 0])}
     ${sec('Stabilized by location (current)', ['Location', 'Totes', 'Kg'], (d.byLocation && d.byLocation.stabilized || []).map(r => [r.location, fmt(r.totes), fmt(r.kg, 0)]), [0, 1, 1])}
     ${sec('Finished goods by location (current)', ['Location', 'Units', 'Litres'], (d.byLocation && d.byLocation.finishedGoods || []).map(r => [r.location, fmt(r.units), fmt(r.litres, 0)]), [0, 1, 1])}
-    ${sec('Consumables / packaging by location (current)', ['Location', 'Item', 'On hand'], (d.byLocation && d.byLocation.consumables || []).map(r => [r.location, r.name, fmt(r.onHand, 1) + ' ' + r.unit]), [0, 0, 0])}
-    ${sec('Disposed / written off', ['Date', 'Type', 'Item', 'Qty', 'Reason', 'By'], (d.disposed && d.disposed.lines || []).map(l => [l.date, l.type, l.ref, fmt(l.qty, 1) + ' ' + (l.unit || ''), l.reason, l.by || '']), [0, 0, 0, 1, 0, 0])}
+    ${sec('Reagents / packaging by location (current)', ['Location', 'Item', 'On hand'], (d.byLocation && d.byLocation.consumables || []).map(r => [r.location, r.name, fmt(r.onHand, 1) + ' ' + r.unit]), [0, 0, 0])}
+    ${sec('Disposed / written off', ['Date', 'Type', 'Item', 'Qty', 'Reason', 'By'], (d.disposed && d.disposed.lines || []).map(l => [l.date, disposalTypeLabel(l.type), l.ref, fmt(l.qty, 1) + ' ' + (l.unit || ''), l.reason, l.by || '']), [0, 0, 0, 1, 0, 0])}
     <p style="margin-top:14px;font-size:10px;color:#999">Generated by KelpWorks ERP · ${d.month}</p>
     <script>window.onload=()=>window.print()<\/script></body></html>`);
   w.document.close();
@@ -3282,17 +3559,17 @@ function exportReportCsv(d) {
   add('FINISHED GOODS SHIPPED'); add('Customer', 'Units', 'Litres'); d.finishedGoods.shippedByCustomer.forEach(r => add(r.customer, r.units, r.litres));
   add('FG ON HAND (' + d.asOf + ')'); add('SKU', 'Litres'); d.finishedGoods.onHand.forEach(r => add(skuName(r.sku), r.litres));
   add('');
-  add('CONSUMABLES'); add('Item', 'Unit', 'Received', 'Used', 'On hand (' + d.asOf + ')');
+  add('REAGENTS'); add('Item', 'Unit', 'Received', 'Used', 'On hand (' + d.asOf + ')');
   const oh = {}; d.consumables.onHand.forEach(r => oh[r.name] = r.onHand);
   d.consumables.inMonth.forEach(r => add(r.name, r.unit, r.received, r.used, oh[r.name] ?? ''));
   add('');
   add('INVENTORY BY LOCATION (current)');
   add('Stabilized', 'Location', 'Totes', 'Kg'); (d.byLocation && d.byLocation.stabilized || []).forEach(r => add('', r.location, r.totes, r.kg));
   add('Finished goods', 'Location', 'Units', 'Litres'); (d.byLocation && d.byLocation.finishedGoods || []).forEach(r => add('', r.location, r.units, r.litres));
-  add('Consumables', 'Location', 'Item', 'On hand', 'Unit'); (d.byLocation && d.byLocation.consumables || []).forEach(r => add('', r.location, r.name, r.onHand, r.unit));
+  add('Reagents / packaging', 'Location', 'Item', 'On hand', 'Unit'); (d.byLocation && d.byLocation.consumables || []).forEach(r => add('', r.location, r.name, r.onHand, r.unit));
   add('');
   add('DISPOSED / WRITTEN OFF'); add('Date', 'Type', 'Item', 'Qty', 'Unit', 'Reason', 'By');
-  (d.disposed && d.disposed.lines || []).forEach(l => add(l.date, l.type, l.ref, l.qty, l.unit, l.reason, l.by));
+  (d.disposed && d.disposed.lines || []).forEach(l => add(l.date, disposalTypeLabel(l.type), l.ref, l.qty, l.unit, l.reason, l.by));
   const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
   const a = el('a', { href: URL.createObjectURL(blob), download: 'kelpworks-report-' + d.month + '.csv' });
   document.body.append(a); a.click(); a.remove();
@@ -3343,6 +3620,27 @@ const CALCULATIONS = [
     settings: [],
   },
   {
+    title: 'Nabenzoate, calculated (L)',
+    formula: 'Nabenzoate, calculated (L) = Fill level, Tank 6A/B (L) × Nabenzoate target (w/v) / Nabenzoate stock concentration (w/v)',
+    description: 'The estimated volume of stock sodium benzoate solution needed to reach the product SKU’s target Nabenzoate dose in the tank’s current fill volume (same mass-conservation math as Ksorbate, calculated).',
+    location: 'Production → Process log → Dilution & Preservation → Preservatives',
+    settings: ['nabenzoate_stock_concentration_default_pct'],
+  },
+  {
+    title: 'Sodium benzoate added (kg)',
+    formula: 'Sodium benzoate added (kg) = Sodium benzoate added (L) × Nabenzoate stock concentration (w/v) / 100',
+    description: 'The mass of sodium benzoate added to the batch, from the volume of stock solution added and its %w/v concentration.',
+    location: 'Production → Process log → Dilution & Preservation → Preservatives',
+    settings: ['nabenzoate_stock_concentration_default_pct'],
+  },
+  {
+    title: 'Reagent usage (inventory deduction)',
+    formula: 'Citric Acid (kg) = Citric acid added (kg)   ·   Potassium Sorbate (kg) = Ksorbate added (L) × stock (w/v) / 100   ·   Sodium Benzoate (kg) = Sodium benzoate added (L) × stock (w/v) / 100',
+    description: 'What Saving Dilution & Preservation (or finalizing the run) deducts from Reagent stock, as one net-change ledger line per reagent: only the change since the last save is deducted, and discarding a draft refunds it. The same kg are added to the run’s Citric / Sorbate / Na benzoate totals.',
+    location: 'Production → Process log → Dilution & Preservation (applied on Save and when a run is finalized)',
+    settings: [],
+  },
+  {
     title: 'Density (calculated)',
     formula: 'Density (kg/L) = Weight (kg) / Volume (L), rounded to 3 decimals',
     description: 'A tote or feedstock sample’s density, from its weighed mass and measured volume.',
@@ -3366,7 +3664,28 @@ const CALCULATIONS = [
   {
     title: 'Output (L) / New IBCs filled',
     formula: 'Output (L) = Σ (entry qty × container unit’s litres each)   ·   New IBCs filled = Σ qty where the container unit is IBC',
-    description: 'A run’s total bottled output and IBC usage, computed from the Packaging table’s entries at finalization using each container’s litres-each value (Consumables & Packaging → Packaging).',
+    description: 'A run’s total bottled output and IBC usage, computed from the Packaging table’s entries at finalization using each container’s litres-each value (Inventory Items → Packaging).',
+    location: 'Production → Packaging section, applied when a run is finalized',
+    settings: [],
+  },
+  {
+    title: 'CIP duration',
+    formula: 'Duration (min) = CIP end time − CIP start time',
+    description: 'How long a Clean In Place took, shown as hours/minutes once both times are entered.',
+    location: 'CIP Log → each entry’s Duration column',
+    settings: [],
+  },
+  {
+    title: 'CIP chemical usage (inventory deduction)',
+    formula: 'Stock change per CIP agent = − Σ qty (L) on the entry’s chemical lines; edits adjust by the difference, deleting an entry refunds',
+    description: 'Saving, editing or deleting a CIP Log entry adjusts the CIP Acid / Caustic / Sanitizer stock in Inventory Items, as one ledger line per agent referencing the CIP entry. A shortage never blocks logging a cleaning; it just drives stock below zero and the save says to receive stock.',
+    location: 'CIP Log → Log CIP / Edit',
+    settings: [],
+  },
+  {
+    title: 'Finished-good label usage (inventory deduction)',
+    formula: 'Labels deducted = Σ entry qty, per (SKU, package type) that has an FG label item',
+    description: 'When a run is finalized, one finished-good label is deducted for every finished unit packaged, from the label item mapped to that product SKU and package type (Inventory Items → Finished-good labels). No matching label item means nothing is deducted.',
     location: 'Production → Packaging section, applied when a run is finalized',
     settings: [],
   },
