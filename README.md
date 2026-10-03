@@ -2,7 +2,7 @@
 
 A small web-based manufacturing ERP for Cascadia Seaweed's liquid kelp extract
 (LKE) process. Tracks stabilized kelp inventory, production runs, finished
-goods, consumables, and prints barcode tracking labels.
+goods, reagents/packaging, and prints barcode tracking labels.
 
 Built dependency-free in the same shape as the other apps in this repo: pure
 Python standard library (sqlite3 + http.server) for the backend, vanilla JS for
@@ -27,9 +27,10 @@ citric acid + potassium sorbate, and bottled as finished Liquid Kelp Extract.
 |------|--------------|
 | **Dashboard** | Stabilized totes & kg on hand, finished-goods litres, low-stock alerts, recent runs |
 | **Stabilized Inventory** | Every IBC tote as a lot. **Check in a harvest batch** → enter total kg + tote count and the system averages the weight across totes and auto-generates lot numbers |
-| **Production** | Pick stabilized totes, set a target TDS, add citric/sorbate, define the packaged output (IBC / 4L / 1L / 250ml). Consumes the totes, draws down consumables and empty IBCs, and creates finished-goods lots under an auto-generated Processing Lot # |
+| **Production** | Pick stabilized totes, set a target TDS, add citric/sorbate, define the packaged output (IBC / 4L / 1L / 250ml). Consumes the totes, draws down reagents, finished-good labels and empty IBCs, and creates finished-goods lots under an auto-generated Processing Lot # |
 | **Finished Goods** | Two SKUs (Saccharina LKE, Macrocystis LKE) on hand by package size; edit qty / status / location |
-| **Consumables** | Citric Acid, Potassium Sorbate, empty IBC totes — receive / use, reorder alerts |
+| **CIP Log** | Log every Clean In Place (equipment, times, operators, chemicals used with concentration / temperature / contact time, pass/fail, optional run link); chemicals deduct CIP Acid / Caustic / Sanitizer stock; "Last cleaned" per equipment |
+| **Inventory Items** | Reagents (Citric Acid, Potassium Sorbate, Sodium Benzoate), containers (IBC totes, 55 gallon drums, bottles) and finished-good labels per SKU + package type, each with an optional Item # — receive / use, reorder alerts |
 | **Labels** | Code128 barcode tracking labels for any tote or finished-goods lot, print-ready 2-up |
 
 ## Lot numbering (matches the inventory spreadsheet)
@@ -43,7 +44,7 @@ citric acid + potassium sorbate, and bottled as finished Liquid Kelp Extract.
 
 `seed.json` was extracted from `202605 Inventory.xlsx` (species, farm sites, the
 394 stabilized Sugar Kelp totes from the 2025/2026 Fresh Inventory tabs, and
-consumable on-hand quantities). On first run the database (`kelp_erp.db`) is
+reagent/packaging on-hand quantities). On first run the database (`kelp_erp.db`) is
 created and seeded automatically.
 
 ## Configuration (environment variables)

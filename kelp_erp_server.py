@@ -19,7 +19,8 @@ What it models (a kelp -> liquid extract process):
      Extract (LKE) finished goods. Each run gets a Processing Lot # (PR-...).
   3. Finished goods        : two SKUs (Saccharina LKE, Macrocystis LKE) in IBC /
      4L / 1L / 250 ml packs.
-  4. Consumables           : Citric Acid, Potassium Sorbate, empty IBC totes —
+  4. Reagents & packaging  : Citric Acid, Potassium Sorbate, Sodium Benzoate,
+     containers (IBC totes, drums, bottles) and finished-good labels --
      auto-deducted by production runs, with reorder alerts.
   5. Barcode labels        : every lot (tote / FG / processing) prints a Code128
      barcode label from the web UI.
@@ -109,6 +110,8 @@ SETTINGS_DEFAULTS = [
      "Pre-filled value for a new run's Target %Wet-Solids field."),
     ("ksorbate_stock_concentration_default_pct", 25.0, "Ksorbate stock concentration default (w/v %)",
      "Pre-filled value for a new run's Ksorbate stock concentration (w/v) field."),
+    ("nabenzoate_stock_concentration_default_pct", 25.0, "Nabenzoate stock concentration default (w/v %)",
+     "Pre-filled value for a new run's Sodium benzoate stock concentration (w/v) field."),
     ("separation_default_flowrate_lpm", 40, "Separation default Flow rate (L/min)",
      "Pre-filled value for a new run's Separation Flow rate (L/min) field."),
     ("separation_default_mesh_micron", 74, "Separation default Mesh size (micron)",
@@ -448,16 +451,23 @@ CREATE TABLE IF NOT EXISTS disposals (
 );
 CREATE INDEX IF NOT EXISTS idx_disposals_date ON disposals(disposed_date);
 
--- Consumables & packaging (citric acid, potassium sorbate, empty IBCs ...).
--- A container type (New 1,000 L IBC Tote, 2 L, 1 L, a Sample Point vessel
--- like a falcon tube, ...) is just a row here with is_container=1 -- same
--- on-hand/reorder/cost/location fields as any other consumable, shown in
--- the Consumables & Packaging page's "Packaging" section instead of the
--- general "Consumables" one. litres_each is set only for containers used
--- in Packaging's FG-output math (New 1,000 L IBC Tote/2 L/1 L); left null
--- for containers that are never an FG package (Used 1,000 L IBC Tote) or
--- that are only a Sample Point vessel (is_sample_container=1) -- a
--- container can be neither, either, or both.
+-- Inventory items (the table keeps its original "consumables" name; the UI
+-- calls the general group "Reagents": citric acid, potassium sorbate, sodium
+-- benzoate ...). Three groups share this one table, told apart by flags
+-- rather than a category column:
+--   * Packaging: is_container=1 -- a container type (New 1,000 L IBC Tote,
+--     55 gallon drum, 2 L, 1 L, a Sample Point vessel like a falcon tube,
+--     ...) with the same on-hand/reorder/cost/location fields as any other
+--     item. litres_each is set only for containers used in Packaging's
+--     FG-output math; left null for containers that are never an FG
+--     package (Used 1,000 L IBC Tote) or that are only a Sample Point
+--     vessel (is_sample_container=1) -- a container can be neither,
+--     either, or both.
+--   * Finished-good labels: label_sku_code + label_package both set -- one
+--     item per (SKU, package type), deducted 1 per finished unit when a run
+--     is finalized. Unrelated to the Labels tab (internal barcode printing).
+--   * Reagents: everything else.
+-- item_number is an optional, admin-assigned stock/part number on any item.
 CREATE TABLE IF NOT EXISTS consumables (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     name                TEXT NOT NULL UNIQUE,
@@ -468,7 +478,11 @@ CREATE TABLE IF NOT EXISTS consumables (
     location            TEXT,
     is_container        INTEGER NOT NULL DEFAULT 0,
     litres_each         REAL,
-    is_sample_container INTEGER NOT NULL DEFAULT 0
+    is_sample_container INTEGER NOT NULL DEFAULT 0,
+    item_number         TEXT,
+    label_sku_code      TEXT,
+    label_package       TEXT,
+    is_cip_agent        INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS consumable_txns (
@@ -511,6 +525,7 @@ CREATE TABLE IF NOT EXISTS production_runs (
     output_litres  REAL DEFAULT 0,
     citric_kg      REAL DEFAULT 0,
     sorbate_kg     REAL DEFAULT 0,
+    nabenzoate_kg  REAL DEFAULT 0,
     ibc_used       INTEGER DEFAULT 0,
     location       TEXT,
     notes          TEXT,
@@ -612,6 +627,8 @@ CREATE TABLE IF NOT EXISTS production_runs (
     dilution_citric_kg              REAL,
     dilution_ksorbate_stock_pct     REAL,
     dilution_ksorbate_added_l       REAL,
+    dilution_nabenzoate_stock_pct   REAL,
+    dilution_nabenzoate_added_l     REAL,
     -- Packaging stage. packaging_started_at stays defined (additive-only)
     -- but is no longer collected -- "Packaging started at" was removed in
     -- favor of packaging_packaged_at, the repeatable table's shared
@@ -732,6 +749,55 @@ CREATE TABLE IF NOT EXISTS run_packaging_commits (
     committed_qty  REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (run_id, container_unit)
 );
+
+-- Same net-change commit model for the reagents (Citric Acid, Potassium
+-- Sorbate, Sodium Benzoate) logged under Dilution & Preservation: saving that
+-- section (or finalizing) deducts only the change in kg since the last
+-- commit, one consumable_txns line per reagent (see _commit_reagent_usage);
+-- discarding a draft refunds exactly what was committed. reagent is the
+-- consumable's name.
+CREATE TABLE IF NOT EXISTS run_reagent_commits (
+    run_id         INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+    reagent        TEXT NOT NULL,
+    committed_kg   REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, reagent)
+);
+
+-- CIP (Clean In Place) log: one row per cleaning event, with the chemicals
+-- used as lines on it. The lines are the single source of truth for both the
+-- cleaning record and reagent consumption -- saving/editing/deleting an event
+-- adjusts the CIP agents' stock by the difference (see _apply_cip_stock).
+-- Independent of production runs (a CIP happens between runs, on equipment);
+-- run_id is an optional "cleaned after/before this run" link.
+CREATE TABLE IF NOT EXISTS cip_events (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    cip_ref               TEXT NOT NULL UNIQUE,   -- CIP-YYYYMMDD-NNN
+    started_at            TEXT NOT NULL,
+    ended_at              TEXT,
+    equipment             TEXT NOT NULL,          -- process area / circuit cleaned (free text)
+    purpose               TEXT,                   -- Post-run | Pre-run | Changeover | Scheduled | Other
+    run_id                INTEGER REFERENCES production_runs(id) ON DELETE SET NULL,
+    operators             TEXT,
+    rinse_ph              REAL,                   -- no longer collected (additive-only; kept, unused)
+    rinse_conductivity_us REAL,                   -- no longer collected (additive-only; kept, unused)
+    result                TEXT,                   -- pass | fail
+    notes                 TEXT,
+    created_by            TEXT,
+    created_at            TEXT NOT NULL,
+    updated_by            TEXT,
+    updated_at            TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_cip_started ON cip_events(started_at);
+CREATE TABLE IF NOT EXISTS cip_event_chemicals (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    cip_event_id   INTEGER NOT NULL REFERENCES cip_events(id) ON DELETE CASCADE,
+    consumable_id  INTEGER NOT NULL REFERENCES consumables(id),
+    qty            REAL NOT NULL,                 -- in the item's own unit (L)
+    concentration_pct REAL,
+    temp_c         REAL,
+    contact_min    REAL
+);
+CREATE INDEX IF NOT EXISTS idx_cipchem_event ON cip_event_chemicals(cip_event_id);
 
 -- Admin-editable options for the Packaging table's "Container unit" dropdown,
 -- each mapped to a fixed litres-per-unit conversion (e.g. IBC = 1000 L) --
@@ -961,6 +1027,8 @@ def migrate(conn):
         ("dilution_fill_level_tank_6ab_l", "REAL"), ("dilution_measured_ph", "REAL"),
         ("dilution_citric_kg", "REAL"), ("dilution_ksorbate_stock_pct", "REAL"),
         ("dilution_ksorbate_added_l", "REAL"),
+        ("dilution_nabenzoate_stock_pct", "REAL"), ("dilution_nabenzoate_added_l", "REAL"),
+        ("nabenzoate_kg", "REAL DEFAULT 0"),
         ("packaging_started_at", "TEXT"), ("packaging_packaged_at", "TEXT"),
         ("packaging_qc_ph", "REAL"), ("packaging_tds_pct", "REAL"), ("packaging_brix_pct", "REAL"),
         ("packaging_mannitol_pct", "REAL"), ("packaging_ts_liquid_pct", "REAL"),
@@ -975,7 +1043,9 @@ def migrate(conn):
         conn.execute("UPDATE container_units SET is_ibc=1 WHERE code='IBC'")
     ccols = {r["name"] for r in conn.execute("PRAGMA table_info(consumables)")}
     for col, decl in [("is_container", "INTEGER NOT NULL DEFAULT 0"), ("litres_each", "REAL"),
-                       ("is_sample_container", "INTEGER NOT NULL DEFAULT 0")]:
+                       ("is_sample_container", "INTEGER NOT NULL DEFAULT 0"),
+                       ("item_number", "TEXT"), ("label_sku_code", "TEXT"), ("label_package", "TEXT"),
+                       ("is_cip_agent", "INTEGER NOT NULL DEFAULT 0")]:
         if col not in ccols:
             conn.execute("ALTER TABLE consumables ADD COLUMN %s %s" % (col, decl))
     ctcols = {r["name"] for r in conn.execute("PRAGMA table_info(consumable_txns)")}
@@ -1144,7 +1214,7 @@ def migrate(conn):
     # Seed the Sample Point boxes' container options -- INSERT OR IGNORE so an
     # admin's already-edited counts are never overwritten. On-hand starts at 0
     # since these are being tracked for the first time; the plant enters its
-    # real starting counts via Consumables & Packaging -> Packaging.
+    # real starting counts via Inventory Items -> Packaging.
     for name in ("50 mL falcon tube", "100 g sample bag", "1 L bottle", "2 L bottle"):
         if not conn.execute("SELECT 1 FROM consumables WHERE name=?", (name,)).fetchone():
             conn.execute(
@@ -1156,6 +1226,23 @@ def migrate(conn):
     # merge each pair into one container valid for both purposes.
     _merge_consumable(conn, "1 L Bottle", "1 L bottle")
     _merge_consumable(conn, "2 L Bottle", "2 L bottle")
+    # Sodium Benzoate (a reagent, like Citric Acid / Potassium Sorbate) and the
+    # 55 gallon drum FG package (55 US gal = 208.2 L; unit must not be 'tote',
+    # which the harvest check-in source list filters on). Insert-only so an
+    # admin's later edits stick; on-hand starts at 0 for the plant to count in.
+    if not conn.execute("SELECT 1 FROM consumables WHERE name='Sodium Benzoate'").fetchone():
+        conn.execute("INSERT INTO consumables (name,unit,on_hand,reorder_level)"
+                     " VALUES ('Sodium Benzoate','kg',0,0)")
+    # The three CIP (Clean In Place) cleaning agents -- reagents in litres,
+    # flagged is_cip_agent so they're the ones offered on a CIP log line.
+    # Named "CIP ..." so Acid can't be confused with Citric Acid.
+    for cip_name in ("CIP Acid", "CIP Caustic", "CIP Sanitizer"):
+        if not conn.execute("SELECT 1 FROM consumables WHERE name=?", (cip_name,)).fetchone():
+            conn.execute("INSERT INTO consumables (name,unit,on_hand,reorder_level,is_cip_agent)"
+                         " VALUES (?,'L',0,0,1)", (cip_name,))
+    if not conn.execute("SELECT 1 FROM consumables WHERE name='55 gallon drum'").fetchone():
+        conn.execute("INSERT INTO consumables (name,unit,on_hand,reorder_level,is_container,litres_each)"
+                     " VALUES ('55 gallon drum','drum',0,0,1,208.2)")
 
 
 def ensure_users(conn):
@@ -1276,7 +1363,8 @@ def run_public(r):
     d = {"id": r["id"], "processingLot": r["processing_lot"], "runDate": r["run_date"],
          "species": r["species_code"], "sku": r["sku_code"], "inputKg": r["input_kg"],
          "targetTds": r["target_tds"], "outputLitres": r["output_litres"],
-         "citricKg": r["citric_kg"], "sorbateKg": r["sorbate_kg"], "ibcUsed": r["ibc_used"],
+         "citricKg": r["citric_kg"], "sorbateKg": r["sorbate_kg"],
+         "nabenzoateKg": r["nabenzoate_kg"], "ibcUsed": r["ibc_used"],
          "location": r["location"], "notes": r["notes"], "status": r["status"],
          "operators": r["operators"], "createdAt": r["created_at"]}
     try:
@@ -1336,7 +1424,9 @@ def run_public(r):
             "measuredPh": r["dilution_measured_ph"],
             "citricKg": r["dilution_citric_kg"],
             "ksorbateStockPct": r["dilution_ksorbate_stock_pct"],
-            "ksorbateAddedL": r["dilution_ksorbate_added_l"]},
+            "ksorbateAddedL": r["dilution_ksorbate_added_l"],
+            "nabenzoateStockPct": r["dilution_nabenzoate_stock_pct"],
+            "nabenzoateAddedL": r["dilution_nabenzoate_added_l"]},
         "packaging": {
             "packagedAt": r["packaging_packaged_at"],
             "qcPh": r["packaging_qc_ph"], "tdsPct": r["packaging_tds_pct"],
@@ -1674,6 +1764,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.route_harvest(method, seg, conn)
         if seg[:2] == ["api", "consumables"]:
             return self.route_consumables(method, seg, conn, user)
+        if seg[:2] == ["api", "cip"]:
+            return self.route_cip(method, seg, conn, user)
         if seg[:2] == ["api", "production"]:
             return self.route_production(method, seg, conn, user)
         if seg[:2] == ["api", "fg"]:
@@ -2394,7 +2486,20 @@ class Handler(BaseHTTPRequestHandler):
                     reorderLevel=r["reorder_level"], costPerUnit=r["cost_per_unit"],
                     location=r["location"], isContainer=bool(r["is_container"]),
                     litresEach=r["litres_each"], isSampleContainer=bool(r["is_sample_container"]),
+                    itemNumber=r["item_number"], labelSku=r["label_sku_code"],
+                    labelPackage=r["label_package"], isCipAgent=bool(r["is_cip_agent"]),
                     low=(r["on_hand"] <= r["reorder_level"]))
+
+    def _clean_item_number(self, conn, raw, exclude_id=None):
+        """Item # is optional free text; blank clears it. Non-blank values
+        must be unique across all inventory items (409 otherwise)."""
+        item_number = (raw or "").strip() or None
+        if item_number:
+            dup = conn.execute("SELECT id FROM consumables WHERE item_number=? AND id IS NOT ?",
+                               (item_number, exclude_id)).fetchone()
+            if dup:
+                raise ApiError(409, "Item # %s is already used by another item" % item_number)
+        return item_number
 
     def route_consumables(self, method, seg, conn, user):
         if seg == ["api", "consumables"]:
@@ -2403,32 +2508,57 @@ class Handler(BaseHTTPRequestHandler):
                 return {"consumables": [self._consumable_public(r) for r in rows]}
             if method == "POST":
                 d = self._body_json()
+                label_sku = (d.get("labelSku") or "").strip()
+                label_package = (d.get("labelPackage") or "").strip()
+                is_label = bool(label_sku or label_package)
                 name = (d.get("name") or "").strip()
+                if is_label:
+                    # A finished-good label: one item per (SKU, package type),
+                    # named automatically, deducted 1 per finished unit at
+                    # finalize. Admin-only, like any new container type.
+                    self._require_admin(user)
+                    sku_row = conn.execute("SELECT name FROM fg_skus WHERE code=?", (label_sku,)).fetchone()
+                    if not sku_row:
+                        raise ApiError(400, "Choose a product SKU for this label")
+                    if label_package not in packaging_container_litres_map(conn):
+                        raise ApiError(400, "Choose a package type for this label")
+                    if conn.execute("SELECT 1 FROM consumables WHERE label_sku_code=? AND label_package=?",
+                                    (label_sku, label_package)).fetchone():
+                        raise ApiError(409, "A label for that SKU and package type already exists")
+                    name = name or "FG Label - %s - %s" % (sku_row["name"], label_package)
                 if not name:
                     raise ApiError(400, "Name is required")
-                is_container = bool(d.get("isContainer"))
-                # Anyone can add a general consumable (unchanged); only an
+                is_container = bool(d.get("isContainer")) and not is_label
+                # Anyone can add a general reagent (unchanged); only an
                 # admin can introduce a new container type (Packaging output
                 # unit or Sample Point vessel) -- editing/receiving/using an
                 # existing one stays open to everyone below.
                 if is_container:
                     self._require_admin(user)
                 if conn.execute("SELECT 1 FROM consumables WHERE name=?", (name,)).fetchone():
-                    raise ApiError(409, "That consumable already exists")
+                    raise ApiError(409, "That item already exists")
+                item_number = self._clean_item_number(conn, d.get("itemNumber"))
                 location = self._ensure_location(conn, d.get("location"))
                 litres_each = numn(d.get("litresEach")) if is_container else None
                 is_sample = 1 if (is_container and d.get("isSampleContainer")) else 0
+                # Only a plain reagent can be a CIP cleaning agent (offered on
+                # CIP log lines) -- not a container or a label.
+                is_cip = 1 if (d.get("isCipAgent") and not is_container and not is_label) else 0
+                if is_cip:
+                    self._require_admin(user)
                 conn.execute(
                     "INSERT INTO consumables (name,unit,on_hand,reorder_level,cost_per_unit,location,"
-                    "is_container,litres_each,is_sample_container) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (name, (d.get("unit") or "unit").strip(), num(d.get("onHand")),
+                    "is_container,litres_each,is_sample_container,item_number,label_sku_code,label_package,"
+                    "is_cip_agent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (name, "ea" if is_label else (d.get("unit") or "unit").strip(), num(d.get("onHand")),
                      num(d.get("reorderLevel")), numn(d.get("costPerUnit")), location,
-                     1 if is_container else 0, litres_each, is_sample))
+                     1 if is_container else 0, litres_each, is_sample, item_number,
+                     label_sku if is_label else None, label_package if is_label else None, is_cip))
                 return {"ok": True}
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "history" and method == "GET":
             cid = int(seg[2])
             if not conn.execute("SELECT 1 FROM consumables WHERE id=?", (cid,)).fetchone():
-                raise ApiError(404, "Consumable not found")
+                raise ApiError(404, "Item not found")
             return {"history": self._consumable_history(conn, cid)}
         if seg == ["api", "consumables", "bulk"] and method == "POST":
             # Bulk inventory update (physical stocktake corrections, receiving
@@ -2440,7 +2570,7 @@ class Handler(BaseHTTPRequestHandler):
             cid = int(seg[2])
             c = conn.execute("SELECT * FROM consumables WHERE id=?", (cid,)).fetchone()
             if not c:
-                raise ApiError(404, "Consumable not found")
+                raise ApiError(404, "Item not found")
             d = self._body_json()
             delta = num(d.get("delta"))
             if delta == 0:
@@ -2453,21 +2583,168 @@ class Handler(BaseHTTPRequestHandler):
             cid = int(seg[2])
             c = conn.execute("SELECT * FROM consumables WHERE id=?", (cid,)).fetchone()
             if not c:
-                raise ApiError(404, "Consumable not found")
+                raise ApiError(404, "Item not found")
             d = self._body_json()
             location = self._ensure_location(conn, d["location"]) if "location" in d else c["location"]
+            item_number = (self._clean_item_number(conn, d["itemNumber"], cid)
+                           if "itemNumber" in d else c["item_number"])
             conn.execute(
                 "UPDATE consumables SET reorder_level=?, cost_per_unit=?, location=?, litres_each=?,"
-                " is_sample_container=? WHERE id=?",
+                " is_sample_container=?, item_number=? WHERE id=?",
                 (num(d["reorderLevel"]) if "reorderLevel" in d else c["reorder_level"],
                  numn(d["costPerUnit"]) if "costPerUnit" in d else c["cost_per_unit"],
                  location,
                  (numn(d["litresEach"]) if "litresEach" in d else c["litres_each"]) if c["is_container"] else None,
                  (1 if d.get("isSampleContainer") else 0) if "isSampleContainer" in d
                  else c["is_sample_container"],
+                 item_number,
                  cid))
             return {"ok": True}
         raise ApiError(404, "Unknown consumables endpoint")
+
+    # ---- CIP (Clean In Place) log ------------------------------------------ #
+    CIP_PURPOSES = ("Post-run", "Pre-run", "Changeover", "Scheduled", "Other")
+
+    def _cip_public(self, conn, r):
+        chems = [dict(id=c["id"], consumableId=c["consumable_id"], name=c["name"], unit=c["unit"],
+                      qty=c["qty"], concentrationPct=c["concentration_pct"], tempC=c["temp_c"],
+                      contactMin=c["contact_min"])
+                 for c in conn.execute(
+                     "SELECT cc.*, c.name, c.unit FROM cip_event_chemicals cc"
+                     " JOIN consumables c ON c.id=cc.consumable_id WHERE cc.cip_event_id=? ORDER BY cc.id",
+                     (r["id"],))]
+        lot = None
+        if r["run_id"]:
+            run = conn.execute("SELECT processing_lot FROM production_runs WHERE id=?", (r["run_id"],)).fetchone()
+            lot = run["processing_lot"] if run else None
+        return {"id": r["id"], "ref": r["cip_ref"], "startedAt": r["started_at"], "endedAt": r["ended_at"],
+                "equipment": r["equipment"], "purpose": r["purpose"], "runId": r["run_id"],
+                "processingLot": lot, "operators": r["operators"], "result": r["result"],
+                "notes": r["notes"], "chemicals": chems, "createdBy": r["created_by"],
+                "createdAt": r["created_at"], "updatedBy": r["updated_by"], "updatedAt": r["updated_at"]}
+
+    def _cip_fields(self, conn, d):
+        """Validate a CIP event body. Returns (fields dict, chemical lines,
+        {consumable_id: total qty})."""
+        def dt(key, required):
+            raw = (d.get(key) or "").strip()
+            if not raw:
+                if required:
+                    raise ApiError(400, "Enter the CIP start date and time")
+                return None
+            try:
+                datetime.datetime.fromisoformat(raw)
+            except ValueError:
+                raise ApiError(400, "Enter a valid date and time for %s" % ("start" if key == "startedAt" else "end"))
+            return raw
+        started_at = dt("startedAt", True)
+        ended_at = dt("endedAt", False)
+        if ended_at and ended_at < started_at:
+            raise ApiError(400, "The CIP end time can't be before its start time")
+        equipment = (d.get("equipment") or "").strip()
+        if not equipment:
+            raise ApiError(400, "Enter the equipment that was cleaned")
+        purpose = (d.get("purpose") or "").strip() or None
+        if purpose and purpose not in self.CIP_PURPOSES:
+            raise ApiError(400, "Choose a valid purpose")
+        result = (d.get("result") or "").strip().lower() or None
+        if result not in (None, "pass", "fail"):
+            raise ApiError(400, "Result must be pass or fail")
+        run_id = d.get("runId")
+        run_id = int(run_id) if run_id not in (None, "") else None
+        if run_id is not None and not conn.execute("SELECT 1 FROM production_runs WHERE id=?", (run_id,)).fetchone():
+            raise ApiError(400, "Linked production run not found")
+        lines, totals = [], {}
+        for ln in (d.get("chemicals") or []):
+            cid = ln.get("consumableId")
+            row = conn.execute("SELECT * FROM consumables WHERE id=?", (cid,)).fetchone() if cid not in (None, "") else None
+            if not row or not row["is_cip_agent"]:
+                raise ApiError(400, "Each chemical line must be a CIP cleaning agent")
+            qty = num(ln.get("qty"))
+            if qty <= 0:
+                raise ApiError(400, "Enter a quantity greater than 0 for %s" % row["name"])
+            lines.append((row["id"], qty, numn(ln.get("concentrationPct")), numn(ln.get("tempC")),
+                          numn(ln.get("contactMin"))))
+            totals[row["id"]] = round(totals.get(row["id"], 0) + qty, 4)
+        fields = {"started_at": started_at, "ended_at": ended_at, "equipment": equipment, "purpose": purpose,
+                  "run_id": run_id, "operators": (d.get("operators") or "").strip() or None,
+                  "result": result, "notes": (d.get("notes") or "").strip() or None}
+        return fields, lines, totals
+
+    def _cip_totals(self, conn, event_id):
+        return {r["consumable_id"]: round(r["t"], 4) for r in conn.execute(
+            "SELECT consumable_id, SUM(qty) t FROM cip_event_chemicals WHERE cip_event_id=?"
+            " GROUP BY consumable_id", (event_id,))}
+
+    def _apply_cip_stock(self, conn, ref, old_totals, new_totals, user_name, reason):
+        """Deduct (or refund) the net change in each CIP agent's litres. Never
+        raises on a shortage -- a cleaning that really happened must always be
+        recorded -- so any item driven below zero is returned as a warning for
+        the UI to show ("receive stock to correct")."""
+        warnings = []
+        for cid in set(old_totals) | set(new_totals):
+            delta = round(new_totals.get(cid, 0) - old_totals.get(cid, 0), 4)
+            if not delta:
+                continue
+            self._consume(conn, cid, -delta, reason, ref, user_name)
+            row = conn.execute("SELECT name, unit, on_hand FROM consumables WHERE id=?", (cid,)).fetchone()
+            if delta > 0 and row["on_hand"] < 0:
+                warnings.append("%s is now below zero (%.1f %s) -- receive stock to correct"
+                                % (row["name"], row["on_hand"], row["unit"]))
+        return warnings
+
+    def route_cip(self, method, seg, conn, user):
+        uname = user["name"] if user else None
+        if seg == ["api", "cip"]:
+            if method == "GET":
+                rows = conn.execute("SELECT * FROM cip_events ORDER BY started_at DESC, id DESC").fetchall()
+                return {"events": [self._cip_public(conn, r) for r in rows]}
+            if method == "POST":
+                fields, lines, totals = self._cip_fields(conn, self._body_json())
+                ts = now_iso()
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO cip_events (cip_ref,started_at,ended_at,equipment,purpose,run_id,operators,"
+                    "result,notes,created_by,created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    ("TEMP-" + secrets.token_hex(6), fields["started_at"], fields["ended_at"], fields["equipment"],
+                     fields["purpose"], fields["run_id"], fields["operators"],
+                     fields["result"], fields["notes"], uname, ts))
+                eid = cur.lastrowid
+                ref = "CIP-%s-%03d" % (fields["started_at"][:10].replace("-", ""), eid)
+                cur.execute("UPDATE cip_events SET cip_ref=? WHERE id=?", (ref, eid))
+                for ln in lines:
+                    cur.execute("INSERT INTO cip_event_chemicals (cip_event_id,consumable_id,qty,"
+                                "concentration_pct,temp_c,contact_min) VALUES (?,?,?,?,?,?)", (eid, *ln))
+                warnings = self._apply_cip_stock(conn, ref, {}, totals, uname, "CIP cleaning")
+                row = conn.execute("SELECT * FROM cip_events WHERE id=?", (eid,)).fetchone()
+                return {"event": self._cip_public(conn, row), "warnings": warnings}
+        if len(seg) == 3 and seg[2].isdigit():
+            eid = int(seg[2])
+            row = conn.execute("SELECT * FROM cip_events WHERE id=?", (eid,)).fetchone()
+            if not row:
+                raise ApiError(404, "CIP entry not found")
+            if method == "PUT":
+                fields, lines, totals = self._cip_fields(conn, self._body_json())
+                old_totals = self._cip_totals(conn, eid)
+                sets = ", ".join("%s=?" % k for k in fields)
+                conn.execute("UPDATE cip_events SET %s, updated_by=?, updated_at=? WHERE id=?" % sets,
+                             (*fields.values(), uname, now_iso(), eid))
+                conn.execute("DELETE FROM cip_event_chemicals WHERE cip_event_id=?", (eid,))
+                for ln in lines:
+                    conn.execute("INSERT INTO cip_event_chemicals (cip_event_id,consumable_id,qty,"
+                                 "concentration_pct,temp_c,contact_min) VALUES (?,?,?,?,?,?)", (eid, *ln))
+                warnings = self._apply_cip_stock(conn, row["cip_ref"], old_totals, totals, uname,
+                                                 "CIP entry edited")
+                row = conn.execute("SELECT * FROM cip_events WHERE id=?", (eid,)).fetchone()
+                return {"event": self._cip_public(conn, row), "warnings": warnings}
+            if method == "DELETE":
+                self._require_admin(user)
+                self._apply_cip_stock(conn, row["cip_ref"], self._cip_totals(conn, eid), {}, uname,
+                                      "CIP entry deleted")
+                conn.execute("DELETE FROM cip_events WHERE id=?", (eid,))
+                return {"ok": True}
+        raise ApiError(404, "Unknown CIP endpoint")
 
     def _consumables_bulk(self, conn, user):
         d = self._body_json()
@@ -2493,7 +2770,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(400, "Row %d: name is required" % i)
             c = conn.execute("SELECT * FROM consumables WHERE name=?", (name,)).fetchone()
             if not c:
-                raise ApiError(400, "Row %d: unknown consumable '%s'" % (i, name))
+                raise ApiError(400, "Row %d: unknown item '%s'" % (i, name))
             try:
                 new_on_hand = float((row.get("onHand") or "").strip())
             except ValueError:
@@ -2566,6 +2843,61 @@ class Handler(BaseHTTPRequestHandler):
                 conn.execute("INSERT INTO run_packaging_commits (run_id,container_unit,committed_qty)"
                              " VALUES (?,?,?)", (run_id, unit, new_total))
 
+    # Reagents deducted from the Dilution & Preservation entries: consumable
+    # name -> the production_runs column holding that run's running total kg.
+    REAGENT_RUN_COLUMNS = {
+        "Citric Acid": "citric_kg",
+        "Potassium Sorbate": "sorbate_kg",
+        "Sodium Benzoate": "nabenzoate_kg",
+    }
+
+    @staticmethod
+    def _dilution_reagent_kg(run):
+        """kg of each reagent the run's Dilution & Preservation entries imply:
+        citric straight from its field; sorbate/benzoate from the volume of
+        stock solution added x its w/v concentration (same math the UI shows
+        as "added (kg)")."""
+        def stock_kg(added_l, stock_pct):
+            return round((added_l or 0) * (stock_pct or 0) / 100.0, 4)
+        return {
+            "Citric Acid": round(run["dilution_citric_kg"] or 0, 4),
+            "Potassium Sorbate": stock_kg(run["dilution_ksorbate_added_l"], run["dilution_ksorbate_stock_pct"]),
+            "Sodium Benzoate": stock_kg(run["dilution_nabenzoate_added_l"], run["dilution_nabenzoate_stock_pct"]),
+        }
+
+    def _commit_reagent_usage(self, conn, run_id, user_name=None):
+        """Nets the Dilution & Preservation reagent entries since the last
+        commit into at most one consumable_txns line per reagent, same model
+        as _commit_packaging_stock: unchanged since the last commit = no
+        entry at all. The delta is also added to the run's running kg total
+        (production_runs.citric_kg / sorbate_kg / nabenzoate_kg) so anything
+        entered via Edit run keeps counting. A reagent with no matching
+        consumable row is skipped (and not recorded as committed)."""
+        run = conn.execute("SELECT * FROM production_runs WHERE id=?", (run_id,)).fetchone()
+        if not run:
+            return
+        lot = run["processing_lot"]
+        current = self._dilution_reagent_kg(run)
+        committed = {r["reagent"]: r["committed_kg"] for r in conn.execute(
+            "SELECT reagent, committed_kg FROM run_reagent_commits WHERE run_id=?", (run_id,))}
+        for name, col in self.REAGENT_RUN_COLUMNS.items():
+            delta = round(current[name] - committed.get(name, 0), 4)
+            if not delta:
+                continue
+            row = self._consumable_by_name(conn, name)
+            if not row:
+                continue
+            if delta > 0 and row["on_hand"] < delta:
+                raise ApiError(400, "Not enough %s on hand (%.1f < %.1f)" % (name, row["on_hand"], delta))
+            self._consume(conn, row["id"], -delta, "Dilution & Preservation saved (net change)",
+                          lot, user_name)
+            conn.execute(
+                "INSERT INTO run_reagent_commits (run_id,reagent,committed_kg) VALUES (?,?,?)"
+                " ON CONFLICT(run_id, reagent) DO UPDATE SET committed_kg=excluded.committed_kg",
+                (run_id, name, current[name]))
+            conn.execute("UPDATE production_runs SET %s = ROUND(COALESCE(%s, 0) + ?, 4) WHERE id=?" % (col, col),
+                         (delta, run_id))
+
     # Stages that actually contain a "QC Check" container (Pasteurization and
     # Dilution & Preservation only have Process Check/Sample Point boxes).
     QC_CHECK_STAGES = {"homogenization", "extraction", "separation", "packaging"}
@@ -2626,6 +2958,7 @@ class Handler(BaseHTTPRequestHandler):
         ("run_date", "runDate", "Run date", "text"),
         ("citric_kg", "citricKg", "Citric acid (kg)", "num"),
         ("sorbate_kg", "sorbateKg", "Potassium sorbate (kg)", "num"),
+        ("nabenzoate_kg", "nabenzoateKg", "Sodium benzoate (kg)", "num"),
         ("location", "location", "Production Location", "text"),
         ("notes", "notes", "Notes", "text"),
         ("operators", "operators", "Operators", "text"),
@@ -2711,6 +3044,8 @@ class Handler(BaseHTTPRequestHandler):
             ("dilution_citric_kg", "citricKg", "num"),
             ("dilution_ksorbate_stock_pct", "ksorbateStockPct", "num"),
             ("dilution_ksorbate_added_l", "ksorbateAddedL", "num"),
+            ("dilution_nabenzoate_stock_pct", "nabenzoateStockPct", "num"),
+            ("dilution_nabenzoate_added_l", "nabenzoateAddedL", "num"),
         ],
         "packaging": [
             # packaging_started_at removed -- see the schema comment above.
@@ -3347,6 +3682,10 @@ class Handler(BaseHTTPRequestHandler):
         # moment the ledger reflects.
         if stage == "packaging":
             self._commit_packaging_stock(conn, rid, user["name"] if user else None)
+        # Likewise Dilution & Preservation's Save commits the net change in
+        # citric acid / potassium sorbate / sodium benzoate used.
+        if stage == "dilution":
+            self._commit_reagent_usage(conn, rid, user["name"] if user else None)
         return {"run": run_public(conn.execute(
             "SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone())}
 
@@ -3571,6 +3910,11 @@ class Handler(BaseHTTPRequestHandler):
             row = self._consumable_by_name(conn, "Potassium Sorbate")
             if delta and row:
                 self._consume(conn, row["id"], -delta, "Production run edit", run["processing_lot"], uname)
+        if "nabenzoate_kg" in updates:
+            delta = (updates["nabenzoate_kg"] or 0) - (run["nabenzoate_kg"] or 0)
+            row = self._consumable_by_name(conn, "Sodium Benzoate")
+            if delta and row:
+                self._consume(conn, row["id"], -delta, "Production run edit", run["processing_lot"], uname)
 
         sets = ", ".join("%s=?" % c for c in updates)
         conn.execute("UPDATE production_runs SET %s WHERE id=?" % sets,
@@ -3616,6 +3960,9 @@ class Handler(BaseHTTPRequestHandler):
             # the operator never clicked its Save button -- the ledger still
             # only gets one net-change line per container, same as a normal save.
             self._commit_packaging_stock(conn, existing["id"], user["name"] if user else None)
+            # Same for the Dilution & Preservation reagents (citric acid,
+            # potassium sorbate, sodium benzoate).
+            self._commit_reagent_usage(conn, existing["id"], user["name"] if user else None)
         target_tds = sku_row["tds_target"]  # fixed product spec, not user-entered
         citric = num(d.get("citricKg"))
         sorbate = num(d.get("sorbateKg"))
@@ -3686,9 +4033,13 @@ class Handler(BaseHTTPRequestHandler):
             lot = existing["processing_lot"]
             if lot.startswith("DRAFT-"):  # legacy placeholder never numbered — heal it now
                 lot = lot_number_for(existing["created_at"], run_id)
+            # citric_kg/sorbate_kg add the payload amounts (always 0 from the
+            # SPA) onto whatever _commit_reagent_usage already accumulated
+            # from Dilution & Preservation saves, instead of overwriting it.
             cur.execute(
                 "UPDATE production_runs SET processing_lot=?, run_date=?, species_code=?, sku_code=?,"
-                " input_kg=?, target_tds=?, output_litres=?, citric_kg=?, sorbate_kg=?, ibc_used=?,"
+                " input_kg=?, target_tds=?, output_litres=?, citric_kg=COALESCE(citric_kg,0)+?,"
+                " sorbate_kg=COALESCE(sorbate_kg,0)+?, ibc_used=?,"
                 " location=?, notes=?, operators=?, status='completed', draft_data=NULL WHERE id=?",
                 (lot, run_date, species, sku, input_kg, target_tds, output_litres,
                  citric, sorbate, ibc_used, location, notes, operators, run_id))
@@ -3754,6 +4105,14 @@ class Handler(BaseHTTPRequestHandler):
                 (fg_lot, sku, run_id, unit, qty, unit_litres[unit], run_date,
                  target_tds, location, ts))
             fg_created.append(fg_lot)
+            # One finished-good label per unit, from the label item mapped to
+            # this SKU + package type (if any -- no matching item means labels
+            # simply aren't tracked for this combination). A shortage never
+            # blocks finalizing; it just shows as low/negative stock.
+            label_row = conn.execute(
+                "SELECT id FROM consumables WHERE label_sku_code=? AND label_package=?", (sku, unit)).fetchone()
+            if label_row:
+                self._consume(conn, label_row["id"], -qty, "FG labels applied", lot, uname)
 
         return {"processingLot": lot, "runId": run_id, "inputKg": input_kg,
                 "outputLitres": output_litres, "fgLots": fg_created}
@@ -3881,6 +4240,13 @@ class Handler(BaseHTTPRequestHandler):
                                           r["processing_lot"], uname)
         for sp in conn.execute("SELECT container, qty FROM run_sample_points WHERE run_id=?", (rid,)):
             self._adjust_container_stock(conn, sp["container"], sp["qty"] or 0, note, r["processing_lot"], uname)
+        # Reagents (citric acid / potassium sorbate / sodium benzoate) commit a
+        # net amount on Dilution & Preservation Save/finalize, so refund
+        # exactly what run_reagent_commits holds.
+        for rc in conn.execute("SELECT reagent, committed_kg FROM run_reagent_commits WHERE run_id=?", (rid,)):
+            row = self._consumable_by_name(conn, rc["reagent"])
+            if row and rc["committed_kg"]:
+                self._consume(conn, row["id"], rc["committed_kg"], note, r["processing_lot"], uname)
         conn.execute("DELETE FROM production_runs WHERE id=?", (rid,))
         return {"ok": True}
 
@@ -4185,7 +4551,7 @@ class Handler(BaseHTTPRequestHandler):
             c = conn.execute("SELECT * FROM consumables WHERE name=? OR id=?",
                              (key, key if str(key).isdigit() else -1)).fetchone()
             if not c:
-                raise ApiError(404, "Consumable not found")
+                raise ApiError(404, "Item not found")
             title, unit = c["name"], c["unit"]
             # balance at start of period = current on hand minus everything from `frm` onward
             after = conn.execute(
@@ -4328,7 +4694,8 @@ class Handler(BaseHTTPRequestHandler):
         # --- Production ---
         p = conn.execute(
             "SELECT COUNT(*) runs, COALESCE(SUM(input_kg),0) ik, COALESCE(SUM(output_litres),0) ol, "
-            "COALESCE(SUM(citric_kg),0) ck, COALESCE(SUM(sorbate_kg),0) sk "
+            "COALESCE(SUM(citric_kg),0) ck, COALESCE(SUM(sorbate_kg),0) sk, "
+            "COALESCE(SUM(nabenzoate_kg),0) nk "
             "FROM production_runs WHERE status='completed' AND run_date>=? AND run_date<=?", (start, end)).fetchone()
         prod_by_sku = rows(
             "SELECT sku_code sku, COUNT(*) runs, COALESCE(SUM(output_litres),0) litres "
@@ -4404,6 +4771,7 @@ class Handler(BaseHTTPRequestHandler):
                 "outputLitres": round(p["ol"] or 0, 1),
                 "yield": round((p["ol"] / p["ik"]), 3) if p["ik"] else None,
                 "citricKg": round(p["ck"] or 0, 1), "sorbateKg": round(p["sk"] or 0, 1),
+                "nabenzoateKg": round(p["nk"] or 0, 1),
                 "bySku": [{"sku": r["sku"], "runs": r["runs"], "litres": round(r["litres"] or 0, 1)}
                           for r in prod_by_sku]},
             "finishedGoods": {
@@ -4512,7 +4880,7 @@ class Handler(BaseHTTPRequestHandler):
                 log("consumable", c["id"], c["name"], qty, c["unit"])
                 disposed += 1
             if not any_qty:
-                raise ApiError(400, "Enter a quantity to write off for at least one consumable")
+                raise ApiError(400, "Enter a quantity to write off for at least one item")
         else:
             raise ApiError(400, "Unknown disposal type")
 
@@ -4793,7 +5161,8 @@ def report_workbook(data, spname, skname):
     s.section("Summary (" + ml + ")", 3)
     for label, val, st in [("Runs", pr["runs"], 4), ("Input (kg)", pr["inputKg"], 5),
                            ("Output (L)", pr["outputLitres"], 5), ("Yield (L/kg)", pr["yield"], 6),
-                           ("Citric acid (kg)", pr["citricKg"], 5), ("Potassium sorbate (kg)", pr["sorbateKg"], 5)]:
+                           ("Citric acid (kg)", pr["citricKg"], 5), ("Potassium sorbate (kg)", pr["sorbateKg"], 5),
+                           ("Sodium benzoate (kg)", pr["nabenzoateKg"], 5)]:
         s.row([T(label, 7), N(val, st)])
     s.section("By product", 3)
     s.row([H("SKU"), HR("Runs"), HR("Litres")])
@@ -4818,8 +5187,8 @@ def report_workbook(data, spname, skname):
         s.row([T(skname.get(r["sku"], r["sku"])), N(r["litres"], 5)])
     sheets.append(s)
 
-    s = XlsxSheet("Consumables"); s.set_widths([26, 10, 12, 12, 16])
-    s.title("Consumables", 5)
+    s = XlsxSheet("Reagents"); s.set_widths([26, 10, 12, 12, 16])
+    s.title("Reagents", 5)
     s.section("Received / used in " + ml, 5)
     s.row([H("Item"), H("Unit"), HR("Received"), HR("Used"), HR("On hand " + data["asOf"])])
     oh = {r["name"]: r["onHand"] for r in data["consumables"]["onHand"]}
@@ -4838,7 +5207,7 @@ def report_workbook(data, spname, skname):
     s.row([H("Location"), HR("Units"), HR("Litres")])
     for r in bl.get("finishedGoods", []):
         s.row([T(r["location"]), N(r["units"]), N(r["litres"], 5)])
-    s.section("Consumables / packaging", 3)
+    s.section("Reagents / packaging", 3)
     s.row([H("Location"), H("Item"), HR("On hand")])
     for r in bl.get("consumables", []):
         s.row([T(r["location"]), T(r["name"]), N(r["onHand"], 5)])
@@ -4850,7 +5219,7 @@ def report_workbook(data, spname, skname):
     s.section("Summary", 7)
     s.row([T("Totes", 7), N(dz.get("totes", 0)), T("kg", 8), N(dz.get("toteKg", 0), 5)])
     s.row([T("FG lots", 7), N(dz.get("fgLots", 0)), T("litres", 8), N(dz.get("fgLitres", 0), 5)])
-    s.row([T("Consumable write-offs", 7), N(dz.get("consumableEvents", 0))])
+    s.row([T("Reagent / packaging write-offs", 7), N(dz.get("consumableEvents", 0))])
     s.section("Detail", 7)
     s.row([H("Date"), H("Type"), H("Item"), HR("Qty"), H("Unit"), H("Reason"), H("By")])
     for l in dz.get("lines", []):

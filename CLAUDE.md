@@ -2,8 +2,8 @@
 
 A small **manufacturing / processing ERP** for Cascadia Seaweed's liquid kelp
 extract (LKE) line: stabilized kelp inventory → production runs → finished
-goods → customer shipments, plus consumables, reports, barcode labels, and an
-admin panel.
+goods → customer shipments, plus reagents/packaging inventory, reports, barcode
+labels, and an admin panel.
 
 ## Golden rules (read before editing)
 
@@ -59,8 +59,25 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
   `_body_json`. Binary responses (attachment download, `/api/reports/xlsx`) are
   handled specially in `do_GET` and authenticate via the `Authorization` header
   **or** a `?token=` query param (so files/sheets can open in a browser tab).
-- **Consumable stock** moves through `_consume(conn, id, delta, reason, ref)`
-  which updates `on_hand` and logs a `consumable_txns` row (feeds the ledger).
+- **Inventory stock** (the `consumables` table, shown on the "Inventory Items" tab; the UI calls the general group
+  "Reagents") moves through `_consume(conn, id, delta, reason, ref)` which updates
+  `on_hand` and logs a `consumable_txns` row (feeds the ledger). One table, three
+  groups told apart by flags: Packaging = `is_container`, finished-good labels =
+  `label_sku_code`+`label_package` set (one item per SKU + package type, deducted 1
+  per finished unit at finalize -- not the Labels tab, which prints internal
+  barcodes), Reagents = the rest. `item_number` is an optional admin-set Item #.
+- **Reagent usage** (Citric Acid, Potassium Sorbate, Sodium Benzoate) is deducted
+  by `_commit_reagent_usage` from the Dilution & Preservation entries on that
+  section's Save and at finalize: one net-change ledger line per reagent
+  (`run_reagent_commits` remembers what was committed; a draft discard refunds it),
+  same model as Packaging's `_commit_packaging_stock`.
+- **CIP (Clean In Place) log** (`cip_events` + `cip_event_chemicals`, `/api/cip`, the
+  "CIP Log" tab) is a standalone record per cleaning -- not part of a production run
+  (optional `run_id` link only). Its chemical lines are the source of truth for CIP
+  agent consumption: `_apply_cip_stock` deducts/refunds the *difference* on save/edit/
+  delete (one ledger line per agent, ref = `CIP-YYYYMMDD-NNN`) and never blocks on a
+  shortage. Agents are reagents flagged `consumables.is_cip_agent` (seeded: CIP Acid,
+  CIP Caustic, CIP Sanitizer, in L).
 - **Env vars:** `PORT` (8002), `KELP_ERP_DB`, `KELP_ERP_UPLOADS`,
   `KELP_ERP_SECRET`, `KELP_ERP_ADMIN_EMAIL/PASSWORD`, `KELP_ERP_INITIAL_PASSWORD`.
 
@@ -78,8 +95,10 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
 
 `species`, `sites`, `tote_lots` (stabilized totes; status in_stock/consumed/
 disposed), `production_runs` + `run_inputs`, `fg_lots`, `consumables` +
-`consumable_txns`, `customers` / `shipments` / `shipment_lines`, `disposals`,
-`run_attachments`, `run_edits`, `location_moves`, `tote_ph_log`, `users`.
+`consumable_txns`, `run_reagent_commits`, `cip_events` / `cip_event_chemicals`,
+`customers` / `shipments` /
+`shipment_lines`, `disposals`, `run_attachments`, `run_edits`, `location_moves`,
+`tote_ph_log`, `users`.
 
 **IBC lifecycle** (easy to get wrong): harvest check-in consumes empty IBCs from
 a chosen source; a production run **frees** each processed tote's IBC into the
