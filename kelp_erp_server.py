@@ -50,6 +50,7 @@ import sqlite3
 import secrets
 import tempfile
 import datetime
+import statistics
 from xml.sax.saxutils import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -112,6 +113,8 @@ SETTINGS_DEFAULTS = [
      "Pre-filled value for a new run's Ksorbate stock concentration (w/v) field."),
     ("nabenzoate_stock_concentration_default_pct", 25.0, "Nabenzoate stock concentration default (w/v %)",
      "Pre-filled value for a new run's Sodium benzoate stock concentration (w/v) field."),
+    ("yield_report_min_runs", 5, "Yield & Usage minimum runs per group",
+     "A Yield & Usage group with fewer completed (non-excluded) runs than this is tagged \"Low sample\"."),
     ("separation_default_flowrate_lpm", 40, "Separation default Flow rate (L/min)",
      "Pre-filled value for a new run's Separation Flow rate (L/min) field."),
     ("separation_default_mesh_micron", 74, "Separation default Mesh size (micron)",
@@ -526,6 +529,9 @@ CREATE TABLE IF NOT EXISTS production_runs (
     citric_kg      REAL DEFAULT 0,
     sorbate_kg     REAL DEFAULT 0,
     nabenzoate_kg  REAL DEFAULT 0,
+    exclude_from_stats INTEGER NOT NULL DEFAULT 0,  -- test/spoiled run: skipped by Yield & Usage
+    exclude_reason TEXT,
+    finalized_at   TEXT,  -- when the run was finalized (NULL for runs finalized before this was recorded)
     ibc_used       INTEGER DEFAULT 0,
     location       TEXT,
     notes          TEXT,
@@ -1029,6 +1035,8 @@ def migrate(conn):
         ("dilution_ksorbate_added_l", "REAL"),
         ("dilution_nabenzoate_stock_pct", "REAL"), ("dilution_nabenzoate_added_l", "REAL"),
         ("nabenzoate_kg", "REAL DEFAULT 0"),
+        ("exclude_from_stats", "INTEGER NOT NULL DEFAULT 0"), ("exclude_reason", "TEXT"),
+        ("finalized_at", "TEXT"),
         ("packaging_started_at", "TEXT"), ("packaging_packaged_at", "TEXT"),
         ("packaging_qc_ph", "REAL"), ("packaging_tds_pct", "REAL"), ("packaging_brix_pct", "REAL"),
         ("packaging_mannitol_pct", "REAL"), ("packaging_ts_liquid_pct", "REAL"),
@@ -1365,6 +1373,8 @@ def run_public(r):
          "targetTds": r["target_tds"], "outputLitres": r["output_litres"],
          "citricKg": r["citric_kg"], "sorbateKg": r["sorbate_kg"],
          "nabenzoateKg": r["nabenzoate_kg"], "ibcUsed": r["ibc_used"],
+         "excludeFromStats": bool(r["exclude_from_stats"]), "excludeReason": r["exclude_reason"],
+         "finalizedAt": r["finalized_at"],
          "location": r["location"], "notes": r["notes"], "status": r["status"],
          "operators": r["operators"], "createdAt": r["created_at"]}
     try:
@@ -1528,6 +1538,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._download_sop(path)
         if path == "/api/reports/xlsx":
             return self._report_xlsx()
+        if path == "/api/yield-usage/xlsx":
+            return self._yield_usage_xlsx()
         if path == "/api/admin/backup":
             return self._admin_backup()
         if path.startswith("/api/"):
@@ -1556,6 +1568,32 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition",
                              'attachment; filename="kelpworks-report-%s_%s.xlsx"'
                              % (data["from"], data["to"]))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(content)
+        except Exception as e:  # pragma: no cover
+            self._send_json({"error": "Server error: %s" % e}, 500)
+        finally:
+            conn.close()
+
+    def _yield_usage_xlsx(self):
+        conn = db()
+        try:
+            qs = parse_qs(urlparse(self.path).query)
+            header = self.headers.get("Authorization", "")
+            tok = header[7:] if header.startswith("Bearer ") else qs.get("token", [None])[0]
+            if not read_token(tok or ""):
+                return self._send_json({"error": "Invalid or missing token"}, 401)
+            try:
+                data = self.route_yield_usage(qs, conn)
+            except ApiError as e:
+                return self._send_json({"error": e.message}, e.status)
+            content = yield_usage_workbook(data)
+            self.send_response(200)
+            self.send_header("Content-Type",
+                             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Content-Disposition", 'attachment; filename="kelpworks-yield-usage.xlsx"')
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(content)
@@ -1774,6 +1812,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.route_customers(method, seg, conn)
         if seg[:2] == ["api", "shipments"]:
             return self.route_shipments(method, seg, query, conn, user)
+        if method == "GET" and seg == ["api", "yield-usage"]:
+            return self.route_yield_usage(query, conn)
         if method == "GET" and seg == ["api", "reports"]:
             return self.route_reports(query, conn)
         if method == "GET" and seg == ["api", "ledger"]:
@@ -2959,6 +2999,8 @@ class Handler(BaseHTTPRequestHandler):
         ("citric_kg", "citricKg", "Citric acid (kg)", "num"),
         ("sorbate_kg", "sorbateKg", "Potassium sorbate (kg)", "num"),
         ("nabenzoate_kg", "nabenzoateKg", "Sodium benzoate (kg)", "num"),
+        ("exclude_from_stats", "excludeFromStats", "Exclude from yield & usage analysis (1 = excluded)", "num"),
+        ("exclude_reason", "excludeReason", "Exclusion reason", "text"),
         ("location", "location", "Production Location", "text"),
         ("notes", "notes", "Notes", "text"),
         ("operators", "operators", "Operators", "text"),
@@ -3895,6 +3937,12 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             updates[col] = new
             changes.append((label, old, new))
+        # An excluded run must say why (audit trail for the Yield & Usage report).
+        if "exclude_from_stats" in updates or "exclude_reason" in updates:
+            final_flag = updates.get("exclude_from_stats", run["exclude_from_stats"])
+            final_reason = updates.get("exclude_reason", run["exclude_reason"])
+            if final_flag and not (final_reason or "").strip():
+                raise ApiError(400, "Enter a reason for excluding this run from the yield & usage analysis")
         if not updates:
             return {"run": run_public(run), "edits": self._run_edits(conn, rid), "changed": 0}
 
@@ -4040,18 +4088,19 @@ class Handler(BaseHTTPRequestHandler):
                 "UPDATE production_runs SET processing_lot=?, run_date=?, species_code=?, sku_code=?,"
                 " input_kg=?, target_tds=?, output_litres=?, citric_kg=COALESCE(citric_kg,0)+?,"
                 " sorbate_kg=COALESCE(sorbate_kg,0)+?, ibc_used=?,"
-                " location=?, notes=?, operators=?, status='completed', draft_data=NULL WHERE id=?",
+                " location=?, notes=?, operators=?, status='completed', draft_data=NULL,"
+                " finalized_at=? WHERE id=?",
                 (lot, run_date, species, sku, input_kg, target_tds, output_litres,
-                 citric, sorbate, ibc_used, location, notes, operators, run_id))
+                 citric, sorbate, ibc_used, location, notes, operators, ts, run_id))
         else:
             placeholder = "TEMP-" + secrets.token_hex(6)
             cur.execute(
                 "INSERT INTO production_runs (processing_lot,run_date,species_code,sku_code,input_kg,"
                 "target_tds,output_litres,citric_kg,sorbate_kg,ibc_used,location,notes,operators,"
-                "status,created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'completed', ?)",
+                "status,created_at,finalized_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'completed', ?, ?)",
                 (placeholder, run_date, species, sku, input_kg, target_tds, output_litres,
-                 citric, sorbate, ibc_used, location, notes, operators, ts))
+                 citric, sorbate, ibc_used, location, notes, operators, ts, ts))
             run_id = cur.lastrowid
             lot = lot_number_for(ts, run_id)
             cur.execute("UPDATE production_runs SET processing_lot=? WHERE id=?", (lot, run_id))
@@ -4194,10 +4243,14 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(404, "Draft not found")
             if run["status"] != "draft":
                 raise ApiError(409, "This run has already been finalized")
+            # citric_kg / sorbate_kg / nabenzoate_kg are deliberately NOT written
+            # here: the run's reagent totals are accumulated by
+            # _commit_reagent_usage from Dilution & Preservation saves, and the
+            # SPA's draft payload never carries them (it would reset them to 0).
             conn.execute(
                 "UPDATE production_runs SET run_date=?, species_code=?, sku_code=?, target_tds=?,"
-                " citric_kg=?, sorbate_kg=?, location=?, notes=?, operators=? WHERE id=?",
-                (run_date, species, sku, target_tds, citric, sorbate,
+                " location=?, notes=?, operators=? WHERE id=?",
+                (run_date, species, sku, target_tds,
                  location, notes, operators, rid))
 
         processing_lot = conn.execute(
@@ -4647,6 +4700,229 @@ class Handler(BaseHTTPRequestHandler):
         closing = round(opening + sum(t["change"] or 0 for t in txns), 2)
         return {"title": title, "unit": unit, "from": frm, "to": to,
                 "opening": opening, "closing": closing, "txns": txns}
+
+    # ---- Yield & Usage: observed conversion rates + consumption per run ------ #
+    YU_DIMS = ("sku", "species", "farm", "stabilization", "harvest_month", "processing_month")
+    YU_MIXED = "\x00MIXED"   # sorts first; a run with >1 distinct value of a ticked dimension
+
+    @staticmethod
+    def _yu_stats(values):
+        vals = [v for v in values if v is not None]
+        if not vals:
+            return None
+        return {"n": len(vals), "median": round(statistics.median(vals), 4),
+                "min": round(min(vals), 4), "max": round(max(vals), 4)}
+
+    @staticmethod
+    def _yu_category(reason, is_container, label_sku):
+        """Which usage family a ledger line belongs to, or None to ignore it
+        (the Used-IBC inflow and harvest check-in aren't run consumption)."""
+        r = reason or ""
+        if r.startswith("Emptied by processing") or r.startswith("Harvest check-in"):
+            return None
+        if label_sku:
+            return "label"
+        if is_container:
+            return "sample" if r.startswith("Sample point") else "packaging"
+        return "reagent"
+
+    def route_yield_usage(self, query, conn):
+        """Read-only report over completed production runs: two conversion
+        rates (process = output L / measured input kg; harvest = output L /
+        stored batch-average input kg) and what each run consumed (from the
+        consumable ledger, ref = processing lot), grouped by SKU x feedstock
+        source. Excluded runs never count toward group stats."""
+        frm = query.get("from", [""])[0]
+        to = query.get("to", [""])[0]
+        # groupBy is a comma-separated list of dimensions (empty = one "All runs"
+        # group); order follows YU_DIMS, not the query, so titles are stable.
+        raw_dims = query.get("groupBy", ["sku,species,farm"])[0]
+        asked = {d.strip() for d in raw_dims.split(",") if d.strip() and d.strip() != "none"}  # "none": parse_qs drops a blank value
+        bad = asked - set(self.YU_DIMS)
+        if bad:
+            raise ApiError(400, "Unknown groupBy dimension: %s" % ", ".join(sorted(bad)))
+        dims = [d for d in self.YU_DIMS if d in asked]
+        include_excluded = query.get("includeExcluded", ["0"])[0] in ("1", "true")
+        min_runs = int(get_setting_value(conn, "yield_report_min_runs", 5))
+        sql = "SELECT * FROM production_runs WHERE status='completed'"
+        args = []
+        if frm:
+            sql += " AND run_date>=?"; args.append(frm)
+        if to:
+            sql += " AND run_date<=?"; args.append(to)
+        runs = conn.execute(sql + " ORDER BY run_date, id", args).fetchall()
+        sku_names = {r["code"]: r["name"] for r in conn.execute("SELECT code,name FROM fg_skus")}
+        site_names = {r["code"]: r["name"] for r in conn.execute("SELECT code,name FROM sites")}
+        sp_names = {r["code"]: (r["common"] or r["name"]) for r in conn.execute("SELECT * FROM species")}
+
+        def chunks(seq, n=500):
+            for i in range(0, len(seq), n):
+                yield seq[i:i + n]
+
+        ids = [r["id"] for r in runs]
+        totes, measured, usage_rows = {}, {}, {}
+        for part in chunks(ids):
+            ph = ",".join("?" * len(part))
+            for t in conn.execute(
+                    "SELECT id, run_id, site_code, species_code, stabilization_method, checkin_date FROM tote_lots"
+                    " WHERE status='consumed' AND run_id IN (%s)" % ph, part):
+                totes.setdefault(t["run_id"], []).append(t)
+            for ri in conn.execute(
+                    "SELECT ri.run_id, ri.tote_lot_id, ri.weight_kg FROM run_inputs ri"
+                    " JOIN tote_lots t ON t.id=ri.tote_lot_id AND t.run_id=ri.run_id AND t.status='consumed'"
+                    " WHERE ri.run_id IN (%s) AND ri.decision='accepted'" % ph, part):
+                measured.setdefault(ri["run_id"], {})[ri["tote_lot_id"]] = ri["weight_kg"]
+        lot_to_id = {r["processing_lot"]: r["id"] for r in runs}
+        lots = list(lot_to_id)
+        for part in chunks(lots):
+            ph = ",".join("?" * len(part))
+            for u in conn.execute(
+                    "SELECT t.ref, t.reason, t.delta, c.id cid, c.name, c.unit, c.is_container, c.label_sku_code"
+                    " FROM consumable_txns t JOIN consumables c ON c.id=t.consumable_id"
+                    " WHERE t.ref IN (%s)" % ph, part):
+                cat = self._yu_category(u["reason"], u["is_container"], u["label_sku_code"])
+                if not cat:
+                    continue
+                slot = usage_rows.setdefault(lot_to_id[u["ref"]], {}).setdefault(
+                    (u["cid"], cat), {"item": u["name"], "unit": u["unit"], "category": cat, "net": 0.0})
+                slot["net"] += -u["delta"]
+
+        run_out = []
+        for r in runs:
+            rt = totes.get(r["id"], [])
+            pairs = sorted({(t["site_code"], t["species_code"]) for t in rt})
+            sites = sorted({p[0] for p in pairs if p[0]})
+            species = sorted({p[1] for p in pairs if p[1]})
+            mixed = len(pairs) > 1
+            meas = measured.get(r["id"], {})
+            weights = [meas.get(t["id"]) for t in rt]
+            process_kg = (round(sum(weights), 2) if rt and all(w is not None for w in weights) else None)
+            harvest_kg = r["input_kg"] or 0
+            out_l = r["output_litres"] or 0
+            u_items = [dict(item=v["item"], unit=v["unit"], category=v["category"], amount=round(v["net"], 4))
+                       for v in usage_rows.get(r["id"], {}).values()]
+            flags = []
+            if not rt:
+                flags.append("no_source")
+            if rt and process_kg is None:
+                flags.append("missing_measured_weight")
+            if mixed:
+                flags.append("mixed")
+            if not u_items:
+                flags.append("no_usage_data")
+            if harvest_kg <= 0 or out_l <= 0:
+                flags.append("no_output")
+            excluded = bool(r["exclude_from_stats"])
+            # Harvest date = when the totes were checked in (a range if the run
+            # blended several days); processing date = when the run was
+            # finalized, falling back to the run date for runs finalized before
+            # finalized_at was recorded (marked estimated).
+            h_dates = sorted({t["checkin_date"] for t in rt if t["checkin_date"]})
+            fin = r["finalized_at"]
+            run_out.append({
+                "id": r["id"], "lot": r["processing_lot"], "date": r["run_date"], "sku": r["sku_code"],
+                "harvestDateFrom": h_dates[0] if h_dates else None,
+                "harvestDateTo": h_dates[-1] if h_dates else None,
+                "processingDate": fin[:10] if fin else r["run_date"],
+                "processingDateEstimated": not fin,
+                "finalPh": r["packaging_qc_ph"], "finalTds": r["packaging_tds_pct"],
+                # Extraction efficiency (%) = (TDS after extraction - TDS before) / TDS before,
+                # using the Extraction Performance and Homogenization Lot characterization TDS.
+                "tdsBeforeExtraction": r["homog_tds_pct"], "tdsAfterExtraction": r["extraction_tds_pct"],
+                "extractionEfficiency": (round((r["extraction_tds_pct"] - r["homog_tds_pct"]) / r["homog_tds_pct"] * 100, 1)
+                                         if r["homog_tds_pct"] and r["extraction_tds_pct"] is not None else None),
+                "farms": sites, "species": species, "mixed": mixed,
+                "stabilization": sorted({t["stabilization_method"] for t in rt if t["stabilization_method"]}),
+                "harvestKg": round(harvest_kg, 2), "processKg": process_kg, "outputL": round(out_l, 2),
+                "harvestRate": round(out_l / harvest_kg, 3) if harvest_kg > 0 and out_l > 0 else None,
+                "processRate": round(out_l / process_kg, 3) if process_kg and out_l > 0 else None,
+                "weightDiffPct": (round((process_kg - harvest_kg) / harvest_kg * 100, 1)
+                                  if process_kg is not None and harvest_kg > 0 else None),
+                "excluded": excluded, "excludeReason": r["exclude_reason"], "flags": flags,
+                "usage": u_items})
+
+        # ---- group (excluded runs are listed but never counted) ----
+        def dim_values(run, dim):
+            if dim == "sku":
+                return [run["sku"]]
+            if dim == "species":
+                return run["species"]
+            if dim == "farm":
+                return run["farms"]
+            if dim == "stabilization":
+                return run["stabilization"]
+            if dim == "harvest_month":
+                return sorted({d[:7] for d in (run["harvestDateFrom"], run["harvestDateTo"]) if d})
+            return [run["processingDate"][:7]] if run["processingDate"] else []
+
+        def group_key(run):
+            key = []
+            for dim in dims:
+                vals = dim_values(run, dim)
+                key.append(self.YU_MIXED if len(vals) > 1 else (vals[0] if vals else None))
+            return tuple(key)
+
+        def dim_label(dim, val):
+            if val == self.YU_MIXED:
+                return "Mixed"
+            if val is None:
+                return "Not recorded"
+            if dim == "sku":
+                return sku_names.get(val, val)
+            if dim == "species":
+                return sp_names.get(val, val)
+            if dim == "farm":
+                return site_names.get(val, val)
+            return val
+
+        buckets = {}
+        for run in run_out:
+            if not run["excluded"]:
+                buckets.setdefault(group_key(run), []).append(run)
+        groups = []
+        for key, grp in sorted(buckets.items(), key=lambda kv: tuple(str(x) for x in kv[0])):
+            labels = [dim_label(d, v) for d, v in zip(dims, key)]
+            mixed = self.YU_MIXED in key
+            with_usage = [g for g in grp if g["usage"]]
+            items = {}
+            for g in with_usage:
+                for u in g["usage"]:
+                    if u["amount"] <= 0:
+                        continue
+                    items.setdefault((u["item"], u["category"], u["unit"]), []).append((g, u["amount"]))
+            usage = []
+            for (item, cat, unit), pairs_ in sorted(items.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+                usage.append({
+                    "item": item, "category": cat, "unit": unit,
+                    "usedIn": len(pairs_), "ofRuns": len(with_usage),
+                    "total": round(sum(a for _g, a in pairs_), 4),
+                    "perKLOutput": self._yu_stats([a / g["outputL"] * 1000 for g, a in pairs_ if g["outputL"] > 0]),
+                    "perTonneProcess": self._yu_stats([a / g["processKg"] * 1000 for g, a in pairs_ if g["processKg"]]),
+                    "perTonneHarvest": self._yu_stats([a / g["harvestKg"] * 1000 for g, a in pairs_ if g["harvestKg"] > 0])})
+            proc = [g for g in grp if g["processRate"] is not None]
+            harv = [g for g in grp if g["harvestRate"] is not None]
+            groups.append({
+                "dims": dict(zip(dims, labels)), "title": " · ".join(labels) if labels else "All runs",
+                "mixed": mixed,
+                "runs": len(grp), "lowSample": len(grp) < min_runs,
+                "harvestKg": round(sum(g["harvestKg"] for g in grp), 2),
+                "processKg": round(sum(g["processKg"] for g in proc), 2),
+                "outputL": round(sum(g["outputL"] for g in grp), 2),
+                "processRate": dict(self._yu_stats([g["processRate"] for g in proc]) or {},
+                                    pooled=(round(sum(g["outputL"] for g in proc) / sum(g["processKg"] for g in proc), 3)
+                                            if proc and sum(g["processKg"] for g in proc) else None)) if proc else None,
+                "harvestRate": dict(self._yu_stats([g["harvestRate"] for g in harv]) or {},
+                                    pooled=(round(sum(g["outputL"] for g in harv) / sum(g["harvestKg"] for g in harv), 3)
+                                            if harv and sum(g["harvestKg"] for g in harv) else None)) if harv else None,
+                "usageRuns": len(with_usage), "usage": usage})
+        shown = run_out if include_excluded else [r for r in run_out if not r["excluded"]]
+        for r in shown:
+            r["skuName"] = sku_names.get(r["sku"], r["sku"])
+            r["farmNames"] = [site_names.get(s, s) for s in r["farms"]]
+            r["speciesNames"] = [sp_names.get(s, s) for s in r["species"]]
+        return {"from": frm or None, "to": to or None, "groupBy": dims, "minRuns": min_runs,
+                "includeExcluded": include_excluded, "excludedCount": sum(1 for r in run_out if r["excluded"]),
+                "groups": groups, "runs": shown}
 
     def route_reports(self, query, conn):
         frm = query.get("from", [""])[0]
@@ -5113,6 +5389,72 @@ def xlsx_build(sheets):
         z.writestr("xl/worksheets/sheet%d.xml" % (i + 1), s.xml())
     z.close()
     return buf.getvalue()
+
+
+def yield_usage_workbook(data):
+    """Two-sheet .xlsx of the Yield & Usage report: the grouped stats and the
+    per-run detail (every column the page shows, all three usage bases)."""
+    T = lambda v, s=0: ("t", v, s)
+    N = lambda v, s=6: (("n", v, s) if v is not None else ("t", "—", 0))
+    H = lambda v: ("t", v, 3)
+    HR = lambda v: ("t", v, 9)
+    sheets = []
+    # One label column holding the group title (the ticked dimensions joined);
+    # the second column is kept blank-free by folding it into the first.
+    DIM_LABEL = {"sku": "Product", "species": "Species", "farm": "Farm", "stabilization": "Stabilization",
+                 "harvest_month": "Harvest month", "processing_month": "Processing month"}
+    grouped = ", ".join(DIM_LABEL[d] for d in data["groupBy"]) or "None (all runs)"
+    rng = lambda a, b: (a if a == b else "%s to %s" % (a, b)) if a else "—"
+
+    s = XlsxSheet("Yield & Usage"); s.set_widths([40, 8, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12])
+    s.title("Yield & Usage -- completed, non-excluded runs", 14)
+    s.row([T("Range", 7), T("%s to %s" % (data["from"] or "start", data["to"] or "today"))])
+    s.row([T("Grouped by", 7), T(grouped)])
+    s.section("Conversion rates (L output per kg input)", 14)
+    s.row([H("Group"), HR("Runs"), H("Sample"),
+           HR("Process n"), HR("Process median"), HR("Process min"), HR("Process max"), HR("Process pooled"),
+           HR("Harvest n"), HR("Harvest median"), HR("Harvest min"), HR("Harvest max"), HR("Harvest pooled")])
+    for g in data["groups"]:
+        pr, hr = g["processRate"] or {}, g["harvestRate"] or {}
+        s.row([T(g["title"]), N(g["runs"], 4), T("Low sample" if g["lowSample"] else "OK"),
+               N(pr.get("n"), 4), N(pr.get("median")), N(pr.get("min")), N(pr.get("max")), N(pr.get("pooled")),
+               N(hr.get("n"), 4), N(hr.get("median")), N(hr.get("min")), N(hr.get("max")), N(hr.get("pooled"))])
+    s.section("Usage (net kg / L / units consumed per run, from the ledger)", 14)
+    s.row([H("Group"), H("Item"), H("Category"), H("Unit"), HR("Used in"), HR("Of runs"), HR("Total"),
+           HR("/1000 L out median"), HR("min"), HR("max"),
+           HR("/1000 kg process median"), HR("min"), HR("max")])
+    for g in data["groups"]:
+        for u in g["usage"]:
+            ko, tp = u["perKLOutput"] or {}, u["perTonneProcess"] or {}
+            s.row([T(g["title"]), T(u["item"]), T(u["category"]), T(u["unit"]),
+                   N(u["usedIn"], 4), N(u["ofRuns"], 4), N(u["total"]),
+                   N(ko.get("median")), N(ko.get("min")), N(ko.get("max")),
+                   N(tp.get("median")), N(tp.get("min")), N(tp.get("max"))])
+    s.section("Usage per 1000 kg harvest input", 14)
+    s.row([H("Group"), H("Item"), HR("median"), HR("min"), HR("max")])
+    for g in data["groups"]:
+        for u in g["usage"]:
+            th = u["perTonneHarvest"] or {}
+            s.row([T(g["title"]), T(u["item"]), N(th.get("median")), N(th.get("min")), N(th.get("max"))])
+    sheets.append(s)
+
+    s = XlsxSheet("Runs"); s.set_widths([22, 16, 22, 22, 22, 22, 16, 12, 12, 12, 12, 12, 10, 10, 14, 10, 26, 30])
+    s.title("Runs", 18)
+    s.row([H("Lot"), H("Processing date"), H("Harvest date"), H("Product"), H("Farm"), H("Species"),
+           H("Stabilization"), HR("Harvest kg"), HR("Process kg"), HR("Output L"),
+           HR("Harvest rate"), HR("Process rate"), HR("Final pH"), HR("Final TDS (%)"), HR("Extraction efficiency (%)"),
+           H("Excluded"), H("Reason"), H("Flags")])
+    for r in data["runs"]:
+        s.row([T(r["lot"]),
+               T(r["processingDate"] + (" (est.)" if r["processingDateEstimated"] else "")),
+               T(rng(r["harvestDateFrom"], r["harvestDateTo"])), T(r["skuName"]),
+               T(" / ".join(r["farmNames"]) or "—"), T(" / ".join(r["speciesNames"]) or "—"),
+               T(" / ".join(r["stabilization"]) or "—"),
+               N(r["harvestKg"], 5), N(r["processKg"], 5), N(r["outputL"], 5), N(r["harvestRate"]), N(r["processRate"]),
+               N(r["finalPh"], 6), N(r["finalTds"], 6), N(r["extractionEfficiency"], 6),
+               T("Yes" if r["excluded"] else ""), T(r["excludeReason"] or ""), T(", ".join(r["flags"]))])
+    sheets.append(s)
+    return xlsx_build(sheets)
 
 
 def report_workbook(data, spname, skname):

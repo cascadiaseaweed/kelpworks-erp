@@ -99,7 +99,7 @@ function render() {
   const v = $('#view'); v.innerHTML = '';
   ({ dashboard: pageDashboard, stabilized: pageStabilized, production: pageProduction, cip: pageCIP,
      qc: pageQC, fg: pageFG, shipping: pageShipping, consumables: pageConsumables, reports: pageReports,
-     calculations: pageCalculations, labels: pageLabels, admin: pageAdmin }[State.tab])(v);
+     yieldusage: pageYield, calculations: pageCalculations, labels: pageLabels, admin: pageAdmin }[State.tab])(v);
 }
 
 /* ---------------- Dashboard ---------------- */
@@ -615,7 +615,8 @@ async function pageProduction(v) {
     const fgList = run.fgLots.map(f => `${fmt(f.qty)} × ${f.packageSize}`).join(', ') || '—';
     const card = el('div', { class: 'card' },
       el('div', { class: 'page-head', style: 'margin:0 0 8px' },
-        el('h3', { style: 'margin:0' }, mono(run.processingLot) , '  ', el('span', { class: 'pill' }, skuName(run.sku))),
+        el('h3', { style: 'margin:0' }, mono(run.processingLot) , '  ', el('span', { class: 'pill' }, skuName(run.sku)),
+          run.excludeFromStats ? el('span', { class: 'pill', style: 'margin-left:6px', title: run.excludeReason || '' }, 'Excluded from analysis') : null),
         el('div', { class: 'actions' },
           el('button', { class: 'secondary', onclick: () => editRun(run) }, 'Edit'),
           el('button', { class: 'secondary', onclick: () => openProcessLog(run) }, '📋 Process log'),
@@ -717,7 +718,12 @@ async function editRun(run) {
     field('Production Location', productionLocationSelect('e_loc', run.location)),
     field('Operators', operatorsSelect.el),
     field('Notes', el('textarea', { id: 'e_notes', rows: '2' }, run.notes || '')),
+    el('div', { class: 'qc-check-section-title' }, 'Yield & Usage analysis'),
+    field('Exclude this run from the yield & usage analysis (test / spoiled / unrepresentative)',
+      el('input', { type: 'checkbox', id: 'e_excl' })),
+    field('Reason for excluding', el('input', { id: 'e_excl_reason', value: run.excludeReason || '', placeholder: 'required when excluded' })),
     el('div', { class: 'help' }, 'These kg totals include what was logged under Dilution & Preservation. Changing citric / sorbate / benzoate adjusts reagent stock by the difference. Every change is logged with your name.'));
+  body.querySelector('#e_excl').checked = !!run.excludeFromStats;
   modal('Edit run — ' + run.processingLot, body, async () => {
     const r = await api('PUT', '/production/' + run.id, {
       runDate: body.querySelector('#e_date').value,
@@ -726,7 +732,9 @@ async function editRun(run) {
       nabenzoateKg: body.querySelector('#e_nabenzoate').value || 0,
       location: body.querySelector('#e_loc').value,
       operators: operatorsSelect.value,
-      notes: body.querySelector('#e_notes').value
+      notes: body.querySelector('#e_notes').value,
+      excludeFromStats: body.querySelector('#e_excl').checked ? 1 : 0,
+      excludeReason: body.querySelector('#e_excl_reason').value
     });
     State.ref = await api('GET', '/refdata');
     toast(r.changed ? r.changed + ' change' + (r.changed === 1 ? '' : 's') + ' logged' : 'No changes');
@@ -3575,6 +3583,158 @@ function exportReportCsv(d) {
   document.body.append(a); a.click(); a.remove();
 }
 
+/* ---------------- Yield & Usage ---------------- */
+// Read-only view over completed runs: observed conversion rates (process =
+// output L / measured input kg, harvest = output L / stored batch-average
+// input kg) and what each run consumed, grouped by any ticked combination of product / species / farm / ... --
+// the observation layer a BOM is later promoted from. Excluded runs never
+// count toward the stats (Edit run -> "Exclude from yield & usage analysis").
+const YU_CATEGORIES = { reagent: 'Reagent', packaging: 'Packaging', sample: 'Sample container', label: 'FG label' };
+const YU_FLAGS = { mixed: 'Mixed source', missing_measured_weight: 'No measured weight', no_usage_data: 'No usage data',
+  no_output: 'No output', no_source: 'No source totes' };
+const YU_BASES = {
+  perKLOutput: { label: 'per 1,000 L output' },
+  perTonneProcess: { label: 'per 1,000 kg process input (measured)' },
+  perTonneHarvest: { label: 'per 1,000 kg harvest input (batch-average)' },
+};
+const YU_DIMS = [['sku', 'Product'], ['species', 'Species'], ['farm', 'Farm'], ['stabilization', 'Stabilization method'],
+  ['harvest_month', 'Harvest month'], ['processing_month', 'Processing month']];
+const yuDimLabels = dims => (dims || []).map(d => (YU_DIMS.find(x => x[0] === d) || [d, d])[1]).join(', ') || 'None (all runs)';
+const yuRange = (a, b) => !a ? '—' : (a === b ? a : a + ' → ' + b);
+function yuQuery(s) {
+  return '?groupBy=' + (s.dims.join(',') || 'none') + (s.from ? '&from=' + s.from : '') + (s.to ? '&to=' + s.to : '')
+    + (s.showExcluded ? '&includeExcluded=1' : '');
+}
+async function pageYield(v) {
+  const s = { from: '', to: '', dims: ['sku', 'species', 'farm'], showExcluded: false, basis: 'perKLOutput' };
+  let data = null;
+  const fromInp = el('input', { type: 'date' }), toInp = el('input', { type: 'date' });
+  // Any combination of dimensions may be ticked; a run holding more than one
+  // value of a ticked dimension lands in that dimension's "Mixed" bucket.
+  const dimCbs = YU_DIMS.map(([k, label]) => {
+    const cb = el('input', { type: 'checkbox' });
+    cb.checked = s.dims.includes(k);
+    cb.addEventListener('change', load);
+    return { k, cb, el: el('label', { style: 'display:inline-flex;align-items:center;gap:4px;margin-right:14px;font-weight:normal;white-space:nowrap' }, cb, label) };
+  });
+  const groupBox = el('div', { style: 'display:flex;flex-wrap:wrap;padding:4px 0' }, ...dimCbs.map(d => d.el));
+  const basisSel = selectFrom('', Object.entries(YU_BASES).map(([k, b]) => [k, b.label]));
+  const exclCb = el('input', { type: 'checkbox' });
+  const host = el('div', {});
+  async function load() {
+    s.from = fromInp.value; s.to = toInp.value; s.dims = dimCbs.filter(d => d.cb.checked).map(d => d.k); s.showExcluded = exclCb.checked;
+    data = await api('GET', '/yield-usage' + yuQuery(s));
+    draw();
+  }
+  function setRange(from, to) { fromInp.value = from; toInp.value = to; load(); }
+  const today = new Date().toISOString().slice(0, 10);
+  const daysAgo = n => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
+  v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Yield & Usage'),
+    el('div', { class: 'actions' },
+      el('button', { class: 'secondary', onclick: () => exportYieldCsv(data) }, '⬇ CSV'),
+      el('button', { class: 'secondary', onclick: () => {
+        const a = el('a', { href: '/api/yield-usage/xlsx' + yuQuery(s) + '&token=' + encodeURIComponent(State.token), download: 'kelpworks-yield-usage.xlsx' });
+        document.body.append(a); a.click(); a.remove();
+      } }, '⬇ Excel'))));
+  v.append(el('div', { class: 'help', style: 'margin-bottom:10px' },
+    'Observed conversion rates and consumption from completed runs -- the basis for a BOM. Process rate = output L / measured input kg; '
+    + 'harvest rate = output L / stored batch-average input kg. Usage comes from the consumable ledger; runs finalized before reagent deduction have no usage data.'),
+    el('div', { class: 'form-row-3', style: 'margin-bottom:6px' }, field('From', fromInp), field('To', toInp), field('Group by (tick any combination)', groupBox)),
+    el('div', { class: 'form-row-3', style: 'margin-bottom:10px' },
+      field('Usage shown', basisSel),
+      field('Show excluded runs', exclCb),
+      el('div', { class: 'actions', style: 'align-self:end;display:flex;gap:6px' },
+        el('button', { class: 'secondary', onclick: () => setRange('', '') }, 'All time'),
+        el('button', { class: 'secondary', onclick: () => setRange(daysAgo(90), today) }, 'Last 90 days'),
+        el('button', { class: 'secondary', onclick: () => setRange(today.slice(0, 4) + '-01-01', today) }, 'Year to date'))),
+    host);
+  [fromInp, toInp, exclCb].forEach(c => c.addEventListener('change', load));
+  basisSel.addEventListener('change', () => { s.basis = basisSel.value; draw(); });
+
+  const stat = (st, d) => st ? [fmt(st.median, d), fmt(st.min, d), fmt(st.max, d)] : ['—', '—', '—'];
+  function draw() {
+    host.innerHTML = '';
+    if (!data.groups.length) {
+      host.append(el('div', { class: 'empty card' }, 'No completed runs match this range' + (data.excludedCount ? ' (' + data.excludedCount + ' excluded).' : '.')));
+    }
+    data.groups.forEach(g => {
+      const rate = (label, r) => [label, r ? fmt(r.n) : '0', ...stat(r, 3), r && r.pooled != null ? fmt(r.pooled, 3) : '—'];
+      host.append(el('div', { class: 'card', style: 'margin-bottom:14px' },
+        el('h3', {}, g.title, ' ', g.lowSample ? badge('low', 'LOW SAMPLE (n<' + data.minRuns + ')') : null),
+        el('div', { class: 'summary-line' }, sl('Runs', fmt(g.runs)), sl('Harvest input', fmt(g.harvestKg, 0) + ' kg'),
+          sl('Process input (' + (g.processRate ? g.processRate.n : 0) + ' runs measured)', fmt(g.processKg, 0) + ' kg'),
+          sl('Output', fmt(g.outputL, 0) + ' L')),
+        table(['Conversion rate (L / kg)', 'Runs', 'Median', 'Min', 'Max', 'Pooled'],
+          [rate('Process (measured weight)', g.processRate), rate('Harvest (batch-average weight)', g.harvestRate)],
+          [false, true, true, true, true, true]),
+        el('div', { class: 'qc-check-section-title' }, 'Usage ' + YU_BASES[s.basis].label),
+        g.usage.length ? table(['Item', 'Category', 'Unit', 'Used in', 'Median', 'Min', 'Max', 'Total'],
+          g.usage.map(u => [u.item, YU_CATEGORIES[u.category] || u.category, u.unit,
+            u.usedIn + ' of ' + u.ofRuns + ' runs', ...stat(u[s.basis], 3), fmt(u.total, 2)]),
+          [false, false, false, false, true, true, true, true])
+          : el('div', { class: 'help' }, g.usageRuns ? 'No consumption recorded for these runs.'
+            : 'No usage data yet -- runs finalized before reagent deduction have none.')));
+    });
+    if (data.runs.length) {
+      const body = table(['Lot', 'Processing date', 'Harvest date', 'Product', 'Farm', 'Species', 'Harvest kg', 'Process kg', 'Output L',
+        'Harvest rate', 'Process rate', 'Extraction eff. (%)', 'Final pH', 'Final TDS (%)', 'Flags', ''],
+        data.runs.map(r => [mono(r.lot),
+          r.processingDate + (r.processingDateEstimated ? ' (est.)' : ''),
+          yuRange(r.harvestDateFrom, r.harvestDateTo), r.skuName,
+          r.farmNames.join(' · ') || '—', r.speciesNames.join(' · ') || '—',
+          fmt(r.harvestKg, 1), r.processKg != null ? fmt(r.processKg, 1) : '—', fmt(r.outputL, 0),
+          r.harvestRate != null ? fmt(r.harvestRate, 3) : '—', r.processRate != null ? fmt(r.processRate, 3) : '—',
+          r.extractionEfficiency != null ? fmt(r.extractionEfficiency, 1) : '—',
+          r.finalPh != null ? fmt(r.finalPh, 2) : '—', r.finalTds != null ? fmt(r.finalTds, 2) : '—',
+          (r.excluded ? ['Excluded' + (r.excludeReason ? ': ' + r.excludeReason : '')] : []).concat(r.flags.map(f => YU_FLAGS[f] || f)).join(' · ') || '—',
+          rowActions([['Edit', async () => {
+            const run = (await api('GET', '/production')).runs.find(x => x.id === r.id);
+            if (run) editRun(run);
+          }]])]),
+        [false, false, false, false, false, false, true, true, true, true, true, true, true, true, false, false]);
+      [...body.querySelectorAll('tbody tr')].forEach((tr, i) => { if (data.runs[i].excluded) tr.style.opacity = '.55'; });
+      host.append(el('details', { class: 'accordion', style: 'margin-top:6px' }, el('summary', {}, 'Runs (' + data.runs.length + ')'),
+        el('div', { class: 'accordion-body' }, body)));
+    }
+  }
+  await load();
+}
+function exportYieldCsv(d) {
+  if (!d) return toast('Nothing to export yet.', true);
+  const lines = [];
+  const add = (...cols) => lines.push(cols.map(c => '"' + String(c == null ? '' : c).replace(/"/g, '""') + '"').join(','));
+  add('Cascadia Seaweed — Yield & Usage', (d.from || 'start') + ' to ' + (d.to || 'today'), 'Grouped by', yuDimLabels(d.groupBy));
+  add('');
+  add('CONVERSION RATES (L output per kg input)');
+  add('Group', 'Runs', 'Low sample', 'Process n', 'Process median', 'Process min', 'Process max', 'Process pooled',
+    'Harvest n', 'Harvest median', 'Harvest min', 'Harvest max', 'Harvest pooled');
+  d.groups.forEach(g => {
+    const p = g.processRate || {}, h = g.harvestRate || {};
+    add(g.title, g.runs, g.lowSample ? 'yes' : '', p.n ?? '', p.median ?? '', p.min ?? '', p.max ?? '', p.pooled ?? '',
+      h.n ?? '', h.median ?? '', h.min ?? '', h.max ?? '', h.pooled ?? '');
+  });
+  add('');
+  add('USAGE (net consumed per run, from the ledger)');
+  add('Group', 'Item', 'Category', 'Unit', 'Used in', 'Of runs', 'Total',
+    'per 1000 L output median', 'min', 'max', 'per 1000 kg process median', 'min', 'max', 'per 1000 kg harvest median', 'min', 'max');
+  d.groups.forEach(g => g.usage.forEach(u => {
+    const o = u.perKLOutput || {}, p = u.perTonneProcess || {}, h = u.perTonneHarvest || {};
+    add(g.title, u.item, YU_CATEGORIES[u.category] || u.category, u.unit, u.usedIn, u.ofRuns, u.total,
+      o.median ?? '', o.min ?? '', o.max ?? '', p.median ?? '', p.min ?? '', p.max ?? '', h.median ?? '', h.min ?? '', h.max ?? '');
+  }));
+  add('');
+  add('RUNS');
+  add('Lot', 'Processing date', 'Processing date estimated', 'Harvest date', 'Product', 'Farm', 'Species', 'Stabilization',
+    'Harvest kg', 'Process kg', 'Output L', 'Harvest rate', 'Process rate', 'TDS before extraction (%)', 'TDS after extraction (%)', 'Extraction efficiency (%)', 'Final pH', 'Final TDS (%)', 'Excluded', 'Reason', 'Flags');
+  d.runs.forEach(r => add(r.lot, r.processingDate, r.processingDateEstimated ? 'yes' : '', yuRange(r.harvestDateFrom, r.harvestDateTo),
+    r.skuName, r.farmNames.join(' / '), r.speciesNames.join(' / '), r.stabilization.join(' / '),
+    r.harvestKg, r.processKg ?? '', r.outputL, r.harvestRate ?? '', r.processRate ?? '', r.tdsBeforeExtraction ?? '', r.tdsAfterExtraction ?? '', r.extractionEfficiency ?? '', r.finalPh ?? '', r.finalTds ?? '',
+    r.excluded ? 'yes' : '', r.excludeReason || '', r.flags.join(' ')));
+  const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+  const a = el('a', { href: URL.createObjectURL(blob), download: 'kelpworks-yield-usage.csv' });
+  document.body.append(a); a.click(); a.remove();
+}
+
 /* ---------------- Calculations ---------------- */
 // Registry of every calculated field in the app -- displayed on the
 // Calculations page. Keep this in sync going forward: add an entry when a
@@ -3667,6 +3827,26 @@ const CALCULATIONS = [
     description: 'A run’s total bottled output and IBC usage, computed from the Packaging table’s entries at finalization using each container’s litres-each value (Inventory Items → Packaging).',
     location: 'Production → Packaging section, applied when a run is finalized',
     settings: [],
+  },
+  {
+    title: 'Process / Harvest conversion rate (Yield & Usage)',
+    formula: 'Process rate (L/kg) = Output (L) / Σ measured tote weights (kg)   ·   Harvest rate (L/kg) = Output (L) / stored input (kg, batch-average tote weight)   ·   Pooled = Σ output / Σ input over the group’s runs',
+    description: 'Per completed, non-excluded run, with median / min / max across the group. A run missing a measured weight on any accepted tote has no process rate (no fallback). Groups with fewer runs than the minimum are tagged "Low sample".',
+    location: 'Yield & Usage tab',
+    settings: ['yield_report_min_runs'],
+  },
+  {
+    title: 'Extraction efficiency (Yield & Usage)',
+    formula: 'Extraction efficiency (%) = (TDS after extraction − TDS before extraction) / TDS before extraction × 100',
+    description: 'TDS before extraction is the Homogenization → Lot characterization TDS (%); TDS after extraction is the Extraction → Extraction Performance TDS (%). Blank when either value is missing or the before-TDS is zero.',
+    location: 'Yield & Usage tab → Runs table',
+  },
+  {
+    title: 'Usage per 1,000 L / 1,000 kg (Yield & Usage)',
+    formula: 'Usage = net units consumed on the run’s ledger lines (reagents, packaging, sample containers, FG labels; refunds and edits netted)   ·   per 1,000 L = usage / output (L) × 1000   ·   per 1,000 kg = usage / input (kg) × 1000',
+    description: 'Statistics are over the runs that used the item; "used in a of b runs" counts b as the group’s runs that have any usage data (runs finalized before reagent deduction have none and are left out rather than counted as zero).',
+    location: 'Yield & Usage tab',
+    settings: ['yield_report_min_runs'],
   },
   {
     title: 'CIP duration',
