@@ -78,6 +78,20 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
   delete (one ledger line per agent, ref = `CIP-YYYYMMDD-NNN`) and never blocks on a
   shortage. Agents are reagents flagged `consumables.is_cip_agent` (seeded: CIP Acid,
   CIP Caustic, CIP Sanitizer, in L).
+- **Yield & Usage** (`route_yield_usage`, `/api/yield-usage` + `/xlsx`, the "Yield & Usage"
+  tab) is a read-only report over completed runs: two conversion rates -- process
+  (output L / measured `run_inputs.weight_kg`) and harvest (output L / stored
+  `input_kg`, the batch-average tote weight) -- plus per-run consumption read from the
+  consumable ledger (`ref` = processing lot; reagents / packaging / sample containers /
+  FG labels). Group-by is a set of checkboxes (`groupBy=a,b` over `YU_DIMS`: sku, species,
+  farm, stabilization, harvest_month, processing_month); species/farm/harvest date come from
+  the run's consumed totes, and a run holding several values of a ticked dimension goes in
+  that dimension's "Mixed" bucket. Run rows show harvest date (tote check-in), processing
+  date (`production_runs.finalized_at`, stamped at finalize; older runs fall back to the run
+  date, shown "(est.)"), extraction efficiency ((`extraction_tds_pct` - `homog_tds_pct`) / `homog_tds_pct`, %) and final pH/TDS (Packaging QC Check `packaging_qc_ph`/`packaging_tds_pct`).
+  `production_runs.exclude_from_stats` (+ reason,
+  set in Edit run) removes a test/spoiled run from the stats. Runs finalized before
+  reagent deduction have no usage data and are left out of usage stats, not counted as 0.
 - **Env vars:** `PORT` (8002), `KELP_ERP_DB`, `KELP_ERP_UPLOADS`,
   `KELP_ERP_SECRET`, `KELP_ERP_ADMIN_EMAIL/PASSWORD`, `KELP_ERP_INITIAL_PASSWORD`.
 
