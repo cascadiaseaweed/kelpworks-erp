@@ -64,7 +64,8 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
   `on_hand` and logs a `consumable_txns` row (feeds the ledger). One table, three
   groups told apart by flags: Packaging = `is_container`, finished-good labels =
   `label_sku_code`+`label_package` set (one item per SKU + package type, deducted 1
-  per finished unit at finalize -- not the Labels tab, which prints internal
+  per container consumed by the Packaging commit (`_commit_label_stock`, net-change via
+  `run_label_commits`) -- not the Labels tab, which prints internal
   barcodes), Reagents = the rest. `item_number` is an optional admin-set Item #.
 - **Reagent usage** (Citric Acid, Potassium Sorbate, Sodium Benzoate) is deducted
   by `_commit_reagent_usage` from the Dilution & Preservation entries on that
@@ -92,6 +93,70 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
   `production_runs.exclude_from_stats` (+ reason,
   set in Edit run) removes a test/spoiled run from the stats. Runs finalized before
   reagent deduction have no usage data and are left out of usage stats, not counted as 0.
+- **Product release (review + Quality sign-off)** gates sales. Finalizing a run sets
+  `production_runs.release_state='pending_review'` and creates its `fg_lots` with status
+  `pending_release` (not shippable: `create_shipment` only ships `on_hand`; `PUT /api/fg`
+  can't move a lot in/out of `pending_release` or to `on_hand` unless the run is released).
+  A user flagged `is_production_manager` or `is_quality_manager` (Admin > Users; admin role
+  alone grants nothing; flag changes go to `user_permission_log`) signs the production-log
+  review (-> `pending_release`, awaiting QA), then a Quality Manager signs release (lots ->
+  `on_hand`) or rejects (lots -> `hold`); the same person may do both. Endpoints under
+  `/api/release` (`route_release`/`_release_action`); every signature re-checks the password.
+  Audit = append-only `release_events`, hash-chained (`release_log` / `release_verify_chain`),
+  each with the SHA-256 of the production-log snapshot (`_release_snapshot_hash`, built from
+  `_run_full` minus edits / FG lots / the exclusion flag). Any non-GET under
+  `/api/production/<run id>/...` runs `_release_reconcile`: if the log no longer matches the
+  signed hash the sign-off is voided (run -> pending review, unsold lots -> pending release,
+  shipped units recorded in the event). Runs finalized before this existed are `legacy`
+  (grandfathered as released, one SYSTEM event each, via `migrate()`). Don't add a way to
+  edit/delete `release_events` rows.
+- **Production-log required fields** are defined once, server-side, in `PROGRESS_SECTIONS` /
+  `REQUIRED_FEEDSTOCK` (`kelp_erp_server.py`; exposed to the SPA as `refdata.requiredFields`).
+  Everything is required except: every Notes field, the Homogenization / Separation /
+  Pasteurization sample-point boxes, Extraction's QC Check Total-solids + Density fields,
+  checkboxes, calculated values and legacy dilution-tank rows. `_run_progress` returns
+  per-section `{total, filled, missing, done}` (attached to drafts and `_run_full`; also
+  `GET /api/production/<id>/progress`) -- the progress chips are green only when a section is
+  `done`. `_finalize_run` ends with `_required_problems`; raising there rolls the whole
+  finalize back. The SPA marks required labels with `rfield()/reqLabel()` (red `*`), and
+  `finalizeRun` saves the header + presses every `button.section-save` before finalizing. When
+  adding a production-log field, add it to the registry (and use `rfield`) or it stays optional.
+  The feedstock accept/reject decision must be an explicit choice: `run_inputs.decision` is
+  NOT NULL, so `run_inputs.decision_set` records whether an operator actually chose (inputs of
+  runs finalized before it existed were backfilled as set; `_run_inputs_public` returns
+  `decision: None` until set).
+- **Packaging edits after finalize** re-derive everything computed from the packaging rows in the
+  same transaction (`_sync_completed_packaging`): container + FG-label stock (net-change commit),
+  the run's FG lots (`_adjust_fg_lot`, refuses to go below units already shipped/moved), and
+  `output_litres` / `ibc_used`. A draft's rows still only count once committed. Principle: a
+  derived value (FG lot, stock, output) must be recomputed from the source rows by the code that
+  changes them, never edited separately. Legacy runs without commit rows get a no-movement baseline
+  first (`_ensure_packaging_baseline`).
+- **Amend run** (production-log changes after finalize). A completed run's production log is
+  LOCKED: `_amend_guard` (called in `_route` for every `/api/production/<id>/...` write) returns
+  409 `code: amendment_required` unless the run has an open amendment. Exempt: `/attachments`
+  (documents), `/amendments`, and `edit_run`'s yield-analysis exclusion flag; label printing is
+  client-side. `run_amendments` + routes in `route_amendments`: open (reason + category; a run that
+  was reviewed/released needs a Production/Quality Manager's password) -> run is `amending`,
+  review hash cleared, on_hand lots held -> edit -> submit (ONE revision = diff of the log vs
+  `start_snapshot`, reason/category stored; refuses to leave a previously complete run incomplete;
+  run -> `pending_review`) or cancel (only if nothing changed; restores prior state/lots).
+  Events (`amendment_opened/submitted/cancelled`) go in the hash-chained `release_events`.
+  Documents are excluded from the release snapshot/hash (`_RELEASE_HASH_SKIP`) so they never
+  create revisions or void sign-offs. If you change what the snapshot contains, bump
+  `RELEASE_SNAPSHOT_VERSION`: boot re-hashes reviewed/released runs (SYSTEM `rebaseline` event) so a
+  format change is never mistaken for a tampered log.
+- **Revision tracker**: `run_revisions` (append-only). Rev 1 = finalize; each submitted amendment
+  adds a revision with the reason, category and field-level old -> new changes. Runs finalized
+  earlier show a synthetic Rev 1. `progress`/`revisions`/`revision`/`amendment` are excluded from
+  the release snapshot hash.
+- **Data integrity check** (`_integrity_check`, `GET /api/integrity`; admin or Quality Manager;
+  UI: Admin and Product Release pages): per finalized run, packaging entries vs FG lots + shipped
+  + disposed, output litres, container/label stock commits, release status vs lot status, signed
+  log hash vs current log, open amendments, required fields (info), and the audit chain. Safe
+  derived-data repairs (`POST /api/integrity/repair`: resync_lots, recompute_output,
+  recommit_stock, fix_lot_status) need the actor's password and are logged to `release_events`.
+  Legacy runs without packaging entries can't be cross-checked and are reported as info only.
 - **Env vars:** `PORT` (8002), `KELP_ERP_DB`, `KELP_ERP_UPLOADS`,
   `KELP_ERP_SECRET`, `KELP_ERP_ADMIN_EMAIL/PASSWORD`, `KELP_ERP_INITIAL_PASSWORD`.
 
@@ -109,7 +174,7 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
 
 `species`, `sites`, `tote_lots` (stabilized totes; status in_stock/consumed/
 disposed), `production_runs` + `run_inputs`, `fg_lots`, `consumables` +
-`consumable_txns`, `run_reagent_commits`, `cip_events` / `cip_event_chemicals`,
+`consumable_txns`, `run_reagent_commits`, `release_events`, `cip_events` / `cip_event_chemicals`,
 `customers` / `shipments` /
 `shipment_lines`, `disposals`, `run_attachments`, `run_edits`, `location_moves`,
 `tote_ph_log`, `users`.
