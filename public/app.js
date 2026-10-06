@@ -1193,21 +1193,46 @@ async function openQcForRun(run) {
 // Every stage (Homogenization, Extraction, Separation, Pasteurization) is
 // bespoke -- each needs a QC Check/Sample Point card and/or custom per-field
 // placeholders/defaults a generic field-list renderer can't do.
+// ---- Tank 5A/5B -> Tank 6A/6B dilution ------------------------------------------------
+// The operator pushes product from 5A/5B into 6A, 6B or both (connected = double capacity) and
+// dilutes it to the SKU's target TDS. Mass balance (c1V1 = c2V2): c1 = Separation filtrate TDS,
+// c2 = target TDS, so the diluted volume is V1 x c1/c2. The receiving tanks' current contents
+// are part of the fit check.
+const RECEIVING_TANKS = [['6A', 'Tank 6A only'], ['6B', 'Tank 6B only'], ['6AB', 'Tank 6A + 6B connected']];
+const usesTank = (receiving, t) => receiving === '6AB' || receiving === t;
+function dilutionPlanCalc(p) {
+  const cap = settingValue('dilution_tank_capacity_each_l', 5000);
+  const n = p.receiving === '6AB' ? 2 : (p.receiving ? 1 : 0);
+  const existing = (usesTank(p.receiving, '6A') ? (p.start6a || 0) : 0) + (usesTank(p.receiving, '6B') ? (p.start6b || 0) : 0);
+  const out = { cap, n, existing, available: null, space: n ? Math.max(0, cap * n - existing) : null,
+    maxTransfer: null, transfer: null, water: null, expectedFinal: null, remaining: null, fits: null };
+  if (p.v5a != null || p.v5b != null) out.available = (p.v5a || 0) + (p.v5b || 0);
+  if (!n || !p.c1 || !p.c2) return out;
+  const ratio = p.c1 / p.c2;
+  out.maxTransfer = ratio > 1 ? out.space / ratio : out.space;     // most product that still fits once diluted
+  if (out.available == null) return out;
+  out.transfer = Math.min(out.available, out.maxTransfer);
+  out.water = ratio > 1 ? out.transfer * (ratio - 1) : 0;         // 0 when already at/below target
+  out.expectedFinal = existing + out.transfer + out.water;
+  out.remaining = out.available - out.transfer;
+  out.fits = out.remaining <= 0.5;
+  return out;
+}
+const round10 = v => Math.round(v / 10) * 10;
+const fmtL = v => v == null ? null : fmt(round10(v), 0) + ' L';
+
 // Pasteurization: "Start Conditions" groups the stage's process parameters
 // (Total volume (L) was removed); "Pasteurization Out" holds a Sample Point
-// box subtitled "Post-pasteurization microbial check" (the matching
-// "Pre-pasteurization microbial check" box was removed -- its backend column/
-// historical run_sample_points rows stay, additive-only, just no longer
-// collected). Same one-accordion/section-title/single-Save formatting as
-// Extraction/Separation. Pasteurization In's
-// Process Check ("Dilution requirements") also holds the run's TDS target
-// and Tank 6A/B max level (both display-only) and the calculated Target
-// fill level, Tank 6A/B (L) -- same mass-conservation math as
-// Homogenization's Recommended Dilution Water (L) -- so `getTdsTarget` is
-// a getter (not a plain value): a caller with a live-changing SKU (the
-// picker in a draft still being edited) can call the returned `refresh()`
-// again after that changes.
-function buildPasteurizationSection(getRunId, values, samplePoints, processingLot, getTdsTarget, getExtractionTds) {
+// box subtitled "Post-pasteurization microbial check". Pasteurization In's
+// Process Check is the DILUTION PLAN for pushing product from Tanks 5A/5B into
+// 6A/6B: the levels in 5A/5B, which receiving tank(s), what is already in them,
+// and from those the maximum product that can be transferred before the tanks
+// reach capacity once diluted, plus the recommended transfer and dilution water
+// (see dilutionPlanCalc). The actuals live in Dilution & Preservation.
+// `getTdsTarget` / `getSeparationTds` are getters (not plain values) so a caller
+// with a live-changing SKU or a just-saved Separation can call `refresh()` /
+// `refreshTds()` again.
+function buildPasteurizationSection(getRunId, values, samplePoints, processingLot, getTdsTarget, getSeparationTds) {
   values = values || {};
   const startedAt = el('input', { type: 'datetime-local', value: values.startedAt || '' });
   const productSetpointInp = el('input', { inputmode: 'decimal', placeholder: 'Product set-point (°C)' }); attachNumericMask(productSetpointInp, 2);
@@ -1217,51 +1242,76 @@ function buildPasteurizationSection(getRunId, values, samplePoints, processingLo
   boilerSetpointInp.value = values.boilerSetpointC != null ? formatQcValue(values.boilerSetpointC, 2)
     : String(settingValue('pasteurization_default_boiler_setpoint_c', 90));
 
-  // Pasteurization In: a Process Check for the dilution TDS reading used to
-  // work out the fill level in Tanks 6A/B, followed by the pre-
-  // pasteurization microbial Sample Point.
-  // TDS concentrated (%) is read-only here -- it always mirrors Extraction's
-  // own QC Check TDS reading, never a separately-typed value. refreshTds()
-  // re-reads getExtractionTds() and is called both on initial render and
-  // externally (refreshExtractionTds, below) right after Extraction's Save
-  // succeeds, so this display updates immediately in the same session --
-  // no reload needed. currentTds is what actually gets snapshotted into
-  // pasteurization_tds_pct on Save (see save(), below).
-  const dilutionTdsValue = el('span', {});
-  let currentTds = null;
-  function refreshTds() {
-    currentTds = getExtractionTds ? getExtractionTds() : null;
-    if (currentTds != null) {
-      dilutionTdsValue.className = 'qc-check-result-value';
-      dilutionTdsValue.textContent = formatQcValue(currentTds, 1) + '%';
-    } else {
-      dilutionTdsValue.className = 'help';
-      dilutionTdsValue.textContent = 'Please enter a %TDS value in Extraction -> QC Check';
-    }
-    refreshDilutionReq();
+  // ---- Dilution plan
+  const levelInp = v => { const i = el('input', { inputmode: 'decimal', placeholder: 'Measured using level sensor' }); attachNumericMask(i, 2); if (v != null) i.value = formatQcValue(v, 2); return i; };
+  const numOf = inp => inp.value.trim() === '' ? null : qcParseValue(inp.value);
+  const tank5aInp = levelInp(values.tank5aL), tank5bInp = levelInp(values.tank5bL);
+  const receivingSel = el('select', {}, el('option', { value: '' }, 'Select…'), ...RECEIVING_TANKS.map(([v, l]) => el('option', { value: v }, l)));
+  receivingSel.value = values.receivingTanks || '';
+  const start6aInp = levelInp(values.tank6aStartL != null ? values.tank6aStartL : 0);
+  const start6bInp = levelInp(values.tank6bStartL != null ? values.tank6bStartL : 0);
+  const start6aField = rfield('pasteurization', 'tank6aStartL', 'Tank 6A level before transfer (L)', start6aInp);
+  const start6bField = rfield('pasteurization', 'tank6bStartL', 'Tank 6B level before transfer (L)', start6bInp);
+  let currentTds = null, lastCalc = null;
+  const planCbs = [];
+  const tile = () => el('span', { class: 'help' });
+  const T = { available: tile(), space: tile(), max: tile(), transfer: tile(), water: tile(), expected: tile() };
+  const summaryHost = el('div', { class: 'summary-line' });
+  const statusLine = el('div', { class: 'plan-status' });
+  const resultRow = (label, node, cls) => el('div', { class: 'qc-check-result' + (cls ? ' ' + cls : '') },
+    el('span', { class: 'qc-check-result-label' }, label), node);
+  function getPlan() {
+    return { receiving: receivingSel.value, v5a: numOf(tank5aInp), v5b: numOf(tank5bInp), start6a: numOf(start6aInp), start6b: numOf(start6bInp),
+      c1: currentTds, c2: getTdsTarget(), calc: lastCalc };
   }
-  const dilutionReqContent = el('div', {});
+  const setTile = (span, text) => { span.className = text != null ? 'qc-check-result-value' : 'help'; span.textContent = text != null ? text : '—'; };
   function refreshDilutionReq() {
-    dilutionReqContent.innerHTML = '';
-    const tdsTarget = getTdsTarget();
-    const tankMax = settingValue('dilution_tank_6ab_max_level_l', 5000);
-    const fillLevelRaw = (currentTds != null && currentTds > 0 && tdsTarget != null) ? tankMax * tdsTarget / currentTds : null;
-    lastFillLevel = fillLevelRaw != null ? Math.round(fillLevelRaw / 10) * 10 : null;
-    dilutionReqContent.append(
-      el('div', { class: 'summary-line' },
-        sl('TDS target', tdsTarget != null ? formatQcValue(tdsTarget, 1) + '%' : '—'),
-        sl('Tank 6A/B max level (L)', fmt(tankMax, 0) + ' L')),
-      field('Target fill level, Tank 6A/B (L)',
-        el('span', { class: lastFillLevel != null ? 'qc-check-result-value' : 'help' },
-          lastFillLevel != null ? fmt(lastFillLevel, 0) + ' L'
-            : 'Enter the TDS concentrated (%) and select a SKU with a target TDS to calculate')));
+    start6aField.classList.toggle('hidden', !usesTank(receivingSel.value, '6A'));
+    start6bField.classList.toggle('hidden', !usesTank(receivingSel.value, '6B'));
+    const p = getPlan();
+    const c = lastCalc = dilutionPlanCalc(p);
+    summaryHost.innerHTML = '';
+    summaryHost.append(sl('TDS concentrated (Separation filtrate)', p.c1 != null ? formatQcValue(p.c1, 2) + '%' : '—'),
+      sl('TDS target', p.c2 != null ? formatQcValue(p.c2, 2) + '%' : '—'), sl('Capacity per tank', fmt(c.cap, 0) + ' L'));
+    setTile(T.available, fmtL(c.available));
+    setTile(T.space, fmtL(c.space));
+    setTile(T.max, c.maxTransfer != null ? fmt(Math.floor(c.maxTransfer / 10) * 10, 0) + ' L' : null);
+    setTile(T.transfer, fmtL(c.transfer));
+    setTile(T.water, fmtL(c.water));
+    setTile(T.expected, fmtL(c.expectedFinal));
+    if (p.c1 == null) { statusLine.className = 'plan-status'; statusLine.textContent = 'Needs the Separation filtrate TDS (Separation → Filtrate QC Check).'; }
+    else if (!p.c2) { statusLine.className = 'plan-status'; statusLine.textContent = 'Select a product SKU with a target TDS.'; }
+    else if (!c.n) { statusLine.className = 'plan-status'; statusLine.textContent = 'Choose the receiving tank(s) to see how much can be transferred.'; }
+    else if (c.fits === null) { statusLine.className = 'plan-status'; statusLine.textContent = 'Enter the Tank 5A / 5B levels to see the recommended transfer.'; }
+    else if (c.fits) {
+      statusLine.className = 'plan-status ok';
+      statusLine.textContent = '✓ All ' + fmtL(c.available) + ' in 5A/5B fits once diluted.';
+    } else {
+      statusLine.className = 'plan-status warn';
+      statusLine.textContent = '⚠ Only ' + fmt(Math.floor(c.maxTransfer / 10) * 10, 0) + ' L of the ' + fmt(round10(c.available), 0)
+        + ' L in 5A/5B can be pushed through before the receiving tank(s) reach capacity after dilution — about ' + fmtL(c.remaining) + ' stays behind.';
+    }
+    planCbs.forEach(cb => cb());
   }
-  let lastFillLevel = null;
+  function refreshTds() { currentTds = getSeparationTds ? getSeparationTds() : null; refreshDilutionReq(); }
+  [tank5aInp, tank5bInp, start6aInp, start6bInp].forEach(i => i.addEventListener('input', refreshDilutionReq));
+  receivingSel.addEventListener('change', refreshDilutionReq);
   const dilutionProcessCheckBox = el('div', { class: 'qc-check-box' },
     el('div', { class: 'qc-check-title' }, 'Process Check'),
-    el('div', { class: 'qc-check-subtitle' }, 'Dilution requirements'),
-    field('TDS concentrated (%)', dilutionTdsValue),
-    dilutionReqContent);
+    el('div', { class: 'qc-check-subtitle' }, 'Dilution plan — Tanks 5A/5B → 6A/6B'),
+    summaryHost,
+    el('div', { class: 'form-row' },
+      rfield('pasteurization', 'tank5aL', 'Tank 5A level (L)', tank5aInp),
+      rfield('pasteurization', 'tank5bL', 'Tank 5B level (L)', tank5bInp)),
+    el('div', { class: 'form-row' }, rfield('pasteurization', 'receivingTanks', 'Receiving tanks', receivingSel)),
+    el('div', { class: 'form-row' }, start6aField, start6bField),
+    resultRow('Product available in 5A / 5B', T.available),
+    resultRow('Available space in receiving tank(s)', T.space),
+    resultRow('Maximum product to transfer', T.max, 'plan-key'),
+    resultRow('Recommended product transfer', T.transfer),
+    resultRow('Recommended dilution water', T.water),
+    resultRow('Expected final volume in receiving tank(s)', T.expected),
+    statusLine);
 
   const postCollectedInp = el('input', { type: 'datetime-local',
     value: values.postSampleCollectedAt ? values.postSampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
@@ -1277,12 +1327,19 @@ function buildPasteurizationSection(getRunId, values, samplePoints, processingLo
     status.textContent = ''; saveBtn.disabled = true;
     try {
       const rid = await getRunId();
+      const p = getPlan(), c = p.calc || {};
       await api('PUT', '/production/' + rid + '/stages/pasteurization', {
         startedAt: startedAt.value || null,
-        productSetpointC: productSetpointInp.value.trim() === '' ? null : qcParseValue(productSetpointInp.value),
-        boilerSetpointC: boilerSetpointInp.value.trim() === '' ? null : qcParseValue(boilerSetpointInp.value),
+        productSetpointC: numOf(productSetpointInp),
+        boilerSetpointC: numOf(boilerSetpointInp),
         postSampleCollectedAt: postCollectedInp.value || null,
         tdsPct: currentTds,
+        tank5aL: p.v5a, tank5bL: p.v5b, receivingTanks: p.receiving || null,
+        tank6aStartL: usesTank(p.receiving, '6A') ? p.start6a : null,
+        tank6bStartL: usesTank(p.receiving, '6B') ? p.start6b : null,
+        maxTransferL: c.maxTransfer != null ? c.maxTransfer : null,
+        recommendedTransferL: c.transfer != null ? c.transfer : null,
+        recommendedWaterL: c.water != null ? c.water : null,
       });
       status.textContent = 'Saved.';
     } catch (e) { status.textContent = e.message; }
@@ -1290,7 +1347,7 @@ function buildPasteurizationSection(getRunId, values, samplePoints, processingLo
   }
   refreshTds();
   return {
-    refreshExtractionTds: refreshTds,
+    refreshTds,
     box: el('details', { class: 'accordion' }, el('summary', {}, 'Pasteurization'),
       el('div', { class: 'accordion-body' },
         el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Start Conditions'),
@@ -1306,7 +1363,8 @@ function buildPasteurizationSection(getRunId, values, samplePoints, processingLo
         postSamplePointBox,
         el('div', { style: 'margin-top:6px' }, saveBtn, status))),
     refresh: refreshDilutionReq,
-    getTargetFillLevel: () => lastFillLevel
+    getPlan,
+    onPlanChange: cb => planCbs.push(cb)
   };
 }
 // "solids" renders as a subscript -- Unicode has no subscript i/d, so this
@@ -1462,7 +1520,7 @@ function buildExtractionSection(getRunId, values, onSaved) {
 // Check and a Sample Point box; "Liquid Out" is a QC Check with only the
 // Liquid fields (no Slurry/Solids section). Same one-accordion/section-
 // title/single-Save formatting as Extraction.
-function buildSeparationSection(getRunId, values, samplePoints, processingLot) {
+function buildSeparationSection(getRunId, values, samplePoints, processingLot, onSaved) {
   values = values || {};
   const startedAt = el('input', { type: 'datetime-local', value: values.startedAt || '' });
   const flowrateInp = el('input', { inputmode: 'decimal', placeholder: 'Flow rate (L/min)' }); attachNumericMask(flowrateInp, 2);
@@ -1512,7 +1570,7 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot) {
     try {
       const rid = await getRunId();
       const liquidPayload = liquidQc.getPayload();
-      await api('PUT', '/production/' + rid + '/stages/separation', {
+      const sepPayload = {
         startedAt: startedAt.value || null,
         flowrateLpm: flowrateInp.value.trim() === '' ? null : qcParseValue(flowrateInp.value),
         meshMicron: meshInp.value.trim() === '' ? null : qcParseValue(meshInp.value),
@@ -1523,7 +1581,12 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot) {
         liquidBrixPct: liquidPayload.brixPct, liquidMannitolPct: liquidPayload.mannitolPct,
         liquidTsLiquidPct: liquidPayload.tsLiquidPct, liquidRhoLiquidGMl: liquidPayload.rhoLiquidGMl,
         solidsSampleCollectedAt: solidsCollectedInp.value || null,
-      });
+      };
+      await api('PUT', '/production/' + rid + '/stages/separation', sepPayload);
+      // keep the shared stages.separation object current and let Pasteurization's dilution plan
+      // re-read the filtrate TDS right now, not just next time the window is opened
+      Object.assign(values, sepPayload);
+      if (onSaved) onSaved();
       status.textContent = 'Saved.';
     } catch (e) { status.textContent = e.message; }
     saveBtn.disabled = false;
@@ -2171,28 +2234,21 @@ function buildFeedstockCard(opts) {
     el('div', { class: 'accordion-body' }, ...bodyEls));
 }
 
-// Dilution & Preservation -> "Dilution" and "Preservatives". The Dilution
-// requirements Process Check (TDS concentrated/target, Tank 6A/B max level,
-// Target fill level) now lives entirely in Pasteurization In (see
-// buildPasteurizationSection) -- this box only holds the run's actual
-// measured fill level/pH and the citric acid added to correct it, plain
-// (unboxed) fields, against the SKU's fixed Target pH; and "Preservatives",
-// the potassium sorbate stock-solution dosing fields, including a
-// calculated estimate of how much stock solution to add (never persisted
-// itself, same convention as every other calculated field in KelpWorks).
-// Everything here saves together through the "dilution" stage endpoint; the
-// repeatable tank list below (buildDilutionsSection) is unrelated and saves
-// independently per row. `getTargetPh`/`getKsorbateTarget`/`getTargetFillLevel`
-// are getters (not plain values) so a caller with a live-changing SKU (e.g.
-// the picker in a draft still being edited) can call `refresh()` again after
-// that changes; `getTargetFillLevel` also changes live as the operator types
-// into Pasteurization In's TDS concentrated (%) field.
-function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsorbateTarget, getTargetFillLevel, getNabenzoateTarget) {
+// Dilution & Preservation -> "Dilution", "Preservatives" and "pH Balancing". Dilution records
+// what actually happened against the Dilution plan in Pasteurization In: the product transferred
+// from 5A/5B, the dilution water added (measured, e.g. totalizer) and the final level in each
+// receiving tank, with checks against the plan (final volume variance, expected TDS). Preservative
+// doses are worked out PER TANK from that tank's final volume; the run totals (which drive the
+// reagent deduction) are the sums. `getPlan` returns the Pasteurization plan (receiving tanks,
+// starting levels, TDS) live. Everything here saves together through the "dilution" stage
+// endpoint, called by the section's single Save.
+function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsorbateTarget, getPlan, getNabenzoateTarget) {
   values = values || {};
-
-  const fillLevelInp = el('input', { inputmode: 'decimal', placeholder: 'Measured using level sensor' });
-  attachNumericMask(fillLevelInp, 2);
-  if (values.fillLevelTank6abL != null) fillLevelInp.value = formatQcValue(values.fillLevelTank6abL, 2);
+  const numOf = inp => inp.value.trim() === '' ? null : qcParseValue(inp.value);
+  const lvl = (v, ph) => { const i = el('input', { inputmode: 'decimal', placeholder: ph || 'Measured using level sensor' }); attachNumericMask(i, 2); if (v != null) i.value = formatQcValue(v, 2); return i; };
+  const productInp = lvl(values.productTransferredL, 'From the 5A/5B level drop');
+  const waterInp = lvl(values.waterAddedL, 'Measured using dilution totalizer');
+  const final6aInp = lvl(values.tank6aFinalL), final6bInp = lvl(values.tank6bFinalL);
   const measuredPhInp = el('input', { inputmode: 'decimal', placeholder: 'pH' }); attachNumericMask(measuredPhInp, 1);
   if (values.measuredPh != null) measuredPhInp.value = formatQcValue(values.measuredPh, 1);
   const citricInp = el('input', { inputmode: 'decimal', placeholder: 'kg' }); attachNumericMask(citricInp, 2);
@@ -2203,153 +2259,397 @@ function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsor
     targetPhValue.textContent = targetPh != null ? formatQcValue(targetPh, 1) : '—';
   }
 
-  // Dilution water added, TDS: how much dilution water was actually added,
-  // found by comparing the tank's measured Fill level against the planned
-  // (pre-dilution) Target fill level, Tank 6A/B (L) from Pasteurization In.
-  const dilutionWaterAddedValue = el('span', { class: 'help' });
-  function calcDilutionWaterAddedTds() {
-    const fillLevel = fillLevelInp.value.trim() === '' ? null : qcParseValue(fillLevelInp.value);
-    const targetFillLevel = getTargetFillLevel();
-    if (fillLevel == null || targetFillLevel == null) return null;
-    return Math.round((fillLevel - targetFillLevel) / 10) * 10;
-  }
-  function refreshDilutionWaterAdded() {
-    const v = calcDilutionWaterAddedTds();
-    dilutionWaterAddedValue.className = v != null ? 'qc-check-result-value' : 'help';
-    dilutionWaterAddedValue.textContent = v != null ? fmt(v, 0) + ' L'
-      : 'Enter the Fill level, Tank 6A/B to calculate';
-  }
-  fillLevelInp.addEventListener('input', refreshDilutionWaterAdded);
+  const tile = () => el('span', { class: 'help' });
+  const setTile = (span, text, cls) => { span.className = text != null ? (cls || 'qc-check-result-value') : 'help'; span.textContent = text != null ? text : '—'; };
+  const resultRow = (label, node, cls) => el('div', { class: 'qc-check-result' + (cls ? ' ' + cls : '') },
+    el('span', { class: 'qc-check-result-label' }, label), node);
+  const recapReceiving = tile(), recapTransfer = tile(), recapWater = tile();
+  const totalFinalT = tile(), expectedT = tile(), varianceT = tile(), expTdsT = tile();
+  const noPlanNote = el('div', { class: 'help', style: 'margin-bottom:6px' });
+  const final6aField = rfield('dilution', 'tank6aFinalL', 'Final level, Tank 6A (L)', final6aInp);
+  const final6bField = rfield('dilution', 'tank6bFinalL', 'Final level, Tank 6B (L)', final6bInp);
 
+  // preservative stock concentrations
   const ksorbateStockInp = el('input', { inputmode: 'decimal', placeholder: '%' }); attachNumericMask(ksorbateStockInp, 1);
   ksorbateStockInp.value = values.ksorbateStockPct != null ? formatQcValue(values.ksorbateStockPct, 1)
     : formatQcValue(settingValue('ksorbate_stock_concentration_default_pct', 25), 1);
-  const ksorbateStockField = el('div', { style: 'display:flex;align-items:center;gap:6px' },
-    ksorbateStockInp, el('span', { class: 'help' }, '%'));
-
-  // Ksorbate, calculated (L): the volume of stock solution needed to reach
-  // the SKU's target Ksorbate dose in the tank's current (actual) fill
-  // volume -- same mass-conservation shape as Target fill level, Tank 6A/B
-  // (L), solved for volume instead of level.
-  const ksorbateCalculatedLValue = el('span', { class: 'help' });
-  function calcKsorbateCalculatedL() {
-    const fillLevel = fillLevelInp.value.trim() === '' ? null : qcParseValue(fillLevelInp.value);
-    const stockPct = ksorbateStockInp.value.trim() === '' ? null : qcParseValue(ksorbateStockInp.value);
-    const ksorbateTarget = getKsorbateTarget();
-    if (fillLevel == null || !stockPct || ksorbateTarget == null) return null;
-    return fillLevel * ksorbateTarget * 100 / stockPct;
-  }
-  function refreshKsorbateCalculatedL() {
-    const v = calcKsorbateCalculatedL();
-    ksorbateCalculatedLValue.className = v != null ? 'qc-check-result-value' : 'help';
-    ksorbateCalculatedLValue.textContent = v != null ? formatQcValue(v, 2) + ' L'
-      : 'Enter the Fill level, Tank 6A/B and Ksorbate stock concentration, and select a SKU with a Ksorbate target to calculate';
-  }
-
-  const ksorbateAddedLInp = el('input', { inputmode: 'decimal', placeholder: 'L' }); attachNumericMask(ksorbateAddedLInp, 2);
-  if (values.ksorbateAddedL != null) ksorbateAddedLInp.value = formatQcValue(values.ksorbateAddedL, 2);
-  const ksorbateAddedKgValue = el('span', { class: 'help' });
-  function calcKsorbateAddedKg() {
-    const stockPct = ksorbateStockInp.value.trim() === '' ? null : qcParseValue(ksorbateStockInp.value);
-    const addedL = ksorbateAddedLInp.value.trim() === '' ? null : qcParseValue(ksorbateAddedLInp.value);
-    if (stockPct == null || addedL == null) return null;
-    return addedL * stockPct / 100;
-  }
-  function refreshKsorbateAddedKg() {
-    const v = calcKsorbateAddedKg();
-    ksorbateAddedKgValue.className = v != null ? 'qc-check-result-value' : 'help';
-    ksorbateAddedKgValue.textContent = v != null ? formatQcValue(v, 2) + ' kg' : 'Enter the stock concentration and volume added to calculate';
-  }
-  fillLevelInp.addEventListener('input', refreshKsorbateCalculatedL);
-  ksorbateStockInp.addEventListener('input', () => { refreshKsorbateCalculatedL(); refreshKsorbateAddedKg(); });
-  ksorbateAddedLInp.addEventListener('input', refreshKsorbateAddedKg);
-
-  // Sodium benzoate: identical stock-solution mechanics to Ksorbate above --
-  // a stock concentration (w/v), the volume needed to reach the SKU's
-  // Nabenzoate target in the current fill, the volume actually added, and
-  // the resulting kg (which is what Save deducts from Sodium Benzoate stock).
+  const ksorbateStockField = el('div', { style: 'display:flex;align-items:center;gap:6px' }, ksorbateStockInp, el('span', { class: 'help' }, '%'));
   const nabenzoateStockInp = el('input', { inputmode: 'decimal', placeholder: '%' }); attachNumericMask(nabenzoateStockInp, 1);
   nabenzoateStockInp.value = values.nabenzoateStockPct != null ? formatQcValue(values.nabenzoateStockPct, 1)
     : formatQcValue(settingValue('nabenzoate_stock_concentration_default_pct', 25), 1);
-  const nabenzoateStockField = el('div', { style: 'display:flex;align-items:center;gap:6px' },
-    nabenzoateStockInp, el('span', { class: 'help' }, '%'));
-  const nabenzoateCalculatedLValue = el('span', { class: 'help' });
-  function calcNabenzoateCalculatedL() {
-    const fillLevel = fillLevelInp.value.trim() === '' ? null : qcParseValue(fillLevelInp.value);
-    const stockPct = nabenzoateStockInp.value.trim() === '' ? null : qcParseValue(nabenzoateStockInp.value);
-    const nabenzoateTarget = getNabenzoateTarget ? getNabenzoateTarget() : null;
-    if (fillLevel == null || !stockPct || nabenzoateTarget == null) return null;
-    return fillLevel * nabenzoateTarget * 100 / stockPct;
+  const nabenzoateStockField = el('div', { style: 'display:flex;align-items:center;gap:6px' }, nabenzoateStockInp, el('span', { class: 'help' }, '%'));
+
+  // per-tank preservative rows (a row only shows for a tank being filled)
+  const prInp = v => { const i = el('input', { inputmode: 'decimal', placeholder: 'L' }); attachNumericMask(i, 2); if (v != null) i.value = formatQcValue(v, 2); return i; };
+  const ks = { '6A': prInp(values.ksorbateAddedL6a), '6B': prInp(values.ksorbateAddedL6b) };
+  const nb = { '6A': prInp(values.nabenzoateAddedL6a), '6B': prInp(values.nabenzoateAddedL6b) };
+  const rowT = {};
+  ['6A', '6B'].forEach(t => {
+    rowT[t] = { fin: tile(), ksCalc: tile(), nbCalc: tile() };
+    rowT[t].tr = el('tr', {}, el('td', {}, el('b', {}, 'Tank ' + t)), el('td', { class: 'num' }, rowT[t].fin),
+      el('td', { class: 'num' }, rowT[t].ksCalc), el('td', {}, ks[t]), el('td', { class: 'num' }, rowT[t].nbCalc), el('td', {}, nb[t]));
+  });
+  const ksTotalL = tile(), ksTotalKg = tile(), nbTotalL = tile(), nbTotalKg = tile();
+  const changeCbs = [];
+
+  const finalIn = t => numOf(t === '6A' ? final6aInp : final6bInp);
+  const used = () => { const p = getPlan(); return { p, a: usesTank(p.receiving, '6A'), b: usesTank(p.receiving, '6B') }; };
+  const usedList = () => { const u = used(); return ['6A', '6B'].filter(t => t === '6A' ? u.a : u.b); };
+  function totalFinal() {
+    const tanks = usedList();
+    if (!tanks.length) return null;
+    const vals = tanks.map(finalIn);
+    return vals.some(v => v == null) ? null : vals.reduce((a, b) => a + b, 0);
   }
-  function refreshNabenzoateCalculatedL() {
-    const v = calcNabenzoateCalculatedL();
-    nabenzoateCalculatedLValue.className = v != null ? 'qc-check-result-value' : 'help';
-    nabenzoateCalculatedLValue.textContent = v != null ? formatQcValue(v, 2) + ' L'
-      : 'Enter the Fill level, Tank 6A/B and Nabenzoate stock concentration, and select a SKU with a Nabenzoate target to calculate';
+  function expectedFinal() {
+    const { p } = used();
+    const tr = numOf(productInp), w = numOf(waterInp);
+    if (!p.receiving || tr == null || w == null) return null;
+    return ((usesTank(p.receiving, '6A') ? (p.start6a || 0) : 0) + (usesTank(p.receiving, '6B') ? (p.start6b || 0) : 0)) + tr + w;
   }
-  const nabenzoateAddedLInp = el('input', { inputmode: 'decimal', placeholder: 'L' }); attachNumericMask(nabenzoateAddedLInp, 2);
-  if (values.nabenzoateAddedL != null) nabenzoateAddedLInp.value = formatQcValue(values.nabenzoateAddedL, 2);
-  const nabenzoateAddedKgValue = el('span', { class: 'help' });
-  function calcNabenzoateAddedKg() {
-    const stockPct = nabenzoateStockInp.value.trim() === '' ? null : qcParseValue(nabenzoateStockInp.value);
-    const addedL = nabenzoateAddedLInp.value.trim() === '' ? null : qcParseValue(nabenzoateAddedLInp.value);
-    if (stockPct == null || addedL == null) return null;
-    return addedL * stockPct / 100;
+  function variancePct() { const t = totalFinal(), e = expectedFinal(); return (t != null && e) ? (t - e) / e * 100 : null; }
+  function expectedTds() {
+    const { p } = used();
+    const tr = numOf(productInp), w = numOf(waterInp);
+    return (p.c1 != null && tr != null && w != null && tr + w > 0) ? p.c1 * tr / (tr + w) : null;
   }
-  function refreshNabenzoateAddedKg() {
-    const v = calcNabenzoateAddedKg();
-    nabenzoateAddedKgValue.className = v != null ? 'qc-check-result-value' : 'help';
-    nabenzoateAddedKgValue.textContent = v != null ? formatQcValue(v, 2) + ' kg' : 'Enter the stock concentration and volume added to calculate';
+  function sumAdded(map) {
+    const tanks = usedList();
+    if (!tanks.length) return null;
+    const vals = tanks.map(t => numOf(map[t]));
+    return vals.some(v => v == null) ? null : vals.reduce((a, b) => a + b, 0);
   }
-  fillLevelInp.addEventListener('input', refreshNabenzoateCalculatedL);
-  nabenzoateStockInp.addEventListener('input', () => { refreshNabenzoateCalculatedL(); refreshNabenzoateAddedKg(); });
-  nabenzoateAddedLInp.addEventListener('input', refreshNabenzoateAddedKg);
+  function calcPerTank(t, which) {
+    const fin = finalIn(t);
+    const stockPct = numOf(which === 'ks' ? ksorbateStockInp : nabenzoateStockInp);
+    const target = which === 'ks' ? getKsorbateTarget() : (getNabenzoateTarget ? getNabenzoateTarget() : null);
+    return (fin != null && stockPct && target != null) ? fin * target * 100 / stockPct : null;
+  }
+
+  function refresh() {
+    refreshTargetPh();
+    const { p, a, b } = used();
+    const c = p.calc || {};
+    noPlanNote.textContent = p.receiving ? '' : 'Choose the receiving tank(s) and enter the tank levels in Pasteurization → Dilution plan first; the tank fields for this section then appear here.'
+      + (values.fillLevelTank6abL != null ? ' (Earlier single-tank entry on this run: final level ' + fmt(values.fillLevelTank6abL, 0) + ' L'
+        + (values.ksorbateAddedL != null ? ', Ksorbate added ' + fmt(values.ksorbateAddedL, 2) + ' L' : '')
+        + (values.nabenzoateAddedL != null ? ', sodium benzoate added ' + fmt(values.nabenzoateAddedL, 2) + ' L' : '') + '.)' : '');
+    noPlanNote.classList.toggle('hidden', !!p.receiving);
+    final6aField.classList.toggle('hidden', !a);
+    final6bField.classList.toggle('hidden', !b);
+    rowT['6A'].tr.classList.toggle('hidden', !a);
+    rowT['6B'].tr.classList.toggle('hidden', !b);
+    const recv = RECEIVING_TANKS.find(r => r[0] === p.receiving);
+    setTile(recapReceiving, recv ? recv[1] : null);
+    setTile(recapTransfer, fmtL(c.transfer));
+    setTile(recapWater, fmtL(c.water));
+    const tf = totalFinal(), ef = expectedFinal(), vp = variancePct();
+    setTile(totalFinalT, tf != null ? fmt(tf, 0) + ' L' : null);
+    setTile(expectedT, ef != null ? fmt(ef, 0) + ' L' : null);
+    const flag = settingValue('dilution_variance_flag_pct', 5);
+    if (vp != null) {
+      const over = Math.abs(vp) > flag;
+      varianceT.className = 'qc-check-result-value' + (over ? ' var-flag' : '');
+      varianceT.textContent = (vp > 0 ? '+' : '') + vp.toFixed(1) + '%' + (over ? '  ⚠ exceeds ' + flag + '%' : '  ✓ within ' + flag + '%');
+    } else { setTile(varianceT, null); }
+    const et = expectedTds(); const tgt = p.c2;
+    setTile(expTdsT, et != null ? formatQcValue(et, 2) + '%' + (tgt != null ? '  (target ' + formatQcValue(tgt, 2) + '%)' : '') : null);
+    ['6A', '6B'].forEach(t => {
+      const fin = finalIn(t);
+      setTile(rowT[t].fin, fin != null ? fmt(fin, 0) + ' L' : null);
+      const k = calcPerTank(t, 'ks'), n = calcPerTank(t, 'nb');
+      setTile(rowT[t].ksCalc, k != null ? formatQcValue(k, 2) + ' L' : null);
+      setTile(rowT[t].nbCalc, n != null ? formatQcValue(n, 2) + ' L' : null);
+    });
+    const kL = sumAdded(ks), nL = sumAdded(nb);
+    const ksPct = numOf(ksorbateStockInp), nbPct = numOf(nabenzoateStockInp);
+    setTile(ksTotalL, kL != null ? formatQcValue(kL, 2) + ' L' : null);
+    setTile(ksTotalKg, kL != null && ksPct != null ? formatQcValue(kL * ksPct / 100, 2) + ' kg' : null);
+    setTile(nbTotalL, nL != null ? formatQcValue(nL, 2) + ' L' : null);
+    setTile(nbTotalKg, nL != null && nbPct != null ? formatQcValue(nL * nbPct / 100, 2) + ' kg' : null);
+    changeCbs.forEach(cb => cb());
+  }
+  // Product still in Tank 5A/5B after this (first) pass: what the plan saw there minus what was
+  // actually transferred (or, before that is entered, minus the recommended transfer).
+  function getRemaining() {
+    const p = getPlan();
+    if (p.v5a == null && p.v5b == null) return null;
+    const avail = (p.v5a || 0) + (p.v5b || 0), c = p.calc || {};
+    const moved = numOf(productInp) != null ? numOf(productInp) : (c.transfer != null ? c.transfer : null);
+    return moved == null ? null : Math.max(0, avail - moved);
+  }
+  const getStock = () => ({ ksPct: numOf(ksorbateStockInp), nbPct: numOf(nabenzoateStockInp),
+    ksTarget: getKsorbateTarget(), nbTarget: getNabenzoateTarget ? getNabenzoateTarget() : null });
+  [productInp, waterInp, final6aInp, final6bInp, ksorbateStockInp, nabenzoateStockInp, ks['6A'], ks['6B'], nb['6A'], nb['6B']]
+    .forEach(i => i.addEventListener('input', refresh));
 
   // No Save button of its own: Dilution & Preservation has ONE Save (at the bottom of
   // the section) that calls this and then saves the LKE QC Check + Sample Point.
   async function save() {
     const rid = await getRunId();
-    await api('PUT', '/production/' + rid + '/stages/dilution', {
-      fillLevelTank6abL: fillLevelInp.value.trim() === '' ? null : qcParseValue(fillLevelInp.value),
-      measuredPh: measuredPhInp.value.trim() === '' ? null : qcParseValue(measuredPhInp.value),
-      citricKg: citricInp.value.trim() === '' ? null : qcParseValue(citricInp.value),
-      ksorbateStockPct: ksorbateStockInp.value.trim() === '' ? null : qcParseValue(ksorbateStockInp.value),
-      ksorbateAddedL: ksorbateAddedLInp.value.trim() === '' ? null : qcParseValue(ksorbateAddedLInp.value),
-      nabenzoateStockPct: nabenzoateStockInp.value.trim() === '' ? null : qcParseValue(nabenzoateStockInp.value),
-      nabenzoateAddedL: nabenzoateAddedLInp.value.trim() === '' ? null : qcParseValue(nabenzoateAddedLInp.value),
-    });
+    const { p, a, b } = used();
+    const payload = {
+      measuredPh: numOf(measuredPhInp), citricKg: numOf(citricInp),
+      ksorbateStockPct: numOf(ksorbateStockInp), nabenzoateStockPct: numOf(nabenzoateStockInp),
+    };
+    // Per-tank fields only exist once the receiving tank(s) are chosen; a run still on the older
+    // single-total layout keeps its existing totals untouched.
+    if (p.receiving) {
+      Object.assign(payload, {
+        productTransferredL: numOf(productInp), waterAddedL: numOf(waterInp),
+        tank6aFinalL: a ? numOf(final6aInp) : null, tank6bFinalL: b ? numOf(final6bInp) : null,
+        fillLevelTank6abL: totalFinal(), finalVariancePct: variancePct(),
+        ksorbateAddedL6a: a ? numOf(ks['6A']) : null, ksorbateAddedL6b: b ? numOf(ks['6B']) : null,
+        nabenzoateAddedL6a: a ? numOf(nb['6A']) : null, nabenzoateAddedL6b: b ? numOf(nb['6B']) : null,
+        ksorbateAddedL: sumAdded(ks), nabenzoateAddedL: sumAdded(nb),
+      });
+    }
+    await api('PUT', '/production/' + rid + '/stages/dilution', payload);
   }
 
-  refreshTargetPh();
-  refreshDilutionWaterAdded();
-  refreshKsorbateCalculatedL();
-  refreshKsorbateAddedKg();
-  refreshNabenzoateCalculatedL();
-  refreshNabenzoateAddedKg();
+  refresh();
   return {
     box: el('div', {},
       el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Dilution'),
+      noPlanNote,
+      el('div', { class: 'form-row-3' },
+        field('Receiving tanks (plan)', el('div', { class: 'calc-tile' }, recapReceiving)),
+        field('Recommended transfer', el('div', { class: 'calc-tile' }, recapTransfer)),
+        field('Recommended dilution water', el('div', { class: 'calc-tile' }, recapWater))),
       el('div', { class: 'form-row' },
-        rfield('dilution', 'fillLevelTank6abL', 'Fill level, Tank 6A/B (L)', fillLevelInp),
-        field('Dilution water added, TDS', dilutionWaterAddedValue)),
+        rfield('dilution', 'productTransferredL', 'Product transferred from 5A/5B (L)', productInp),
+        rfield('dilution', 'waterAddedL', 'Dilution water added (L)', waterInp)),
+      el('div', { class: 'form-row' }, final6aField, final6bField),
+      el('div', { class: 'qc-check-box' },
+        el('div', { class: 'qc-check-title' }, 'Dilution check'),
+        resultRow('Total final volume, Tanks 6A/6B', totalFinalT),
+        resultRow('Expected final volume (start + product + water)', expectedT),
+        resultRow('Variance vs expected', varianceT),
+        resultRow('Expected TDS after dilution', expTdsT)),
       el('div', { class: 'qc-check-section-title' }, 'Preservatives'),
       el('div', { class: 'form-row' },
         rfield('dilution', 'ksorbateStockPct', 'Ksorbate stock concentration (w/v)', ksorbateStockField),
-        field('Ksorbate, calculated (L)', ksorbateCalculatedLValue)),
-      rfield('dilution', 'ksorbateAddedL', 'Ksorbate added (L)', ksorbateAddedLInp),
-      field('Ksorbate added (kg)', ksorbateAddedKgValue),
-      el('div', { class: 'form-row' },
-        rfield('dilution', 'nabenzoateStockPct', 'Nabenzoate stock concentration (w/v)', nabenzoateStockField),
-        field('Nabenzoate, calculated (L)', nabenzoateCalculatedLValue)),
-      rfield('dilution', 'nabenzoateAddedL', 'Sodium benzoate added (L)', nabenzoateAddedLInp),
-      field('Sodium benzoate added (kg)', nabenzoateAddedKgValue),
+        rfield('dilution', 'nabenzoateStockPct', 'Nabenzoate stock concentration (w/v)', nabenzoateStockField)),
+      el('div', { class: 'help' }, 'Doses are sized to the volume in each tank. Enter the stock solution added to each tank.'),
+      el('div', { class: 'tablewrap' }, el('table', { class: 'qc-check-checklist tank-table' },
+        el('thead', {}, el('tr', {}, el('th', {}, 'Tank'), el('th', { class: 'num' }, 'Final volume'),
+          el('th', { class: 'num' }, 'Ksorbate calc.'), el('th', {}, reqLabel('Ksorbate added (L)')),
+          el('th', { class: 'num' }, 'Benzoate calc.'), el('th', {}, reqLabel('Benzoate added (L)')))),
+        el('tbody', {}, rowT['6A'].tr, rowT['6B'].tr))),
+      el('div', { class: 'qc-check-box' },
+        resultRow('Ksorbate added, total', el('span', {}, ksTotalL, ' ', ksTotalKg)),
+        resultRow('Sodium benzoate added, total', el('span', {}, nbTotalL, ' ', nbTotalKg))),
       el('div', { class: 'qc-check-section-title' }, 'pH Balancing'),
       el('div', { class: 'form-row-3' },
         rfield('dilution', 'measuredPh', 'Measured pH', measuredPhInp), field('Target pH', targetPhValue),
         rfield('dilution', 'citricKg', 'Citric acid added (kg)', citricInp))),
     save,
-    refresh: () => { refreshTargetPh(); refreshDilutionWaterAdded(); refreshKsorbateCalculatedL(); refreshNabenzoateCalculatedL(); }
+    refresh,
+    getRemaining, getStock,
+    onChange: cb => changeCbs.push(cb)
   };
+}
+// ---- Additional dilution passes (pass 2, 3, ...) -----------------------------------------------
+// When product is left in Tank 5A/5B after a pass, the operator runs another pass. Each extra pass is
+// one self-contained card -- its own plan (5A/5B levels, receiving tank(s), starting levels, the
+// recommended transfer/water via dilutionPlanCalc), actuals (product transferred, water added, final
+// level per tank, variance) and per-tank preservative additions -- saved to /dilution-passes. The run's
+// reagent totals are summed across every pass on the server. The TDS, SKU target and preservative
+// stock concentrations are shared with pass 1.
+function buildDilutionPassCard(pass, ctx) {
+  const numOf = inp => inp.value.trim() === '' ? null : qcParseValue(inp.value);
+  const lvl = (v, ph) => { const i = el('input', { inputmode: 'decimal', placeholder: ph || 'Measured using level sensor' }); attachNumericMask(i, 2); if (v != null) i.value = formatQcValue(v, 2); return i; };
+  const t5a = lvl(pass.tank5aL), t5b = lvl(pass.tank5bL);
+  const recvSel = el('select', {}, el('option', { value: '' }, 'Select…'), ...RECEIVING_TANKS.map(([v, l]) => el('option', { value: v }, l)));
+  recvSel.value = pass.receivingTanks || '';
+  const s6a = lvl(pass.tank6aStartL != null ? pass.tank6aStartL : 0), s6b = lvl(pass.tank6bStartL != null ? pass.tank6bStartL : 0);
+  const productInp = lvl(pass.productTransferredL, 'From the 5A/5B level drop');
+  const waterInp = lvl(pass.waterAddedL, 'Measured using dilution totalizer');
+  const f6a = lvl(pass.tank6aFinalL), f6b = lvl(pass.tank6bFinalL);
+  const prInp = v => { const i = el('input', { inputmode: 'decimal', placeholder: 'L' }); attachNumericMask(i, 2); if (v != null) i.value = formatQcValue(v, 2); return i; };
+  const ks = { '6A': prInp(pass.ksorbateAddedL6a), '6B': prInp(pass.ksorbateAddedL6b) };
+  const nb = { '6A': prInp(pass.nabenzoateAddedL6a), '6B': prInp(pass.nabenzoateAddedL6b) };
+  // pH balancing for this pass (each pass needs its own citric acid correction)
+  const phInp = el('input', { inputmode: 'decimal', placeholder: 'pH' }); attachNumericMask(phInp, 1);
+  if (pass.measuredPh != null) phInp.value = formatQcValue(pass.measuredPh, 1);
+  const citricInp = el('input', { inputmode: 'decimal', placeholder: 'kg' }); attachNumericMask(citricInp, 2);
+  if (pass.citricKg != null) citricInp.value = formatQcValue(pass.citricKg, 2);
+  const targetPhTile = el('span', { class: 'help' });
+  const tile = () => el('span', { class: 'help' });
+  const setTile = (span, text) => { span.className = text != null ? 'qc-check-result-value' : 'help'; span.textContent = text != null ? text : '—'; };
+  const resultRow = (label, node, cls) => el('div', { class: 'qc-check-result' + (cls ? ' ' + cls : '') }, el('span', { class: 'qc-check-result-label' }, label), node);
+  const sA = field(reqLabel('Tank 6A level before transfer (L)'), s6a), sB = field(reqLabel('Tank 6B level before transfer (L)'), s6b);
+  const fA = field(reqLabel('Final level, Tank 6A (L)'), f6a), fB = field(reqLabel('Final level, Tank 6B (L)'), f6b);
+  const T = { available: tile(), space: tile(), max: tile(), transfer: tile(), water: tile(), expected: tile(),
+    totalFinal: tile(), expFinal: tile(), variance: tile(), expTds: tile() };
+  const summaryHost = el('div', { class: 'summary-line' }), statusLine = el('div', { class: 'plan-status' });
+  const rowT = {};
+  ['6A', '6B'].forEach(t => {
+    rowT[t] = { fin: tile(), ksCalc: tile(), nbCalc: tile() };
+    rowT[t].tr = el('tr', {}, el('td', {}, el('b', {}, 'Tank ' + t)), el('td', { class: 'num' }, rowT[t].fin),
+      el('td', { class: 'num' }, rowT[t].ksCalc), el('td', {}, ks[t]), el('td', { class: 'num' }, rowT[t].nbCalc), el('td', {}, nb[t]));
+  });
+  const ksTotal = tile(), nbTotal = tile();
+  let lastCalc = null;
+
+  const used = () => { const r = recvSel.value; return { r, a: usesTank(r, '6A'), b: usesTank(r, '6B') }; };
+  const planOf = () => ({ receiving: recvSel.value, v5a: numOf(t5a), v5b: numOf(t5b), start6a: numOf(s6a), start6b: numOf(s6b),
+    c1: ctx.getTdsConc(), c2: ctx.getTdsTarget() });
+  const finalIn = t => numOf(t === '6A' ? f6a : f6b);
+  const usedList = () => { const u = used(); return ['6A', '6B'].filter(t => t === '6A' ? u.a : u.b); };
+  const sumOf = fn => { const l = usedList(); if (!l.length) return null; const v = l.map(fn); return v.some(x => x == null) ? null : v.reduce((a, b) => a + b, 0); };
+  const totalFinal = () => sumOf(finalIn);
+  const addedSum = map => sumOf(t => numOf(map[t]));
+  function expectedFinal() {
+    const p = planOf(), tr = numOf(productInp), w = numOf(waterInp);
+    if (!p.receiving || tr == null || w == null) return null;
+    return (usesTank(p.receiving, '6A') ? (p.start6a || 0) : 0) + (usesTank(p.receiving, '6B') ? (p.start6b || 0) : 0) + tr + w;
+  }
+  const variancePct = () => { const t = totalFinal(), e = expectedFinal(); return (t != null && e) ? (t - e) / e * 100 : null; };
+  function getRemaining() {
+    const p = planOf();
+    if (p.v5a == null && p.v5b == null) return null;
+    const avail = (p.v5a || 0) + (p.v5b || 0);
+    const moved = numOf(productInp) != null ? numOf(productInp) : (lastCalc && lastCalc.transfer != null ? lastCalc.transfer : null);
+    return moved == null ? null : Math.max(0, avail - moved);
+  }
+  function calcPerTank(t, which) {
+    const st = ctx.getStock(), fin = finalIn(t);
+    const pct = which === 'ks' ? st.ksPct : st.nbPct, target = which === 'ks' ? st.ksTarget : st.nbTarget;
+    return (fin != null && pct && target != null) ? fin * target * 100 / pct : null;
+  }
+  function refresh() {
+    const u = used(), p = planOf(), c = lastCalc = dilutionPlanCalc(p);
+    const tph = ctx.getTargetPh ? ctx.getTargetPh() : null;
+    targetPhTile.textContent = tph != null ? formatQcValue(tph, 1) : '—';
+    sA.classList.toggle('hidden', !u.a); sB.classList.toggle('hidden', !u.b);
+    fA.classList.toggle('hidden', !u.a); fB.classList.toggle('hidden', !u.b);
+    rowT['6A'].tr.classList.toggle('hidden', !u.a); rowT['6B'].tr.classList.toggle('hidden', !u.b);
+    summaryHost.innerHTML = '';
+    summaryHost.append(sl('TDS concentrated (Separation filtrate)', p.c1 != null ? formatQcValue(p.c1, 2) + '%' : '—'),
+      sl('TDS target', p.c2 != null ? formatQcValue(p.c2, 2) + '%' : '—'), sl('Capacity per tank', fmt(c.cap, 0) + ' L'));
+    setTile(T.available, fmtL(c.available)); setTile(T.space, fmtL(c.space));
+    setTile(T.max, c.maxTransfer != null ? fmt(Math.floor(c.maxTransfer / 10) * 10, 0) + ' L' : null);
+    setTile(T.transfer, fmtL(c.transfer)); setTile(T.water, fmtL(c.water)); setTile(T.expected, fmtL(c.expectedFinal));
+    if (p.c1 == null) { statusLine.className = 'plan-status'; statusLine.textContent = 'Needs the Separation filtrate TDS.'; }
+    else if (!p.c2) { statusLine.className = 'plan-status'; statusLine.textContent = 'Select a product SKU with a target TDS.'; }
+    else if (!c.n) { statusLine.className = 'plan-status'; statusLine.textContent = 'Choose the receiving tank(s).'; }
+    else if (c.fits === null) { statusLine.className = 'plan-status'; statusLine.textContent = 'Enter the Tank 5A / 5B levels.'; }
+    else if (c.fits) { statusLine.className = 'plan-status ok'; statusLine.textContent = '✓ All ' + fmtL(c.available) + ' in 5A/5B fits once diluted.'; }
+    else { statusLine.className = 'plan-status warn';
+      statusLine.textContent = '⚠ Only ' + fmt(Math.floor(c.maxTransfer / 10) * 10, 0) + ' L of the ' + fmt(round10(c.available), 0) + ' L can be pushed through — about ' + fmtL(c.remaining) + ' still stays behind (another pass).'; }
+    const tf = totalFinal(), ef = expectedFinal(), vp = variancePct(), flag = settingValue('dilution_variance_flag_pct', 5);
+    setTile(T.totalFinal, tf != null ? fmt(tf, 0) + ' L' : null); setTile(T.expFinal, ef != null ? fmt(ef, 0) + ' L' : null);
+    if (vp != null) { const over = Math.abs(vp) > flag; T.variance.className = 'qc-check-result-value' + (over ? ' var-flag' : '');
+      T.variance.textContent = (vp > 0 ? '+' : '') + vp.toFixed(1) + '%' + (over ? '  ⚠ exceeds ' + flag + '%' : '  ✓ within ' + flag + '%'); }
+    else setTile(T.variance, null);
+    const tr = numOf(productInp), w = numOf(waterInp);
+    setTile(T.expTds, (p.c1 != null && tr != null && w != null && tr + w > 0) ? formatQcValue(p.c1 * tr / (tr + w), 2) + '%' + (p.c2 != null ? '  (target ' + formatQcValue(p.c2, 2) + '%)' : '') : null);
+    ['6A', '6B'].forEach(t => {
+      const fin = finalIn(t), k = calcPerTank(t, 'ks'), n = calcPerTank(t, 'nb');
+      setTile(rowT[t].fin, fin != null ? fmt(fin, 0) + ' L' : null);
+      setTile(rowT[t].ksCalc, k != null ? formatQcValue(k, 2) + ' L' : null); setTile(rowT[t].nbCalc, n != null ? formatQcValue(n, 2) + ' L' : null);
+    });
+    const kL = addedSum(ks), nL = addedSum(nb), st = ctx.getStock();
+    setTile(ksTotal, kL != null ? formatQcValue(kL, 2) + ' L' + (st.ksPct != null ? '  ·  ' + formatQcValue(kL * st.ksPct / 100, 2) + ' kg' : '') : null);
+    setTile(nbTotal, nL != null ? formatQcValue(nL, 2) + ' L' + (st.nbPct != null ? '  ·  ' + formatQcValue(nL * st.nbPct / 100, 2) + ' kg' : '') : null);
+    if (ctx.onChanged) ctx.onChanged();
+  }
+  [t5a, t5b, s6a, s6b, productInp, waterInp, f6a, f6b, ks['6A'], ks['6B'], nb['6A'], nb['6B'], phInp, citricInp].forEach(i => i.addEventListener('input', refresh));
+  recvSel.addEventListener('change', refresh);
+
+  const status = el('span', { class: 'help' });
+  const saveBtn = el('button', { type: 'button', class: 'secondary section-save', onclick: async () => {
+    status.textContent = ''; saveBtn.disabled = true;
+    try {
+      const u = used(), p = planOf(), c = lastCalc || {};
+      const rid = await ctx.getRunId();
+      const r = await api('PUT', '/production/' + rid + '/dilution-passes/' + pass.id, {
+        tank5aL: p.v5a, tank5bL: p.v5b, receivingTanks: p.receiving || null, tdsPct: p.c1,
+        tank6aStartL: u.a ? p.start6a : null, tank6bStartL: u.b ? p.start6b : null,
+        maxTransferL: c.maxTransfer != null ? c.maxTransfer : null, recommendedTransferL: c.transfer != null ? c.transfer : null,
+        recommendedWaterL: c.water != null ? c.water : null,
+        productTransferredL: numOf(productInp), waterAddedL: numOf(waterInp),
+        tank6aFinalL: u.a ? numOf(f6a) : null, tank6bFinalL: u.b ? numOf(f6b) : null, finalVariancePct: variancePct(),
+        ksorbateAddedL6a: u.a ? numOf(ks['6A']) : null, ksorbateAddedL6b: u.b ? numOf(ks['6B']) : null,
+        nabenzoateAddedL6a: u.a ? numOf(nb['6A']) : null, nabenzoateAddedL6b: u.b ? numOf(nb['6B']) : null,
+        measuredPh: numOf(phInp), citricKg: numOf(citricInp),
+      });
+      if (ctx.onItems) ctx.onItems(r.dilutionPasses);
+      status.textContent = 'Saved.';
+    } catch (e) { status.textContent = e.message; }
+    saveBtn.disabled = false;
+  } }, 'Save pass ' + pass.passNo);
+  const removeBtn = ctx.isLast ? el('button', { type: 'button', class: 'danger', onclick: () => ctx.onRemove() }, 'Remove pass ' + pass.passNo) : null;
+  refresh();
+  const prevRem = ctx.getPrevRemaining();
+  const box = el('div', { class: 'qc-check-box pass-card' },
+    el('div', { class: 'qc-check-title' }, 'Dilution pass ' + pass.passNo),
+    el('div', { class: 'qc-check-subtitle' }, 'Tanks 5A/5B → 6A/6B' + (prevRem != null ? ' · about ' + fmtL(prevRem) + ' was left in 5A/5B after the previous pass' : '')),
+    el('div', { class: 'qc-check-section-title', style: 'margin-top:4px' }, 'Plan'),
+    summaryHost,
+    el('div', { class: 'form-row' }, field(reqLabel('Tank 5A level (L)'), t5a), field(reqLabel('Tank 5B level (L)'), t5b)),
+    el('div', { class: 'form-row' }, field(reqLabel('Receiving tanks'), recvSel)),
+    el('div', { class: 'form-row' }, sA, sB),
+    resultRow('Product available in 5A / 5B', T.available), resultRow('Available space in receiving tank(s)', T.space),
+    resultRow('Maximum product to transfer', T.max, 'plan-key'), resultRow('Recommended product transfer', T.transfer),
+    resultRow('Recommended dilution water', T.water), resultRow('Expected final volume in receiving tank(s)', T.expected), statusLine,
+    el('div', { class: 'qc-check-section-title' }, 'Actual'),
+    el('div', { class: 'form-row' }, field(reqLabel('Product transferred from 5A/5B (L)'), productInp), field(reqLabel('Dilution water added (L)'), waterInp)),
+    el('div', { class: 'form-row' }, fA, fB),
+    resultRow('Total final volume', T.totalFinal), resultRow('Expected final volume (start + product + water)', T.expFinal),
+    resultRow('Variance vs expected', T.variance), resultRow('Expected TDS after dilution', T.expTds),
+    el('div', { class: 'qc-check-section-title' }, 'Preservatives (this pass)'),
+    el('div', { class: 'tablewrap' }, el('table', { class: 'qc-check-checklist tank-table' },
+      el('thead', {}, el('tr', {}, el('th', {}, 'Tank'), el('th', { class: 'num' }, 'Final volume'), el('th', { class: 'num' }, 'Ksorbate calc.'),
+        el('th', {}, reqLabel('Ksorbate added (L)')), el('th', { class: 'num' }, 'Benzoate calc.'), el('th', {}, reqLabel('Benzoate added (L)')))),
+      el('tbody', {}, rowT['6A'].tr, rowT['6B'].tr))),
+    resultRow('Ksorbate added, this pass', ksTotal), resultRow('Sodium benzoate added, this pass', nbTotal),
+    el('div', { class: 'qc-check-section-title' }, 'pH Balancing (this pass)'),
+    el('div', { class: 'form-row-3' }, field(reqLabel('Measured pH'), phInp), field('Target pH', targetPhTile),
+      field(reqLabel('Citric acid added (kg)'), citricInp)),
+    el('div', { style: 'margin-top:8px;display:flex;gap:10px;align-items:center' }, saveBtn, status, removeBtn));
+  return { box, getRemaining, refresh };
+}
+function buildDilutionPassesSection(initial, getRunId, ctx) {
+  let items = (initial || []).slice();
+  const host = el('div', {}), addHost = el('div', {});
+  const root = el('div', {}, host, addHost);
+  let cards = [];
+  function draw() {
+    host.innerHTML = ''; cards = [];
+    items.forEach((p, i) => {
+      const card = buildDilutionPassCard(p, {
+        getRunId, getTdsConc: ctx.getTdsConc, getTdsTarget: ctx.getTdsTarget, getStock: ctx.getStock, getTargetPh: ctx.getTargetPh,
+        getPrevRemaining: () => i === 0 ? ctx.getPass1Remaining() : (cards[i - 1] ? cards[i - 1].getRemaining() : null),
+        isLast: i === items.length - 1, onChanged: () => refreshAdd(), onItems: list => { items = list; },
+        onRemove: async () => {
+          if (!confirm('Remove dilution pass ' + p.passNo + '? Its preservative additions are refunded to stock.')) return;
+          try { items = (await api('DELETE', '/production/' + await getRunId() + '/dilution-passes/' + p.id)).dilutionPasses; draw(); }
+          catch (e) { toast(e.message, true); }
+        },
+      });
+      cards.push(card); host.append(card.box);
+    });
+    refreshAdd();
+  }
+  function lastRemaining() { return items.length ? (cards[items.length - 1] ? cards[items.length - 1].getRemaining() : null) : ctx.getPass1Remaining(); }
+  function refreshAdd() {
+    addHost.innerHTML = '';
+    const r = lastRemaining();
+    if (r == null || r <= 0.5) return;
+    const next = items.length + 2;
+    addHost.append(el('div', { class: 'plan-status warn', style: 'margin:8px 0' },
+      '⚠ About ' + fmtL(r) + ' of product is still in Tank 5A/5B. ',
+      el('button', { type: 'button', class: 'secondary', style: 'margin-left:8px', onclick: async () => {
+        try {
+          if (ctx.ensureSaved) await ctx.ensureSaved();      // pass 1's plan must be saved first
+          items = (await api('POST', '/production/' + await getRunId() + '/dilution-passes', {})).dilutionPasses; draw(); }
+        catch (e) { toast(e.message, true); }
+      } }, '+ Add dilution pass ' + next)));
+  }
+  draw();
+  return { box: root, refresh: refreshAdd };
 }
 // Dilution & Preservation: a run may split its output across several tanks.
 // Existing entries can still be edited/saved/removed, but new ones can no
@@ -2680,24 +2980,37 @@ async function openRun(draftSummary, opts) {
   // this point, so the callback looks it up lazily (it's only actually
   // invoked later, after Save is clicked, by which time it's assigned below).
   let pasteurizationSectionRef;
-  const extractionSection = buildExtractionSection(ensureRunId, stages.extraction,
-    () => pasteurizationSectionRef?.refreshExtractionTds());
+  const extractionSection = buildExtractionSection(ensureRunId, stages.extraction);
   const separationSection =
-    buildSeparationSection(ensureRunId, stages.separation, draft?.samplePoints || [], draft?.processingLot);
+    buildSeparationSection(ensureRunId, stages.separation, draft?.samplePoints || [], draft?.processingLot,
+      () => pasteurizationSectionRef?.refreshTds());
   // TDS/pH/Ksorbate targets follow the currently-selected SKU (which can
   // still change in this draft), so they're refreshed alongside the spec
   // panel below.
   const pasteurizationSection = buildPasteurizationSection(
     ensureRunId, stages.pasteurization, draft?.samplePoints || [], draft?.processingLot,
     () => skus.find(x => x.code === skuSel.value)?.tdsTarget,
-    () => stages.extraction?.tdsPct);
+    () => stages.separation?.liquidTdsPct);
   pasteurizationSectionRef = pasteurizationSection;
   const dilutionSummary = buildDilutionAndPreservativesBox(
     ensureRunId, stages.dilution,
     () => skus.find(x => x.code === skuSel.value)?.phTarget,
     () => skus.find(x => x.code === skuSel.value)?.ksorbateTarget,
-    () => pasteurizationSection.getTargetFillLevel(),
+    () => pasteurizationSection.getPlan(),
     () => skus.find(x => x.code === skuSel.value)?.nabenzoateTarget);
+  pasteurizationSection.onPlanChange(() => dilutionSummary.refresh());
+  dilutionSummary.refresh();
+  const dilutionPasses = buildDilutionPassesSection(draft?.dilutionPasses || [], ensureRunId, {
+    getTdsConc: () => stages.separation?.liquidTdsPct, getTdsTarget: () => skus.find(x => x.code === skuSel.value)?.tdsTarget,
+    ensureSaved: async () => {
+      const b = pasteurizationSection.box.querySelector('button.section-save');
+      b.click(); for (let i = 0; i < 100 && b.disabled; i++) await new Promise(r => setTimeout(r, 50));
+      const msg = b.nextElementSibling ? b.nextElementSibling.textContent.trim() : '';
+      if (msg && msg !== 'Saved.') throw new Error(msg);
+    },
+    getStock: () => dilutionSummary.getStock(), getPass1Remaining: () => dilutionSummary.getRemaining(),
+    getTargetPh: () => skus.find(x => x.code === skuSel.value)?.phTarget });
+  dilutionSummary.onChange(() => dilutionPasses.refresh());
   const dilutionsSection = buildDilutionsSection(draft?.dilutions || [], ensureRunId);
   const packagingEntriesSection = buildPackagingEntriesSection(draft?.packagingEntries || [], ensureRunId);
   const packagingPackagedInp = el('input', { type: 'datetime-local', value: stages.packaging?.packagedAt || '' });
@@ -2780,7 +3093,7 @@ async function openRun(draftSummary, opts) {
     pasteurizationSection.box,
     el('details', { class: 'accordion' }, el('summary', {}, 'Dilution & Preservation'),
       el('div', { class: 'accordion-body' },
-        dilutionSummary.box, dilutionsSection,
+        dilutionSummary.box, dilutionPasses.box, dilutionsSection,
         packagingQcCheck.box,
         packagingSamplePointBox,
         el('div', { style: 'margin-top:6px' }, packagingQcSaveBtn, packagingQcStatus))),
@@ -2899,23 +3212,36 @@ async function openProcessLog(run, section) {
   // See openRun's identical comment: extractionSection's Save needs to poke
   // pasteurizationSection, which isn't built yet at this point.
   let pasteurizationSectionRef;
-  const extractionSection = buildExtractionSection(getRunId, stages.extraction,
-    () => pasteurizationSectionRef?.refreshExtractionTds());
+  const extractionSection = buildExtractionSection(getRunId, stages.extraction);
   const separationSection =
-    buildSeparationSection(getRunId, stages.separation, run.samplePoints || [], run.processingLot);
+    buildSeparationSection(getRunId, stages.separation, run.samplePoints || [], run.processingLot,
+      () => pasteurizationSectionRef?.refreshTds());
   // SKU is fixed once a run is finalized, so TDS/pH/Ksorbate targets need no
   // refresh wiring here.
   const pasteurizationSection = buildPasteurizationSection(
     getRunId, stages.pasteurization, run.samplePoints || [], run.processingLot,
     () => run.targetTds,
-    () => stages.extraction?.tdsPct);
+    () => stages.separation?.liquidTdsPct);
   pasteurizationSectionRef = pasteurizationSection;
   const dilutionSummary = buildDilutionAndPreservativesBox(
     getRunId, stages.dilution,
     () => State.ref.skus.find(s => s.code === run.sku)?.phTarget,
     () => State.ref.skus.find(s => s.code === run.sku)?.ksorbateTarget,
-    () => pasteurizationSection.getTargetFillLevel(),
+    () => pasteurizationSection.getPlan(),
     () => State.ref.skus.find(s => s.code === run.sku)?.nabenzoateTarget);
+  pasteurizationSection.onPlanChange(() => dilutionSummary.refresh());
+  dilutionSummary.refresh();
+  const dilutionPasses = buildDilutionPassesSection(run.dilutionPasses || [], getRunId, {
+    getTdsConc: () => stages.separation?.liquidTdsPct, getTdsTarget: () => run.targetTds,
+    ensureSaved: async () => {
+      const b = pasteurizationSection.box.querySelector('button.section-save');
+      b.click(); for (let i = 0; i < 100 && b.disabled; i++) await new Promise(r => setTimeout(r, 50));
+      const msg = b.nextElementSibling ? b.nextElementSibling.textContent.trim() : '';
+      if (msg && msg !== 'Saved.') throw new Error(msg);
+    },
+    getStock: () => dilutionSummary.getStock(), getPass1Remaining: () => dilutionSummary.getRemaining(),
+    getTargetPh: () => State.ref.skus.find(s => s.code === run.sku)?.phTarget });
+  dilutionSummary.onChange(() => dilutionPasses.refresh());
   const dilutionsSection = buildDilutionsSection(run.dilutions || [], getRunId);
   const packagingEntriesSection = buildPackagingEntriesSection(run.packagingEntries || [], getRunId);
   const packagingPackagedInp = el('input', { type: 'datetime-local', value: stages.packaging?.packagedAt || '' });
@@ -3001,7 +3327,7 @@ async function openProcessLog(run, section) {
     pasteurizationSection.box,
     el('details', { class: 'accordion' }, el('summary', {}, 'Dilution & Preservation'),
       el('div', { class: 'accordion-body' },
-        dilutionSummary.box, dilutionsSection,
+        dilutionSummary.box, dilutionPasses.box, dilutionsSection,
         packagingQcCheck.box,
         packagingSamplePointBox,
         el('div', { style: 'margin-top:6px' }, packagingQcSaveBtn, packagingQcStatus))),
@@ -3724,7 +4050,7 @@ async function pageConsumables(v) {
     const reagents = r.consumables.filter(c => !c.isContainer && !c.labelSku);
     host.append(el('div', { class: 'page-head' }, el('h2', {}, 'Reagents'),
       el('div', { class: 'actions' }, el('button', { onclick: addConsumable }, '+ Add reagent'))));
-    host.append(itemsTable(reagents));
+    host.append(itemsTable(reagents, { history: true }));
     host.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Packaging'),
       el('div', { class: 'actions' },
         isAdmin ? el('button', { class: 'secondary', onclick: openContainerBulkImport }, '📤 Bulk import CSV') : null,
@@ -3802,7 +4128,7 @@ function consumableHistoryTable(log) {
         el('th', {}, 'Reason'), el('th', {}, 'Reference'), el('th', {}, 'By'))),
       el('tbody', {}, ...log.map(r => el('tr', {},
         el('td', { class: 'muted' }, fmtWhen(r.createdAt)),
-        el('td', { class: 'num' }, el('b', {}, (r.delta > 0 ? '+' : '') + fmt(r.delta, r.delta % 1 ? 1 : 0))),
+        el('td', { class: 'num' }, el('b', {}, (r.delta > 0 ? '+' : '') + fmt(r.delta, r.delta % 1 ? 2 : 0))),
         el('td', {}, r.reason || '—'),
         el('td', { class: 'muted' }, r.ref || '—'),
         el('td', {}, r.userName || '—'))))));
@@ -3810,7 +4136,7 @@ function consumableHistoryTable(log) {
 async function showConsumableHistory(c) {
   const data = await api('GET', '/consumables/' + c.id + '/history');
   const body = el('div', {},
-    el('div', { class: 'summary-line' }, sl('Item', c.name), sl('On hand', fmt(c.onHand, 0) + ' ' + c.unit)),
+    el('div', { class: 'summary-line' }, sl('Item', c.name), sl('On hand', fmt(c.onHand, (c.isContainer || c.labelSku) ? 0 : 1) + ' ' + c.unit)),
     consumableHistoryTable(data.history));
   modal('Transaction history — ' + c.name, body, async () => {}, 'Close', { noCancel: true });
 }
@@ -4347,16 +4673,37 @@ const CALCULATIONS = [
     settings: [],
   },
   {
-    title: 'Target fill level, Tank 6A/B (L)',
-    formula: 'Target fill level, Tank 6A/B (L) = Tank 6A/B max level (L) × TDS target / TDS concentrated (%)',
-    description: 'The largest initial volume that, once diluted from the measured TDS concentrated (%) down to the SKU’s TDS target, still fits Tank 6A/B’s max level (mass-conservation dilution math).',
-    location: 'Production → Process log → Pasteurization → Pasteurization In → Process Check (Dilution requirements)',
-    settings: ['dilution_tank_6ab_max_level_l'],
+    title: 'Maximum product to transfer, Tanks 5A/5B → 6A/6B (L)',
+    formula: 'Available space = (Tank 6A/6B capacity × number of receiving tanks) − current level in the receiving tank(s)   ·   Maximum product to transfer = Available space × TDS target ÷ TDS concentrated (or = Available space if TDS concentrated ≤ target)',
+    description: 'The most product that can be pushed through from 5A/5B before the receiving tank(s) reach capacity once it is diluted to the SKU’s target TDS (c₁V₁ = c₂V₂). TDS concentrated is the Separation filtrate TDS. Selecting 6A + 6B connected doubles the capacity; whatever is already in the selected tanks is deducted first.',
+    location: 'Production → Process log → Pasteurization → Pasteurization In → Process Check (Dilution plan)',
+    settings: ['dilution_tank_capacity_each_l'],
+  },
+  {
+    title: 'Recommended product transfer and dilution water (L)',
+    formula: 'Recommended product transfer = the smaller of (Tank 5A + 5B levels) and the Maximum product to transfer   ·   Recommended dilution water = transfer × (TDS concentrated ÷ TDS target − 1), or 0 when TDS concentrated ≤ target   ·   Expected final volume = current level in receiving tank(s) + transfer + water',
+    description: 'What to move from 5A/5B and how much water to add to reach the target TDS without exceeding the receiving tank(s). When more product is available than fits, the remainder is shown as staying behind in 5A/5B. Volumes display rounded to the nearest 10 L.',
+    location: 'Production → Process log → Pasteurization → Pasteurization In → Process Check (Dilution plan)',
+    settings: ['dilution_tank_capacity_each_l'],
+  },
+  {
+    title: 'Product remaining in Tank 5A/5B and additional dilution passes (L)',
+    formula: 'Remaining product = (Tank 5A level + Tank 5B level) − Product transferred (the recommended transfer until the actual is entered)',
+    description: 'When product is left in 5A/5B after a pass, the section offers another pass. Each extra pass has its own plan, actuals and per-tank preservative additions using the same maximum-transfer, recommended-water, variance and preservative-dose formulas as the first pass. The run’s Ksorbate / sodium benzoate totals (and so the reagent deduction) are the sum across all passes.',
+    location: 'Production → Process log → Dilution & Preservation → Additional dilution passes',
+    settings: ['dilution_tank_capacity_each_l', 'dilution_variance_flag_pct'],
+  },
+  {
+    title: 'Dilution check: final volume variance and expected TDS',
+    formula: 'Expected final volume = starting level(s) + Product transferred + Dilution water added   ·   Variance (%) = (Total final volume − Expected) ÷ Expected × 100, flagged when |Variance| exceeds the setting   ·   Expected TDS = TDS concentrated × Product transferred ÷ (Product transferred + Dilution water added)',
+    description: 'Compares what the receiving tank level sensors read after dilution with what the transfer and water imply, and shows the TDS the measured amounts should produce against the target.',
+    location: 'Production → Process log → Dilution & Preservation → Dilution',
+    settings: ['dilution_variance_flag_pct'],
   },
   {
     title: 'Ksorbate, calculated (L)',
-    formula: 'Ksorbate, calculated (L) = Fill level, Tank 6A/B (L) × Ksorbate target (w/v) / Ksorbate stock concentration (w/v)',
-    description: 'The estimated volume of stock Ksorbate solution needed to reach the product SKU’s target Ksorbate dose in the tank’s current fill volume (mass-conservation dilution math).',
+    formula: 'Ksorbate, calculated (L), per tank = Final level of that tank (L) × Ksorbate target (w/v) / Ksorbate stock concentration (w/v)',
+    description: 'The estimated volume of stock Ksorbate solution needed to reach the product SKU’s target Ksorbate dose in the volume in each receiving tank (mass-conservation dilution math). The run total is the sum of what was added to each tank.',
     location: 'Production → Process log → Dilution & Preservation → Preservatives',
     settings: [],
   },
@@ -4369,8 +4716,8 @@ const CALCULATIONS = [
   },
   {
     title: 'Nabenzoate, calculated (L)',
-    formula: 'Nabenzoate, calculated (L) = Fill level, Tank 6A/B (L) × Nabenzoate target (w/v) / Nabenzoate stock concentration (w/v)',
-    description: 'The estimated volume of stock sodium benzoate solution needed to reach the product SKU’s target Nabenzoate dose in the tank’s current fill volume (same mass-conservation math as Ksorbate, calculated).',
+    formula: 'Nabenzoate, calculated (L), per tank = Final level of that tank (L) × Nabenzoate target (w/v) / Nabenzoate stock concentration (w/v)',
+    description: 'The estimated volume of stock sodium benzoate solution needed to reach the product SKU’s target Nabenzoate dose in the volume in each receiving tank (same mass-conservation math as Ksorbate; the run total is the sum of the tanks).',
     location: 'Production → Process log → Dilution & Preservation → Preservatives',
     settings: ['nabenzoate_stock_concentration_default_pct'],
   },
@@ -4383,7 +4730,7 @@ const CALCULATIONS = [
   },
   {
     title: 'Reagent usage (inventory deduction)',
-    formula: 'Citric Acid (kg) = Citric acid added (kg)   ·   Potassium Sorbate (kg) = Ksorbate added (L) × stock (w/v) / 100   ·   Sodium Benzoate (kg) = Sodium benzoate added (L) × stock (w/v) / 100',
+    formula: 'Citric Acid (kg) = Citric acid added (kg), plus the citric acid added in each additional dilution pass   ·   Potassium Sorbate (kg) = Ksorbate added (L) × stock (w/v) / 100   ·   Sodium Benzoate (kg) = Sodium benzoate added (L) × stock (w/v) / 100',
     description: 'What Saving Dilution & Preservation (or finalizing the run) deducts from Reagent stock, as one net-change ledger line per reagent: only the change since the last save is deducted, and discarding a draft refunds it. The same kg are added to the run’s Citric / Sorbate / Na benzoate totals.',
     location: 'Production → Process log → Dilution & Preservation (applied on Save and when a run is finalized)',
     settings: [],

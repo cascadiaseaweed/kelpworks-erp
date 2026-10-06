@@ -125,6 +125,19 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
   NOT NULL, so `run_inputs.decision_set` records whether an operator actually chose (inputs of
   runs finalized before it existed were backfilled as set; `_run_inputs_public` returns
   `decision: None` until set).
+- **Tank 5A/5B -> 6A/6B dilution**: the plan (Pasteurization In: 5A/5B levels, receiving tanks 6A / 6B / 6A+6B, tank 6A/6B starting
+  levels, TDS = Separation filtrate TDS, target = SKU) is calculated client-side by `dilutionPlanCalc` (c1V1=c2V2: max product =
+  space x c2/c1, transfer = min(available, max), water = transfer x (c1/c2 - 1), 0 if c1<=c2) and stored on `production_runs`
+  (`pasteurization_*`); the actuals (product transferred, water added, final level per tank, per-tank Ksorbate/benzoate added,
+  variance vs the `dilution_variance_flag_pct` setting) are the `dilution_*` columns. The run-level `dilution_fill_level_tank_6ab_l`
+  and `dilution_ksorbate/nabenzoate_added_l` are now the SUMS of the per-tank values, so reagent deduction is unchanged.
+  Per-tank required fields use the optional 4th element of a `PROGRESS_SECTIONS` field entry (a predicate over `stages`).
+  Capacity per tank is the `dilution_tank_capacity_each_l` setting (connected = double).
+  Product left in 5A/5B => further passes: `run_dilution_passes` (routes `/api/production/<id>/dilution-passes`, UI
+  `buildDilutionPassCard`) each carry their own plan + actuals + per-tank preservatives; `_recompute_dilution_totals` keeps the
+  run-level Ksorbate/benzoate totals = pass 1 + all extra passes, so the reagent deduction covers every pass (each pass also has its own pH balancing: measured pH + citric acid added, with the
+  citric acid summed into the run's citric usage by `_commit_reagent_usage`). Pass items are
+  required-field items in the Dilution & Preservation section, and `dilutionPasses` is part of the signed-log snapshot.
 - **Packaging edits after finalize** re-derive everything computed from the packaging rows in the
   same transaction (`_sync_completed_packaging`): container + FG-label stock (net-change commit),
   the run's FG lots (`_adjust_fg_lot`, refuses to go below units already shipped/moved), and

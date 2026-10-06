@@ -100,8 +100,10 @@ SETTINGS_DEFAULTS = [
     ("orp_watch_closely_below", 0, "ORP \"Watch closely\" threshold (mV)",
      "ORP readings at or above \"Spoilage underway\" but below this value are classified \"Watch closely\";"
      " at or above it, \"Stable / safe zone\"."),
-    ("dilution_tank_6ab_max_level_l", 5000, "Tank 6A/B max level (L)",
-     "Maximum working volume of Tank 6A/B -- used by Dilution & Preservation's Target fill level, Tank 6A/B (L) calculation."),
+    ("dilution_tank_capacity_each_l", 5000, "Tank 6A / 6B capacity, each (L)",
+     "Maximum working volume of EACH of Tank 6A and Tank 6B (6A + 6B connected = double) -- used by the Dilution plan's available space / maximum product transfer."),
+    ("dilution_variance_flag_pct", 5, "Dilution final-volume variance flag (%)",
+     "Flags a dilution when the final tank volume differs from the expected volume (starting level + product transferred + water added) by more than this percentage."),
     ("extraction_default_amplitude_pct", 100, "Extraction default Amplitude (%)",
      "Pre-filled value for a new run's Extraction Amplitude (%) field."),
     ("extraction_default_flowrate_lpm", 15, "Extraction default Flow rate (L/min)",
@@ -189,6 +191,10 @@ _QC_ALL = [
     ("mannitolPct", "QC Check: Mannitol (%)"), ("tsLiquidPct", "QC Check: TSliquid (%)"),
     ("rhoLiquidGMl", "QC Check: \u03c1liquid (g/mL)"),
 ]
+# A field entry may carry a 4th element: a predicate over the run's stages dict -- the field is
+# only required when it is true (per-tank fields apply only to the tanks being filled).
+_uses_6a = lambda st: (st["pasteurization"].get("receivingTanks") or "") in ("6A", "6AB")
+_uses_6b = lambda st: (st["pasteurization"].get("receivingTanks") or "") in ("6B", "6AB")
 PROGRESS_SECTIONS = [
     {"key": "feedstock", "label": "Feedstock"},
     {"key": "homogenization", "label": "Homogenization", "fields": [
@@ -219,12 +225,24 @@ PROGRESS_SECTIONS = [
         ("separation", "liquidRhoLiquidGMl", "Filtrate QC Check: \u03c1liquid (g/mL)")]},
     {"key": "pasteurization", "label": "Pasteurization", "fields": [
         ("pasteurization", "startedAt", "Started at"), ("pasteurization", "productSetpointC", "Product set-point (\u00b0C)"),
-        ("pasteurization", "boilerSetpointC", "Boiler set-point (\u00b0C)")]},
+        ("pasteurization", "boilerSetpointC", "Boiler set-point (\u00b0C)"),
+        ("pasteurization", "tank5aL", "Tank 5A level (L)"), ("pasteurization", "tank5bL", "Tank 5B level (L)"),
+        ("pasteurization", "receivingTanks", "Receiving tanks (6A / 6B / both)"),
+        ("pasteurization", "tank6aStartL", "Tank 6A level before transfer (L)", _uses_6a),
+        ("pasteurization", "tank6bStartL", "Tank 6B level before transfer (L)", _uses_6b)]},
     {"key": "dilution", "label": "Dilution & Preservation", "fields": [
         ("dilution", "fillLevelTank6abL", "Fill level, Tank 6A/B (L)"), ("dilution", "measuredPh", "Measured pH"),
         ("dilution", "citricKg", "Citric acid added (kg)"), ("dilution", "ksorbateStockPct", "Ksorbate stock concentration"),
         ("dilution", "ksorbateAddedL", "Ksorbate added (L)"), ("dilution", "nabenzoateStockPct", "Nabenzoate stock concentration"),
-        ("dilution", "nabenzoateAddedL", "Sodium benzoate added (L)")]
+        ("dilution", "nabenzoateAddedL", "Sodium benzoate added (L)"),
+        ("dilution", "productTransferredL", "Product transferred from 5A/5B (L)"),
+        ("dilution", "waterAddedL", "Dilution water added (L)"),
+        ("dilution", "tank6aFinalL", "Final level, Tank 6A (L)", _uses_6a),
+        ("dilution", "tank6bFinalL", "Final level, Tank 6B (L)", _uses_6b),
+        ("dilution", "ksorbateAddedL6a", "Ksorbate added, Tank 6A (L)", _uses_6a),
+        ("dilution", "ksorbateAddedL6b", "Ksorbate added, Tank 6B (L)", _uses_6b),
+        ("dilution", "nabenzoateAddedL6a", "Sodium benzoate added, Tank 6A (L)", _uses_6a),
+        ("dilution", "nabenzoateAddedL6b", "Sodium benzoate added, Tank 6B (L)", _uses_6b)]
         + [("packaging", k, l.replace("QC Check", "LKE QC Check")) for k, l in _QC_ALL]
         + [("packaging", "sampleCollectedAt", "LKE Sample Point: collection date and time")],
      "sample_rows": "LKE Sample Point: at least one sample"},
@@ -238,7 +256,8 @@ def required_keys_by_stage():
     """stage -> [keys] the SPA marks with an asterisk (plus the two table rules)."""
     out = {"feedstock": [k for k, _l in REQUIRED_FEEDSTOCK], "packagingEntries": True, "packagingSampleRows": True}
     for sec in PROGRESS_SECTIONS:
-        for stage, key, _label in sec.get("fields", []):
+        for entry in sec.get("fields", []):
+            stage, key = entry[0], entry[1]
             out.setdefault(stage, [])
             if key not in out[stage]:
                 out[stage].append(key)
@@ -256,6 +275,15 @@ _KEY_LABELS = {
     "dilutionWaterL": "Dilution water added (L)", "lotPctSolids": "Lot %Solids Loading, (w/w)",
     "pctWetSolids": "Measured %Solids Loading, (w/w)", "targetPctWetSolids": "Target %Solids Loading, (w/w)",
     "dilutionWaterTargetL": "Recommended Dilution Water (L)",
+    "tank5aL": "Tank 5A level (L)", "tank5bL": "Tank 5B level (L)", "receivingTanks": "Receiving tanks",
+    "tank6aStartL": "Tank 6A level before transfer (L)", "tank6bStartL": "Tank 6B level before transfer (L)",
+    "maxTransferL": "Max product to transfer (L)", "recommendedTransferL": "Recommended product transfer (L)",
+    "recommendedWaterL": "Recommended dilution water (L)", "productTransferredL": "Product transferred (L)",
+    "waterAddedL": "Dilution water added (L)", "tank6aFinalL": "Final level, Tank 6A (L)",
+    "tank6bFinalL": "Final level, Tank 6B (L)", "ksorbateAddedL6a": "Ksorbate added, Tank 6A (L)",
+    "ksorbateAddedL6b": "Ksorbate added, Tank 6B (L)", "nabenzoateAddedL6a": "Sodium benzoate added, Tank 6A (L)",
+    "nabenzoateAddedL6b": "Sodium benzoate added, Tank 6B (L)", "finalVariancePct": "Final volume variance (%)",
+    "fillLevelTank6abL": "Total final volume, Tanks 6A/6B (L)",
 }
 
 
@@ -993,6 +1021,32 @@ CREATE TABLE IF NOT EXISTS release_events (
 );
 CREATE INDEX IF NOT EXISTS idx_release_events_run ON release_events(run_id);
 
+-- Additional dilution passes (2, 3, ...): when product is left in Tank 5A/5B after the first
+-- pass (which is the run-level pasteurization_* / dilution_* columns), each further pass
+-- records its own plan (5A/5B levels, receiving tank(s), starting levels, TDS), actuals
+-- (product transferred, water added, final level per tank) and per-tank preservative
+-- additions. The run-level reagent totals are the sum over all passes (see
+-- Handler._recompute_dilution_totals), so reagent deduction is unchanged.
+CREATE TABLE IF NOT EXISTS run_dilution_passes (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id                  INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+    pass_no                 INTEGER NOT NULL,
+    tank5a_l                REAL, tank5b_l REAL,
+    receiving               TEXT,              -- 6A | 6B | 6AB
+    tank6a_start_l          REAL, tank6b_start_l REAL,
+    tds_pct                 REAL,              -- Separation filtrate TDS used by this pass's plan
+    max_transfer_l          REAL, transfer_rec_l REAL, water_rec_l REAL,
+    product_transferred_l   REAL, water_added_l REAL,
+    tank6a_final_l          REAL, tank6b_final_l REAL,
+    ksorbate_added_l_6a     REAL, ksorbate_added_l_6b REAL,
+    nabenzoate_added_l_6a   REAL, nabenzoate_added_l_6b REAL,
+    final_variance_pct      REAL,
+    measured_ph             REAL,              -- pH balancing for this pass
+    citric_kg               REAL,              -- citric acid added in this pass (counts toward the run's citric usage)
+    created_at              TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dilpasses_run ON run_dilution_passes(run_id);
+
 -- Revision tracker for a finalized run's production log. Rev 1 is the
 -- finalized record; every later change to the log (any section, via any
 -- endpoint) adds a revision holding a field-level diff (old -> new) and who
@@ -1131,7 +1185,7 @@ def init_db():
 # change that snapshot's content or format, BUMP this: on the next boot every run that is
 # currently reviewed/released is re-hashed (one SYSTEM audit event each), so a format
 # change is never mistaken for someone altering a signed log.
-RELEASE_SNAPSHOT_VERSION = 3
+RELEASE_SNAPSHOT_VERSION = 5
 
 
 def rebaseline_release_hashes(conn):
@@ -1242,6 +1296,18 @@ def migrate(conn):
         ("homog_output_l", "REAL"), ("homog_started_at", "TEXT"),
         ("homog_wet_solids_wt_g", "REAL"), ("homog_liquid_wt_g", "REAL"), ("homog_pct_wet_solids", "REAL"),
         ("homog_post_dilution_tank_l", "REAL"), ("homog_lot_pct_solids", "REAL"),
+        # Tank 5A/5B -> 6A/6B dilution: plan (Pasteurization In) ...
+        ("pasteurization_tank5a_l", "REAL"), ("pasteurization_tank5b_l", "REAL"),
+        ("pasteurization_receiving", "TEXT"),        # 6A | 6B | 6AB (connected)
+        ("pasteurization_tank6a_start_l", "REAL"), ("pasteurization_tank6b_start_l", "REAL"),
+        ("pasteurization_max_transfer_l", "REAL"), ("pasteurization_transfer_rec_l", "REAL"),
+        ("pasteurization_water_rec_l", "REAL"),
+        # ... and actuals (Dilution & Preservation), with per-tank preservative additions
+        ("dilution_product_transferred_l", "REAL"), ("dilution_water_added_l", "REAL"),
+        ("dilution_tank6a_final_l", "REAL"), ("dilution_tank6b_final_l", "REAL"),
+        ("dilution_ksorbate_added_l_6a", "REAL"), ("dilution_ksorbate_added_l_6b", "REAL"),
+        ("dilution_nabenzoate_added_l_6a", "REAL"), ("dilution_nabenzoate_added_l_6b", "REAL"),
+        ("dilution_final_variance_pct", "REAL"),
         ("homog_initial_ph", "REAL"), ("homog_target_pct_wet_solids", "REAL"),
         ("homog_dilution_water_target_l", "REAL"), ("homog_final_ph", "REAL"),
         ("homog_qc_ph", "REAL"), ("homog_sample_collected_at", "TEXT"),
@@ -1313,9 +1379,16 @@ def migrate(conn):
     # Homogenization's dilution calculation no longer uses a tank max level (c1V1=c2V2 on the
     # measured Tank level), so that setting is retired; the default-target setting was renamed.
     conn.execute("DELETE FROM settings WHERE key='homog_tank_2ab_max_level_l'")
+    # The old single "Tank 6A/B max level" meant one combined figure; the dilution plan needs a
+    # per-tank capacity (connected = double), so it is replaced by a new, clearly-named setting.
+    conn.execute("DELETE FROM settings WHERE key='dilution_tank_6ab_max_level_l'")
     conn.execute("UPDATE settings SET label=?, description=? WHERE key='homog_default_target_pct_wet_solids'",
                  ("Homogenization default Target %Solids Loading, (w/w)",
                   "Pre-filled value for a new run's Target %Solids Loading, (w/w) field."))
+    dpcols = {r["name"] for r in conn.execute("PRAGMA table_info(run_dilution_passes)")}
+    for col in ("measured_ph", "citric_kg"):
+        if col not in dpcols:
+            conn.execute("ALTER TABLE run_dilution_passes ADD COLUMN %s REAL" % col)
     rrcols = {r["name"] for r in conn.execute("PRAGMA table_info(run_revisions)")}
     for col, decl in (("category", "TEXT"), ("reason", "TEXT"), ("amendment_id", "INTEGER")):
         if col not in rrcols:
@@ -1774,7 +1847,12 @@ def run_public(r):
             "totalVolumeL": r["pasteurization_total_volume_l"],
             "preSampleCollectedAt": r["pasteurization_pre_sample_collected_at"],
             "postSampleCollectedAt": r["pasteurization_post_sample_collected_at"],
-            "tdsPct": r["pasteurization_tds_pct"]},
+            "tdsPct": r["pasteurization_tds_pct"],
+            "tank5aL": r["pasteurization_tank5a_l"], "tank5bL": r["pasteurization_tank5b_l"],
+            "receivingTanks": r["pasteurization_receiving"],
+            "tank6aStartL": r["pasteurization_tank6a_start_l"], "tank6bStartL": r["pasteurization_tank6b_start_l"],
+            "maxTransferL": r["pasteurization_max_transfer_l"], "recommendedTransferL": r["pasteurization_transfer_rec_l"],
+            "recommendedWaterL": r["pasteurization_water_rec_l"]},
         "dilution": {
             "fillLevelTank6abL": r["dilution_fill_level_tank_6ab_l"],
             "measuredPh": r["dilution_measured_ph"],
@@ -1782,7 +1860,12 @@ def run_public(r):
             "ksorbateStockPct": r["dilution_ksorbate_stock_pct"],
             "ksorbateAddedL": r["dilution_ksorbate_added_l"],
             "nabenzoateStockPct": r["dilution_nabenzoate_stock_pct"],
-            "nabenzoateAddedL": r["dilution_nabenzoate_added_l"]},
+            "nabenzoateAddedL": r["dilution_nabenzoate_added_l"],
+            "productTransferredL": r["dilution_product_transferred_l"], "waterAddedL": r["dilution_water_added_l"],
+            "tank6aFinalL": r["dilution_tank6a_final_l"], "tank6bFinalL": r["dilution_tank6b_final_l"],
+            "ksorbateAddedL6a": r["dilution_ksorbate_added_l_6a"], "ksorbateAddedL6b": r["dilution_ksorbate_added_l_6b"],
+            "nabenzoateAddedL6a": r["dilution_nabenzoate_added_l_6a"], "nabenzoateAddedL6b": r["dilution_nabenzoate_added_l_6b"],
+            "finalVariancePct": r["dilution_final_variance_pct"]},
         "packaging": {
             "packagedAt": r["packaging_packaged_at"],
             "qcPh": r["packaging_qc_ph"], "tdsPct": r["packaging_tds_pct"],
@@ -3328,6 +3411,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         lot = run["processing_lot"]
         current = self._dilution_reagent_kg(run)
+        # citric acid added in additional dilution passes' pH balancing counts too
+        extra_citric = conn.execute("SELECT COALESCE(SUM(citric_kg),0) c FROM run_dilution_passes WHERE run_id=?",
+                                    (run_id,)).fetchone()["c"]
+        current["Citric Acid"] = round(current["Citric Acid"] + extra_citric, 4)
         committed = {r["reagent"]: r["committed_kg"] for r in conn.execute(
             "SELECT reagent, committed_kg FROM run_reagent_commits WHERE run_id=?", (run_id,))}
         for name, col in self.REAGENT_RUN_COLUMNS.items():
@@ -3486,7 +3573,15 @@ class Handler(BaseHTTPRequestHandler):
             ("pasteurization_product_setpoint_c", "productSetpointC", "num"),
             ("pasteurization_boiler_setpoint_c", "boilerSetpointC", "num"),
             ("pasteurization_post_sample_collected_at", "postSampleCollectedAt", "text"),
-            ("pasteurization_tds_pct", "tdsPct", "num"),
+            ("pasteurization_tds_pct", "tdsPct", "num"),      # now the Separation filtrate TDS used by the plan
+            ("pasteurization_tank5a_l", "tank5aL", "num"),
+            ("pasteurization_tank5b_l", "tank5bL", "num"),
+            ("pasteurization_receiving", "receivingTanks", "text"),
+            ("pasteurization_tank6a_start_l", "tank6aStartL", "num"),
+            ("pasteurization_tank6b_start_l", "tank6bStartL", "num"),
+            ("pasteurization_max_transfer_l", "maxTransferL", "num"),
+            ("pasteurization_transfer_rec_l", "recommendedTransferL", "num"),
+            ("pasteurization_water_rec_l", "recommendedWaterL", "num"),
             # pasteurization_pre_sample_collected_at and pasteurization_total_volume_l
             # columns stay (additive-only) but are no longer collected -- the
             # "Pre-pasteurization microbial check" box and "Total volume (L)"
@@ -3500,6 +3595,15 @@ class Handler(BaseHTTPRequestHandler):
             ("dilution_ksorbate_added_l", "ksorbateAddedL", "num"),
             ("dilution_nabenzoate_stock_pct", "nabenzoateStockPct", "num"),
             ("dilution_nabenzoate_added_l", "nabenzoateAddedL", "num"),
+            ("dilution_product_transferred_l", "productTransferredL", "num"),
+            ("dilution_water_added_l", "waterAddedL", "num"),
+            ("dilution_tank6a_final_l", "tank6aFinalL", "num"),
+            ("dilution_tank6b_final_l", "tank6bFinalL", "num"),
+            ("dilution_ksorbate_added_l_6a", "ksorbateAddedL6a", "num"),
+            ("dilution_ksorbate_added_l_6b", "ksorbateAddedL6b", "num"),
+            ("dilution_nabenzoate_added_l_6a", "nabenzoateAddedL6a", "num"),
+            ("dilution_nabenzoate_added_l_6b", "nabenzoateAddedL6b", "num"),
+            ("dilution_final_variance_pct", "finalVariancePct", "num"),
         ],
         "packaging": [
             # packaging_started_at removed -- see the schema comment above.
@@ -3580,6 +3684,7 @@ class Handler(BaseHTTPRequestHandler):
         }
         d["inputs"] = self._run_inputs_public(conn, r["id"])
         d["dilutions"] = self._dilutions_public(conn, r["id"])
+        d["dilutionPasses"] = self._dilution_passes_public(conn, r["id"])
         d["samplePoints"] = self._sample_points_public(conn, r["id"])
         d["packagingEntries"] = self._packaging_entries_public(conn, r["id"])
         d["release"] = {"state": r["release_state"], "label": RELEASE_LABELS.get(r["release_state"], "—"),
@@ -3622,8 +3727,29 @@ class Handler(BaseHTTPRequestHandler):
                     for key, label in REQUIRED_FEEDSTOCK:
                         items.append(("%s: %s" % (name, label), _has_value(row.get(key))))
             else:
-                for stage, key, label in sec["fields"]:
+                for entry in sec["fields"]:
+                    stage, key, label = entry[:3]
+                    if len(entry) > 3 and not entry[3](stages):
+                        continue          # conditional field that doesn't apply to this run
                     items.append((label, _has_value(stages[stage].get(key))))
+                if sec["key"] == "dilution":
+                    for ps in conn.execute("SELECT * FROM run_dilution_passes WHERE run_id=? ORDER BY pass_no", (rid,)):
+                        recv = ps["receiving"] or ""
+                        ua, ub = recv in ("6A", "6AB"), recv in ("6B", "6AB")
+                        n = ps["pass_no"]
+                        parts = [("Tank 5A level (L)", ps["tank5a_l"]), ("Tank 5B level (L)", ps["tank5b_l"]),
+                                 ("Receiving tanks", recv), ("Product transferred (L)", ps["product_transferred_l"]),
+                                 ("Dilution water added (L)", ps["water_added_l"]),
+                                 ("Measured pH", ps["measured_ph"]), ("Citric acid added (kg)", ps["citric_kg"])]
+                        for on, t in ((ua, "6A"), (ub, "6B")):
+                            if on:
+                                lc = t.lower()
+                                parts += [("Tank %s level before transfer (L)" % t, ps["tank%s_start_l" % lc]),
+                                          ("Final level, Tank %s (L)" % t, ps["tank%s_final_l" % lc]),
+                                          ("Ksorbate added, Tank %s (L)" % t, ps["ksorbate_added_l_%s" % lc]),
+                                          ("Sodium benzoate added, Tank %s (L)" % t, ps["nabenzoate_added_l_%s" % lc])]
+                        for label, val in parts:
+                            items.append(("Pass %d: %s" % (n, label), _has_value(val)))
                 if sec.get("sample_rows"):
                     n = conn.execute("SELECT COUNT(*) c FROM run_sample_points WHERE run_id=? AND stage='packaging'",
                                      (rid,)).fetchone()["c"]
@@ -3674,6 +3800,8 @@ class Handler(BaseHTTPRequestHandler):
     def _item_label(self, section, item):
         if section == "inputs":
             return "Feedstock %s" % (item.get("toteLot") or "#%s" % item["id"])
+        if section == "dilutionPasses":
+            return "Dilution pass %s" % (item.get("passNo") or "#%s" % item["id"])
         if section == "dilutions":
             return "Dilution tank %s" % (item.get("tank") or "#%s" % item["id"])
         if section == "samplePoints":
@@ -4390,6 +4518,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.upload_input_photo(conn, int(seg[2]), int(seg[4]), user)
         if len(seg) == 5 and seg[2].isdigit() and seg[3] == "stages" and method == "PUT":
             return self.save_stage(conn, int(seg[2]), seg[4], user)
+        if len(seg) >= 4 and seg[2].isdigit() and seg[3] == "dilution-passes":
+            return self.route_dilution_passes(method, seg, conn, user)
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "dilutions":
             rid = int(seg[2])
             if not conn.execute("SELECT 1 FROM production_runs WHERE id=?", (rid,)).fetchone():
@@ -4904,6 +5034,7 @@ class Handler(BaseHTTPRequestHandler):
         # Likewise Dilution & Preservation's Save commits the net change in
         # citric acid / potassium sorbate / sodium benzoate used.
         if stage == "dilution":
+            self._recompute_dilution_totals(conn, rid)
             self._commit_reagent_usage(conn, rid, user["name"] if user else None)
         return {"run": run_public(conn.execute(
             "SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone())}
@@ -4938,6 +5069,94 @@ class Handler(BaseHTTPRequestHandler):
         if updates:
             sets = ", ".join("%s=?" % c for c in updates)
             conn.execute("UPDATE run_dilutions SET %s WHERE id=?" % sets, (*updates.values(), did))
+
+    # ---- additional dilution passes ---------------------------------------- #
+    PASS_FIELDS = [
+        ("tank5a_l", "tank5aL", "num"), ("tank5b_l", "tank5bL", "num"), ("receiving", "receivingTanks", "text"),
+        ("tank6a_start_l", "tank6aStartL", "num"), ("tank6b_start_l", "tank6bStartL", "num"),
+        ("tds_pct", "tdsPct", "num"), ("max_transfer_l", "maxTransferL", "num"),
+        ("transfer_rec_l", "recommendedTransferL", "num"), ("water_rec_l", "recommendedWaterL", "num"),
+        ("product_transferred_l", "productTransferredL", "num"), ("water_added_l", "waterAddedL", "num"),
+        ("tank6a_final_l", "tank6aFinalL", "num"), ("tank6b_final_l", "tank6bFinalL", "num"),
+        ("ksorbate_added_l_6a", "ksorbateAddedL6a", "num"), ("ksorbate_added_l_6b", "ksorbateAddedL6b", "num"),
+        ("nabenzoate_added_l_6a", "nabenzoateAddedL6a", "num"), ("nabenzoate_added_l_6b", "nabenzoateAddedL6b", "num"),
+        ("final_variance_pct", "finalVariancePct", "num"),
+        ("measured_ph", "measuredPh", "num"), ("citric_kg", "citricKg", "num"),
+    ]
+
+    def _dilution_passes_public(self, conn, run_id):
+        out = []
+        for r in conn.execute("SELECT * FROM run_dilution_passes WHERE run_id=? ORDER BY pass_no, id", (run_id,)):
+            d = {"id": r["id"], "passNo": r["pass_no"]}
+            for col, key, _kind in self.PASS_FIELDS:
+                d[key] = r[col]
+            out.append(d)
+        return out
+
+    def _recompute_dilution_totals(self, conn, run_id):
+        """Run-level Ksorbate / sodium benzoate added (L) = pass 1 (its per-tank values) plus every
+        additional pass, so the reagent deduction (which reads the run totals) covers all passes.
+        A run still on the older single-total layout (no receiving tank chosen) is left alone."""
+        r = conn.execute("SELECT * FROM production_runs WHERE id=?", (run_id,)).fetchone()
+        if not r or not r["pasteurization_receiving"]:
+            return
+        extra = conn.execute(
+            "SELECT COALESCE(SUM(COALESCE(ksorbate_added_l_6a,0)+COALESCE(ksorbate_added_l_6b,0)),0) k,"
+            " COALESCE(SUM(COALESCE(nabenzoate_added_l_6a,0)+COALESCE(nabenzoate_added_l_6b,0)),0) n"
+            " FROM run_dilution_passes WHERE run_id=?", (run_id,)).fetchone()
+        npasses = conn.execute("SELECT COUNT(*) c FROM run_dilution_passes WHERE run_id=?", (run_id,)).fetchone()["c"]
+
+        def total(a, b, more):
+            if a is None and b is None and not npasses:
+                return None          # nothing entered yet: leave "not recorded", don't invent a 0
+            return round((a or 0) + (b or 0) + more, 4)
+        conn.execute("UPDATE production_runs SET dilution_ksorbate_added_l=?, dilution_nabenzoate_added_l=? WHERE id=?",
+                     (total(r["dilution_ksorbate_added_l_6a"], r["dilution_ksorbate_added_l_6b"], extra["k"]),
+                      total(r["dilution_nabenzoate_added_l_6a"], r["dilution_nabenzoate_added_l_6b"], extra["n"]), run_id))
+
+    def _apply_pass_fields(self, conn, pid, d):
+        updates = {}
+        for col, key, kind in self.PASS_FIELDS:
+            if key not in d:
+                continue
+            updates[col] = numn(d[key]) if kind == "num" else ((d[key] or "").strip() or None)
+        if updates:
+            sets = ", ".join("%s=?" % c for c in updates)
+            conn.execute("UPDATE run_dilution_passes SET %s WHERE id=?" % sets, (*updates.values(), pid))
+
+    def route_dilution_passes(self, method, seg, conn, user):
+        rid = int(seg[2])
+        run = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
+        if not run:
+            raise ApiError(404, "Production run not found")
+        uname = user["name"] if user else None
+        if len(seg) == 4 and method == "POST":
+            if not run["pasteurization_receiving"]:
+                raise ApiError(400, "Complete the first pass's dilution plan (receiving tanks) before adding another pass")
+            n = conn.execute("SELECT COALESCE(MAX(pass_no),1) m FROM run_dilution_passes WHERE run_id=?", (rid,)).fetchone()["m"] + 1
+            cur = conn.execute("INSERT INTO run_dilution_passes (run_id,pass_no,created_at) VALUES (?,?,?)", (rid, n, now_iso()))
+            self._apply_pass_fields(conn, cur.lastrowid, self._body_json())
+        elif len(seg) == 5 and seg[4].isdigit():
+            pid = int(seg[4])
+            row = conn.execute("SELECT * FROM run_dilution_passes WHERE id=? AND run_id=?", (pid, rid)).fetchone()
+            if not row:
+                raise ApiError(404, "Dilution pass not found")
+            if method == "PUT":
+                self._apply_pass_fields(conn, pid, self._body_json())
+            elif method == "DELETE":
+                last = conn.execute("SELECT MAX(pass_no) m FROM run_dilution_passes WHERE run_id=?", (rid,)).fetchone()["m"]
+                if row["pass_no"] != last:
+                    raise ApiError(400, "Only the most recent pass can be removed")
+                conn.execute("DELETE FROM run_dilution_passes WHERE id=?", (pid,))
+            else:
+                raise ApiError(405, "Method not allowed")
+        elif method != "GET":
+            raise ApiError(405, "Method not allowed")
+        if method != "GET":
+            # run totals = pass 1 + all additional passes; the net change is deducted/refunded
+            self._recompute_dilution_totals(conn, rid)
+            self._commit_reagent_usage(conn, rid, uname)
+        return {"dilutionPasses": self._dilution_passes_public(conn, rid)}
 
     def add_dilution(self, conn, run_id, user):
         cur = conn.cursor()
@@ -5509,6 +5728,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(404, "Draft not found")
         d = run_public(r)
         d["dilutions"] = self._dilutions_public(conn, rid)
+        d["dilutionPasses"] = self._dilution_passes_public(conn, rid)
         d["samplePoints"] = self._sample_points_public(conn, rid)
         d["packagingEntries"] = self._packaging_entries_public(conn, rid)
         d["progress"] = self._run_progress(conn, r)
