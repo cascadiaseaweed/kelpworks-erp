@@ -100,16 +100,14 @@ SETTINGS_DEFAULTS = [
     ("orp_watch_closely_below", 0, "ORP \"Watch closely\" threshold (mV)",
      "ORP readings at or above \"Spoilage underway\" but below this value are classified \"Watch closely\";"
      " at or above it, \"Stable / safe zone\"."),
-    ("homog_tank_2ab_max_level_l", 5000, "Tank 2A/B max level (L)",
-     "Maximum working volume of Tank 2A/B -- used by Homogenization's Target fill level, Tank 2A/B (L) calculation."),
     ("dilution_tank_6ab_max_level_l", 5000, "Tank 6A/B max level (L)",
      "Maximum working volume of Tank 6A/B -- used by Dilution & Preservation's Target fill level, Tank 6A/B (L) calculation."),
     ("extraction_default_amplitude_pct", 100, "Extraction default Amplitude (%)",
      "Pre-filled value for a new run's Extraction Amplitude (%) field."),
     ("extraction_default_flowrate_lpm", 15, "Extraction default Flow rate (L/min)",
      "Pre-filled value for a new run's Extraction Flow rate (L/min) field."),
-    ("homog_default_target_pct_wet_solids", 50.0, "Homogenization default Target %Wet-Solids",
-     "Pre-filled value for a new run's Target %Wet-Solids field."),
+    ("homog_default_target_pct_wet_solids", 50.0, "Homogenization default Target %Solids Loading, (w/w)",
+     "Pre-filled value for a new run's Target %Solids Loading, (w/w) field."),
     ("ksorbate_stock_concentration_default_pct", 25.0, "Ksorbate stock concentration default (w/v %)",
      "Pre-filled value for a new run's Ksorbate stock concentration (w/v) field."),
     ("nabenzoate_stock_concentration_default_pct", 25.0, "Nabenzoate stock concentration default (w/v %)",
@@ -195,9 +193,10 @@ PROGRESS_SECTIONS = [
     {"key": "feedstock", "label": "Feedstock"},
     {"key": "homogenization", "label": "Homogenization", "fields": [
         ("homogenization", "startedAt", "Started at"), ("homogenization", "rinsingWaterL", "Rinse water (L)"),
-        ("homogenization", "slurryL", "Tank level (L)"), ("homogenization", "wetSolidsWtG", "Wet-solids-wt (g)"),
-        ("homogenization", "liquidWtG", "Liquid-wt (g)"), ("homogenization", "targetPctWetSolids", "Target %Wet-Solids"),
-        ("homogenization", "dilutionWaterL", "Dilution water added (L)")]
+        ("homogenization", "slurryL", "Pre-Dilution Tank Level (L)"), ("homogenization", "wetSolidsWtG", "Wet-solids-wt (g)"),
+        ("homogenization", "liquidWtG", "Liquid-wt (g)"), ("homogenization", "targetPctWetSolids", "Target %Solids Loading, (w/w)"),
+        ("homogenization", "dilutionWaterL", "Dilution water added (L)"),
+        ("homogenization", "postDilutionTankL", "Post-Dilution Tank Level (L)")]
         + [("homogenization", k, l) for k, l in _QC_ALL]
         + [("homogenization", "tsSlurryPct", "QC Check: TSslurry (%)"),
            ("homogenization", "rhoSlurryGMl", "QC Check: \u03c1slurry (g/mL)"),
@@ -252,7 +251,17 @@ _KEY_TOKENS = {"ph": "pH", "tds": "TDS", "orp": "ORP", "psi": "(psi)", "pct": "(
                "nabenzoate": "Nabenzoate", "6ab": "6A/B"}
 
 
+_KEY_LABELS = {
+    "slurryL": "Pre-Dilution Tank Level (L)", "postDilutionTankL": "Post-Dilution Tank Level (L)",
+    "dilutionWaterL": "Dilution water added (L)", "lotPctSolids": "Lot %Solids Loading, (w/w)",
+    "pctWetSolids": "Measured %Solids Loading, (w/w)", "targetPctWetSolids": "Target %Solids Loading, (w/w)",
+    "dilutionWaterTargetL": "Recommended Dilution Water (L)",
+}
+
+
 def humanize_key(k):
+    if k in _KEY_LABELS:
+        return _KEY_LABELS[k]
     toks = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+[a-z]*", str(k).replace("GMl", "Gperml"))
     return " ".join(_KEY_TOKENS.get(t.lower(), t[:1].upper() + t[1:]) for t in toks) or str(k)
 
@@ -641,9 +650,11 @@ CREATE TABLE IF NOT EXISTS production_runs (
     homog_wet_solids_wt_g    REAL,  -- Homogenization Input QC Check
     homog_liquid_wt_g        REAL,
     homog_pct_wet_solids     REAL,  -- calculated: wet_solids_wt / (wet_solids_wt + liquid_wt)
+    homog_post_dilution_tank_l REAL, -- measured Post-Dilution Tank Level (L)
+    homog_lot_pct_solids     REAL,  -- calculated lot %solids (ratio) = measured * (post_tank - dilution_water) / post_tank
     homog_initial_ph              REAL,  -- Homogenization Input
     homog_target_pct_wet_solids   REAL,  -- Homogenization Output, entered as a percent (e.g. 50.0)
-    homog_dilution_water_target_l REAL,  -- calculated: water needed to reach the target from tank_level/pct_wet_solids
+    homog_dilution_water_target_l REAL,  -- calculated Recommended Dilution Water (L) = V1*(c1/c2 - 1), 0 if c1<=c2 (c1V1=c2V2); older runs stored the former Target fill level here
     homog_final_ph                REAL,
     -- Homogenization Output, QC Check (lot characterization)
     homog_qc_ph              REAL,
@@ -1120,7 +1131,7 @@ def init_db():
 # change that snapshot's content or format, BUMP this: on the next boot every run that is
 # currently reviewed/released is re-hashed (one SYSTEM audit event each), so a format
 # change is never mistaken for someone altering a signed log.
-RELEASE_SNAPSHOT_VERSION = 2
+RELEASE_SNAPSHOT_VERSION = 3
 
 
 def rebaseline_release_hashes(conn):
@@ -1230,6 +1241,7 @@ def migrate(conn):
         ("homog_dilution_water_l", "REAL"), ("homog_citric_kg", "REAL"),
         ("homog_output_l", "REAL"), ("homog_started_at", "TEXT"),
         ("homog_wet_solids_wt_g", "REAL"), ("homog_liquid_wt_g", "REAL"), ("homog_pct_wet_solids", "REAL"),
+        ("homog_post_dilution_tank_l", "REAL"), ("homog_lot_pct_solids", "REAL"),
         ("homog_initial_ph", "REAL"), ("homog_target_pct_wet_solids", "REAL"),
         ("homog_dilution_water_target_l", "REAL"), ("homog_final_ph", "REAL"),
         ("homog_qc_ph", "REAL"), ("homog_sample_collected_at", "TEXT"),
@@ -1298,6 +1310,12 @@ def migrate(conn):
     # Every Sample Point row created before this column existed belongs to
     # the (only, at the time) Homogenization Sample Point box.
     conn.execute("UPDATE run_sample_points SET stage='homogenization' WHERE stage IS NULL")
+    # Homogenization's dilution calculation no longer uses a tank max level (c1V1=c2V2 on the
+    # measured Tank level), so that setting is retired; the default-target setting was renamed.
+    conn.execute("DELETE FROM settings WHERE key='homog_tank_2ab_max_level_l'")
+    conn.execute("UPDATE settings SET label=?, description=? WHERE key='homog_default_target_pct_wet_solids'",
+                 ("Homogenization default Target %Solids Loading, (w/w)",
+                  "Pre-filled value for a new run's Target %Solids Loading, (w/w) field."))
     rrcols = {r["name"] for r in conn.execute("PRAGMA table_info(run_revisions)")}
     for col, decl in (("category", "TEXT"), ("reason", "TEXT"), ("amendment_id", "INTEGER")):
         if col not in rrcols:
@@ -1715,6 +1733,7 @@ def run_public(r):
             "citricKg": r["homog_citric_kg"], "outputL": r["homog_output_l"],
             "wetSolidsWtG": r["homog_wet_solids_wt_g"], "liquidWtG": r["homog_liquid_wt_g"],
             "pctWetSolids": r["homog_pct_wet_solids"], "initialPh": r["homog_initial_ph"],
+            "postDilutionTankL": r["homog_post_dilution_tank_l"], "lotPctSolids": r["homog_lot_pct_solids"],
             "targetPctWetSolids": r["homog_target_pct_wet_solids"],
             "dilutionWaterTargetL": r["homog_dilution_water_target_l"],
             "finalPh": r["homog_final_ph"],
@@ -3409,6 +3428,8 @@ class Handler(BaseHTTPRequestHandler):
             ("homog_target_pct_wet_solids", "targetPctWetSolids", "num"),
             ("homog_dilution_water_target_l", "dilutionWaterTargetL", "num"),
             ("homog_dilution_water_l", "dilutionWaterL", "num"),
+            ("homog_post_dilution_tank_l", "postDilutionTankL", "num"),
+            ("homog_lot_pct_solids", "lotPctSolids", "num"),
             ("homog_qc_ph", "qcPh", "num"),
             ("homog_sample_collected_at", "sampleCollectedAt", "text"),
             ("homog_tds_pct", "tdsPct", "num"),
@@ -4962,6 +4983,26 @@ class Handler(BaseHTTPRequestHandler):
             sets = ", ".join("%s=?" % c for c in updates)
             conn.execute("UPDATE run_sample_points SET %s WHERE id=?" % sets, (*updates.values(), spid))
 
+    # The LKE characterization Sample Point (Dilution & Preservation) starts with these samples
+    # on every new run: (type, description, qty, container). Container stock is consumed like any
+    # other sample row (and refunded if the row or the draft is removed); a shortage never blocks
+    # creating the run, it just shows as low/negative stock.
+    DEFAULT_LKE_SAMPLES = [
+        ("Liquid", "Microbial", 1, "50 mL falcon tube"),
+        ("Liquid", "Metals & Nutrients", 2, "50 mL falcon tube"),
+        ("Liquid", "Retention", 4, "50 mL falcon tube"),
+        ("Liquid", "R&D", 2, "1 L bottle"),
+    ]
+
+    def _seed_default_samples(self, conn, run_id, lot, user):
+        uname = user["name"] if user else None
+        for typ, desc, qty, container in self.DEFAULT_LKE_SAMPLES:
+            conn.execute("INSERT INTO run_sample_points (run_id,type,description,qty,container,stage,created_at)"
+                         " VALUES (?,?,?,?,?,'packaging',?)", (run_id, typ, desc, qty, container, now_iso()))
+            row = self._consumable_by_name(conn, container)
+            if row:
+                self._consume(conn, row["id"], -qty, "Sample point added (default)", lot, uname)
+
     def add_sample_point(self, conn, run_id, user):
         # No container is assigned yet (the operator picks one from the
         # dropdown after adding the row), so nothing to consume here --
@@ -5515,6 +5556,7 @@ class Handler(BaseHTTPRequestHandler):
             # placeholder that gets swapped out at finalize.
             conn.execute("UPDATE production_runs SET processing_lot=? WHERE id=?",
                          (lot_number_for(ts, rid), rid))
+            self._seed_default_samples(conn, rid, lot_number_for(ts, rid), user)
         else:
             run = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
             if not run:
@@ -6196,7 +6238,9 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     items.setdefault((u["item"], u["category"], u["unit"]), []).append((g, u["amount"]))
             usage = []
-            for (item, cat, unit), pairs_ in sorted(items.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+            # reagents, then packaging (incl. sample containers), then finished-goods labels
+            usage_order = {"reagent": 0, "packaging": 1, "sample": 1, "label": 2}
+            for (item, cat, unit), pairs_ in sorted(items.items(), key=lambda kv: (usage_order.get(kv[0][1], 9), kv[0][0])):
                 usage.append({
                     "item": item, "category": cat, "unit": unit,
                     "usedIn": len(pairs_), "ofRuns": len(with_usage),
@@ -6724,23 +6768,40 @@ def yield_usage_workbook(data):
         s.row([T(g["title"]), N(g["runs"], 4), T("Low sample" if g["lowSample"] else "OK"),
                N(pr.get("n"), 4), N(pr.get("median")), N(pr.get("min")), N(pr.get("max")), N(pr.get("pooled")),
                N(hr.get("n"), 4), N(hr.get("median")), N(hr.get("min")), N(hr.get("max")), N(hr.get("pooled"))])
-    s.section("Usage (net kg / L / units consumed per run, from the ledger)", 14)
-    s.row([H("Group"), H("Item"), H("Category"), H("Unit"), HR("Used in"), HR("Of runs"), HR("Total"),
+    # Usage is grouped Reagents / Packaging / Finished-goods labels. Reagents keep the
+    # median/min/max statistics (rounded to 0.1); packaging and labels are whole-unit
+    # totals only (rounded to the nearest 1).
+    R1 = lambda v: N(round(v, 1), 5) if v is not None else N(None)
+    R0 = lambda v: N(round(v), 4) if v is not None else N(None)
+    s.section("Reagents (net kg / L consumed per run, from the ledger; rounded to 0.1)", 14)
+    s.row([H("Group"), H("Item"), H("Unit"), HR("Used in"), HR("Of runs"), HR("Total"),
            HR("/1000 L out median"), HR("min"), HR("max"),
            HR("/1000 kg process median"), HR("min"), HR("max")])
     for g in data["groups"]:
         for u in g["usage"]:
+            if u["category"] != "reagent":
+                continue
             ko, tp = u["perKLOutput"] or {}, u["perTonneProcess"] or {}
-            s.row([T(g["title"]), T(u["item"]), T(u["category"]), T(u["unit"]),
-                   N(u["usedIn"], 4), N(u["ofRuns"], 4), N(u["total"]),
-                   N(ko.get("median")), N(ko.get("min")), N(ko.get("max")),
-                   N(tp.get("median")), N(tp.get("min")), N(tp.get("max"))])
-    s.section("Usage per 1000 kg harvest input", 14)
+            s.row([T(g["title"]), T(u["item"]), T(u["unit"]),
+                   N(u["usedIn"], 4), N(u["ofRuns"], 4), R1(u["total"]),
+                   R1(ko.get("median")), R1(ko.get("min")), R1(ko.get("max")),
+                   R1(tp.get("median")), R1(tp.get("min")), R1(tp.get("max"))])
+    s.section("Reagents per 1000 kg harvest input", 14)
     s.row([H("Group"), H("Item"), HR("median"), HR("min"), HR("max")])
     for g in data["groups"]:
         for u in g["usage"]:
+            if u["category"] != "reagent":
+                continue
             th = u["perTonneHarvest"] or {}
-            s.row([T(g["title"]), T(u["item"]), N(th.get("median")), N(th.get("min")), N(th.get("max"))])
+            s.row([T(g["title"]), T(u["item"]), R1(th.get("median")), R1(th.get("min")), R1(th.get("max"))])
+    for title, cats in (("Packaging (total count used)", ("packaging", "sample")),
+                        ("Finished-goods labels (total count used)", ("label",))):
+        s.section(title, 14)
+        s.row([H("Group"), H("Item"), H("Unit"), HR("Used in"), HR("Of runs"), HR("Total")])
+        for g in data["groups"]:
+            for u in g["usage"]:
+                if u["category"] in cats:
+                    s.row([T(g["title"]), T(u["item"]), T(u["unit"]), N(u["usedIn"], 4), N(u["ofRuns"], 4), R0(u["total"])])
     sheets.append(s)
 
     s = XlsxSheet("Runs"); s.set_widths([22, 16, 22, 22, 22, 22, 16, 12, 12, 12, 12, 12, 10, 10, 14, 10, 26, 30])

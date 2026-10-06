@@ -616,15 +616,15 @@ async function pageProduction(v) {
       el('div', { class: 'page-head', style: 'margin:0 0 8px' },
         el('h3', { style: 'margin:0' }, mono(run.processingLot),
           run.excludeFromStats ? el('span', { class: 'pill', style: 'margin-left:6px', title: run.excludeReason || '' }, 'Excluded from analysis') : null,
-          run.release && run.release.state && run.release.state !== 'legacy' ? [' ', releaseBadge(run.release.state)] : null),
+          run.release && run.release.state && run.release.state !== 'legacy' ? [' ', releaseBadge(run.release.state)] : null,
+          ' ', analysisInfoButton(run)),
         el('div', { class: 'actions' },
           canAmendLog() ? (run.amendment
             ? el('button', { onclick: () => openRunLog(run.id) }, '✏️ Continue amendment')
             : el('button', { onclick: () => openAmendDialog(run) }, '✏️ Amend run')) : null,
-          el('button', { class: 'secondary', onclick: () => editRun(run) }, 'Edit'),
           el('button', { class: 'secondary', onclick: () => openProcessLog(run) }, '📋 Process log'),
           el('button', { class: 'secondary', onclick: () => openQcForRun(run) },
-            '🧪 QC' + (run.qcSummary ? ' (' + run.qcSummary.recorded + '/' + run.qcSummary.total + ')' : '')),
+            '🧪 QC'),
           el('button', { class: 'secondary', onclick: () => openAttachments(run) },
             '📎 Documents' + (run.attachments && run.attachments.length ? ' (' + run.attachments.length + ')' : '')),
           el('button', { class: 'secondary', onclick: () => printLabels(run.fgLots.map(f => fgLabel(f, run))) }, 'Print FG labels'))),
@@ -853,6 +853,20 @@ async function openIntegrityCheck() {
 const canAmendLog = () => !!(State.user && State.user.canAmendLog);
 const canIntegrity = () => !!(State.user && (State.user.role === 'admin' || State.user.isQualityManager));
 
+// Quiet bar-chart icon in the card's title row (not an action button): hover explains the Yield & Usage
+// analysis setting and shows this run's current state; click opens the Analysis window.
+function analysisInfoButton(run) {
+  const tip = run.excludeFromStats
+    ? 'Yield & Usage analysis: this run is EXCLUDED' + (run.excludeReason ? ' (' + run.excludeReason + ')' : '') + '. Click to change.'
+    : 'Yield & Usage analysis: this run is included in the statistics. Click to exclude a test, spoiled or unrepresentative run.';
+  // bar-chart glyph = "analysis"; a slash through it when the run is excluded
+  const svg = '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true">'
+    + '<rect x="2" y="9" width="3" height="5" rx=".6"/><rect x="6.5" y="5" width="3" height="9" rx=".6"/><rect x="11" y="2" width="3" height="12" rx=".6"/>'
+    + (run.excludeFromStats ? '<path d="M1.5 14.5 14.5 1.5" stroke="#fff" stroke-width="3.2" stroke-linecap="round"/><path d="M1.5 14.5 14.5 1.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>' : '')
+    + '</svg>';
+  return el('button', { type: 'button', class: 'info-btn' + (run.excludeFromStats ? ' on' : ''), 'data-tip': tip, 'aria-label': tip,
+    onclick: () => editRun(run), html: svg });
+}
 // Opens (and scrolls to) one section of a production-log modal: sections are the
 // top-level accordions, identified by their summary text.
 const LOG_SECTION_TITLES = { feedstock: 'Feedstock', homogenization: 'Homogenization', extraction: 'Extraction',
@@ -926,50 +940,35 @@ function fmtWhen(iso) {
   const get = t => (parts.find(p => p.type === t) || {}).value;
   return get('year') + '-' + get('month') + '-' + get('day') + ' ' + get('hour') + ':' + get('minute');
 }
+// "Analysis": the run's Yield & Usage analysis setting (exclude a test / spoiled / unrepresentative run).
+// It is not a production-log entry, so it never needs an amendment. Amending the log is the card's
+// "Amend run" button; run date / location / operators / notes live in the Process log's Initiation section.
 async function editRun(run) {
-  const operatorsSelect = buildOperatorsSelect(run.operators || '');
+  // One tidy option row (same look as the user-permission checklist); the reason field only
+  // appears while the option is ticked, and is required then.
+  const cb = el('input', { type: 'checkbox', id: 'e_excl' });
+  cb.checked = !!run.excludeFromStats;
+  const reason = el('input', { id: 'e_excl_reason', value: run.excludeReason || '', placeholder: 'e.g. test run, spoiled batch, unrepresentative yield' });
+  const reasonField = field(reqLabel('Reason for excluding'), reason);
+  const row = el('label', { class: 'perm-item' + (cb.checked ? ' on' : '') }, cb,
+    el('span', { class: 'perm-text' }, el('b', {}, 'Exclude this run from the analysis'),
+      el('small', {}, 'Leaves it out of the Yield & Usage statistics (test, spoiled or unrepresentative runs). It stays visible behind “Show excluded”.')));
+  const sync = () => { row.classList.toggle('on', cb.checked); reasonField.classList.toggle('hidden', !cb.checked); };
+  cb.addEventListener('change', () => { sync(); if (cb.checked) reason.focus(); });
+  sync();
   const body = el('div', {},
-    el('div', { class: 'summary-line' }, sl('Processing lot', run.processingLot), sl('SKU', skuName(run.sku)),
-      sl('Target TDS', run.targetTds != null ? run.targetTds + '%' : '—'),
-      el('span', { class: 'muted' }, 'Totes consumed & packaged output are fixed; correct the run details below.')),
-    el('div', { class: 'form-row' },
-      field('Run date', el('input', { type: 'date', id: 'e_date', value: run.runDate || todayStr() })),
-      field('Citric acid (kg)', el('input', { type: 'number', step: '0.1', id: 'e_citric', value: run.citricKg ?? 0 }))),
-    el('div', { class: 'form-row' },
-      field('Potassium sorbate (kg)', el('input', { type: 'number', step: '0.1', id: 'e_sorbate', value: run.sorbateKg ?? 0 })),
-      field('Sodium benzoate (kg)', el('input', { type: 'number', step: '0.1', id: 'e_nabenzoate', value: run.nabenzoateKg ?? 0 }))),
-    field('Production Location', productionLocationSelect('e_loc', run.location)),
-    field('Operators', operatorsSelect.el),
-    field('Notes', el('textarea', { id: 'e_notes', rows: '2' }, run.notes || '')),
-    el('div', { class: 'qc-check-section-title' }, 'Yield & Usage analysis'),
-    field('Exclude this run from the yield & usage analysis (test / spoiled / unrepresentative)',
-      el('input', { type: 'checkbox', id: 'e_excl' })),
-    field('Reason for excluding', el('input', { id: 'e_excl_reason', value: run.excludeReason || '', placeholder: 'required when excluded' })),
-    el('div', { class: 'help' }, 'These kg totals include what was logged under Dilution & Preservation. Changing citric / sorbate / benzoate adjusts reagent stock by the difference. Every change is logged with your name.'));
-  body.querySelector('#e_excl').checked = !!run.excludeFromStats;
-  const locked = !run.amendment || !canAmendLog();
-  if (locked) {
-    body.prepend(logLockBanner(run, 'The run date, reagent totals, location, operators and notes are production-log entries. Only the yield-analysis exclusion below can be changed without an amendment.'));
-    body.querySelectorAll('input, select, textarea, button').forEach(c => { if (!c.closest('.allow-locked') && !['e_excl', 'e_excl_reason'].includes(c.id)) c.disabled = true; });
-  }
-  modal('Edit run — ' + run.processingLot, body, async () => {
-    const full = {
-      runDate: body.querySelector('#e_date').value,
-      citricKg: body.querySelector('#e_citric').value || 0,
-      sorbateKg: body.querySelector('#e_sorbate').value || 0,
-      nabenzoateKg: body.querySelector('#e_nabenzoate').value || 0,
-      location: body.querySelector('#e_loc').value,
-      operators: operatorsSelect.value,
-      notes: body.querySelector('#e_notes').value,
-      excludeFromStats: body.querySelector('#e_excl').checked ? 1 : 0,
-      excludeReason: body.querySelector('#e_excl_reason').value
-    };
-    const r = await api('PUT', '/production/' + run.id,
-      locked ? { excludeFromStats: full.excludeFromStats, excludeReason: full.excludeReason } : full);
+    el('div', { class: 'summary-line' }, sl('Run', run.processingLot), sl('Product', skuName(run.sku))),
+    el('div', { class: 'perm-box' }, el('div', { class: 'perm-title' }, 'Yield & Usage analysis'),
+      el('div', { class: 'perm-list' }, row)),
+    reasonField,
+    el('div', { class: 'perm-note' }, 'Not a production-log entry, so no amendment is needed. The change is logged with your name.'));
+  modal('Analysis — ' + run.processingLot, body, async () => {
+    if (cb.checked && !reason.value.trim()) throw new Error('Enter a reason for excluding this run.');
+    const r = await api('PUT', '/production/' + run.id, { excludeFromStats: cb.checked ? 1 : 0, excludeReason: cb.checked ? reason.value : '' });
     State.ref = await api('GET', '/refdata');
-    toast(r.changed ? r.changed + ' change' + (r.changed === 1 ? '' : 's') + ' logged' : 'No changes');
+    toast(r.changed ? 'Analysis setting saved' : 'No changes');
     render();
-  }, 'Save changes');
+  }, 'Save');
 }
 function fmtBytes(n) {
   if (n == null) return '—';
@@ -1169,18 +1168,15 @@ async function openQcForRun(run) {
     groups.forEach(g => {
       if (filter !== 'all' && filter !== g.key) return;
       const fields = qcChecks.filter(e => e.stage === g.stage && e.subtitle === g.subtitle);
-      const box = el('div', { class: 'qc-check-box theme-quality' },
-        el('div', { class: 'qc-check-title' }, g.stageLabel),
-        el('div', { class: 'qc-check-subtitle' }, g.subtitle));
+      const box = el('div', { class: 'qc-log-card' },
+        el('div', { class: 'qc-log-head' }, el('b', {}, g.stageLabel), el('span', {}, g.subtitle)));
       fields.forEach(e => {
         const recorded = e.value != null;
-        const valueText = recorded
-          ? formatQcValue(e.value, qcMaxDecimals(e.unit)) + (e.unit ? ' ' + e.unit : '')
-          : 'Not yet recorded';
-        box.append(el('div', { class: 'qc-row' },
-          el('span', { class: 'qc-row-label' }, el('b', { html: e.label })),
-          el('span', { class: recorded ? 'qc-check-result-value' : 'help' }, valueText),
-          recorded ? el('span', { class: 'help' }, (e.recordedBy || 'Unknown') + '  ·  ' + fmtWhen(e.recordedAt)) : null));
+        box.append(el('div', { class: 'qc-log-row' + (recorded ? '' : ' empty') },
+          el('span', { class: 'qc-log-label', html: e.label }),
+          el('span', { class: 'qc-log-value' }, recorded ? formatQcValue(e.value, qcMaxDecimals(e.unit)) : '—',
+            recorded && e.unit ? el('small', {}, e.unit) : null),
+          recorded ? el('span', { class: 'qc-log-meta' }, (e.recordedBy || 'Unknown') + ' · ' + fmtWhen(e.recordedAt)) : null));
       });
       listHost.append(box);
     });
@@ -1207,7 +1203,7 @@ async function openQcForRun(run) {
 // Process Check ("Dilution requirements") also holds the run's TDS target
 // and Tank 6A/B max level (both display-only) and the calculated Target
 // fill level, Tank 6A/B (L) -- same mass-conservation math as
-// Homogenization's Target fill level, Tank 2A/B (L) -- so `getTdsTarget` is
+// Homogenization's Recommended Dilution Water (L) -- so `getTdsTarget` is
 // a getter (not a plain value): a caller with a live-changing SKU (the
 // picker in a draft still being edited) can call the returned `refresh()`
 // again after that changes.
@@ -1558,14 +1554,14 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
 
   const rinsingInp = el('input', { inputmode: 'decimal', placeholder: 'Measured using garden hose' }); attachNumericMask(rinsingInp, 2);
   if (values.rinsingWaterL != null) rinsingInp.value = formatQcValue(values.rinsingWaterL, 2);
-  // Tank level (L) is also the starting volume the dilution-water-target
-  // calc (in the Output section, below) scales up from.
+  // Pre-Dilution Tank Level (L) is also V1, the starting volume the Recommended Dilution
+  // Water calc (in the Output section, below) works from.
   const tankInp = el('input', { inputmode: 'decimal', placeholder: 'Measured using level sensor' }); attachNumericMask(tankInp, 2);
   if (values.slurryL != null) tankInp.value = formatQcValue(values.slurryL, 2);
-  // Process Check (Solids loading): %Wet-Solids, (g/g) = Wet-solids-wt /
+  // Process Check (Solids loading): Measured %Solids Loading, (w/w) = Wet-solids-wt /
   // (Wet-solids-wt + Liquid-wt) -- shown as a percentage, but kept internally
-  // as the raw 0-1 ratio so the Output section's dilution-target calc (which
-  // reuses this function) can use it directly.
+  // as the raw 0-1 ratio so the Output section's dilution calc (which reuses
+  // this function) can use it directly.
   const wetInp = el('input', { inputmode: 'decimal', placeholder: 'g' });
   attachNumericMask(wetInp, 2);
   if (values.wetSolidsWtG != null) wetInp.value = formatQcValue(values.wetSolidsWtG, 2);
@@ -1586,19 +1582,18 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
   const processCheck1Box = el('div', { class: 'qc-check-box' },
     el('div', { class: 'qc-check-title' }, 'Process Check'),
     el('div', { class: 'qc-check-subtitle' }, 'Solids loading'),
-    el('div', { class: 'qc-check-result' },
-      el('span', { class: 'qc-check-result-label' }, '%Wet-Solids, (g/g)'), resultValue),
     el('div', { class: 'form-row' },
       rfield('homogenization', 'wetSolidsWtG', 'Wet-solids-wt (g)', wetInp),
       rfield('homogenization', 'liquidWtG', 'Liquid-wt (g)', liquidInp)),
+    el('div', { class: 'qc-check-result' },
+      el('span', { class: 'qc-check-result-label' }, 'Measured %Solids Loading, (w/w)'), resultValue),
     sopLinkEl('wet_solids_sop'));
 
-  // Output: a target %Wet-Solids to dilute the tank down to, and the
-  // initial fill volume ("Target fill level") the tank should be loaded to
-  // so that topping it up to the target %Wet-Solids with dilution water
-  // lands it exactly at Tank 2A/B's max level (admin-editable, see the
-  // Calculations page) -- standard mass-conservation dilution math:
-  // fill level = tank max level x target %Wet-Solids / actual %Wet-Solids.
+  // Output: the Target %Solids Loading, (w/w) to dilute the tank down to, and the
+  // Recommended Dilution Water (L) to get there. Mass-conservation dilution
+  // (c1V1 = c2V2): c1 = Measured %Solids Loading, V1 = Tank level (L), c2 = target,
+  // so V2 = V1 x c1 / c2 and the water to add is V2 - V1 = V1 x (c1/c2 - 1) --
+  // 0 when the measured loading is already at or below the target.
   const targetPctInp = el('input', { inputmode: 'decimal', placeholder: '%' }); attachNumericMask(targetPctInp, 1);
   targetPctInp.value = values.targetPctWetSolids != null ? formatQcValue(values.targetPctWetSolids, 1)
     : formatQcValue(settingValue('homog_default_target_pct_wet_solids', 50.0), 1);
@@ -1606,28 +1601,51 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
   // the label, so the value's units are unambiguous at a glance.
   const targetPctField = el('div', { style: 'display:flex;align-items:center;gap:6px' },
     targetPctInp, el('span', { class: 'help' }, '%'));
-  // Shown large (matches the %Wet-Solids result style) once calculable, and
-  // rounded UP to the nearest 10 L with no decimals -- an operator fills to
-  // a round number, not a precise fraction of a litre.
+  // Shown large once calculable, rounded to the nearest 10 L with no decimals --
+  // an operator adds a round number, not a precise fraction of a litre.
   const dilutionTargetValue = el('span', { class: 'help' });
   function calcDilutionTarget() {
-    const initialPct = calcPctWetSolids();
-    const targetPctRaw = targetPctInp.value.trim() === '' ? null : qcParseValue(targetPctInp.value);
-    if (initialPct == null || !initialPct || !targetPctRaw) return null;
-    const targetPct = targetPctRaw / 100;
-    const maxLevel = settingValue('homog_tank_2ab_max_level_l', 5000);
-    return maxLevel * targetPct / initialPct;
+    const c1 = calcPctWetSolids();
+    const c2Raw = targetPctInp.value.trim() === '' ? null : qcParseValue(targetPctInp.value);
+    const v1 = tankInp.value.trim() === '' ? null : qcParseValue(tankInp.value);
+    if (c1 == null || !c2Raw || v1 == null) return null;
+    const c2 = c2Raw / 100;
+    if (c1 <= c2) return 0;
+    return v1 * c1 / c2 - v1;
   }
   function refreshDilutionTarget() {
     const v = calcDilutionTarget();
     dilutionTargetValue.className = v != null ? 'qc-check-result-value' : 'help';
-    dilutionTargetValue.textContent = v != null ? fmt(Math.ceil(v / 10) * 10, 0) + ' L' : 'Enter the QC Check and Target %Wet-Solids to calculate';
+    dilutionTargetValue.textContent = v != null ? fmt(Math.round(v / 10) * 10, 0) + ' L'
+      : 'Needs the tank level, Process Check and target';
   }
   refreshDilutionTarget();
   targetPctInp.addEventListener('input', refreshDilutionTarget);
+  tankInp.addEventListener('input', refreshDilutionTarget);
 
   const dilutionInp = el('input', { inputmode: 'decimal', placeholder: 'Measured using dilution totalizer' }); attachNumericMask(dilutionInp, 2);
   if (values.dilutionWaterL != null) dilutionInp.value = formatQcValue(values.dilutionWaterL, 2);
+  const postTankInp = el('input', { inputmode: 'decimal', placeholder: 'Measured using level sensor' }); attachNumericMask(postTankInp, 2);
+  if (values.postDilutionTankL != null) postTankInp.value = formatQcValue(values.postDilutionTankL, 2);
+  // Lot %Solids Loading, (w/w) (calculated): the measured loading after dilution. Mass
+  // balance c1V1 = c2V2 with V2 = the final (Post-Dilution) tank volume and V1 = V2 minus
+  // the dilution water added, so lot %solids = measured x (V2 - water) / V2.
+  const lotPctValue = el('span', { class: 'help' });
+  function calcLotPctSolids() {
+    const c1 = calcPctWetSolids();
+    const water = dilutionInp.value.trim() === '' ? null : qcParseValue(dilutionInp.value);
+    const v2 = postTankInp.value.trim() === '' ? null : qcParseValue(postTankInp.value);
+    if (c1 == null || water == null || !v2 || water > v2) return null;
+    return c1 * (v2 - water) / v2;
+  }
+  function refreshLotPct() {
+    const v = calcLotPctSolids();
+    lotPctValue.className = v != null ? 'qc-check-result-value' : 'help';
+    lotPctValue.textContent = v != null ? (v * 100).toFixed(1) + '%'
+      : 'Needs the Process Check, water added and final level';
+  }
+  [wetInp, liquidInp, dilutionInp, postTankInp].forEach(inp => inp.addEventListener('input', refreshLotPct));
+  refreshLotPct();
 
   // QC Check (lot characterization): liquid-phase and slurry/solids-phase
   // readings, each its own compact wrapping row -- shared with Extraction
@@ -1661,6 +1679,8 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
         targetPctWetSolids: targetPctInp.value.trim() === '' ? null : qcParseValue(targetPctInp.value),
         dilutionWaterTargetL: calcDilutionTarget(),
         dilutionWaterL: dilutionInp.value.trim() === '' ? null : qcParseValue(dilutionInp.value),
+        postDilutionTankL: postTankInp.value.trim() === '' ? null : qcParseValue(postTankInp.value),
+        lotPctSolids: calcLotPctSolids(),
         ...qcCheck.getPayload(),
         sampleCollectedAt: collectedInp.value || null,
       });
@@ -1674,13 +1694,22 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
       el('div', { class: 'form-row' }, rfield('homogenization', 'startedAt', 'Started at', startedAt)),
       el('div', { class: 'form-row' },
         rfield('homogenization', 'rinsingWaterL', 'Rinse water (L)', rinsingInp),
-        rfield('homogenization', 'slurryL', 'Tank level (L)', tankInp)),
+        rfield('homogenization', 'slurryL', 'Pre-Dilution Tank Level (L)', tankInp)),
       processCheck1Box,
       el('div', { class: 'qc-check-section-title' }, 'Homogenization Out'),
-      el('div', { class: 'form-row' },
-        rfield('homogenization', 'targetPctWetSolids', 'Target %Wet-Solids', targetPctField),
-        field('Target fill level, Tank 2A/B (L)', dilutionTargetValue)),
-      el('div', { class: 'form-row' }, rfield('homogenization', 'dilutionWaterL', 'Dilution water added (L)', dilutionInp)),
+      // Dilution card: the target and the water recommended for it, then what was actually
+      // added and the resulting tank level, then the lot %solids that follows from them.
+      el('div', { class: 'qc-check-box' },
+        el('div', { class: 'qc-check-title' }, 'Dilution'),
+        el('div', { class: 'qc-check-subtitle' }, 'Target, water added and final volume'),
+        el('div', { class: 'form-row' },
+          rfield('homogenization', 'targetPctWetSolids', 'Target %Solids Loading, (w/w)', targetPctField),
+          field('Recommended Dilution Water (L)', el('div', { class: 'calc-tile' }, dilutionTargetValue))),
+        el('div', { class: 'form-row' },
+          rfield('homogenization', 'dilutionWaterL', 'Dilution water added (L)', dilutionInp),
+          rfield('homogenization', 'postDilutionTankL', 'Post-Dilution Tank Level (L)', postTankInp)),
+        el('div', { class: 'qc-check-result' },
+          el('span', { class: 'qc-check-result-label' }, 'Lot %Solids Loading, (w/w) (calculated)'), lotPctValue)),
       qcCheckBox,
       samplePointBox,
       el('div', { style: 'margin-top:6px' }, saveBtn, status)));
@@ -2303,9 +2332,6 @@ function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsor
       el('div', { class: 'form-row' },
         rfield('dilution', 'fillLevelTank6abL', 'Fill level, Tank 6A/B (L)', fillLevelInp),
         field('Dilution water added, TDS', dilutionWaterAddedValue)),
-      el('div', { class: 'form-row-3' },
-        rfield('dilution', 'measuredPh', 'Measured pH', measuredPhInp), field('Target pH', targetPhValue),
-        rfield('dilution', 'citricKg', 'Citric acid added (kg)', citricInp)),
       el('div', { class: 'qc-check-section-title' }, 'Preservatives'),
       el('div', { class: 'form-row' },
         rfield('dilution', 'ksorbateStockPct', 'Ksorbate stock concentration (w/v)', ksorbateStockField),
@@ -2316,7 +2342,11 @@ function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsor
         rfield('dilution', 'nabenzoateStockPct', 'Nabenzoate stock concentration (w/v)', nabenzoateStockField),
         field('Nabenzoate, calculated (L)', nabenzoateCalculatedLValue)),
       rfield('dilution', 'nabenzoateAddedL', 'Sodium benzoate added (L)', nabenzoateAddedLInp),
-      field('Sodium benzoate added (kg)', nabenzoateAddedKgValue)),
+      field('Sodium benzoate added (kg)', nabenzoateAddedKgValue),
+      el('div', { class: 'qc-check-section-title' }, 'pH Balancing'),
+      el('div', { class: 'form-row-3' },
+        rfield('dilution', 'measuredPh', 'Measured pH', measuredPhInp), field('Target pH', targetPhValue),
+        rfield('dilution', 'citricKg', 'Citric acid added (kg)', citricInp))),
     save,
     refresh: () => { refreshTargetPh(); refreshDilutionWaterAdded(); refreshKsorbateCalculatedL(); refreshNabenzoateCalculatedL(); }
   };
@@ -2834,7 +2864,7 @@ async function openRun(draftSummary, opts) {
     render();
   }
   modal(draft ? 'Production run — ' + draft.processingLot : 'New production run', body, finalizeRun, 'Finalize run',
-    { extraLabel: 'Save & close', onExtra: saveDraft, wide: true });
+    { extraLabel: 'Save & close', onExtra: saveDraft, wide: true, closeX: true, onClose: () => render() });
   if (opts && opts.section) jumpToSection(body, opts.section);
 }
 
@@ -2933,6 +2963,28 @@ async function openProcessLog(run, section) {
     }
   }, 'Save');
 
+  // Initiation: the run-level details that used to live in the card's Edit window. Product is
+  // fixed once finalized; the rest are editable under an amendment (like every other log entry).
+  const plDate = el('input', { type: 'date', value: run.runDate || '' });
+  const plLoc = productionLocationSelect('pl_loc', run.location);
+  const plOps = buildOperatorsSelect(run.operators || '');
+  const plNotes = el('textarea', { rows: '2', placeholder: 'Optional batch notes' }, run.notes || '');
+  const plStatus = el('span', { class: 'help' });
+  const plSave = el('button', { type: 'button', class: 'secondary', onclick: async () => {
+    plStatus.textContent = ''; plSave.disabled = true;
+    try {
+      await api('PUT', '/production/' + run.id, { runDate: plDate.value, location: plLoc.value, operators: plOps.value, notes: plNotes.value });
+      plStatus.textContent = 'Saved.';
+    } catch (e) { plStatus.textContent = e.message; }
+    plSave.disabled = false;
+  } }, 'Save');
+  const initiationSection = el('details', { class: 'accordion' }, el('summary', {}, 'Initiation'),
+    el('div', { class: 'accordion-body' },
+      el('div', { class: 'summary-line' }, sl('Product', skuName(run.sku)), el('span', { class: 'muted' }, 'fixed once the run is finalized')),
+      el('div', { class: 'form-row' }, field(reqLabel('Run date'), plDate), field(reqLabel('Production Location'), plLoc)),
+      field(reqLabel('Operators'), plOps.el),
+      field('Notes', plNotes),
+      el('div', { style: 'margin-top:6px' }, plSave, plStatus)));
   const logProgressHost = el('div', { class: 'allow-locked' });
   const drawLogProgress = prog => { logProgressHost.innerHTML = ''; const p = stageProgress({ progress: prog }, { onSelect: key => jumpToSection(body, key) }); if (p) logProgressHost.append(p); };
   drawLogProgress(run.progress);
@@ -2942,6 +2994,7 @@ async function openProcessLog(run, section) {
       el('span', { class: 'muted' }, 'Each section saves independently and can be filled in or corrected any time.')),
     logProgressHost, reqLegend(),
     logLockBanner(run),
+    initiationSection,
     el('details', { class: 'accordion' }, el('summary', {}, 'Feedstock characterization'),
       el('div', { class: 'accordion-body' }, feedstockHost)),
     homogenizationSection, extractionSection, separationSection,
@@ -2964,7 +3017,7 @@ async function openProcessLog(run, section) {
       try { drawLogProgress((await api('GET', '/production/' + run.id + '/progress')).progress); } catch (e) { /* non-critical */ }
     }, 1200);
   }));
-  modal('Process log — ' + run.processingLot, body, async () => { render(); }, 'Done', { wide: true });
+  modal('Process log — ' + run.processingLot, body, async () => { render(); }, 'Done', { wide: true, closeX: true, onClose: () => render() });
   if (!run.amendment || !canAmendLog()) lockLogBody(body);   // finalized: read-only unless an amendment is open and you may amend
   if (section) jumpToSection(body, section);
 }
@@ -3042,7 +3095,7 @@ function releaseLogSummary(run) {
   out.append(box('Run summary', kvTable({ processingLot: run.processingLot, sku: skuName(run.sku), runDate: run.runDate, finalizedAt: run.finalizedAt,
     finalizedBy: run.release && run.release.finalizedBy, operators: run.operators, inputKg: run.inputKg, outputLitres: run.outputLitres,
     targetTds: run.targetTds, citricKg: run.citricKg, sorbateKg: run.sorbateKg, nabenzoateKg: run.nabenzoateKg, ibcUsed: run.ibcUsed,
-    location: run.location, notes: run.notes, qcRecorded: run.qcSummary ? run.qcSummary.recorded + ' of ' + run.qcSummary.total + ' QC fields' : null })));
+    location: run.location, notes: run.notes })));
   out.append(box('Feedstock (' + (run.inputs || []).length + ' tote(s))', (run.inputs || []).length
     ? table(['Tote', 'Decision', 'Weight kg', 'pH', 'ORP', 'Odour', 'Notes'],
       run.inputs.map(i => [mono(i.toteLot), i.decision || '—', i.weightKg != null ? fmt(i.weightKg, 1) : '—', i.ph ?? '—', i.orp ?? '—', i.odour || '—', i.notes || '—']),
@@ -4093,6 +4146,27 @@ function exportReportCsv(d) {
 // the observation layer a BOM is later promoted from. Excluded runs never
 // count toward the stats (Edit run -> "Exclude from yield & usage analysis").
 const YU_CATEGORIES = { reagent: 'Reagent', packaging: 'Packaging', sample: 'Sample container', label: 'FG label' };
+// Usage is grouped Reagents / Packaging (incl. sample containers) / Finished-goods labels.
+// Reagents show median / min / max (per the chosen basis) and totals rounded to 0.1;
+// packaging and labels are plain whole-unit totals (nearest 1) with no statistics.
+const yuUsageGroup = u => u.category === 'sample' ? 'packaging' : u.category;
+function yuUsageSections(g, basis, stat) {
+  const out = [];
+  const items = k => g.usage.filter(u => yuUsageGroup(u) === k);
+  const reag = items('reagent');
+  if (reag.length) out.push(el('div', { class: 'qc-check-section-title' }, 'Reagents — ' + YU_BASES[basis].label),
+    table(['Item', 'Unit', 'Used in', 'Median', 'Min', 'Max', 'Total'],
+      reag.map(u => [u.item, u.unit, u.usedIn + ' of ' + u.ofRuns + ' runs', ...stat(u[basis], 1), fmt(u.total, 1)]),
+      [false, false, false, true, true, true, true]));
+  [['packaging', 'Packaging — total used'], ['label', 'Finished goods labels — total used']].forEach(([k, title]) => {
+    const rows = items(k);
+    if (rows.length) out.push(el('div', { class: 'qc-check-section-title' }, title),
+      table(['Item', 'Unit', 'Used in', 'Total'],
+        rows.map(u => [u.item, u.unit, u.usedIn + ' of ' + u.ofRuns + ' runs', fmt(u.total, 0)]),
+        [false, false, false, true]));
+  });
+  return out;
+}
 const YU_FLAGS = { mixed: 'Mixed source', missing_measured_weight: 'No measured weight', no_usage_data: 'No usage data',
   no_output: 'No output', no_source: 'No source totes' };
 const YU_BASES = {
@@ -4170,13 +4244,10 @@ async function pageYield(v) {
         table(['Conversion rate (L / kg)', 'Runs', 'Median', 'Min', 'Max', 'Pooled'],
           [rate('Process (measured weight)', g.processRate), rate('Harvest (batch-average weight)', g.harvestRate)],
           [false, true, true, true, true, true]),
-        el('div', { class: 'qc-check-section-title' }, 'Usage ' + YU_BASES[s.basis].label),
-        g.usage.length ? table(['Item', 'Category', 'Unit', 'Used in', 'Median', 'Min', 'Max', 'Total'],
-          g.usage.map(u => [u.item, YU_CATEGORIES[u.category] || u.category, u.unit,
-            u.usedIn + ' of ' + u.ofRuns + ' runs', ...stat(u[s.basis], 3), fmt(u.total, 2)]),
-          [false, false, false, false, true, true, true, true])
-          : el('div', { class: 'help' }, g.usageRuns ? 'No consumption recorded for these runs.'
-            : 'No usage data yet -- runs finalized before reagent deduction have none.')));
+        ...(g.usage.length ? yuUsageSections(g, s.basis, stat)
+          : [el('div', { class: 'qc-check-section-title' }, 'Usage'),
+            el('div', { class: 'help' }, g.usageRuns ? 'No consumption recorded for these runs.'
+              : 'No usage data yet -- runs finalized before reagent deduction have none.')])));
     });
     if (data.runs.length) {
       const body = table(['Lot', 'Processing date', 'Harvest date', 'Product', 'Farm', 'Species', 'Harvest kg', 'Process kg', 'Output L',
@@ -4217,14 +4288,21 @@ function exportYieldCsv(d) {
       h.n ?? '', h.median ?? '', h.min ?? '', h.max ?? '', h.pooled ?? '');
   });
   add('');
-  add('USAGE (net consumed per run, from the ledger)');
-  add('Group', 'Item', 'Category', 'Unit', 'Used in', 'Of runs', 'Total',
+  const r1 = v => v == null ? '' : Math.round(v * 10) / 10;
+  add('REAGENTS (net consumed per run, from the ledger; rounded to 0.1)');
+  add('Group', 'Item', 'Unit', 'Used in', 'Of runs', 'Total',
     'per 1000 L output median', 'min', 'max', 'per 1000 kg process median', 'min', 'max', 'per 1000 kg harvest median', 'min', 'max');
-  d.groups.forEach(g => g.usage.forEach(u => {
+  d.groups.forEach(g => g.usage.filter(u => yuUsageGroup(u) === 'reagent').forEach(u => {
     const o = u.perKLOutput || {}, p = u.perTonneProcess || {}, h = u.perTonneHarvest || {};
-    add(g.title, u.item, YU_CATEGORIES[u.category] || u.category, u.unit, u.usedIn, u.ofRuns, u.total,
-      o.median ?? '', o.min ?? '', o.max ?? '', p.median ?? '', p.min ?? '', p.max ?? '', h.median ?? '', h.min ?? '', h.max ?? '');
+    add(g.title, u.item, u.unit, u.usedIn, u.ofRuns, r1(u.total),
+      r1(o.median), r1(o.min), r1(o.max), r1(p.median), r1(p.min), r1(p.max), r1(h.median), r1(h.min), r1(h.max));
   }));
+  [['packaging', 'PACKAGING (total count used)'], ['label', 'FINISHED GOODS LABELS (total count used)']].forEach(([k, title]) => {
+    add('');
+    add(title);
+    add('Group', 'Item', 'Unit', 'Used in', 'Of runs', 'Total');
+    d.groups.forEach(g => g.usage.filter(u => yuUsageGroup(u) === k).forEach(u => add(g.title, u.item, u.unit, u.usedIn, u.ofRuns, Math.round(u.total))));
+  });
   add('');
   add('RUNS');
   add('Lot', 'Processing date', 'Processing date estimated', 'Harvest date', 'Product', 'Farm', 'Species', 'Stabilization',
@@ -4248,18 +4326,25 @@ function exportYieldCsv(d) {
 // literal in the code, so it shows up in the table below automatically.
 const CALCULATIONS = [
   {
-    title: '%Wet-Solids, (g/g)',
-    formula: '%Wet-Solids = Wet-solids-wt (g) / (Wet-solids-wt (g) + Liquid-wt (g))',
-    description: 'The wet-solids fraction of a homogenized tank sample, from a Process Check split of a weighed sample into its solid and liquid portions.',
+    title: 'Measured %Solids Loading, (w/w)',
+    formula: 'Measured %Solids Loading = Wet-solids-wt (g) / (Wet-solids-wt (g) + Liquid-wt (g))',
+    description: 'The solids loading (w/w) of a homogenized tank sample, from a Process Check split of a weighed sample into its solid and liquid portions.',
     location: 'Production → Process log → Homogenization → Homogenization In → Process Check box',
     settings: [],
   },
   {
-    title: 'Target fill level, Tank 2A/B (L)',
-    formula: 'Target fill level, Tank 2A/B (L) = Tank 2A/B max level (L) × Target %Wet-Solids / %Wet-Solids',
-    description: 'The initial fill volume the tank should be loaded to so that topping it up to the target %Wet-Solids with dilution water lands it exactly at Tank 2A/B’s max level (mass-conservation dilution math).',
+    title: 'Recommended Dilution Water (L)',
+    formula: 'c₁V₁ = c₂V₂, so Recommended Dilution Water (L) = V₂ − V₁ = Pre-Dilution Tank Level (L) × (Measured %Solids Loading ÷ Target %Solids Loading − 1), or 0 when Measured ≤ Target',
+    description: 'c₁ is the Measured %Solids Loading, V₁ the Pre-Dilution Tank Level (L), c₂ the Target %Solids Loading and V₂ the volume the tank reaches once diluted to the target. Rounded to the nearest 10 L; 0 when the measured loading is already at or below the target.',
     location: 'Production → Process log → Homogenization → Homogenization Out',
-    settings: ['homog_tank_2ab_max_level_l'],
+    settings: [],
+  },
+  {
+    title: 'Lot %Solids Loading, (w/w) (calculated)',
+    formula: 'Lot %Solids Loading = Measured %Solids Loading × (Post-Dilution Tank Level (L) − Dilution water added (L)) ÷ Post-Dilution Tank Level (L)',
+    description: 'The solids loading of the lot after dilution, by the same c₁V₁ = c₂V₂ balance: V₂ is the final (Post-Dilution) tank volume, V₁ = V₂ − the dilution water added, c₁ the Measured %Solids Loading and c₂ the result. Blank until all three inputs are entered.',
+    location: 'Production → Process log → Homogenization → Homogenization Out',
+    settings: [],
   },
   {
     title: 'Target fill level, Tank 6A/B (L)',
@@ -4347,7 +4432,7 @@ const CALCULATIONS = [
   {
     title: 'Usage per 1,000 L / 1,000 kg (Yield & Usage)',
     formula: 'Usage = net units consumed on the run’s ledger lines (reagents, packaging, sample containers, FG labels; refunds and edits netted)   ·   per 1,000 L = usage / output (L) × 1000   ·   per 1,000 kg = usage / input (kg) × 1000',
-    description: 'Statistics are over the runs that used the item; "used in a of b runs" counts b as the group’s runs that have any usage data (runs finalized before reagent deduction have none and are left out rather than counted as zero).',
+    description: 'Statistics are over the runs that used the item; "used in a of b runs" counts b as the group’s runs that have any usage data (runs finalized before reagent deduction have none and are left out rather than counted as zero). The report groups items as Reagents (median / min / max, rounded to 0.1), Packaging and Finished goods labels (total count only, rounded to the nearest 1).',
     location: 'Yield & Usage tab',
     settings: ['yield_report_min_runs'],
   },
@@ -4572,7 +4657,7 @@ function modal(title, body, onSubmit, submitLabel = 'Save', opts = {}) {
   }
   actions.append(submitBtn);
   const card = el('div', { class: 'modal' + (opts.wide ? ' wide' : '') },
-    opts.closeX ? el('button', { type: 'button', class: 'modal-close-x', 'aria-label': 'Close', onclick: () => close() }, '×') : null,
+    opts.closeX ? el('button', { type: 'button', class: 'modal-close-x', 'aria-label': 'Close', title: 'Close', onclick: () => { close(); if (opts.onClose) opts.onClose(); } }, '×') : null,
     el('h3', {}, title), body, errBox, actions);
   // Backdrop clicks do NOT close the dialog — only Cancel or completing the
   // action does, so a stray click off the popup can't discard your input.
