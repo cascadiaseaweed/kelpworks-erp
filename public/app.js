@@ -77,6 +77,7 @@ $('#logout').addEventListener('click', logout);
 $('#changePw').addEventListener('click', () => changePasswordModal(false));
 $('#tabs').addEventListener('click', e => { const b = e.target.closest('button'); if (b) selectTab(b.dataset.tab); });
 function selectTab(tab) {
+  if (tab === 'preproc' && State.tab === 'preproc') State.preprocId = null;  // re-clicking the tab returns to the batch list
   State.tab = tab;
   [...$('#tabs').children].forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   render();
@@ -97,7 +98,8 @@ async function boot() {
 /* ---------------- Router ---------------- */
 function render() {
   const v = $('#view'); v.innerHTML = '';
-  ({ dashboard: pageDashboard, stabilized: pageStabilized, production: pageProduction, cip: pageCIP,
+  v.classList.toggle('wrap-wide', State.tab === 'stabilized');   // Feedstock Inventory uses the full window width
+  ({ dashboard: pageDashboard, stabilized: pageStabilized, preproc: pagePreproc, production: pageProduction, cip: pageCIP,
      qc: pageQC, fg: pageFG, shipping: pageShipping, consumables: pageConsumables, reports: pageReports,
      yieldusage: pageYield, release: pageRelease, calculations: pageCalculations, labels: pageLabels, admin: pageAdmin }[State.tab])(v);
 }
@@ -136,21 +138,53 @@ function statusLabel(s) { return STATUS_LABELS[s] || s || '—'; }
 // `value(t)` is what's sorted/filtered on — the human-readable form, so a
 // filter/sort on "Site" or "Status" matches what's actually displayed.
 const STAB_COLUMNS = [
-  { key: 'lot', label: 'Lot number', value: t => t.lot },
-  { key: 'site', label: 'Site', value: t => siteName(t.site), options: () => (State.ref.sites || []).map(s => s.name) },
+  { key: 'lot', label: 'Lot number', value: t => t.lot,
+    cell: t => el('span', {}, t.lot, el('button', { type: 'button', class: 'info-btn', title: 'Feedstock details',
+      onclick: e => { e.stopPropagation(); showToteDetails(t); } }, 'ⓘ')) },
+  { key: 'site', label: 'Site', value: t => siteName(t.site), options: () => (State.ref.sites || []).map(s => s.name),
+    cell: t => siteName(t.site) },
   { key: 'species', label: 'Species', value: t => speciesName(t.species),
-    options: () => [...new Set((State.ref.species || []).map(s => s.common || s.name))] },
+    options: () => [...new Set((State.ref.species || []).map(s => s.common || s.name))], cell: t => speciesName(t.species) },
+  { key: 'grind', label: 'Grind', value: t => t.grind || 'Coarse', options: () => ['Coarse', 'Fine'],
+    cell: t => t.grind === 'Fine' ? badge('ok', 'Fine') : 'Coarse' },
   { key: 'stabMethod', label: 'Stabilization method', value: t => t.stabilizationMethod || '',
-    options: () => ['Citric acid', 'Fresh'] },
-  { key: 'harvestDate', label: 'Harvest date', value: t => t.harvestDate || '' },
-  { key: 'receivedDate', label: 'Received date', value: t => t.receivedDate || '' },
-  { key: 'avgKg', label: 'Avg kg', value: t => t.avgWeightKg, numeric: true },
-  { key: 'ph', label: 'pH', value: t => t.ph, numeric: true },
-  { key: 'orp', label: 'ORP (mV)', value: t => t.orp, numeric: true },
-  { key: 'lastUpdated', label: 'Last updated', value: t => t.lastUpdated ? fmtWhen(t.lastUpdated) : '' },
-  { key: 'location', label: 'Location', value: t => t.location || '' },
-  { key: 'status', label: 'Status', value: t => statusLabel(t.status), options: () => Object.values(STATUS_LABELS) },
+    options: () => ['Citric acid', 'Fresh'], cell: t => t.stabilizationMethod || '—', hidden: true },
+  { key: 'harvestDate', label: 'Harvest date', value: t => t.harvestDate || '', cell: t => t.harvestDate || '—' },
+  { key: 'receivedDate', label: 'Received date', value: t => t.receivedDate || '', cell: t => t.receivedDate || '—' },
+  { key: 'avgKg', label: 'Avg kg', value: t => t.avgWeightKg, numeric: true, cell: t => fmt(t.avgWeightKg, 1), hidden: true },
+  { key: 'ph', label: 'pH', value: t => t.ph, numeric: true, cell: t => phCell(t) },
+  { key: 'orp', label: 'ORP (mV)', value: t => t.orp, numeric: true, cell: t => orpCell(t) },
+  { key: 'lastUpdated', label: 'Last updated', value: t => t.lastUpdated ? fmtWhen(t.lastUpdated) : '',
+    cell: t => t.lastUpdated ? fmtWhen(t.lastUpdated) : '—', hidden: true },
+  { key: 'location', label: 'Location', value: t => t.location || '', cell: t => t.location || '—' },
+  { key: 'status', label: 'Status', value: t => statusLabel(t.status), options: () => Object.values(STATUS_LABELS),
+    cell: t => badge(t.status, statusLabel(t.status)) },
 ];
+// Which columns are shown is a per-browser preference. Stabilization method, Avg kg and Last updated
+// start hidden (they live in each row's ⓘ details window) and can be switched on from "Columns".
+const STAB_COLS_KEY = 'kelp.stabCols';
+function loadStabCols() {
+  try { const saved = JSON.parse(localStorage.getItem(STAB_COLS_KEY)); if (Array.isArray(saved)) return new Set(saved); } catch (e) { /* default */ }
+  return new Set(STAB_COLUMNS.filter(c => !c.hidden).map(c => c.key));
+}
+function showToteDetails(t) {
+  const rows = [
+    ['Lot number', mono(t.lot)], ['Site', siteName(t.site)], ['Species', speciesName(t.species)],
+    ['Grind', t.grind || 'Coarse'], ['Stabilization method', t.stabilizationMethod || '—'],
+    ['Storage unit', t.storageUnit || '—'], ['Avg weight', t.avgWeightKg != null ? fmt(t.avgWeightKg, 1) + ' kg' : '—'],
+    ['Volume', t.volumeL != null ? fmt(t.volumeL, 0) + ' L' : '—'],
+    ['Harvest date', t.harvestDate || '—'], ['Received date', t.receivedDate || '—'],
+    ['pH', t.ph != null ? t.ph + (t.phUpdated ? '  (' + t.phUpdated + ')' : '') : '—'],
+    ['ORP (mV)', t.orp != null ? t.orp + (t.orpUpdated ? '  (' + t.orpUpdated + ')' : '') : '—'],
+    ['Solids', t.solidsPct != null ? fmt(t.solidsPct, 2) + ' %' : '—'],
+    ['Location', t.location || '—'], ['Status', badge(t.status, statusLabel(t.status))],
+    ['Last updated', t.lastUpdated ? fmtWhen(t.lastUpdated) : '—'], ['Notes', t.notes || '—']];
+  if (t.batchLot) rows.splice(4, 0, ['Pre-processing batch', mono(t.batchLot)]);
+  const body = el('div', {}, table(['Field', 'Value'], rows));
+  if (t.grind === 'Fine' || (t.status === 'consumed' && !t.runId))
+    body.append(el('div', { style: 'margin-top:10px' }, el('button', { class: 'secondary', onclick: () => showPreprocTrace(t) }, 'Trace to source totes')));
+  modal('Feedstock details — ' + t.lot, body, async () => {}, 'Close', { noCancel: true });
+}
 async function pageStabilized(v) {
   v.append(el('div', { class: 'page-head' },
     el('h2', {}, 'Feedstock Inventory'),
@@ -168,6 +202,23 @@ async function pageStabilized(v) {
   const filters = {};
   let sortKey = null, sortDir = 1;
   let visibleSelectable = [];
+  let shownCols = loadStabCols();
+  const cols = () => STAB_COLUMNS.filter(c => shownCols.has(c.key));
+  // "Columns" chooser: tick the columns to show (saved in this browser).
+  const colMenu = el('details', { class: 'col-menu' }, el('summary', {}, '⚙ Columns'),
+    el('div', { class: 'col-menu-panel' }, ...STAB_COLUMNS.map(c => {
+      const cb = el('input', { type: 'checkbox', disabled: c.key === 'lot' ? 'disabled' : null });
+      cb.checked = shownCols.has(c.key);
+      cb.addEventListener('change', () => {
+        cb.checked ? shownCols.add(c.key) : shownCols.delete(c.key);
+        if (!shownCols.has(sortKey)) sortKey = null;
+        delete filters[c.key];
+        try { localStorage.setItem(STAB_COLS_KEY, JSON.stringify([...shownCols])); } catch (e) { /* ignore */ }
+        drawStab();
+      });
+      return el('label', {}, cb, ' ' + c.label);
+    })));
+  bar.append(colMenu);
 
   function updateBulk() {
     const n = selected.size;
@@ -181,7 +232,7 @@ async function pageStabilized(v) {
       el('button', { class: 'secondary', onclick: () => { selected.clear(); drawStab(); } }, 'Clear'));
   }
   function drawStab() {
-    let rows = stabCache.filter(t => STAB_COLUMNS.every(c => {
+    let rows = stabCache.filter(t => cols().every(c => {
       const f = (filters[c.key] || '').toLowerCase();
       if (!f) return true;
       return String(c.value(t) ?? '').toLowerCase().includes(f);
@@ -209,7 +260,7 @@ async function pageStabilized(v) {
     allCb.checked = visibleSelectable.length > 0 && visibleSelectable.every(t => selected.has(t.id));
 
     const headRow = el('tr', {}, el('th', { class: 'checkcol' }, allCb),
-      ...STAB_COLUMNS.map(c => {
+      ...cols().map(c => {
         const arrow = sortKey === c.key ? (sortDir === 1 ? ' ▲' : ' ▼') : '';
         return el('th', {
           class: (c.numeric ? 'num ' : '') + 'sortable', title: 'Click to sort',
@@ -218,7 +269,7 @@ async function pageStabilized(v) {
       }), el('th', {}, ''));
 
     const filterRow = el('tr', { class: 'filter-row' }, el('th', {}, ''),
-      ...STAB_COLUMNS.map(c => {
+      ...cols().map(c => {
         const cell = el('th', {});
         if (c.options) {
           const sel = el('select', {}, el('option', { value: '' }, 'All'), ...c.options().map(o => el('option', { value: o }, o)));
@@ -234,7 +285,7 @@ async function pageStabilized(v) {
       }), el('th', {}));
 
     const tbody = el('tbody', {});
-    if (!rows.length) tbody.append(el('tr', {}, el('td', { colspan: STAB_COLUMNS.length + 2, class: 'empty' }, 'No totes match.')));
+    if (!rows.length) tbody.append(el('tr', {}, el('td', { colspan: cols().length + 2, class: 'empty' }, 'No totes match.')));
     rows.forEach(t => {
       const movable = t.status === 'in_stock' || t.status === 'hold';
       tbody.append(el('tr', {
@@ -243,17 +294,12 @@ async function pageStabilized(v) {
         onclick: e => { if (!e.target.closest('.checkcol, .row-actions')) showHistory(t); }
       },
         el('td', { class: 'checkcol' }, rowCheck(t, selected, updateBulk)),
-        el('td', { class: 'mono' }, t.lot), el('td', {}, siteName(t.site)), el('td', {}, speciesName(t.species)),
-        el('td', {}, t.stabilizationMethod || '—'),
-        el('td', {}, t.harvestDate || '—'), el('td', {}, t.receivedDate || '—'),
-        el('td', { class: 'num' }, fmt(t.avgWeightKg, 1)),
-        el('td', { class: 'num' }, phCell(t)), el('td', { class: 'num' }, orpCell(t)),
-        el('td', {}, t.lastUpdated ? fmtWhen(t.lastUpdated) : '—'),
-        el('td', {}, t.location || '—'), el('td', {}, badge(t.status, statusLabel(t.status))),
+        ...cols().map(c => el('td', { class: c.key === 'lot' ? 'mono' : (c.numeric ? 'num' : '') }, c.cell(t))),
         el('td', {}, rowActions([
           movable ? ['Move', () => moveTote(t)] : null,
           movable ? ['Update', () => updateCondition(t)] : null,
           ['Label', () => printLabels([toteLabel(t)])],
+          (t.grind === 'Fine' || (t.status === 'consumed' && !t.runId)) ? ['Trace', () => showPreprocTrace(t)] : null,
           movable ? ['Delete', () => delTote(t), 'danger'] : null
         ]))));
     });
@@ -491,21 +537,13 @@ async function moveFG(f) {
   }, 'Move');
 }
 async function openHarvest() {
-  const sites = State.ref.sites.map(s => [s.code, s.code + ' — ' + s.name]);
-  const species = State.ref.species.map(s => [s.code, s.common || s.name]);
+  const sites = State.ref.sites.filter(s => s.code !== 'MIX').map(s => [s.code, s.code + ' — ' + s.name]);
+  const species = State.ref.species.filter(s => s.code !== 'MIX').map(s => [s.code, s.common || s.name]);
   const locs = State.ref.locations.map(l => [l, l]);
-  const sourceConsumables = (await api('GET', '/consumables')).consumables.filter(c => c.unit === 'tote');
-  // Burlap sacks aren't inventory-tracked as a consumable, so it's always
-  // offered as a literal extra option alongside whatever IBC-tote stock exists.
-  const sourceOpts = [...sourceConsumables.map(c => [String(c.id), c.name + ' (' + fmt(c.onHand, 0) + ' on hand)']),
-    ['BURLAP', 'Burlap sack']];
-  // Stabilization method drives sensible defaults for the two fields below it:
-  // Citric acid → Tote; Fresh → Bag + Burlap sack (fresh kelp is commonly
-  // bagged and delivered loose rather than in a tracked IBC tote).
+  // Stabilization method drives a sensible default for the storage unit:
+  // Citric acid → Tote; Fresh → Bag (fresh kelp is commonly bagged).
   const onStabChange = () => {
-    const fresh = body.querySelector('#h_stab').value === 'Fresh';
-    body.querySelector('#h_unit').value = fresh ? 'Bag' : 'Tote';
-    body.querySelector('#h_source').value = fresh ? 'BURLAP' : (sourceOpts[0] ? sourceOpts[0][0] : 'BURLAP');
+    body.querySelector('#h_unit').value = body.querySelector('#h_stab').value === 'Fresh' ? 'Bag' : 'Tote';
   };
   const body = el('div', {},
     el('div', { class: 'form-row' },
@@ -522,11 +560,10 @@ async function openHarvest() {
       field('Total harvest (kg)', el('input', { type: 'number', id: 'h_kg', min: '0', step: '0.01', placeholder: 'averaged across storage units' })),
       field('Storage unit', selectFrom('', [['Tote', 'Tote'], ['Bag', 'Bag']], null, 'h_unit'))),
     el('div', { class: 'form-row' },
-      field('Storage unit source', selectFrom('', sourceOpts, null, 'h_source')),
+      field('Grind', selectFrom('', [['Coarse', 'Coarse'], ['Fine', 'Fine']], null, 'h_grind')),
       field('pH', el('input', { type: 'number', id: 'h_ph', step: '0.1', placeholder: 'e.g. 3.7' }))),
     field('ORP (mV) — optional', el('input', { type: 'number', id: 'h_orp', step: '1', placeholder: 'e.g. -150' })),
     field('Notes', el('textarea', { id: 'h_notes', rows: '2', placeholder: 'Optional' })),
-    el('div', { class: 'help' }, 'The selected storage unit source stock is reduced by the number of storage units checked in (Burlap sack is not inventory-tracked).'),
     el('div', { class: 'help', id: 'h_preview' }));
   const c_count = body.querySelector('#h_count'), c_kg = body.querySelector('#h_kg');
   const upd = () => {
@@ -536,22 +573,19 @@ async function openHarvest() {
   c_count.addEventListener('input', upd); c_kg.addEventListener('input', upd); upd();
   onStabChange();
   modal('Check in a harvest batch', body, async () => {
-    const sourceSel = body.querySelector('#h_source');
-    const isBurlap = sourceSel.value === 'BURLAP';
     const payload = {
       site: body.querySelector('#h_site').value, species: body.querySelector('#h_species').value,
       harvestDate: body.querySelector('#h_date').value, receivedDate: body.querySelector('#h_received').value,
       location: body.querySelector('#h_loc').value,
       toteCount: +body.querySelector('#h_count').value, totalKg: +body.querySelector('#h_kg').value,
       stabilizationMethod: body.querySelector('#h_stab').value, storageUnit: body.querySelector('#h_unit').value,
-      ibcConsumableId: isBurlap ? null : (sourceSel.value ? +sourceSel.value : null),
-      storageSourceLabel: isBurlap ? 'Burlap sack' : null,
+      grind: body.querySelector('#h_grind').value,
       ph: body.querySelector('#h_ph').value || null, orp: body.querySelector('#h_orp').value || null,
       notes: body.querySelector('#h_notes').value || null
     };
     const r = await api('POST', '/harvest', payload);
     State.ref = await api('GET', '/refdata');
-    toast(`Created ${r.count} storage unit(s) · ${r.avgWeightKg} kg each` + (r.storageSource ? ` · ${r.count} from ${r.storageSource}` : ''));
+    toast(`Created ${r.count} storage unit(s) · ${r.avgWeightKg} kg each`);
     render();
   }, 'Check in');
 }
@@ -588,7 +622,7 @@ async function openFeedstockImport() {
     status,
     el('div', { class: 'help' },
       'Required columns: site, species, harvestDate (YYYY-MM-DD), avgWeightKg. ' +
-      'Optional: receivedDate, stabilizationMethod, storageUnit, location, ph, orp, storageSource, notes. ' +
+      'Optional: receivedDate, stabilizationMethod, storageUnit, grind (Coarse or Fine, default Coarse), location, ph, orp, storageSource, notes. ' +
       'Rows for the same site/species/harvest date are numbered in the order they appear in the file.'));
   modal('Bulk import feedstock (CSV)', body, async () => {
     if (!csvText.trim()) throw new Error('Choose a CSV file to import.');
@@ -4687,6 +4721,27 @@ const CALCULATIONS = [
     settings: ['dilution_tank_capacity_each_l'],
   },
   {
+    title: 'Pre-processing: recommended dilution water and blend mass',
+    formula: 'Shredded mass (kg) = Σ weight of the totes in the pick list.  Recommended water (L) = Shredded mass × (Starting % solids ÷ Target % solids − 1), 0 if the starting % is not above the target.  Blend mass (kg) = Shredded mass + Recommended water (1 kg water = 1 L)',
+    description: 'Solids loading of a shred-and-blend batch: the shredded kelp is diluted from its measured % solids to the target % solids. The target defaults from the setting and can be changed per batch. All Blend fields are optional.',
+    location: 'Pre-Processing → batch → Blend — solids loading',
+    settings: ['preproc_target_solids_pct'],
+  },
+  {
+    title: 'Pre-processing: final % solids (calculated)',
+    formula: 'Final % solids = Starting % solids × Shredded mass ÷ (Shredded mass + Dilution water added)',
+    description: 'What the blend solids loading works out to given the water actually added; stored on each output IBC lot.',
+    location: 'Pre-Processing → batch → Blend — solids loading; Feedstock Inventory → Trace',
+    settings: [],
+  },
+  {
+    title: 'Pre-processing: output IBC weight',
+    formula: 'Output IBC weight (kg) = (Shredded mass + Dilution water added) × (that IBC fill ÷ Total packed)',
+    description: 'Each output IBC lot is stored in Feedstock Inventory with its share of the blend mass as its weight, so downstream yield figures use the blend mass.',
+    location: 'Pre-Processing → batch → Pack-out; Feedstock Inventory → Avg kg',
+    settings: [],
+  },
+  {
     title: 'Product remaining in Tank 5A/5B and additional dilution passes (L)',
     formula: 'Remaining product = (Tank 5A level + Tank 5B level) − Product transferred (the recommended transfer until the actual is entered)',
     description: 'When product is left in 5A/5B after a pass, the section offers another pass. Each extra pass has its own plan, actuals and per-tank preservative additions using the same maximum-transfer, recommended-water, variance and preservative-dose formulas as the first pass. The run’s Ksorbate / sodium benzoate totals (and so the reagent deduction) are the sum across all passes.',
@@ -4874,6 +4929,299 @@ async function pageCalculations(v) {
 }
 
 /* ---------------- Labels ---------------- */
+/* ---------------- Pre-Processing (shred + blend + pack back into feedstock) ---------------- */
+// Recommended dilution water (L) and blend mass for a batch: bring the shredded mass from its measured
+// % solids down to the target % solids (1 kg of water = 1 L). Documented on the Calculations page.
+function preprocPlanCalc(shreddedKg, startPct, targetPct) {
+  if (!(shreddedKg > 0) || !(startPct > 0) || !(targetPct > 0)) return null;
+  const waterL = startPct > targetPct ? shreddedKg * (startPct / targetPct - 1) : 0;
+  return { waterL, blendKg: shreddedKg + waterL };
+}
+function preNumInput(val, dec, ph) {
+  const i = el('input', { inputmode: 'decimal', placeholder: ph || '' });
+  attachNumericMask(i, dec);
+  if (val != null) i.value = formatQcValue(val, dec);
+  return i;
+}
+const preNumOf = inp => inp.value.trim() === '' ? null : qcParseValue(inp.value);
+function preSection(title, bodyEls, saveFn) {
+  const status = el('span', { class: 'help', style: 'margin-left:8px' });
+  const btn = el('button', { type: 'button', class: 'secondary section-save', onclick: () => run() }, 'Save');
+  async function run() {
+    status.textContent = ''; btn.disabled = true;
+    try { await saveFn(); status.textContent = 'Saved.'; return true; }
+    catch (e) { status.textContent = e.message; return false; }
+    finally { btn.disabled = false; }
+  }
+  const box = el('details', { class: 'accordion', open: 'open' }, el('summary', {}, title),
+    el('div', { class: 'accordion-body' }, ...bodyEls, saveFn ? el('div', { style: 'margin-top:10px' }, btn, status) : null));
+  return { box, save: run };
+}
+const preResult = (label, node) => el('div', { class: 'qc-check-result' }, el('span', { class: 'qc-check-result-label' }, label), node);
+function preTile(span, text, warn) { span.className = text != null ? 'qc-check-result-value' + (warn ? ' var-flag' : '') : 'help'; span.textContent = text != null ? text : '—'; }
+
+async function pagePreproc(v) {
+  if (State.preprocId) return openPreprocBatch(v, State.preprocId);
+  v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Pre-Processing'),
+    el('div', { class: 'actions' }, el('button', { onclick: async () => {
+      const b = await api('POST', '/preproc'); State.preprocId = b.id; render();
+    } }, '+ New batch'))));
+  v.append(el('div', { class: 'help', style: 'margin-bottom:8px' },
+    'Pull coarse-ground feedstock totes (pick list), shred them to a fine grind, blend in a tank (solids loading set with dilution water, pH set with citric acid) and pack the blend into IBCs that go back into Feedstock Inventory as fine-grind lots, traceable to the original totes.'));
+  const { batches } = await api('GET', '/preproc');
+  v.append(table(['Batch lot', 'Date', 'Status', 'Totes in', 'Input kg', 'IBCs out', 'Packed (L)', 'Final pH', 'Final % solids'],
+    batches.map(b => [mono(b.batchLot), b.batchDate || '—', badge(b.status === 'completed' ? 'ok' : 'low', b.status === 'completed' ? 'Completed' : 'Draft'),
+      b.inputCount, fmt(b.inputKg, 1), b.outputCount || '—', b.packedL != null ? fmt(b.packedL, 0) : '—',
+      b.measuredPh != null ? fmt(b.measuredPh, 1) : '—', b.finalSolidsPct != null ? fmt(b.finalSolidsPct, 1) : '—']),
+    [false, false, false, true, true, true, true, true, true],
+    ri => { State.preprocId = batches[ri].id; render(); }));
+}
+
+async function openPreprocBatch(v, id) {
+  let B = await api('GET', '/preproc/' + id);
+  const toList = () => { State.preprocId = null; render(); };
+  const head = el('div', { class: 'page-head' }, el('h2', {}, 'Pre-Processing — ' + B.batchLot),
+    el('div', { class: 'actions' }, el('button', { class: 'secondary', onclick: toList }, '← All batches'),
+      B.status === 'draft' ? el('button', { class: 'danger', onclick: async () => {
+        if (!confirm('Discard this draft batch? Every tote pulled into it goes back into stock.')) return;
+        await api('DELETE', '/preproc/' + id); toast('Draft discarded'); toList();
+      } }, 'Discard draft') : null));
+  v.append(head);
+  if (B.status === 'completed') return drawPreprocCompleted(v, B);
+
+  const problemsHost = el('div', {});
+  const drawProblems = () => {
+    problemsHost.innerHTML = '';
+    if (B.problems && B.problems.length)
+      problemsHost.append(el('div', { class: 'help', style: 'margin:8px 0' }, el('b', {}, 'Still required to complete: '), B.problems.join(' · ')));
+  };
+  const apply = r => { B = r; drawProblems(); refreshAll(); };
+  const put = async fields => apply(await api('PUT', '/preproc/' + id, fields));
+
+  /* 1. Initiation */
+  const dateInp = el('input', { type: 'date', value: B.batchDate || todayStr() });
+  const ops = buildOperatorsSelect(B.operators || '');
+  const notesInp = el('textarea', { rows: '2', placeholder: 'Notes' }, B.notes || '');
+  const sInit = preSection('Initiation', [
+    el('div', { class: 'form-row' }, field(reqLabel('Batch date'), dateInp), field(reqLabel('Operators'), ops.el)),
+    field('Notes', notesInp)],
+    () => put({ batchDate: dateInp.value, operators: ops.value || null, notes: notesInp.value }));
+
+  /* 2. Feedstock pick list + characterization */
+  const pickHost = el('div', {}), pickedHost = el('div', {}), pickSummary = el('div', { class: 'summary-line' });
+  let pickTotes = [];
+  const pf = { q: '', species: '', site: '' };
+  const qInp = el('input', { placeholder: 'Search lot / location…' });
+  const spSel = el('select', {}, el('option', { value: '' }, 'All species'),
+    ...(State.ref.species || []).filter(s => s.code !== 'MIX').map(s => el('option', { value: s.code }, s.common || s.name)));
+  const siteSel = el('select', {}, el('option', { value: '' }, 'All sites'),
+    ...(State.ref.sites || []).filter(s => s.code !== 'MIX').map(s => el('option', { value: s.code }, s.name)));
+  const picks = new Set();
+  async function loadPickTotes() {
+    const r = await api('GET', '/totes?status=in_stock');
+    pickTotes = r.totes.filter(t => (t.grind || 'Coarse') === 'Coarse' && t.location !== 'QAQC Hold');
+    drawPick();
+  }
+  function drawPick() {
+    const q = qInp.value.trim().toLowerCase();
+    const rows = pickTotes.filter(t => (!spSel.value || t.species === spSel.value) && (!siteSel.value || t.site === siteSel.value) &&
+      (!q || (t.lot + ' ' + (t.location || '')).toLowerCase().includes(q)));
+    [...picks].forEach(i => { if (!pickTotes.some(t => t.id === i)) picks.delete(i); });
+    pickHost.innerHTML = '';
+    const tb = el('tbody', {});
+    if (!rows.length) tb.append(el('tr', {}, el('td', { colspan: 8, class: 'empty' }, 'No coarse-grind totes in stock match.')));
+    rows.forEach(t => {
+      const cb = el('input', { type: 'checkbox', onchange: () => { cb.checked ? picks.add(t.id) : picks.delete(t.id); addBtn.textContent = 'Add selected (' + picks.size + ')'; } });
+      cb.checked = picks.has(t.id);
+      tb.append(el('tr', {}, el('td', { class: 'checkcol' }, cb), el('td', { class: 'mono' }, t.lot), el('td', {}, siteName(t.site)),
+        el('td', {}, speciesName(t.species)), el('td', {}, t.harvestDate || '—'), el('td', { class: 'num' }, fmt(t.avgWeightKg, 1)),
+        el('td', { class: 'num' }, t.ph != null ? fmt(t.ph, 2) : '—'), el('td', {}, t.location || '—')));
+    });
+    pickHost.append(el('div', { class: 'tablewrap', style: 'max-height:260px;overflow:auto' }, el('table', {},
+      el('thead', {}, el('tr', {}, el('th', { class: 'checkcol' }, ''), ...['Lot', 'Site', 'Species', 'Harvest date'].map(h => el('th', {}, h)),
+        el('th', { class: 'num' }, 'Avg kg'), el('th', { class: 'num' }, 'pH'), el('th', {}, 'Location'))), tb)));
+  }
+  [qInp, spSel, siteSel].forEach(c => c.addEventListener(c === qInp ? 'input' : 'change', drawPick));
+  const addBtn = el('button', { type: 'button', onclick: async () => {
+    if (!picks.size) return toast('Select at least one tote.', true);
+    try { apply(await api('POST', '/preproc/' + id + '/inputs', { toteIds: [...picks] })); picks.clear(); addBtn.textContent = 'Add selected (0)'; await loadPickTotes(); drawPicked(); }
+    catch (e) { toast(e.message, true); }
+  } }, 'Add selected (0)');
+  const charCache = {};
+  async function drawPicked() {
+    pickedHost.innerHTML = '';
+    const kg = B.inputs.reduce((a, i) => a + (i.weightKg || 0), 0);
+    pickSummary.innerHTML = '';
+    pickSummary.append(sl('Totes', B.inputs.length), sl('Input', fmt(kg, 1) + ' kg'));
+    if (!B.inputs.length) { pickedHost.append(el('div', { class: 'help' }, 'Add totes from the pick list above.')); return; }
+    for (const i of B.inputs) {
+      if (!(i.toteLotId in charCache)) {
+        const r = await api('GET', '/totes/' + i.toteLotId + '/ph').catch(() => null);
+        charCache[i.toteLotId] = r && r.latestCharacterization;
+      }
+      const wInp = preNumInput(i.weightKg, 1, 'kg');
+      wInp.addEventListener('change', async () => { try { apply(await api('PUT', '/preproc/' + id + '/inputs/' + i.toteLotId, { weightKg: preNumOf(wInp) })); updatePickSummary(); } catch (e) { toast(e.message, true); } });
+      const rm = el('button', { type: 'button', class: 'secondary', onclick: async () => {
+        apply(await api('DELETE', '/preproc/' + id + '/inputs/' + i.toteLotId)); await loadPickTotes(); drawPicked();
+      } }, 'Remove from batch');
+      const card = buildFeedstockCard({
+        label: 'Characterize — ' + i.lot, initial: charCache[i.toteLotId], mode: 'draft',
+        omit: ['loadedAt', 'weightKg', 'volumeL', 'densityKgL'],
+        onChange: vals => { charCache[i.toteLotId] = vals; },
+        onSave: async vals => {
+          charCache[i.toteLotId] = vals;
+          const r = await api('POST', '/totes/' + i.toteLotId + '/characterize', vals);
+          if (r.rejected) {
+            apply(await api('DELETE', '/preproc/' + id + '/inputs/' + i.toteLotId));
+            toast(i.lot + ' rejected — moved to QAQC Hold and removed from this batch.');
+            await loadPickTotes(); drawPicked();
+          }
+        },
+        uploadPhoto: async (slot, file, b64) => (await api('POST', '/totes/' + i.toteLotId + '/photo',
+          { slot, filename: file.name, contentType: file.type || 'image/jpeg', dataB64: b64 })).attachmentId,
+        photoUrl: attId => toteAttDownloadUrl(i.toteLotId, attId, false)
+      });
+      pickedHost.append(el('div', { class: 'card', style: 'margin:8px 0;padding:10px' },
+        el('div', { style: 'display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap' },
+          el('div', {}, el('b', { class: 'mono' }, i.lot), el('div', { class: 'help' }, siteName(i.site) + ' · ' + speciesName(i.species) + ' · avg ' + fmt(i.avgWeightKg, 1) + ' kg')),
+          field(reqLabel('Weight shredded (kg)'), wInp), rm), card));
+    }
+  }
+  const updatePickSummary = () => {
+    const kg = B.inputs.reduce((a, i) => a + (i.weightKg || 0), 0);
+    pickSummary.innerHTML = ''; pickSummary.append(sl('Totes', B.inputs.length), sl('Input', fmt(kg, 1) + ' kg'));
+  };
+  const sPick = preSection('Feedstock pick list', [
+    el('div', { class: 'help', style: 'margin-bottom:6px' }, 'Only coarse-grind totes in stock (not on QAQC Hold) are offered. Pulled totes are locked to this batch until it is completed or discarded.'),
+    el('div', { class: 'form-row' }, field('Search', qInp), field('Species', spSel), field('Site', siteSel)),
+    pickHost, el('div', { style: 'margin:8px 0' }, addBtn),
+    pickSummary, pickedHost], null);
+
+  /* 3. Blend: solids loading (all fields optional; shredded mass = the pulled totes' weights) */
+  const startInp = preNumInput(B.startSolidsPct, 2, '%'), targetInp = preNumInput(B.targetSolidsPct, 2, '%');
+  const waterInp = preNumInput(B.waterAddedL, 1, 'L'), volInp = preNumInput(B.blendVolumeL, 1, 'L');
+  const shredKgT = el('span', { class: 'help' }), recWaterT = el('span', { class: 'help' }), blendKgT = el('span', { class: 'help' }), finalT = el('span', { class: 'help' });
+  const shreddedKg = () => B.inputKg > 0 ? B.inputKg : null;
+  const finalSolids = () => {
+    const sh = shreddedKg(), st = preNumOf(startInp), w = preNumOf(waterInp);
+    return (sh > 0 && st > 0 && w != null) ? st * sh / (sh + w) : null;
+  };
+  function calcBlend() {
+    const c = preprocPlanCalc(shreddedKg(), preNumOf(startInp), preNumOf(targetInp));
+    preTile(shredKgT, shreddedKg() != null ? fmt(shreddedKg(), 1) + ' kg' : null);
+    preTile(recWaterT, c ? fmt(c.waterL, 0) + ' L' : null); preTile(blendKgT, c ? fmt(c.blendKg, 0) + ' kg' : null);
+    const f = finalSolids(); preTile(finalT, f != null ? fmt(f, 2) + ' %' : null);
+    return c;
+  }
+  [startInp, targetInp, waterInp].forEach(i => i.addEventListener('input', calcBlend));
+  const sBlend = preSection('Blend — solids loading', [
+    el('div', { class: 'help', style: 'margin-bottom:6px' }, 'Shredded mass is the total weight of the totes in the pick list. Recommended water = shredded kg × (starting % ÷ target % − 1), taking 1 kg of water = 1 L. Final % solids = starting % × shredded kg ÷ (shredded kg + water added).'),
+    el('div', { class: 'form-row' }, field('Starting % solids (shredded mass)', startInp), field('Target % solids', targetInp)),
+    preResult('Shredded mass', shredKgT), preResult('Recommended dilution water', recWaterT), preResult('Expected blend mass', blendKgT),
+    el('div', { class: 'form-row', style: 'margin-top:8px' }, field('Dilution water added (L)', waterInp), field('Blend volume (L)', volInp)),
+    preResult('Final % solids (calculated)', finalT)],
+    async () => {
+      const c = calcBlend(), f = finalSolids();
+      await put({ startSolidsPct: preNumOf(startInp), targetSolidsPct: preNumOf(targetInp), recommendedWaterL: c ? Math.round(c.waterL * 10) / 10 : null,
+        waterAddedL: preNumOf(waterInp), blendVolumeL: preNumOf(volInp), finalSolidsPct: f != null ? Math.round(f * 100) / 100 : null });
+    });
+
+  /* 4. pH balancing */
+  const phInp = preNumInput(B.measuredPh, 1, 'pH'), tphInp = preNumInput(B.targetPh, 1, 'pH'), citricInp = preNumInput(B.citricKg, 2, 'kg');
+  const sPh = preSection('pH balancing', [
+    el('div', { class: 'form-row' }, field(reqLabel('Measured pH (final)'), phInp), field(reqLabel('Target pH'), tphInp), field(reqLabel('Citric acid added (kg)'), citricInp)),
+    el('div', { class: 'help' }, 'Citric acid is deducted from Inventory Items when the batch is completed.')],
+    () => put({ measuredPh: preNumOf(phInp), targetPh: preNumOf(tphInp), citricKg: preNumOf(citricInp) }));
+
+  /* 5. Pack-out into IBCs */
+  const containers = (await api('GET', '/consumables')).consumables.filter(c => c.isContainer && !c.isSampleContainer);
+  const locSel = el('select', {}, el('option', { value: '' }, 'Select…'), ...(State.ref.locations || []).map(l => el('option', { value: l }, l)));
+  locSel.value = B.location || '';
+  const packRows = el('tbody', {}), packTotals = el('div', {});
+  const packedT = el('span', { class: 'help' }), ibcT = el('span', { class: 'help' });
+  const rowCtl = [];
+  function addPackRow(r) {
+    r = r || { container: '', qty: null, litresEach: null };
+    const sel = el('select', {}, el('option', { value: '' }, 'Select…'), ...containers.map(c => el('option', { value: c.name }, c.name + ' (' + fmt(c.onHand, 0) + ' on hand)')));
+    sel.value = r.container || '';
+    const qty = preNumInput(r.qty, 0, 'IBCs'), fill = preNumInput(r.litresEach, 1, 'L each');
+    sel.addEventListener('change', () => { const c = containers.find(x => x.name === sel.value); if (c && c.litresEach && !fill.value) fill.value = formatQcValue(c.litresEach, 1); calcPack(); });
+    [qty, fill].forEach(i => i.addEventListener('input', calcPack));
+    const ctl = { sel, qty, fill };
+    const tr = el('tr', {}, el('td', {}, sel), el('td', {}, qty), el('td', {}, fill),
+      el('td', {}, el('button', { type: 'button', class: 'secondary', onclick: () => { rowCtl.splice(rowCtl.indexOf(ctl), 1); tr.remove(); calcPack(); } }, '✕')));
+    rowCtl.push(ctl); packRows.append(tr);
+  }
+  function calcPack() {
+    const n = rowCtl.reduce((a, c) => a + (preNumOf(c.qty) || 0), 0);
+    const l = rowCtl.reduce((a, c) => a + (preNumOf(c.qty) || 0) * (preNumOf(c.fill) || 0), 0);
+    preTile(ibcT, n ? String(n) : null); preTile(packedT, l ? fmt(l, 0) + ' L' : null);
+  }
+  (B.packaging.length ? B.packaging : [null]).forEach(addPackRow);
+  const sPack = preSection('Pack-out into IBCs', [
+    el('div', { class: 'help', style: 'margin-bottom:6px' }, 'Pulled coarse totes are shredded to a fine grind, and each output IBC becomes its own fine-grind lot (' + B.batchLot + '-01, -02 …) in Feedstock Inventory. Empty IBCs are deducted from Inventory Items when the batch is completed; the source totes’ emptied IBCs return to the Used IBC pool.'),
+    field(reqLabel('Output location'), locSel),
+    el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {}, el('th', {}, 'Empty IBC used'), el('th', {}, 'Qty'), el('th', {}, 'Fill each (L)'), el('th', {}, ''))), packRows)),
+    el('div', { style: 'margin:6px 0' }, el('button', { type: 'button', class: 'secondary', onclick: () => addPackRow() }, '+ Add row')),
+    preResult('IBCs produced', ibcT), preResult('Total packed', packedT)],
+    async () => {
+      await api('PUT', '/preproc/' + id + '/packaging', { rows: rowCtl.map(c => ({ container: c.sel.value, qty: preNumOf(c.qty), litresEach: preNumOf(c.fill) })) });
+      await put({ location: locSel.value || null });
+    });
+
+  const sections = [sInit, sPick, sBlend, sPh, sPack];
+  const completeBtn = el('button', { onclick: async () => {
+    completeBtn.disabled = true; errBox.textContent = '';
+    try {
+      for (const s of sections) if (s.save && s !== sPick && !(await s.save())) throw new Error('Fix the section that failed to save, then complete again.');
+      const done = await api('POST', '/preproc/' + id + '/complete');
+      State.ref = await api('GET', '/refdata');
+      toast('Batch ' + done.batchLot + ' completed — ' + done.outputCount + ' fine-grind IBC lot(s) added to Feedstock Inventory.');
+      render();
+    } catch (e) { errBox.textContent = e.message; completeBtn.disabled = false; }
+  } }, 'Complete batch');
+  const errBox = el('div', { class: 'error' });
+  function refreshAll() { updatePickSummary(); calcBlend(); calcPack(); }
+  v.append(...sections.map(s => s.box), problemsHost,
+    el('div', { style: 'margin:12px 0' }, completeBtn, errBox));
+  drawProblems(); refreshAll(); await loadPickTotes(); await drawPicked();
+}
+
+function drawPreprocCompleted(v, B) {
+  const sources = B.inputs.map(i => i.lot);
+  v.append(el('div', { class: 'summary-line' }, sl('Status', 'Completed'), sl('Date', B.batchDate || '—'), sl('Operators', B.operators || '—'),
+    sl('Completed', B.completedAt ? fmtWhen(B.completedAt) + (B.completedBy ? ' by ' + B.completedBy : '') : '—')));
+  const opt = (x, d, u) => x != null ? fmt(x, d) + u : '—';
+  v.append(el('div', { class: 'summary-line' }, sl('Shredded', opt(B.shreddedKg, 1, ' kg')), sl('Start solids', opt(B.startSolidsPct, 2, ' %')),
+    sl('Target solids', opt(B.targetSolidsPct, 2, ' %')), sl('Water added', opt(B.waterAddedL, 0, ' L')), sl('Blend volume', opt(B.blendVolumeL, 0, ' L')),
+    sl('Final solids (calc.)', opt(B.finalSolidsPct, 2, ' %')), sl('pH', fmt(B.measuredPh, 1) + ' (target ' + fmt(B.targetPh, 1) + ')'), sl('Citric acid', fmt(B.citricKg, 2) + ' kg')));
+  v.append(el('h3', {}, 'Source totes (coarse grind)'),
+    table(['Lot', 'Site', 'Species', 'Harvest date', 'Weight shredded (kg)'],
+      B.inputs.map(i => [mono(i.lot), siteName(i.site), speciesName(i.species), i.harvestDate || '—', fmt(i.weightKg, 1)]), [false, false, false, false, true]));
+  v.append(el('div', { class: 'page-head', style: 'margin-top:14px' }, el('h3', {}, 'Fine-grind output IBCs'),
+    el('div', { class: 'actions' }, el('button', { onclick: () => printLabels(B.outputs.map(o => blendLabel(o, sources))) }, '🖨 Print all labels'))));
+  v.append(table(['Lot', 'Volume (L)', 'Weight (kg)', '% solids', 'pH', 'Location', 'Status', ''],
+    B.outputs.map(o => [mono(o.lot), fmt(o.volumeL, 0), fmt(o.avgWeightKg, 1), o.solidsPct != null ? fmt(o.solidsPct, 2) : '—', fmt(o.ph, 1), o.location || '—',
+      badge(o.status, statusLabel(o.status)), rowActions([['Label', () => printLabels([blendLabel(o, sources)])]])]),
+    [false, true, true, true, true, false, false, false]));
+}
+
+async function showPreprocTrace(t) {
+  const r = await api('GET', '/totes/' + t.id + '/trace');
+  if (!r.role) { toast(t.lot + ' has no pre-processing history.'); return; }
+  const b = r.batch;
+  const body = el('div', {},
+    el('div', { class: 'summary-line' }, sl('Lot', t.lot), sl('Batch', b.batchLot), sl('Batch date', b.batchDate || '—'), sl('Status', b.status)),
+    el('div', { class: 'help', style: 'margin:6px 0' }, r.role === 'output'
+      ? t.lot + ' is a fine-grind blend made in batch ' + b.batchLot + ' from these coarse-grind totes:'
+      : t.lot + ' was shredded in batch ' + b.batchLot + ' and now lives in these fine-grind lots:'),
+    el('div', {}, el('b', {}, 'Source totes')),
+    table(['Lot', 'Site', 'Species', 'Harvest date', 'kg shredded'], b.inputs.map(i => [mono(i.lot), siteName(i.site), speciesName(i.species), i.harvestDate || '—', fmt(i.weightKg, 1)]), [false, false, false, false, true]),
+    el('div', { style: 'margin-top:8px' }, el('b', {}, 'Fine-grind lots')),
+    table(['Lot', 'Volume (L)', 'Location', 'Status'], b.outputs.map(o => [mono(o.lot), fmt(o.volumeL, 0), o.location || '—', badge(o.status, statusLabel(o.status))]), [false, true, false, false]));
+  modal('Traceability — ' + t.lot, body, async () => {}, 'Close', { noCancel: true, wide: true });
+}
+
 async function pageLabels(v) {
   v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Print Labels')));
   const src = selectFrom('', [['totes', 'Stabilized totes (in stock)'], ['fg', 'Finished goods (on hand)']], load, 'lbl_src');
@@ -4909,7 +5257,17 @@ function doPrint(host) {
 }
 
 /* label data builders */
+// Fine-grind blend (output of a Pre-Processing batch): its own label, with the batch and the source lots.
+function blendLabel(t, sources) {
+  const src = sources || t.sourceLots || [];
+  return { kind: 'Fine-Grind Blend', lot: t.lot, barcode: t.lot, meta: [
+    ['Grind', 'Fine'], ['Batch', t.batchLot || (t.lot || '').replace(/-\d+$/, '')],
+    ['Source', src.length ? (src.length <= 3 ? src.join(', ') : src.length + ' lots') : '—'],
+    ['Solids', t.solidsPct != null ? fmt(t.solidsPct, 1) + ' %' : '—'], ['pH', t.ph ?? '—'],
+    ['Volume', t.volumeL != null ? fmt(t.volumeL, 0) + ' L' : '—'], ['Date', t.receivedDate || '—'], ['Loc', t.location || '—']] };
+}
 function toteLabel(t) {
+  if (t.grind === 'Fine') return blendLabel(t);
   return { kind: 'Stabilized Tote', lot: t.lot, barcode: t.lot, meta: [
     ['Species', speciesName(t.species)], ['Site', t.site], ['Avg wt', fmt(t.avgWeightKg, 1) + ' kg'],
     ['pH', t.ph ?? '—'], ['Harvest date', t.harvestDate || '—'], ['Loc', t.location || '—']] };

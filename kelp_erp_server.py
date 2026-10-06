@@ -102,6 +102,10 @@ SETTINGS_DEFAULTS = [
      " at or above it, \"Stable / safe zone\"."),
     ("dilution_tank_capacity_each_l", 5000, "Tank 6A / 6B capacity, each (L)",
      "Maximum working volume of EACH of Tank 6A and Tank 6B (6A + 6B connected = double) -- used by the Dilution plan's available space / maximum product transfer."),
+    ("preproc_target_solids_pct", 10, "Pre-processing target blend solids (%)",
+     "Default solids loading a shred-and-blend (Pre-Processing) batch is diluted to. Recommended dilution water = shredded kg x (starting % solids / target % solids - 1), taking 1 kg of water = 1 L."),
+    ("preproc_target_ph", 3.7, "Pre-processing target pH",
+     "Default pH a shred-and-blend batch is adjusted to with citric acid before it is packed back into inventory."),
     ("dilution_variance_flag_pct", 5, "Dilution final-volume variance flag (%)",
      "Flags a dilution when the final tank volume differs from the expected volume (starting level + product transferred + water added) by more than this percentage."),
     ("extraction_default_amplitude_pct", 100, "Extraction default Amplitude (%)",
@@ -1047,6 +1051,49 @@ CREATE TABLE IF NOT EXISTS run_dilution_passes (
 );
 CREATE INDEX IF NOT EXISTS idx_dilpasses_run ON run_dilution_passes(run_id);
 
+-- Pre-Processing: coarse-ground feedstock totes are pulled (pick list), shredded to a fine grind,
+-- blended in a tank (solids loading set with dilution water, pH set with citric acid) and packed
+-- into new IBCs that go back into Feedstock Inventory (tote_lots.grind = 'Fine'). The output lots
+-- trace to their source totes through preproc_inputs.
+CREATE TABLE IF NOT EXISTS preproc_batches (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_lot           TEXT NOT NULL UNIQUE,   -- BL-YYYYMMDD-NNN (output lots are <batch_lot>-NN)
+    status              TEXT NOT NULL DEFAULT 'draft',   -- draft | completed
+    batch_date          TEXT,
+    location            TEXT,                   -- where the output IBCs are stored
+    operators           TEXT,
+    shredder            TEXT,
+    notes               TEXT,
+    shredded_kg         REAL,                   -- measured shredded mass (defaults to the sum of input weights)
+    start_solids_pct    REAL,                   -- measured % solids of the shredded mass
+    target_solids_pct   REAL,
+    recommended_water_l REAL,                   -- calculated by the plan (stored when saved)
+    water_added_l       REAL,
+    blend_volume_l      REAL,                   -- measured volume of the blended batch
+    final_solids_pct    REAL,                   -- measured % solids after dilution
+    measured_ph         REAL,
+    target_ph           REAL,
+    citric_kg           REAL,
+    created_by          TEXT,
+    created_at          TEXT NOT NULL,
+    completed_at        TEXT,
+    completed_by        TEXT
+);
+CREATE TABLE IF NOT EXISTS preproc_inputs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id    INTEGER NOT NULL REFERENCES preproc_batches(id) ON DELETE CASCADE,
+    tote_lot_id INTEGER NOT NULL REFERENCES tote_lots(id),
+    weight_kg   REAL                            -- this tote's weight as shredded
+);
+CREATE INDEX IF NOT EXISTS idx_preproc_inputs_batch ON preproc_inputs(batch_id);
+CREATE TABLE IF NOT EXISTS preproc_packaging (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id    INTEGER NOT NULL REFERENCES preproc_batches(id) ON DELETE CASCADE,
+    container   TEXT,                           -- consumables.name of the empty IBC used
+    qty         INTEGER,
+    litres_each REAL                            -- fill volume of each
+);
+
 -- Revision tracker for a finalized run's production log. Rev 1 is the
 -- finalized record; every later change to the log (any section, via any
 -- endpoint) adds a revision holding a field-level diff (old -> new) and who
@@ -1253,6 +1300,7 @@ def migrate(conn):
         ("stabilization_method", "TEXT DEFAULT 'Citric acid'"), ("storage_unit", "TEXT DEFAULT 'Tote'"),
         ("storage_source", "TEXT"), ("orp", "REAL"), ("orp_updated", "TEXT"), ("notes", "TEXT"),
         ("received_date", "TEXT"),
+        ("grind", "TEXT DEFAULT 'Coarse'"), ("preproc_batch_id", "INTEGER"), ("solids_pct", "REAL"),
     ]:
         if col not in cols:
             conn.execute("ALTER TABLE tote_lots ADD COLUMN %s %s" % (col, decl))
@@ -1389,6 +1437,7 @@ def migrate(conn):
     for col in ("measured_ph", "citric_kg"):
         if col not in dpcols:
             conn.execute("ALTER TABLE run_dilution_passes ADD COLUMN %s REAL" % col)
+    conn.execute("DELETE FROM settings WHERE key='preproc_variance_flag_pct'")
     rrcols = {r["name"] for r in conn.execute("PRAGMA table_info(run_revisions)")}
     for col, decl in (("category", "TEXT"), ("reason", "TEXT"), ("amendment_id", "INTEGER")):
         if col not in rrcols:
@@ -1719,7 +1768,8 @@ def tote_public(r):
             "status": r["status"], "runId": r["run_id"], "disposedDate": r["disposed_date"],
             "stabilizationMethod": r["stabilization_method"], "storageUnit": r["storage_unit"],
             "storageSource": r["storage_source"], "orp": r["orp"], "orpUpdated": r["orp_updated"],
-            "notes": r["notes"]}
+            "notes": r["notes"], "grind": r["grind"] or "Coarse", "preprocBatchId": r["preproc_batch_id"],
+            "solidsPct": r["solids_pct"]}
 
 
 def _canon(v):
@@ -2230,6 +2280,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.route_totes(method, seg, query, conn, user)
         if seg[:2] == ["api", "harvest"]:
             return self.route_harvest(method, seg, conn)
+        if seg[:2] == ["api", "preproc"]:
+            return self.route_preproc(method, seg, conn, user)
         if seg[:2] == ["api", "consumables"]:
             return self.route_consumables(method, seg, conn, user)
         if seg[:2] == ["api", "cip"]:
@@ -2635,9 +2687,12 @@ class Handler(BaseHTTPRequestHandler):
             last_map = {r["tote_lot_id"]: r["last"] for r in conn.execute(
                 "SELECT tote_lot_id, MAX(created_at) AS last FROM tote_stability_log GROUP BY tote_lot_id")}
             totes = []
+            sources = self._preproc_sources(conn) if any(r["preproc_batch_id"] for r in rows) else {}
             for r in rows:
                 t = tote_public(r)
                 t["lastUpdated"] = last_map.get(r["id"]) or r["created_at"]
+                if r["preproc_batch_id"] and r["preproc_batch_id"] in sources:
+                    t["batchLot"], t["sourceLots"] = sources[r["preproc_batch_id"]]
                 totes.append(t)
             return {"totes": totes}
         if seg == ["api", "totes", "move-bulk"] and method == "POST":
@@ -2727,6 +2782,11 @@ class Handler(BaseHTTPRequestHandler):
             # /api/totes/:id/photo  — upload a Detail-card photo (no run involved)
             if len(seg) == 4 and seg[3] == "photo" and method == "POST":
                 return self.upload_tote_photo(conn, tid, user)
+
+            # /api/totes/:id/trace  -- Pre-Processing traceability (parents of a fine-grind blend,
+            # or the blend a coarse tote was shredded into)
+            if len(seg) == 4 and seg[3] == "trace" and method == "GET":
+                return self._preproc_trace(conn, it)
 
             # /api/totes/:id/characterize  — Feedstock Inventory's Detail card:
             # the same characterization capture as a production run's
@@ -2825,6 +2885,276 @@ class Handler(BaseHTTPRequestHandler):
             cand = "%s#%d" % (base, n)
         return cand
 
+    # ---- Pre-Processing: shred + blend + pack back into feedstock inventory ---------- #
+    PREPROC_FIELDS = [
+        ("batch_date", "batchDate", "text"), ("location", "location", "text"), ("operators", "operators", "text"),
+        ("shredder", "shredder", "text"), ("notes", "notes", "text"),
+        ("shredded_kg", "shreddedKg", "num"), ("start_solids_pct", "startSolidsPct", "num"),
+        ("target_solids_pct", "targetSolidsPct", "num"), ("recommended_water_l", "recommendedWaterL", "num"),
+        ("water_added_l", "waterAddedL", "num"), ("blend_volume_l", "blendVolumeL", "num"),
+        ("final_solids_pct", "finalSolidsPct", "num"), ("measured_ph", "measuredPh", "num"),
+        ("target_ph", "targetPh", "num"), ("citric_kg", "citricKg", "num"),
+    ]
+
+    def _preproc_sources(self, conn):
+        """{batch id: (batch lot, [source tote lots])} for every batch that produced a blend."""
+        out = {}
+        for b in conn.execute("SELECT id, batch_lot FROM preproc_batches"):
+            lots = [r["lot_number"] for r in conn.execute(
+                "SELECT t.lot_number FROM preproc_inputs pi JOIN tote_lots t ON t.id=pi.tote_lot_id "
+                "WHERE pi.batch_id=? ORDER BY t.lot_number", (b["id"],))]
+            out[b["id"]] = (b["batch_lot"], lots)
+        return out
+
+    def _preproc_inputs_public(self, conn, bid):
+        return [{"toteLotId": r["id"], "lot": r["lot_number"], "site": r["site_code"],
+                 "species": r["species_code"], "harvestDate": r["checkin_date"],
+                 "avgWeightKg": r["avg_weight_kg"], "weightKg": r["weight_kg"], "ph": r["ph"],
+                 "location": r["location"], "status": r["status"]}
+                for r in conn.execute(
+                    "SELECT pi.weight_kg, t.* FROM preproc_inputs pi JOIN tote_lots t ON t.id=pi.tote_lot_id "
+                    "WHERE pi.batch_id=? ORDER BY t.lot_number", (bid,))]
+
+    def _preproc_public(self, conn, r, full=True):
+        d = {"id": r["id"], "batchLot": r["batch_lot"], "status": r["status"],
+             "createdBy": r["created_by"], "createdAt": r["created_at"],
+             "completedAt": r["completed_at"], "completedBy": r["completed_by"]}
+        for col, key, _kind in self.PREPROC_FIELDS:
+            d[key] = r[col]
+        n_in = conn.execute("SELECT COUNT(*) n, COALESCE(SUM(weight_kg),0) kg FROM preproc_inputs WHERE batch_id=?",
+                            (r["id"],)).fetchone()
+        d["inputCount"], d["inputKg"] = n_in["n"], round(n_in["kg"], 2)
+        outs = [tote_public(t) for t in conn.execute(
+            "SELECT * FROM tote_lots WHERE preproc_batch_id=? ORDER BY tote_number", (r["id"],))]
+        d["outputCount"] = len(outs)
+        d["packedL"] = round(sum(o["volumeL"] or 0 for o in outs), 1) if outs else None
+        if full:
+            d["inputs"] = self._preproc_inputs_public(conn, r["id"])
+            d["packaging"] = [{"container": p["container"], "qty": p["qty"], "litresEach": p["litres_each"]}
+                              for p in conn.execute("SELECT * FROM preproc_packaging WHERE batch_id=? ORDER BY id",
+                                                    (r["id"],))]
+            d["outputs"] = outs
+            d["problems"] = self._preproc_problems(conn, r) if r["status"] == "draft" else []
+        return d
+
+    def _preproc_get(self, conn, bid, draft_only=False):
+        r = conn.execute("SELECT * FROM preproc_batches WHERE id=?", (bid,)).fetchone()
+        if not r:
+            raise ApiError(404, "Pre-processing batch not found")
+        if draft_only and r["status"] != "draft":
+            raise ApiError(409, "This batch is completed and can no longer be changed")
+        return r
+
+    def _preproc_problems(self, conn, b):
+        """Everything a batch needs before it can be completed (all fields are required except notes)."""
+        miss = []
+        # (the Blend / solids-loading fields are optional)
+        for col, label in [("batch_date", "Batch date"), ("location", "Output location"),
+                           ("operators", "Operators"), ("measured_ph", "Measured pH"),
+                           ("target_ph", "Target pH"), ("citric_kg", "Citric acid added (kg)")]:
+            if b[col] is None or b[col] == "":
+                miss.append(label)
+        inputs = conn.execute("SELECT * FROM preproc_inputs WHERE batch_id=?", (b["id"],)).fetchall()
+        if not inputs:
+            miss.append("At least one feedstock tote")
+        elif any(not (i["weight_kg"] and i["weight_kg"] > 0) for i in inputs):
+            miss.append("Weight for every feedstock tote")
+        pk = conn.execute("SELECT * FROM preproc_packaging WHERE batch_id=?", (b["id"],)).fetchall()
+        if not pk:
+            miss.append("At least one pack-out row")
+        elif any(not p["container"] or not (p["qty"] and p["qty"] > 0) or not (p["litres_each"] and p["litres_each"] > 0)
+                 for p in pk):
+            miss.append("Container, quantity and fill volume on every pack-out row")
+        return miss
+
+    def route_preproc(self, method, seg, conn, user):
+        uname = user["name"] if user else None
+        if seg == ["api", "preproc"]:
+            if method == "GET":
+                rows = conn.execute("SELECT * FROM preproc_batches ORDER BY id DESC").fetchall()
+                return {"batches": [self._preproc_public(conn, r, full=False) for r in rows]}
+            if method == "POST":
+                ts = now_iso()
+                cur = conn.cursor()
+                cur.execute("INSERT INTO preproc_batches (batch_lot,batch_date,target_solids_pct,target_ph,created_by,"
+                            "created_at) VALUES (?,?,?,?,?,?)",
+                            ("TEMP-" + secrets.token_hex(6), today_iso(),
+                             get_setting_value(conn, "preproc_target_solids_pct", 10),
+                             get_setting_value(conn, "preproc_target_ph", 3.7), uname, ts))
+                bid = cur.lastrowid
+                cur.execute("UPDATE preproc_batches SET batch_lot=? WHERE id=?",
+                            ("BL-%s-%03d" % (ts[:10].replace("-", ""), bid), bid))
+                return self._preproc_public(conn, self._preproc_get(conn, bid))
+            raise ApiError(405, "Method not allowed")
+        if len(seg) < 3 or not seg[2].isdigit():
+            raise ApiError(404, "Unknown pre-processing endpoint")
+        bid = int(seg[2])
+        if len(seg) == 3:
+            if method == "GET":
+                return self._preproc_public(conn, self._preproc_get(conn, bid))
+            b = self._preproc_get(conn, bid, draft_only=True)
+            if method == "PUT":
+                d = self._body_json()
+                updates = {}
+                for col, key, kind in self.PREPROC_FIELDS:
+                    if key in d:
+                        updates[col] = numn(d[key]) if kind == "num" else ((d[key] or "").strip() or None)
+                if "location" in updates and updates["location"]:
+                    self._ensure_location(conn, updates["location"])
+                if updates:
+                    conn.execute("UPDATE preproc_batches SET %s WHERE id=?" % ", ".join("%s=?" % c for c in updates),
+                                 (*updates.values(), bid))
+                return self._preproc_public(conn, self._preproc_get(conn, bid))
+            if method == "DELETE":
+                # discard a draft: every locked tote goes back into stock
+                for i in conn.execute("SELECT tote_lot_id FROM preproc_inputs WHERE batch_id=?", (bid,)).fetchall():
+                    self._preproc_release_tote(conn, i["tote_lot_id"], b, user)
+                conn.execute("DELETE FROM preproc_batches WHERE id=?", (bid,))
+                return {"ok": True}
+            raise ApiError(405, "Method not allowed")
+        b = self._preproc_get(conn, bid, draft_only=True)
+        if len(seg) == 4 and seg[3] == "inputs" and method == "POST":
+            ids = [int(x) for x in (self._body_json().get("toteIds") or [])]
+            if not ids:
+                raise ApiError(400, "Select at least one tote")
+            for tid in ids:
+                t = conn.execute("SELECT * FROM tote_lots WHERE id=?", (tid,)).fetchone()
+                if not t or t["status"] != "in_stock":
+                    raise ApiError(400, "Tote %s is not in stock" % (t["lot_number"] if t else tid))
+                if (t["grind"] or "Coarse") != "Coarse":
+                    raise ApiError(400, "Tote %s is already fine grind" % t["lot_number"])
+                self._log_stability(conn, tid, user, "Status", "in_stock", "wip",
+                                    "Pulled for pre-processing batch %s" % b["batch_lot"])
+                conn.execute("UPDATE tote_lots SET status='wip' WHERE id=?", (tid,))
+                conn.execute("INSERT INTO preproc_inputs (batch_id,tote_lot_id,weight_kg) VALUES (?,?,?)",
+                             (bid, tid, t["avg_weight_kg"]))
+            return self._preproc_public(conn, self._preproc_get(conn, bid))
+        if len(seg) == 5 and seg[3] == "inputs" and seg[4].isdigit():
+            tid = int(seg[4])
+            row = conn.execute("SELECT * FROM preproc_inputs WHERE batch_id=? AND tote_lot_id=?", (bid, tid)).fetchone()
+            if not row:
+                raise ApiError(404, "That tote is not part of this batch")
+            if method == "PUT":
+                conn.execute("UPDATE preproc_inputs SET weight_kg=? WHERE id=?",
+                             (numn(self._body_json().get("weightKg")), row["id"]))
+            elif method == "DELETE":
+                self._preproc_release_tote(conn, tid, b, user)
+                conn.execute("DELETE FROM preproc_inputs WHERE id=?", (row["id"],))
+            else:
+                raise ApiError(405, "Method not allowed")
+            return self._preproc_public(conn, self._preproc_get(conn, bid))
+        if len(seg) == 4 and seg[3] == "packaging" and method == "PUT":
+            conn.execute("DELETE FROM preproc_packaging WHERE batch_id=?", (bid,))
+            for row in (self._body_json().get("rows") or []):
+                container = (row.get("container") or "").strip() or None
+                qty = int(num(row.get("qty")))
+                if container or qty:
+                    conn.execute("INSERT INTO preproc_packaging (batch_id,container,qty,litres_each) VALUES (?,?,?,?)",
+                                 (bid, container, qty, numn(row.get("litresEach"))))
+            return self._preproc_public(conn, self._preproc_get(conn, bid))
+        if len(seg) == 4 and seg[3] == "complete" and method == "POST":
+            return self._preproc_complete(conn, b, user)
+        raise ApiError(404, "Unknown pre-processing endpoint")
+
+    def _preproc_release_tote(self, conn, tid, batch, user):
+        t = conn.execute("SELECT * FROM tote_lots WHERE id=?", (tid,)).fetchone()
+        if t and t["status"] == "wip":
+            self._log_stability(conn, tid, user, "Status", "wip", "in_stock",
+                                "Released from pre-processing batch %s" % batch["batch_lot"])
+            conn.execute("UPDATE tote_lots SET status='in_stock' WHERE id=?", (tid,))
+
+    def _preproc_complete(self, conn, b, user):
+        """Finish the batch in one transaction: create the fine-grind output IBCs as feedstock lots,
+        consume the source totes, deduct citric acid + the empty IBCs used, and return the emptied
+        source IBCs to the Used IBC pool."""
+        bid, uname = b["id"], (user["name"] if user else None)
+        problems = self._preproc_problems(conn, b)
+        if problems:
+            raise ApiError(400, "Complete these required fields first: " + "; ".join(problems))
+        inputs = conn.execute(
+            "SELECT pi.weight_kg, t.* FROM preproc_inputs pi JOIN tote_lots t ON t.id=pi.tote_lot_id "
+            "WHERE pi.batch_id=? ORDER BY t.lot_number", (bid,)).fetchall()
+        for i in inputs:
+            if i["status"] != "wip":
+                raise ApiError(400, "Tote %s is no longer locked to this batch (status %s)" % (i["lot_number"], i["status"]))
+        packs = conn.execute("SELECT * FROM preproc_packaging WHERE batch_id=? ORDER BY id", (bid,)).fetchall()
+        total_l = sum(p["qty"] * p["litres_each"] for p in packs)
+        # shredded mass = the weights of the pulled totes; blend mass adds the dilution water (1 kg = 1 L)
+        shredded_kg = round(sum(i["weight_kg"] for i in inputs), 2)
+        conn.execute("UPDATE preproc_batches SET shredded_kg=? WHERE id=?", (shredded_kg, bid))
+        blend_kg = shredded_kg + (b["water_added_l"] or 0)
+        sites = {i["site_code"] for i in inputs}
+        species = {i["species_code"] for i in inputs}
+        stab = {i["stabilization_method"] for i in inputs}
+        site = sites.pop() if len(sites) == 1 else "MIX"
+        sp = species.pop() if len(species) == 1 else "MIX"
+        if site == "MIX":
+            conn.execute("INSERT OR IGNORE INTO sites (code,name) VALUES ('MIX','Mixed sites (blend)')")
+        if sp == "MIX":
+            conn.execute("INSERT OR IGNORE INTO species (code,name,common) VALUES ('MIX','Mixed species','Mixed blend')")
+        stabilization = stab.pop() if len(stab) == 1 else "Citric acid"
+        harvests = sorted(i["checkin_date"] for i in inputs if i["checkin_date"])
+        harvest_date = harvests[0] if harvests else None
+        source_lots = [i["lot_number"] for i in inputs]
+        ts = now_iso()
+        # stock: containers first (they can block on a shortage), then citric acid
+        need = {}
+        for p in packs:
+            need[p["container"]] = need.get(p["container"], 0) + p["qty"]
+        for name, qty in need.items():
+            if not self._consumable_by_name(conn, name):
+                raise ApiError(400, "Unknown container: %s" % name)
+            self._adjust_container_stock(conn, name, -qty, "Pre-processing pack-out", b["batch_lot"], uname)
+        if b["citric_kg"]:
+            citric = self._consumable_by_name(conn, "Citric Acid")
+            if not citric:
+                raise ApiError(400, "No 'Citric Acid' reagent exists in Inventory Items")
+            self._consume(conn, citric["id"], -b["citric_kg"], "Pre-processing pH adjustment", b["batch_lot"], uname)
+        used = self._consumable_by_name(conn, "Used 1,000 L IBC Tote")
+        if used and inputs:
+            self._consume(conn, used["id"], len(inputs), "Emptied by pre-processing", b["batch_lot"], uname)
+        # output lots, one per IBC
+        outputs, n = [], 0
+        for p in packs:
+            for _ in range(p["qty"]):
+                n += 1
+                lot = "%s-%02d" % (b["batch_lot"], n)
+                kg = round(blend_kg * p["litres_each"] / total_l, 2)
+                conn.execute(
+                    "INSERT INTO tote_lots (lot_number,site_code,species_code,harvest_year,checkin_date,received_date,"
+                    "tote_number,volume_l,ph,ph_updated,avg_weight_kg,location,description,status,"
+                    "stabilization_method,storage_unit,storage_source,created_at,grind,preproc_batch_id,solids_pct)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'in_stock', ?,?,?,?, 'Fine', ?, ?)",
+                    (lot, site, sp, int(harvest_date[:4]) if harvest_date else None, harvest_date, b["batch_date"],
+                     n, p["litres_each"], b["measured_ph"], b["batch_date"], kg, b["location"],
+                     "Fine-ground blend of %d lot(s), batch %s" % (len(inputs), b["batch_lot"]),
+                     stabilization, "Tote", p["container"], ts, bid, b["final_solids_pct"]))
+                tid = conn.execute("SELECT id FROM tote_lots WHERE lot_number=?", (lot,)).fetchone()["id"]
+                self._log_stability(conn, tid, user, "Created", None, lot,
+                                    "Pre-processing batch %s from %s" % (b["batch_lot"], ", ".join(source_lots)))
+                outputs.append(lot)
+        for i in inputs:
+            self._log_stability(conn, i["id"], user, "Status", "wip", "consumed",
+                                "Shredded in pre-processing batch %s -> %s" % (b["batch_lot"], ", ".join(outputs)))
+            conn.execute("UPDATE tote_lots SET status='consumed' WHERE id=?", (i["id"],))
+        conn.execute("UPDATE preproc_batches SET status='completed', completed_at=?, completed_by=? WHERE id=?",
+                     (ts, uname, bid))
+        return self._preproc_public(conn, self._preproc_get(conn, bid))
+
+    def _preproc_trace(self, conn, tote):
+        """Traceability for one tote: if it is a fine-grind blend, the batch and the source lots it was
+        made from; if it is a coarse tote that was shredded, the batch and the blend lots it went into."""
+        bid = tote["preproc_batch_id"]
+        role = "output" if bid else None
+        if not bid:
+            row = conn.execute("SELECT batch_id FROM preproc_inputs WHERE tote_lot_id=? ORDER BY id DESC",
+                               (tote["id"],)).fetchone()
+            bid, role = (row["batch_id"], "input") if row else (None, None)
+        if not bid:
+            return {"role": None}
+        b = conn.execute("SELECT * FROM preproc_batches WHERE id=?", (bid,)).fetchone()
+        return {"role": role, "batch": self._preproc_public(conn, b)}
+
     # ---- harvest check-in (creates a batch of totes) ---------------------- #
     def route_harvest(self, method, seg, conn):
         if seg == ["api", "harvest"] and method == "POST":
@@ -2840,6 +3170,9 @@ class Handler(BaseHTTPRequestHandler):
             location = (d.get("location") or "").strip() or None
             stabilization_method = (d.get("stabilizationMethod") or "").strip() or "Citric acid"
             storage_unit = (d.get("storageUnit") or "").strip() or "Tote"
+            grind = (d.get("grind") or "").strip().capitalize() or "Coarse"
+            if grind not in ("Coarse", "Fine"):
+                raise ApiError(400, "Grind must be Coarse or Fine")
             notes = (d.get("notes") or "").strip() or None
             if not site or not species or count <= 0:
                 raise ApiError(400, "Site, species and a storage unit count > 0 are required")
@@ -2880,11 +3213,11 @@ class Handler(BaseHTTPRequestHandler):
                 conn.execute(
                     "INSERT INTO tote_lots (lot_number,site_code,species_code,harvest_year,"
                     "checkin_date,received_date,tote_number,volume_l,ph,orp,avg_weight_kg,location,"
-                    "description,status,stabilization_method,storage_unit,storage_source,notes,created_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'in_stock',?,?,?,?,?)",
+                    "description,status,stabilization_method,storage_unit,storage_source,notes,created_at,grind)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'in_stock',?,?,?,?,?,?)",
                     (lot, site, species, int(date[:4]), date, received_date, n, 1000, ph, orp, avg, location,
                      "Fresh Stabilized Ground %s" % common, stabilization_method, storage_unit,
-                     storage_source, notes, ts))
+                     storage_source, notes, ts, grind))
                 created.append(lot)
             if ibc_row:
                 self._consume(conn, ibc_row["id"], -count, "Harvest check-in (storage unit fill)",
@@ -2955,6 +3288,9 @@ class Handler(BaseHTTPRequestHandler):
             stabilization_method = cell("stabilizationMethod") or "Citric acid"
             storage_unit = cell("storageUnit") or "Tote"
             storage_source = cell("storageSource") or None
+            grind = cell("grind").capitalize() or "Coarse"
+            if grind not in ("Coarse", "Fine"):
+                raise ApiError(400, "Row %d: grind '%s' must be Coarse or Fine" % (i, cell("grind")))
             notes = cell("notes") or None
             if not conn.execute("SELECT 1 FROM sites WHERE code=?", (site,)).fetchone():
                 conn.execute("INSERT INTO sites (code,name) VALUES (?,?)", (site, site))
@@ -2974,11 +3310,11 @@ class Handler(BaseHTTPRequestHandler):
             conn.execute(
                 "INSERT INTO tote_lots (lot_number,site_code,species_code,harvest_year,"
                 "checkin_date,received_date,tote_number,volume_l,ph,orp,avg_weight_kg,location,"
-                "description,status,stabilization_method,storage_unit,storage_source,notes,created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'in_stock',?,?,?,?,?)",
+                "description,status,stabilization_method,storage_unit,storage_source,notes,created_at,grind)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'in_stock',?,?,?,?,?,?)",
                 (lot, site, species, int(date[:4]), date, received_date, n, 1000, ph, orp, avg, location,
                  "Fresh Stabilized Ground %s" % common, stabilization_method, storage_unit,
-                 storage_source, notes, ts))
+                 storage_source, notes, ts, grind))
             created.append(lot)
         return {"created": created, "count": len(created)}
 
