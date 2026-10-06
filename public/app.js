@@ -612,16 +612,15 @@ async function pageProduction(v) {
   if (!r.runs.length && !dr.drafts.length) { v.append(el('div', { class: 'empty card' }, 'No production runs yet. Click “New production run” to process stabilized totes into finished goods.')); return; }
   if (!r.runs.length) return;
   for (const run of r.runs) {
-    const fgList = run.fgLots.map(f => `${fmt(f.qty)} × ${f.packageSize}`).join(', ') || '—';
     const card = el('div', { class: 'card' },
       el('div', { class: 'page-head', style: 'margin:0 0 8px' },
-        el('h3', { style: 'margin:0' }, mono(run.processingLot) , '  ', el('span', { class: 'pill' }, skuName(run.sku)),
+        el('h3', { style: 'margin:0' }, mono(run.processingLot),
           run.excludeFromStats ? el('span', { class: 'pill', style: 'margin-left:6px', title: run.excludeReason || '' }, 'Excluded from analysis') : null,
           run.release && run.release.state && run.release.state !== 'legacy' ? [' ', releaseBadge(run.release.state)] : null),
         el('div', { class: 'actions' },
-          run.amendment
+          canAmendLog() ? (run.amendment
             ? el('button', { onclick: () => openRunLog(run.id) }, '✏️ Continue amendment')
-            : el('button', { onclick: () => openAmendDialog(run) }, '✏️ Amend run'),
+            : el('button', { onclick: () => openAmendDialog(run) }, '✏️ Amend run')) : null,
           el('button', { class: 'secondary', onclick: () => editRun(run) }, 'Edit'),
           el('button', { class: 'secondary', onclick: () => openProcessLog(run) }, '📋 Process log'),
           el('button', { class: 'secondary', onclick: () => openQcForRun(run) },
@@ -630,22 +629,53 @@ async function pageProduction(v) {
             '📎 Documents' + (run.attachments && run.attachments.length ? ' (' + run.attachments.length + ')' : '')),
           el('button', { class: 'secondary', onclick: () => printLabels(run.fgLots.map(f => fgLabel(f, run))) }, 'Print FG labels'))),
       run.amendment ? amendBanner(run) : null,
-      el('div', { class: 'summary-line' },
-        sl('Run date', run.runDate), sl('Input', fmt(run.inputKg, 1) + ' kg'),
-        sl('Output', fmt(run.outputLitres, 0) + ' L'),
-        sl('Conversion factor', run.inputKg ? (run.outputLitres / run.inputKg).toFixed(2) + ' L/kg' : '—'),
-        sl('Target TDS', run.targetTds != null ? run.targetTds + '%' : '—'),
-        sl('Citric', fmt(run.citricKg, 1) + ' kg'), sl('Sorbate', fmt(run.sorbateKg, 1) + ' kg'),
-        sl('Na benzoate', fmt(run.nabenzoateKg, 1) + ' kg'),
-        sl('New IBCs filled', fmt(run.ibcUsed)), sl('Used IBCs freed', fmt(run.inputTotes.length)),
-        sl('Packaged', fgList), run.operators ? sl('Operators', run.operators) : null),
+      runSummaryGrid(run),
       stageProgress(run, { onSelect: key => openProcessLog(run, key) }),
-      el('div', { class: 'muted', style: 'margin-top:8px;font-size:12px' },
-        `Consumed ${run.inputTotes.length} tote(s): `, el('span', { class: 'mono' }, run.inputTotes.join(', '))),
-      run.notes ? el('div', { class: 'muted', style: 'margin-top:4px;font-size:12px' }, '“' + run.notes + '”') : null,
       revisionTracker(run));
     v.append(card);
   }
+}
+// The key production figures shown on a run's summary card, all derived from the run's
+// own log: feedstock farms, IBCs (totes) consumed, weights, volume out, final QC, extraction
+// efficiency and the two conversion rates (process = measured weights, harvest = stored
+// batch-average weight -- the same definitions as the Yield & Usage report).
+function runSummaryStats(run) {
+  const inputs = (run.inputs || []).filter(i => i.decision !== 'rejected');
+  const siteCodes = inputs.length ? inputs.map(i => i.site) : (run.inputTotes || []).map(l => String(l).split('-')[0]);
+  const farms = [...new Set(siteCodes.filter(Boolean).map(siteName))];
+  const toteCount = inputs.length || (run.inputTotes || []).length;
+  const measuredKg = inputs.length && inputs.every(i => i.weightKg != null) ? inputs.reduce((a, i) => a + i.weightKg, 0) : null;
+  const out = run.outputLitres || 0;
+  const st = run.stages || {};
+  const tdsBefore = st.homogenization && st.homogenization.tdsPct, tdsAfter = st.extraction && st.extraction.tdsPct;
+  return {
+    farms, toteCount, measuredKg, out,
+    finalPh: st.packaging ? st.packaging.qcPh : null, finalTds: st.packaging ? st.packaging.tdsPct : null,
+    extractionEff: (tdsBefore && tdsAfter != null) ? (tdsAfter - tdsBefore) / tdsBefore * 100 : null,
+    processRate: measuredKg && out > 0 ? out / measuredKg : null,
+    harvestRate: run.inputKg > 0 && out > 0 ? out / run.inputKg : null,
+  };
+}
+function runSummaryGrid(run) {
+  const x = runSummaryStats(run);
+  const fgList = (run.fgLots || []).map(f => fmt(f.qty) + ' × ' + f.packageSize).join(', ') || '—';
+  const cell = (k, v, cls) => el('div', { class: 'rs' + (cls ? ' ' + cls : '') }, el('span', { class: 'rs-k' }, k), el('span', { class: 'rs-v' }, v));
+  const dash = '—';
+  return el('div', { class: 'run-stats' },
+    cell('Run date', run.runDate || dash),
+    cell('Operators', run.operators || dash),
+    cell('Product', skuName(run.sku)),
+    cell('Feedstock farms', x.farms.join(', ') || dash, 'rs-wide'),
+    cell('IBCs consumed', x.toteCount ? fmt(x.toteCount) : dash),
+    cell('Total feedstock weight', x.measuredKg != null ? [fmt(x.measuredKg, 1) + ' kg', el('small', {}, 'measured')]
+      : (run.inputKg ? [fmt(run.inputKg, 1) + ' kg', el('small', {}, 'batch-average')] : dash)),
+    cell('Packaged', fgList, 'rs-wide'),
+    cell('Product volume out', x.out ? fmt(x.out, 0) + ' L' : dash),
+    cell('Final pH', x.finalPh != null ? fmt(x.finalPh, 2) : dash),
+    cell('Final TDS', x.finalTds != null ? fmt(x.finalTds, 2) + ' %' : dash),
+    cell('Extraction efficiency', x.extractionEff != null ? fmt(x.extractionEff, 1) + ' %' : dash),
+    cell('Conversion rate — process', x.processRate != null ? [fmt(x.processRate, 3), el('small', {}, 'L/kg · measured weight')] : dash),
+    cell('Conversion rate — harvest', x.harvestRate != null ? [fmt(x.harvestRate, 3), el('small', {}, 'L/kg · batch-average weight')] : dash));
 }
 // Required-field marking. The server owns the list of required fields
 // (State.ref.requiredFields, from REQUIRED_FIELDS/PROGRESS_SECTIONS in
@@ -704,6 +734,10 @@ function lockLogBody(root) {
   new MutationObserver(apply).observe(root, { childList: true, subtree: true });
 }
 function logLockBanner(run, extra) {
+  if (run.amendment && !canAmendLog()) {
+    return el('div', { class: 'lock-banner allow-locked' }, el('span', {},
+      '🔒 Under amendment by ' + (run.amendment.openedBy || '—') + ' — read only. Only users with the Production Log Amender permission can edit it.'));
+  }
   if (run.amendment) {
     return el('div', { class: 'amend-banner allow-locked' },
       el('b', {}, '✏️ Amendment open'), ' — ' + (run.amendment.categoryLabel || '') + ': ' + run.amendment.reason
@@ -711,28 +745,28 @@ function logLockBanner(run, extra) {
       el('div', { class: 'actions' }, el('button', { type: 'button', onclick: () => openSubmitAmendment(run) }, 'Submit amendment…')));
   }
   return el('div', { class: 'lock-banner allow-locked' },
-    el('span', {}, '🔒 Finalized — read only. ' + (extra || 'To change any production-log entry, amend the run (a reason is required and the change is recorded as a revision). Documents and printing labels are not affected.')),
-    el('button', { type: 'button', onclick: () => openAmendDialog(run) }, '✏️ Amend run…'));
+    el('span', {}, '🔒 Finalized — read only. ' + (extra || 'To change any production-log entry, the run must be amended (a reason is required and the change is recorded as a revision). Documents and printing labels are not affected.')
+      + (canAmendLog() ? '' : ' You don’t have the Production Log Amender permission — ask an administrator.')),
+    canAmendLog() ? el('button', { type: 'button', onclick: () => openAmendDialog(run) }, '✏️ Amend run…') : null);
 }
 function amendBanner(run) {
   const a = run.amendment;
   return el('div', { class: 'amend-banner' },
     el('b', {}, 'Under amendment'), ' — ' + (a.categoryLabel || '') + ': ' + a.reason + '  (opened ' + fmtWhen(a.openedAt) + ' by ' + (a.openedBy || '—') + ')',
     el('div', { class: 'help', style: 'color:inherit' }, 'The log is unlocked for editing; unsold finished goods are held (Pending Release) until the amendment is submitted and re-reviewed.'),
-    el('div', { class: 'actions' },
+    canAmendLog() ? el('div', { class: 'actions' },
       el('button', { onclick: () => openRunLog(run.id) }, 'Continue editing'),
       el('button', { class: 'secondary', onclick: () => openSubmitAmendment(run) }, 'Submit amendment…'),
       el('button', { class: 'secondary', onclick: async () => {
         if (!confirm('Cancel this amendment? Only possible if nothing has been changed; the run returns to its previous status.')) return;
         try { await api('POST', '/production/' + run.id + '/amendments/' + a.id + '/cancel', {}); toast('Amendment cancelled'); render(); }
         catch (e) { toast(e.message, true); }
-      } }, 'Cancel amendment')));
+      } }, 'Cancel amendment')) : null);
 }
 async function openAmendDialog(run) {
   const info = await api('GET', '/production/' + run.id + '/amendments');
   const imp = info.impact;
   const me = State.user || {};
-  const isMgr = !!(me.isProductionManager || me.isQualityManager);
   const catSel = selectFrom('', [['', 'Select a category…'], ...Object.entries(info.categories)]);
   const reason = el('textarea', { rows: '3', placeholder: 'What is being changed, and why?' });
   const pw = el('input', { type: 'password', autocomplete: 'off', placeholder: 'Your password (signature)' });
@@ -750,8 +784,7 @@ async function openAmendDialog(run) {
       + imp.shipped.map(x => x.qty + ' × ' + x.lot + ' on ' + x.shipment).join('; ') + '). The app cannot recall them — Quality should decide whether a deviation notice is needed.') : null,
     field(reqLabel('Category'), catSel), field(reqLabel('Reason'), reason),
     imp.needsSignature ? el('div', {},
-      isMgr ? el('div', { class: 'help' }, 'This run has been reviewed/released, so a Production or Quality Manager signs the amendment.')
-        : el('div', { class: 'help', style: 'color:var(--danger)' }, 'Only a Production Manager or Quality Manager can amend a run that has been reviewed or released.'),
+      el('div', { class: 'help' }, 'This run has been reviewed/released, so amending it is a signed act: re-enter your password. It is re-reviewed before product can be sold again.'),
       field(reqLabel('Password'), pw)) : null);
   modal('Amend run — ' + run.processingLot, body, async () => {
     if (!catSel.value) throw new Error('Choose a category.');
@@ -817,6 +850,7 @@ async function openIntegrityCheck() {
   host.append(el('div', { class: 'help' }, 'Checking…'));
   try { await draw(await api('GET', '/integrity')); } catch (e) { host.innerHTML = ''; host.append(el('div', { class: 'error' }, e.message)); }
 }
+const canAmendLog = () => !!(State.user && State.user.canAmendLog);
 const canIntegrity = () => !!(State.user && (State.user.role === 'admin' || State.user.isQualityManager));
 
 // Opens (and scrolls to) one section of a production-log modal: sections are the
@@ -913,7 +947,7 @@ async function editRun(run) {
     field('Reason for excluding', el('input', { id: 'e_excl_reason', value: run.excludeReason || '', placeholder: 'required when excluded' })),
     el('div', { class: 'help' }, 'These kg totals include what was logged under Dilution & Preservation. Changing citric / sorbate / benzoate adjusts reagent stock by the difference. Every change is logged with your name.'));
   body.querySelector('#e_excl').checked = !!run.excludeFromStats;
-  const locked = !run.amendment;
+  const locked = !run.amendment || !canAmendLog();
   if (locked) {
     body.prepend(logLockBanner(run, 'The run date, reagent totals, location, operators and notes are production-log entries. Only the yield-analysis exclusion below can be changed without an amendment.'));
     body.querySelectorAll('input, select, textarea, button').forEach(c => { if (!c.closest('.allow-locked') && !['e_excl', 'e_excl_reason'].includes(c.id)) c.disabled = true; });
@@ -2931,7 +2965,7 @@ async function openProcessLog(run, section) {
     }, 1200);
   }));
   modal('Process log — ' + run.processingLot, body, async () => { render(); }, 'Done', { wide: true });
-  if (!run.amendment) lockLogBody(body);   // finalized: read-only until an amendment is opened
+  if (!run.amendment || !canAmendLog()) lockLogBody(body);   // finalized: read-only unless an amendment is open and you may amend
   if (section) jumpToSection(body, section);
 }
 
@@ -4583,13 +4617,14 @@ async function pageAdmin(v) {
       el('button', { onclick: addUser }, '+ Add user'))));
   const r = await api('GET', '/users');
   v.append(table(
-    ['Name', 'Email', 'Role', 'Release sign-off', 'Status', 'Actions'],
+    ['Name', 'Email', 'Role', 'Permissions', 'Status', 'Actions'],
     r.users.map(u => [
       u.name, mono(u.email),
       badge(u.role === 'admin' ? 'hold' : 'on_hand', u.role === 'admin' ? 'Admin' : 'User'),
       el('span', {}, u.isProductionManager ? badge('wip', 'Production Mgr') : null, ' ',
-        u.isQualityManager ? badge('on_hand', 'Quality Mgr') : null,
-        !u.isProductionManager && !u.isQualityManager ? el('span', { class: 'muted' }, '—') : null),
+        u.isQualityManager ? badge('on_hand', 'Quality Mgr') : null, ' ',
+        u.canAmendLog ? badge('hold', 'Log Amender') : null,
+        !u.isProductionManager && !u.isQualityManager && !u.canAmendLog ? el('span', { class: 'muted' }, '—') : null),
       u.active ? badge('on_hand', u.mustChange ? 'Must reset' : 'Active') : badge('disposed', 'Inactive'),
       rowActions([
         ['Reset password', () => resetUserPassword(u)],
@@ -4599,7 +4634,7 @@ async function pageAdmin(v) {
     ]), [false, false, false, false, false, false]));
   v.append(el('div', { class: 'help', style: 'margin-top:10px' },
     'New users and password resets require the person to set a new password on next sign-in. '
-    + 'Release sign-off: only users flagged Production Manager / Quality Manager can sign product-release steps (being an administrator does not grant it); changes to these flags are logged.'));
+    + 'Permissions: only users flagged Production Manager / Quality Manager can sign product-release steps, and only users flagged Production Log Amender can amend a finalized production log (being an administrator does not grant any of them); changes to these flags are logged.'));
 
   // SOP documents: controlled documents a production-log QC Check links to
   // by a stable reference key (never the display name, so a rename here is
@@ -4710,26 +4745,37 @@ function downloadDbBackup() {
   document.body.append(a); a.click(); a.remove();
   toast('Backup downloading…');
 }
-function signoffChecks(prefix, u) {
-  const mk = (id, label, on) => el('label', { style: 'display:flex;align-items:center;gap:6px;font-weight:normal;margin:2px 0' },
-    el('input', { type: 'checkbox', id: prefix + '_' + id, checked: !!on }), label);
-  return el('div', { style: 'margin:8px 0' },
-    el('label', {}, 'Product release sign-off permissions'),
-    mk('pm', 'Production Manager — may review and sign off the production log', u && u.isProductionManager),
-    mk('qm', 'Quality Manager — may review, and sign to release finished goods for sale', u && u.isQualityManager),
-    el('div', { class: 'help' }, 'Each grant or removal is logged. Signatures always re-ask for the signer’s password.'));
+// Permissions checklist for Add / Edit user: one tidy row per permission (checkbox, name,
+// plain-language description). Admin role alone grants none of these.
+const USER_PERMISSIONS = [
+  ['pm', 'isProductionManager', 'Production Manager', 'Reviews and signs off finalized production logs (Product Release).'],
+  ['qm', 'isQualityManager', 'Quality Manager', 'Reviews logs, releases or rejects finished goods for sale, and can run the data integrity check.'],
+  ['am', 'canAmendLog', 'Production Log Amender', 'Can amend a finalized run’s production log (open an amendment, edit it, submit it for re-review).'],
+];
+function permissionChecklist(prefix, u) {
+  const list = el('div', { class: 'perm-list' }, ...USER_PERMISSIONS.map(([id, key, name, desc]) => {
+    const cb = el('input', { type: 'checkbox', id: prefix + '_' + id });
+    cb.checked = !!(u && u[key]);
+    const row = el('label', { class: 'perm-item' + (cb.checked ? ' on' : '') }, cb,
+      el('span', { class: 'perm-text' }, el('b', {}, name), el('small', {}, desc)));
+    cb.addEventListener('change', () => row.classList.toggle('on', cb.checked));
+    return row;
+  }));
+  return el('div', { class: 'perm-box' }, el('div', { class: 'perm-title' }, 'Permissions'), list,
+    el('div', { class: 'perm-note' }, 'Being an administrator does not grant any of these. Every change is logged, and signatures re-ask for the signer’s password.'));
 }
+const permissionValues = (body, prefix) => Object.fromEntries(USER_PERMISSIONS.map(([id, key]) => [key, body.querySelector('#' + prefix + '_' + id).checked]));
 function addUser() {
   const body = el('div', {},
     el('div', { class: 'form-row' }, field('Name', el('input', { id: 'u_name' })),
       field('Email', el('input', { id: 'u_email', type: 'email' }))),
     el('div', { class: 'form-row' }, field('Temporary password', el('input', { id: 'u_pw', value: 'Cascadia123!' })),
       field('Role', selectFrom('', [['user', 'User'], ['admin', 'Administrator']], null, 'u_role'))),
-    signoffChecks('u'),
+    permissionChecklist('u'),
     el('div', { class: 'help' }, 'They’ll be required to change this password on first sign-in.'));
   modal('Add user', body, async () => {
     await api('POST', '/users', { name: body.querySelector('#u_name').value, email: body.querySelector('#u_email').value, password: body.querySelector('#u_pw').value, role: body.querySelector('#u_role').value,
-      isProductionManager: body.querySelector('#u_pm').checked, isQualityManager: body.querySelector('#u_qm').checked });
+      ...permissionValues(body, 'u') });
     toast('User created'); render();
   }, 'Create');
 }
@@ -4738,11 +4784,11 @@ function editUser(u) {
     el('div', { class: 'form-row' },
       field('Name', el('input', { id: 'ue_name', value: u.name })),
       field('Role', selectFrom('', [['user', 'User'], ['admin', 'Administrator']], null, 'ue_role'))),
-    signoffChecks('ue', u));
+    permissionChecklist('ue', u));
   body.querySelector('#ue_role').value = u.role;
   modal('Edit ' + u.email, body, async () => {
     await api('PUT', '/users/' + u.id, { name: body.querySelector('#ue_name').value, role: body.querySelector('#ue_role').value,
-      isProductionManager: body.querySelector('#ue_pm').checked, isQualityManager: body.querySelector('#ue_qm').checked });
+      ...permissionValues(body, 'ue') });
     toast('Updated'); render();
   }, 'Save');
 }

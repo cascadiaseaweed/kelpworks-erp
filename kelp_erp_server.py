@@ -1210,6 +1210,15 @@ def migrate(conn):
         conn.execute("ALTER TABLE users ADD COLUMN is_production_manager INTEGER NOT NULL DEFAULT 0")
     if "is_quality_manager" not in ucols:
         conn.execute("ALTER TABLE users ADD COLUMN is_quality_manager INTEGER NOT NULL DEFAULT 0")
+    if "can_amend_log" not in ucols:
+        # Production Log Amender: may open/edit/submit an amendment on a finalized run. Anyone who
+        # already held a Production or Quality Manager permission keeps the ability they had.
+        conn.execute("ALTER TABLE users ADD COLUMN can_amend_log INTEGER NOT NULL DEFAULT 0")
+        for u in conn.execute("SELECT id, email FROM users WHERE is_production_manager=1 OR is_quality_manager=1").fetchall():
+            conn.execute("UPDATE users SET can_amend_log=1 WHERE id=?", (u["id"],))
+            conn.execute("INSERT INTO user_permission_log (user_id,user_email,permission,old_value,new_value,changed_by,changed_at)"
+                         " VALUES (?,?,?,?,?,?,?)", (u["id"], u["email"], "Production Log Amender", 0, 1,
+                                                    "SYSTEM (migration: existing managers)", now_iso()))
     prcols = {r["name"] for r in conn.execute("PRAGMA table_info(production_runs)")}
     if "status" not in prcols:
         conn.execute("ALTER TABLE production_runs ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'")
@@ -2126,7 +2135,7 @@ class Handler(BaseHTTPRequestHandler):
         if seg[:2] == ["api", "production"]:
             # A finalized run's production log is locked: writes need an open
             # amendment (documents and the yield-analysis flag are exempt).
-            self._amend_guard(conn, method, seg)
+            self._amend_guard(conn, method, seg, user)
             return self.route_production(method, seg, conn, user)
         if seg[:2] == ["api", "integrity"]:
             return self.route_integrity(method, seg, conn, user)
@@ -2167,7 +2176,8 @@ class Handler(BaseHTTPRequestHandler):
         return {"id": row["id"], "name": row["name"], "email": row["email"],
                 "role": row["role"], "mustChange": bool(row["must_change_password"]),
                 "isProductionManager": bool(row["is_production_manager"]),
-                "isQualityManager": bool(row["is_quality_manager"])}
+                "isQualityManager": bool(row["is_quality_manager"]),
+                "canAmendLog": bool(row["can_amend_log"])}
 
     # ---- users / admin ---------------------------------------------------- #
     def _user_public(self, r):
@@ -2175,6 +2185,7 @@ class Handler(BaseHTTPRequestHandler):
                 "active": bool(r["active"]), "mustChange": bool(r["must_change_password"]),
                 "isProductionManager": bool(r["is_production_manager"]),
                 "isQualityManager": bool(r["is_quality_manager"]),
+                "canAmendLog": bool(r["can_amend_log"]),
                 "createdAt": r["created_at"]}
 
     def _users(self, conn):
@@ -2224,11 +2235,12 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(409, "A user with that email already exists")
                 must_change = 0 if d.get("mustChange") is False else 1
                 pm, qm = int(bool(d.get("isProductionManager"))), int(bool(d.get("isQualityManager")))
+                am = int(bool(d.get("canAmendLog")))
                 cur = conn.execute(
                     "INSERT INTO users (name,email,password_hash,role,must_change_password,active,created_at,"
-                    "is_production_manager,is_quality_manager) VALUES (?,?,?,?,?,1,?,?,?)",
-                    (name, email, hash_password(pw), role, must_change, now_iso(), pm, qm))
-                for perm, val in (("Production Manager", pm), ("Quality Manager", qm)):
+                    "is_production_manager,is_quality_manager,can_amend_log) VALUES (?,?,?,?,?,1,?,?,?,?)",
+                    (name, email, hash_password(pw), role, must_change, now_iso(), pm, qm, am))
+                for perm, val in (("Production Manager", pm), ("Quality Manager", qm), ("Production Log Amender", am)):
                     if val:
                         self._log_permission(conn, cur.lastrowid, email, perm, 0, 1, user)
                 return {"users": self._users(conn)}
@@ -2261,7 +2273,8 @@ class Handler(BaseHTTPRequestHandler):
                              ((d["name"].strip() if d.get("name") else target["name"]),
                               new_role, new_active, uid))
                 for key, col, perm in (("isProductionManager", "is_production_manager", "Production Manager"),
-                                       ("isQualityManager", "is_quality_manager", "Quality Manager")):
+                                       ("isQualityManager", "is_quality_manager", "Quality Manager"),
+                                       ("canAmendLog", "can_amend_log", "Production Log Amender")):
                     if key in d:
                         new_v = int(bool(d[key]))
                         if new_v != int(target[col] or 0):
@@ -3783,8 +3796,9 @@ class Handler(BaseHTTPRequestHandler):
     def _open_amendment(self, conn, rid):
         return conn.execute("SELECT * FROM run_amendments WHERE run_id=? AND status='open'", (rid,)).fetchone()
 
-    def _amend_guard(self, conn, method, seg):
-        """Reject writes to a finalized run's production log unless an amendment is open."""
+    def _amend_guard(self, conn, method, seg, user):
+        """Reject writes to a finalized run's production log unless an amendment is open
+        (and then only by a user with the Production Log Amender permission)."""
         if method == "GET" or len(seg) < 3 or not seg[2].isdigit():
             return
         rid = int(seg[2])
@@ -3797,6 +3811,8 @@ class Handler(BaseHTTPRequestHandler):
         if len(seg) == 3 and method == "PUT":
             return          # edit_run decides itself (the exclusion flag is exempt)
         if self._open_amendment(conn, rid):
+            if not user["can_amend_log"]:
+                raise ApiError(403, "Only users with the Production Log Amender permission can edit a run under amendment")
             return
         raise ApiError(409, "This production run is finalized and its log is locked. Use \"Amend run\" "
                             "(with a reason) to change production-log entries.", "amendment_required")
@@ -3847,10 +3863,15 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "Choose the category of this amendment")
         if len(reason) < 5:
             raise ApiError(400, "Enter the reason for amending this run (what is being changed and why)")
+        if not user["can_amend_log"]:
+            raise ApiError(403, "You don't have permission to amend production logs (ask an administrator for the "
+                                "Production Log Amender permission)")
         capacity = None
         if state in ("pending_release", "released", "legacy", "rejected"):
-            # Amending product that was reviewed/released: a manager signs it.
-            capacity = self._release_signer(conn, user, d, need_quality=False)
+            # Amending product that was reviewed/released is a signed act: re-enter your password.
+            if not verify_password(d.get("password") or "", user["password_hash"]):
+                raise ApiError(400, "Password is incorrect - your signature was not recorded")
+            capacity = "Production Log Amender"
         start = self._release_snapshot(conn, rid)
         start_hash = hashlib.sha256(_canon(start).encode("utf-8")).hexdigest()
         was_complete = 1 if self._run_progress(conn, r)["complete"] else 0
@@ -3890,9 +3911,12 @@ class Handler(BaseHTTPRequestHandler):
         rid = r["id"]
         if a["status"] != "open":
             raise ApiError(409, "This amendment is already %s" % a["status"])
-        is_mgr = bool(user["is_production_manager"] or user["is_quality_manager"] or user["role"] == "admin")
-        if user["id"] != a["opened_by_id"] and not is_mgr:
-            raise ApiError(403, "Only the person who opened the amendment, a manager or an administrator can close it")
+        can_close = bool(user["can_amend_log"] or user["is_production_manager"] or user["is_quality_manager"]
+                         or user["role"] == "admin")
+        if user["id"] != a["opened_by_id"] and not can_close:
+            raise ApiError(403, "Only the person who opened the amendment, an amender, a manager or an administrator can close it")
+        if user["id"] == a["opened_by_id"] and not user["can_amend_log"] and not can_close:
+            raise ApiError(403, "You no longer have the Production Log Amender permission")
         comment = (d.get("comment") or "").strip() or None
         changes, after = self._amend_changes(conn, rid, a)
         now_hash = hashlib.sha256(_canon(after).encode("utf-8")).hexdigest()

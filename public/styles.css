@@ -392,3 +392,25 @@ button.stage-step:focus-visible { outline: 2px solid var(--teal); outline-offset
 .amend-banner .actions { margin-top: 6px; display: flex; gap: 8px; flex-wrap: wrap; }
 .lock-banner { border: 1px solid var(--line); background: #f3f7f6; border-radius: 8px; padding: 8px 12px; margin: 8px 0; font-size: 13px; color: var(--teal-dark); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .int-sev { display: inline-block; min-width: 62px; text-align: center; }
+
+/* Permissions checklist (Add / Edit user) */
+.perm-box { margin: 12px 0 4px; }
+.perm-box > .perm-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-bottom: 6px; }
+.perm-list { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: #fff; }
+.perm-item { display: flex; align-items: flex-start; gap: 12px; padding: 10px 14px; margin: 0; cursor: pointer; border-bottom: 1px solid var(--line); font-weight: normal; transition: background .12s; }
+.perm-item:last-child { border-bottom: 0; }
+.perm-item:hover { background: #f6faf9; }
+.perm-item.on { background: #eef8f6; }
+.perm-item input[type=checkbox] { width: 18px; height: 18px; flex: none; margin: 2px 0 0; accent-color: var(--teal); }
+.perm-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.perm-text b { font-size: 14px; color: var(--teal-darker); font-weight: 600; }
+.perm-text small { font-size: 12px; color: var(--muted); line-height: 1.35; }
+.perm-note { font-size: 12px; color: var(--muted); margin-top: 6px; }
+
+/* Production run card: key production figures */
+.run-stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px 18px; background: #eef4f2; border-radius: 10px; padding: 12px 14px; margin: 8px 0; }
+.run-stats .rs { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.run-stats .rs-k { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.run-stats .rs-v { font-size: 15px; font-weight: 700; color: var(--teal-darker); overflow-wrap: anywhere; }
+.run-stats .rs-v small { font-size: 11px; font-weight: 400; color: var(--muted); margin-left: 4px; }
+.run-stats .rs-wide { grid-column: span 2; }

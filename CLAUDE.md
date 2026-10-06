@@ -136,8 +136,11 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
   LOCKED: `_amend_guard` (called in `_route` for every `/api/production/<id>/...` write) returns
   409 `code: amendment_required` unless the run has an open amendment. Exempt: `/attachments`
   (documents), `/amendments`, and `edit_run`'s yield-analysis exclusion flag; label printing is
-  client-side. `run_amendments` + routes in `route_amendments`: open (reason + category; a run that
-  was reviewed/released needs a Production/Quality Manager's password) -> run is `amending`,
+  client-side. Only users with `users.can_amend_log` ("Production Log Amender", a checkbox in Admin > Users
+  next to Production/Quality Manager; admin role alone grants nothing; existing managers were
+  backfilled) can open, edit under, or submit an amendment. `run_amendments` + routes in
+  `route_amendments`: open (reason + category; a run that was reviewed/released also needs the
+  amender's password as a signature) -> run is `amending`,
   review hash cleared, on_hand lots held -> edit -> submit (ONE revision = diff of the log vs
   `start_snapshot`, reason/category stored; refuses to leave a previously complete run incomplete;
   run -> `pending_review`) or cancel (only if nothing changed; restores prior state/lots).
