@@ -94,6 +94,16 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 }
 
 .wrap { max-width: 1440px; margin: 0 auto; padding: 20px 18px 60px; }
+/* Feedstock Inventory: full window width and roomier rows, so the many columns read cleanly. */
+.wrap.wrap-wide { max-width: none; padding-left: 28px; padding-right: 28px; }
+.wrap-wide .tablewrap.sticky-actions { max-height: 78vh; }
+.wrap-wide .tablewrap.sticky-actions table { font-size: 14px; }
+.wrap-wide .tablewrap.sticky-actions th, .wrap-wide .tablewrap.sticky-actions td { padding: 10px 12px; }
+.wrap-wide .tablewrap.sticky-actions .filter-row th { padding: 8px 10px; }
+.wrap-wide .tablewrap.sticky-actions tbody tr:nth-child(even) { background: #fafcfc; }
+.wrap-wide .tablewrap.sticky-actions tbody tr.clickable:hover { background: #e9f4f1; }
+.wrap-wide .sticky-actions .row-actions { display: flex; flex-wrap: nowrap; gap: 5px; }
+.wrap-wide .sticky-actions .row-actions button { padding: 4px 9px; font-size: 12px; }
 .page-head { display:flex; align-items:center; justify-content:space-between; margin-bottom: 16px; gap: 12px; flex-wrap: wrap; }
 .page-head h2 { margin: 0; font-size: 20px; color: var(--teal-dark); }
 .page-head .actions { display:flex; gap: 8px; flex-wrap: wrap; }
@@ -452,3 +462,14 @@ button.stage-step:focus-visible { outline: 2px solid var(--teal); outline-offset
 .var-flag { color: #8a5a00; }
 .tank-table td, .tank-table th { vertical-align: middle; }
 .tank-table input { width: 100%; min-width: 90px; }
+
+/* Feedstock Inventory: per-row details icon and the column chooser */
+.info-btn { border: 0; background: none; color: var(--teal); cursor: pointer; font-size: 15px; padding: 0 0 0 6px; line-height: 1; }
+.info-btn:hover { color: var(--teal-dark); }
+.col-menu { position: relative; margin-left: auto; }
+.col-menu summary { cursor: pointer; padding: 6px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); font-size: 13px; list-style: none; }
+.col-menu summary::-webkit-details-marker { display: none; }
+.col-menu-panel { position: absolute; right: 0; top: calc(100% + 4px); z-index: 20; background: var(--card); border: 1px solid var(--line);
+  border-radius: 10px; box-shadow: var(--shadow); padding: 8px 12px; display: grid; gap: 6px; min-width: 210px; }
+.col-menu-panel label { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; margin: 0; }
+.col-menu-panel input { width: auto; }

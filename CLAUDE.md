@@ -138,6 +138,21 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
   run-level Ksorbate/benzoate totals = pass 1 + all extra passes, so the reagent deduction covers every pass (each pass also has its own pH balancing: measured pH + citric acid added, with the
   citric acid summed into the run's citric usage by `_commit_reagent_usage`). Pass items are
   required-field items in the Dilution & Preservation section, and `dilutionPasses` is part of the signed-log snapshot.
+- **Pre-Processing (shred + blend)** (`preproc_batches` / `preproc_inputs` / `preproc_packaging`, `route_preproc`,
+  `/api/preproc`, the "Pre-Processing" tab, `pagePreproc` / `openPreprocBatch`) turns coarse-grind feedstock into
+  fine-grind feedstock (harvest check-in / CSV import set `grind`, default Coarse; check-in no longer has a storage-unit source or deducts empty-IBC stock). A draft batch pulls coarse totes (`tote_lots.grind='Coarse'`, in stock, not on QAQC Hold) from a
+  pick list (status -> `wip`, same lock as a run), each characterized with the shared `buildFeedstockCard`
+  (`/api/totes/:id/characterize` + `/photo`, so it lands in the tote's own stability log; the shredded mass is simply the sum
+  of the pulled totes' weights -- there is no separate shredding section), then blend solids loading (all optional;
+  `preprocPlanCalc`: water = kg x (start%/target% - 1), target default = `preproc_target_solids_pct`; final % solids is CALCULATED =
+  start% x kg / (kg + water added), not measured),
+  pH balancing (measured pH + citric acid kg, default target `preproc_target_ph`) and pack-out rows (empty IBC container x
+  qty x fill L). Completing (`_preproc_complete`, one transaction, all required fields enforced by `_preproc_problems`) creates one
+  `tote_lots` row per output IBC (`<batch lot>-NN`, `grind='Fine'`, `preproc_batch_id`, `solids_pct`, status in_stock; site/species inherit
+  when every source agrees, else the `MIX` placeholder rows), consumes the sources (`consumed`, no run), deducts Citric Acid and the
+  output containers, and returns the emptied source IBCs to the Used IBC pool. A completed batch is read-only (no amend flow). Traceability:
+  `preproc_inputs` + `GET /api/totes/:id/trace` (Feedstock Inventory "Trace" action); fine lots print a `blendLabel`. Output weight = blend
+  mass (shredded kg + water) split by fill volume. `MIX` is hidden from harvest check-in; species-specific SKUs won't offer `MIX` lots in the run picker.
 - **Packaging edits after finalize** re-derive everything computed from the packaging rows in the
   same transaction (`_sync_completed_packaging`): container + FG-label stock (net-change commit),
   the run's FG lots (`_adjust_fg_lot`, refuses to go below units already shipped/moved), and
@@ -191,8 +206,8 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
 
 ## Domain model (key tables)
 
-`species`, `sites`, `tote_lots` (stabilized totes; status in_stock/consumed/
-disposed), `production_runs` + `run_inputs`, `fg_lots`, `consumables` +
+`species`, `sites`, `tote_lots` (stabilized totes; status in_stock/wip/hold/consumed/
+disposed; `grind` Coarse|Fine), `preproc_batches` / `preproc_inputs` / `preproc_packaging`, `production_runs` + `run_inputs`, `fg_lots`, `consumables` +
 `consumable_txns`, `run_reagent_commits`, `release_events`, `cip_events` / `cip_event_chemicals`,
 `customers` / `shipments` /
 `shipment_lines`, `disposals`, `run_attachments`, `run_edits`, `location_moves`,
