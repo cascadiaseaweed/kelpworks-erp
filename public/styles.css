@@ -442,3 +442,13 @@ button.stage-step:focus-visible { outline: 2px solid var(--teal); outline-offset
 /* read-only calculated value, sized to line up with the inputs beside it */
 .calc-tile { display: flex; align-items: center; min-height: 40px; padding: 0 12px; border: 1px dashed #b9cbc8; border-radius: 8px; background: #fff; }
 .calc-tile .help { font-size: 12px; margin: 0; }
+
+/* Dilution plan / check */
+.qc-check-result.plan-key { background: #eaf6f3; border-color: var(--teal); }
+.qc-check-result.plan-key .qc-check-result-label { font-weight: 700; color: var(--teal-darker); }
+.plan-status { margin-top: 8px; font-size: 13px; font-weight: 600; color: var(--muted); }
+.plan-status.ok { color: var(--teal-dark); }
+.plan-status.warn { color: #8a5a00; background: #fff8ec; border: 1px solid #f0c98a; border-radius: 8px; padding: 6px 10px; }
+.var-flag { color: #8a5a00; }
+.tank-table td, .tank-table th { vertical-align: middle; }
+.tank-table input { width: 100%; min-width: 90px; }
