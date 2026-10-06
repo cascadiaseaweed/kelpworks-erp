@@ -145,6 +145,9 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
   `start_snapshot`, reason/category stored; refuses to leave a previously complete run incomplete;
   run -> `pending_review`) or cancel (only if nothing changed; restores prior state/lots).
   Events (`amendment_opened/submitted/cancelled`) go in the hash-chained `release_events`.
+  The card's small bar-chart icon (`analysisInfoButton`, hover explains, click opens the "Analysis" window, `editRun` in app.js) holds only the Yield & Usage exclusion flag; the
+  card's "Amend run" button opens amendments; run date / location / operators / notes are edited in the Process log's
+  Initiation section (under an amendment).
   Documents are excluded from the release snapshot/hash (`_RELEASE_HASH_SKIP`) so they never
   create revisions or void sign-offs. If you change what the snapshot contains, bump
   `RELEASE_SNAPSHOT_VERSION`: boot re-hashes reviewed/released runs (SYSTEM `rebaseline` event) so a

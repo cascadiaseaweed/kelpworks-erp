@@ -414,3 +414,31 @@ button.stage-step:focus-visible { outline: 2px solid var(--teal); outline-offset
 .run-stats .rs-v { font-size: 15px; font-weight: 700; color: var(--teal-darker); overflow-wrap: anywhere; }
 .run-stats .rs-v small { font-size: 11px; font-weight: 400; color: var(--muted); margin-left: 4px; }
 .run-stats .rs-wide { grid-column: span 2; }
+
+/* Quiet info icon with a hover explanation (production run card title row) */
+.info-btn { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0; margin-left: 4px;
+  border: 1px solid #c3d2cf; border-radius: 6px; background: transparent; color: #7f9a95; line-height: 1; cursor: pointer; vertical-align: middle; }
+.info-btn:hover, .info-btn:focus-visible { color: #fff; background: var(--teal); border-color: var(--teal); outline: none; }
+.info-btn.on { color: #fff; background: var(--warn); border-color: var(--warn); }
+.info-btn::after { content: attr(data-tip); position: absolute; left: -8px; top: 32px; z-index: 30; width: 250px; padding: 8px 10px; border-radius: 8px;
+  background: var(--teal-darker); color: #fff; font: 400 12px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif; text-align: left; white-space: normal;
+  box-shadow: 0 6px 18px rgba(0,0,0,.22); opacity: 0; pointer-events: none; transform: translateY(-3px); transition: opacity .12s, transform .12s; }
+.info-btn:hover::after, .info-btn:focus-visible::after { opacity: 1; transform: none; }
+
+/* Quality Control log window: neutral cards, label / value / who-when per row */
+.qc-log-card { border: 1px solid var(--line); border-radius: 10px; margin: 10px 0; overflow: hidden; background: #fff; }
+.qc-log-head { display: flex; align-items: baseline; gap: 8px; padding: 9px 14px; background: #f3f7f6; border-bottom: 1px solid var(--line); }
+.qc-log-head b { font-size: 13px; color: var(--teal-darker); }
+.qc-log-head span { font-size: 12px; color: var(--muted); }
+.qc-log-row { display: grid; grid-template-columns: minmax(130px, 1.2fr) minmax(80px, .8fr) minmax(120px, 1.5fr); gap: 10px; align-items: baseline; padding: 7px 14px; border-bottom: 1px solid #edf2f1; font-size: 13px; }
+.qc-log-row:last-child { border-bottom: 0; }
+.qc-log-label { color: #3d5b57; }
+.qc-log-value { font-weight: 700; color: var(--teal-darker); font-variant-numeric: tabular-nums; text-align: right; }
+.qc-log-value small { font-weight: 400; color: var(--muted); margin-left: 4px; }
+.qc-log-meta { font-size: 11px; color: var(--muted); }
+.qc-log-row.empty .qc-log-value { color: #b3c3c0; font-weight: 400; }
+@media (max-width: 560px) { .qc-log-row { grid-template-columns: 1fr auto; } .qc-log-meta { grid-column: 1 / -1; } }
+
+/* read-only calculated value, sized to line up with the inputs beside it */
+.calc-tile { display: flex; align-items: center; min-height: 40px; padding: 0 12px; border: 1px dashed #b9cbc8; border-radius: 8px; background: #fff; }
+.calc-tile .help { font-size: 12px; margin: 0; }
