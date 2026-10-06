@@ -39,6 +39,7 @@ Environment variables (optional):
 
 import os
 import io
+import re
 import csv
 import json
 import time
@@ -170,6 +171,98 @@ QC_FIELD_REGISTRY = [
     ("packaging_ts_liquid_pct",   "packaging", "Packaging", "LKE characterization", "TSliquid (%)", "%"),
     ("packaging_rho_liquid_g_ml", "packaging", "Packaging", "LKE characterization", "ρliquid (g/mL)", "g/mL"),
 ]
+
+
+# Production-log required fields. A run cannot be finalized until every field
+# here has a value, and a section's progress dot only turns green once all of
+# its fields do. Keys are the JSON names in run_public()["stages"][stage]
+# (feedstock keys are the run_inputs public names). Deliberately NOT required:
+# every Notes field; the Homogenization / Separation / Pasteurization Sample
+# Point boxes; Extraction's QC Check Total solids + Density fields; checkboxes
+# (an unticked box is a real answer); values the app calculates itself; and
+# the legacy Dilution tank rows (new ones can no longer be added).
+REQUIRED_FEEDSTOCK = [
+    ("loadedAt", "Loaded at"), ("ph", "pH"), ("orp", "ORP (mV)"), ("weightKg", "Weight (kg)"),
+    ("volumeL", "Volume (L)"), ("odour", "Odour"), ("odourIntensity", "Odour intensity"),
+    ("decision", "Accept / reject decision"), ("surfacePhoto", "Surface photo"), ("striationPhoto", "Settling / striation photo"),
+]
+_QC_ALL = [
+    ("qcPh", "QC Check: pH"), ("tdsPct", "QC Check: TDS (%)"), ("brixPct", "QC Check: Brix (%)"),
+    ("mannitolPct", "QC Check: Mannitol (%)"), ("tsLiquidPct", "QC Check: TSliquid (%)"),
+    ("rhoLiquidGMl", "QC Check: \u03c1liquid (g/mL)"),
+]
+PROGRESS_SECTIONS = [
+    {"key": "feedstock", "label": "Feedstock"},
+    {"key": "homogenization", "label": "Homogenization", "fields": [
+        ("homogenization", "startedAt", "Started at"), ("homogenization", "rinsingWaterL", "Rinse water (L)"),
+        ("homogenization", "slurryL", "Tank level (L)"), ("homogenization", "wetSolidsWtG", "Wet-solids-wt (g)"),
+        ("homogenization", "liquidWtG", "Liquid-wt (g)"), ("homogenization", "targetPctWetSolids", "Target %Wet-Solids"),
+        ("homogenization", "dilutionWaterL", "Dilution water added (L)")]
+        + [("homogenization", k, l) for k, l in _QC_ALL]
+        + [("homogenization", "tsSlurryPct", "QC Check: TSslurry (%)"),
+           ("homogenization", "rhoSlurryGMl", "QC Check: \u03c1slurry (g/mL)"),
+           ("homogenization", "tsSolidsPct", "QC Check: %Moisture solids"),
+           ("homogenization", "solidsLoadingPct", "QC Check: Solids Loading (%)")]},
+    {"key": "extraction", "label": "Extraction", "fields": [
+        ("extraction", "startedAt", "Started at"), ("extraction", "amplitudePct", "Amplitude (%)"),
+        ("extraction", "flowrateLpm", "Flow rate (L/min)"), ("extraction", "pressurePsi", "Pressure (psi)"),
+        ("extraction", "startingPowerW", "Starting power (W)"),
+        ("extraction", "qcPh", "QC Check: pH"), ("extraction", "tdsPct", "QC Check: TDS (%)"),
+        ("extraction", "brixPct", "QC Check: Brix (%)"), ("extraction", "mannitolPct", "QC Check: Mannitol (%)")]},
+    {"key": "separation", "label": "Separation", "fields": [
+        ("separation", "startedAt", "Started at"), ("separation", "flowrateLpm", "Flow rate (L/min)"),
+        ("separation", "meshMicron", "Mesh size (micron)"), ("separation", "wetSolidsWtKg", "Total wet-solids weight (kg)"),
+        ("separation", "pctMoisture", "%Moisture centrifuge solids"), ("separation", "pctMoistureScrew", "%Moisture screw solids"),
+        ("separation", "liquidQcPh", "Filtrate QC Check: pH"), ("separation", "liquidTdsPct", "Filtrate QC Check: TDS (%)"),
+        ("separation", "liquidBrixPct", "Filtrate QC Check: Brix (%)"),
+        ("separation", "liquidMannitolPct", "Filtrate QC Check: Mannitol (%)"),
+        ("separation", "liquidTsLiquidPct", "Filtrate QC Check: TSliquid (%)"),
+        ("separation", "liquidRhoLiquidGMl", "Filtrate QC Check: \u03c1liquid (g/mL)")]},
+    {"key": "pasteurization", "label": "Pasteurization", "fields": [
+        ("pasteurization", "startedAt", "Started at"), ("pasteurization", "productSetpointC", "Product set-point (\u00b0C)"),
+        ("pasteurization", "boilerSetpointC", "Boiler set-point (\u00b0C)")]},
+    {"key": "dilution", "label": "Dilution & Preservation", "fields": [
+        ("dilution", "fillLevelTank6abL", "Fill level, Tank 6A/B (L)"), ("dilution", "measuredPh", "Measured pH"),
+        ("dilution", "citricKg", "Citric acid added (kg)"), ("dilution", "ksorbateStockPct", "Ksorbate stock concentration"),
+        ("dilution", "ksorbateAddedL", "Ksorbate added (L)"), ("dilution", "nabenzoateStockPct", "Nabenzoate stock concentration"),
+        ("dilution", "nabenzoateAddedL", "Sodium benzoate added (L)")]
+        + [("packaging", k, l.replace("QC Check", "LKE QC Check")) for k, l in _QC_ALL]
+        + [("packaging", "sampleCollectedAt", "LKE Sample Point: collection date and time")],
+     "sample_rows": "LKE Sample Point: at least one sample"},
+    {"key": "packaging", "label": "Packaging", "fields": [
+        ("packaging", "packagedAt", "Packaging date and time")],
+     "packaging_entries": "At least one packaged output quantity"},
+]
+
+
+def required_keys_by_stage():
+    """stage -> [keys] the SPA marks with an asterisk (plus the two table rules)."""
+    out = {"feedstock": [k for k, _l in REQUIRED_FEEDSTOCK], "packagingEntries": True, "packagingSampleRows": True}
+    for sec in PROGRESS_SECTIONS:
+        for stage, key, _label in sec.get("fields", []):
+            out.setdefault(stage, [])
+            if key not in out[stage]:
+                out[stage].append(key)
+    return out
+
+
+_KEY_TOKENS = {"ph": "pH", "tds": "TDS", "orp": "ORP", "psi": "(psi)", "pct": "(%)", "l": "(L)", "kg": "(kg)",
+               "g": "(g)", "ml": "mL", "rho": "\u03c1", "ts": "TS", "qc": "QC", "lpm": "(L/min)", "w": "(W)",
+               "c": "(\u00b0C)", "ibc": "IBC", "sku": "SKU", "id": "ID", "gperml": "(g/mL)", "ksorbate": "Ksorbate",
+               "nabenzoate": "Nabenzoate", "6ab": "6A/B"}
+
+
+def humanize_key(k):
+    toks = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+[a-z]*", str(k).replace("GMl", "Gperml"))
+    return " ".join(_KEY_TOKENS.get(t.lower(), t[:1].upper() + t[1:]) for t in toks) or str(k)
+
+
+STAGE_LABELS = {"homogenization": "Homogenization", "extraction": "Extraction", "separation": "Separation",
+                "pasteurization": "Pasteurization", "dilution": "Dilution & Preservation", "packaging": "Packaging"}
+
+
+def _has_value(v):
+    return v is not None and not (isinstance(v, str) and v.strip() == "")
 
 
 def get_settings(conn):
@@ -467,8 +560,8 @@ CREATE INDEX IF NOT EXISTS idx_disposals_date ON disposals(disposed_date);
 --     vessel (is_sample_container=1) -- a container can be neither,
 --     either, or both.
 --   * Finished-good labels: label_sku_code + label_package both set -- one
---     item per (SKU, package type), deducted 1 per finished unit when a run
---     is finalized. Unrelated to the Labels tab (internal barcode printing).
+--     item per (SKU, package type), deducted 1 per container consumed by the
+--     Packaging table's commit (Save / finalize). Unrelated to the Labels tab (internal barcode printing).
 --   * Reagents: everything else.
 -- item_number is an optional, admin-assigned stock/part number on any item.
 CREATE TABLE IF NOT EXISTS consumables (
@@ -675,6 +768,7 @@ CREATE TABLE IF NOT EXISTS run_inputs (
     volume_l         REAL,      -- this tote's volume as measured for this run
     density_kg_l     REAL,      -- calculated: weight_kg / volume_l
     decision         TEXT NOT NULL DEFAULT 'accepted',  -- accepted | rejected
+    decision_set     INTEGER NOT NULL DEFAULT 0,        -- 1 once an operator explicitly chose
     rejection_reason TEXT,
     notes            TEXT
 );
@@ -754,6 +848,17 @@ CREATE TABLE IF NOT EXISTS run_packaging_commits (
     container_unit TEXT NOT NULL,
     committed_qty  REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (run_id, container_unit)
+);
+
+-- FG labels follow the container: whenever the Packaging commit consumes N of
+-- a container, the label item mapped to (run SKU, that container) is consumed
+-- N too. Tracked per label item (not per container) so changing the run's SKU
+-- before finalize refunds the old SKU's labels and deducts the new one's.
+CREATE TABLE IF NOT EXISTS run_label_commits (
+    run_id         INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+    consumable_id  INTEGER NOT NULL REFERENCES consumables(id),
+    committed_qty  REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, consumable_id)
 );
 
 -- Same net-change commit model for the reagents (Citric Acid, Potassium
@@ -848,8 +953,94 @@ CREATE TABLE IF NOT EXISTS fg_lots (
     produced_date TEXT,
     tds           REAL,
     location      TEXT,
-    status        TEXT NOT NULL DEFAULT 'on_hand',  -- on_hand | hold | sold
+    status        TEXT NOT NULL DEFAULT 'on_hand',  -- pending_release | on_hand | hold | sold | disposed
     created_at    TEXT NOT NULL
+);
+
+-- Product release (review + QA sign-off) audit trail. APPEND-ONLY: rows are
+-- never updated or deleted by the app, and every row carries the hash of the
+-- row before it (prev_hash -> entry_hash), so any later tampering with the
+-- history breaks the chain and shows up in the "Verify audit trail" check.
+-- log_hash is the SHA-256 of the run's production-log snapshot at the moment
+-- of the event; a release is only valid for exactly the log that was reviewed.
+CREATE TABLE IF NOT EXISTS release_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id       INTEGER NOT NULL,
+    event_type   TEXT NOT NULL,     -- submitted | review_approved | review_returned | resubmitted |
+                                    -- released | release_rejected | reopened | voided | legacy_release
+    user_id      INTEGER,
+    user_name    TEXT,
+    user_email   TEXT,
+    capacity     TEXT,              -- Production Manager | Quality Manager | System
+    meaning      TEXT,              -- what the signature attests to
+    comment      TEXT,
+    log_hash     TEXT,
+    detail       TEXT,              -- JSON: from/to state, lots affected, trigger, ...
+    created_at   TEXT NOT NULL,
+    prev_hash    TEXT NOT NULL DEFAULT '',
+    entry_hash   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_release_events_run ON release_events(run_id);
+
+-- Revision tracker for a finalized run's production log. Rev 1 is the
+-- finalized record; every later change to the log (any section, via any
+-- endpoint) adds a revision holding a field-level diff (old -> new) and who
+-- made it. Append-only; runs finalized before this existed get a synthetic
+-- "original record" Rev 1 when displayed.
+CREATE TABLE IF NOT EXISTS run_revisions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+    rev_no      INTEGER NOT NULL,
+    kind        TEXT NOT NULL,      -- finalized | edit
+    user_name   TEXT,
+    created_at  TEXT NOT NULL,
+    summary     TEXT,
+    changes     TEXT,               -- JSON [{field, old, new}]
+    log_hash    TEXT,
+    category    TEXT,               -- amendment category (kind='amendment')
+    reason      TEXT,               -- why the log was amended
+    amendment_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_run_revisions_run ON run_revisions(run_id);
+
+-- A finalized run's production log is locked; changing it requires an
+-- amendment (reason + category). While open the run is 'amending' and its
+-- unsold finished goods are held. prior_* lets a no-change amendment be
+-- cancelled back to exactly where it was; start_snapshot is the log as it was
+-- when the amendment opened (the diff base for the revision it produces).
+CREATE TABLE IF NOT EXISTS run_amendments (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id            INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+    status            TEXT NOT NULL,        -- open | submitted | cancelled
+    category          TEXT NOT NULL,
+    reason            TEXT NOT NULL,
+    opened_by         TEXT,
+    opened_by_id      INTEGER,
+    opened_at         TEXT NOT NULL,
+    prior_state       TEXT,
+    prior_review_hash TEXT,
+    prior_lots        TEXT,
+    start_snapshot    TEXT,
+    start_hash        TEXT,
+    was_complete      INTEGER NOT NULL DEFAULT 0,
+    closed_by         TEXT,
+    closed_at         TEXT,
+    submit_comment    TEXT,
+    revision_no       INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_run_amendments_run ON run_amendments(run_id);
+
+-- Who granted/removed the Production Manager / Quality Manager sign-off
+-- permissions, and when (the permissions decide who may sign).
+CREATE TABLE IF NOT EXISTS user_permission_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    user_email  TEXT,
+    permission  TEXT NOT NULL,
+    old_value   INTEGER,
+    new_value   INTEGER,
+    changed_by  TEXT,
+    changed_at  TEXT NOT NULL
 );
 """
 
@@ -920,7 +1111,32 @@ def init_db():
         seed(conn)
     ensure_users(conn)
     conn.commit()
+    rebaseline_release_hashes(conn)
+    conn.commit()
     conn.close()
+
+
+# What a production-log sign-off hashes (Handler._release_snapshot) is versioned. If you
+# change that snapshot's content or format, BUMP this: on the next boot every run that is
+# currently reviewed/released is re-hashed (one SYSTEM audit event each), so a format
+# change is never mistaken for someone altering a signed log.
+RELEASE_SNAPSHOT_VERSION = 2
+
+
+def rebaseline_release_hashes(conn):
+    ver = conn.execute("PRAGMA user_version").fetchone()[0]
+    if ver >= RELEASE_SNAPSHOT_VERSION:
+        return
+    h = Handler.__new__(Handler)   # snapshot helpers only need a connection, not a request
+    for r in conn.execute("SELECT id, release_state FROM production_runs"
+                          " WHERE release_state IN ('pending_release','released') AND release_review_hash IS NOT NULL").fetchall():
+        new_hash = h._release_snapshot_hash(conn, r["id"])
+        conn.execute("UPDATE production_runs SET release_review_hash=? WHERE id=?", (new_hash, r["id"]))
+        release_log(conn, r["id"], "rebaseline", None, capacity="System",
+                    meaning="Production-log snapshot format changed (version %d); the signed log hash was recomputed "
+                            "from the current log." % RELEASE_SNAPSHOT_VERSION,
+                    log_hash=new_hash, detail={"snapshotVersion": RELEASE_SNAPSHOT_VERSION, "state": r["release_state"]})
+    conn.execute("PRAGMA user_version=%d" % RELEASE_SNAPSHOT_VERSION)
 
 
 def _rename_consumable(conn, old_name, new_name):
@@ -989,6 +1205,20 @@ def migrate(conn):
         conn.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
     if "active" not in ucols:
         conn.execute("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+    # Product-release sign-off permissions (independent of the admin/user role).
+    if "is_production_manager" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN is_production_manager INTEGER NOT NULL DEFAULT 0")
+    if "is_quality_manager" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN is_quality_manager INTEGER NOT NULL DEFAULT 0")
+    if "can_amend_log" not in ucols:
+        # Production Log Amender: may open/edit/submit an amendment on a finalized run. Anyone who
+        # already held a Production or Quality Manager permission keeps the ability they had.
+        conn.execute("ALTER TABLE users ADD COLUMN can_amend_log INTEGER NOT NULL DEFAULT 0")
+        for u in conn.execute("SELECT id, email FROM users WHERE is_production_manager=1 OR is_quality_manager=1").fetchall():
+            conn.execute("UPDATE users SET can_amend_log=1 WHERE id=?", (u["id"],))
+            conn.execute("INSERT INTO user_permission_log (user_id,user_email,permission,old_value,new_value,changed_by,changed_at)"
+                         " VALUES (?,?,?,?,?,?,?)", (u["id"], u["email"], "Production Log Amender", 0, 1,
+                                                    "SYSTEM (migration: existing managers)", now_iso()))
     prcols = {r["name"] for r in conn.execute("PRAGMA table_info(production_runs)")}
     if "status" not in prcols:
         conn.execute("ALTER TABLE production_runs ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'")
@@ -1037,6 +1267,9 @@ def migrate(conn):
         ("nabenzoate_kg", "REAL DEFAULT 0"),
         ("exclude_from_stats", "INTEGER NOT NULL DEFAULT 0"), ("exclude_reason", "TEXT"),
         ("finalized_at", "TEXT"),
+        ("finalized_by", "TEXT"),
+        ("release_state", "TEXT"),          # pending_review | pending_release | released | returned | rejected | legacy
+        ("release_review_hash", "TEXT"),    # log snapshot hash the approving review signed
         ("packaging_started_at", "TEXT"), ("packaging_packaged_at", "TEXT"),
         ("packaging_qc_ph", "REAL"), ("packaging_tds_pct", "REAL"), ("packaging_brix_pct", "REAL"),
         ("packaging_mannitol_pct", "REAL"), ("packaging_ts_liquid_pct", "REAL"),
@@ -1065,7 +1298,19 @@ def migrate(conn):
     # Every Sample Point row created before this column existed belongs to
     # the (only, at the time) Homogenization Sample Point box.
     conn.execute("UPDATE run_sample_points SET stage='homogenization' WHERE stage IS NULL")
+    rrcols = {r["name"] for r in conn.execute("PRAGMA table_info(run_revisions)")}
+    for col, decl in (("category", "TEXT"), ("reason", "TEXT"), ("amendment_id", "INTEGER")):
+        if col not in rrcols:
+            conn.execute("ALTER TABLE run_revisions ADD COLUMN %s %s" % (col, decl))
     ricols = {r["name"] for r in conn.execute("PRAGMA table_info(run_inputs)")}
+    if "decision_set" not in ricols:
+        # The accept/reject decision is now a required, explicit choice. The
+        # column itself can't be blank (NOT NULL DEFAULT 'accepted'), so this
+        # flag records whether an operator actually chose. Every input of an
+        # already-finalized run is treated as decided.
+        conn.execute("ALTER TABLE run_inputs ADD COLUMN decision_set INTEGER NOT NULL DEFAULT 0")
+        conn.execute("UPDATE run_inputs SET decision_set=1 WHERE run_id IN"
+                     " (SELECT id FROM production_runs WHERE status='completed')")
     for col, decl in [
         ("loaded_at", "TEXT"), ("surface_photo", "TEXT"), ("striation_photo", "TEXT"),
         ("ph", "REAL"), ("ph_measured_at", "TEXT"), ("orp", "REAL"), ("orp_range", "TEXT"),
@@ -1251,6 +1496,33 @@ def migrate(conn):
     if not conn.execute("SELECT 1 FROM consumables WHERE name='55 gallon drum'").fetchone():
         conn.execute("INSERT INTO consumables (name,unit,on_hand,reorder_level,is_container,litres_each)"
                      " VALUES ('55 gallon drum','drum',0,0,1,208.2)")
+    # A finished-good label item for every product SKU in each of the two bulk
+    # package types (1,000 L IBC and 55 gal drum); on-hand starts at 0 to be
+    # counted in. Insert-only, so an existing label (and its stock) is never
+    # touched and a SKU added later gets its labels on the next boot.
+    for pkg in ("New 1,000 L IBC Tote", "55 gallon drum"):
+        if not conn.execute("SELECT 1 FROM consumables WHERE is_container=1 AND name=?", (pkg,)).fetchone():
+            continue
+        for sku in conn.execute("SELECT code, name FROM fg_skus ORDER BY code").fetchall():
+            if conn.execute("SELECT 1 FROM consumables WHERE label_sku_code=? AND label_package=?",
+                            (sku["code"], pkg)).fetchone():
+                continue
+            name = "FG Label - %s - %s" % (sku["name"], pkg)
+            if conn.execute("SELECT 1 FROM consumables WHERE name=?", (name,)).fetchone():
+                continue
+            conn.execute("INSERT INTO consumables (name,unit,on_hand,reorder_level,label_sku_code,label_package)"
+                         " VALUES (?,'ea',0,0,?,?)", (name, sku["code"], pkg))
+    # Product release: every run finalized before the process existed is
+    # grandfathered as released (one SYSTEM audit event each, no review hash),
+    # so lots already in stock stay sellable. Runs finalized from now on get a
+    # release_state at finalize, so this only ever touches the pre-process runs.
+    for r in conn.execute("SELECT id, processing_lot FROM production_runs"
+                          " WHERE status='completed' AND release_state IS NULL ORDER BY id").fetchall():
+        conn.execute("UPDATE production_runs SET release_state='legacy' WHERE id=?", (r["id"],))
+        release_log(conn, r["id"], "legacy_release", None, capacity="System",
+                    meaning="Finalized before the product release process existed; grandfathered as released "
+                            "without a production-log review or Quality sign-off.",
+                    detail={"to": "legacy", "lot": r["processing_lot"]})
 
 
 def ensure_users(conn):
@@ -1359,6 +1631,61 @@ def tote_public(r):
             "notes": r["notes"]}
 
 
+def _canon(v):
+    return json.dumps(v, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def release_entry_hash(prev_hash, run_id, event_type, user_id, user_name, capacity, meaning, comment,
+                       log_hash, detail, created_at):
+    payload = "\x1f".join("" if x is None else str(x) for x in (
+        prev_hash, run_id, event_type, user_id, user_name, capacity, meaning, comment,
+        log_hash, detail, created_at))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def release_log(conn, run_id, event_type, user, capacity=None, meaning=None, comment=None,
+                log_hash=None, detail=None):
+    """Append one event to the tamper-evident release audit trail (never
+    edited or deleted afterwards). `user` is a users row, or None for SYSTEM."""
+    last = conn.execute("SELECT entry_hash FROM release_events ORDER BY id DESC LIMIT 1").fetchone()
+    prev_hash = last["entry_hash"] if last else ""
+    ts = now_iso()
+    uid = user["id"] if user else None
+    uname = user["name"] if user else "SYSTEM"
+    uemail = user["email"] if user else None
+    detail_s = _canon(detail) if detail else None
+    entry = release_entry_hash(prev_hash, run_id, event_type, uid, uname, capacity, meaning, comment,
+                               log_hash, detail_s, ts)
+    conn.execute(
+        "INSERT INTO release_events (run_id,event_type,user_id,user_name,user_email,capacity,meaning,"
+        "comment,log_hash,detail,created_at,prev_hash,entry_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (run_id, event_type, uid, uname, uemail, capacity, meaning, comment, log_hash, detail_s, ts,
+         prev_hash, entry))
+
+
+def release_verify_chain(conn):
+    """Recompute every hash in order; report the first event whose stored hash
+    or link to its predecessor doesn't match."""
+    prev = ""
+    n = 0
+    for r in conn.execute("SELECT * FROM release_events ORDER BY id"):
+        n += 1
+        expect = release_entry_hash(prev, r["run_id"], r["event_type"], r["user_id"], r["user_name"],
+                                    r["capacity"], r["meaning"], r["comment"], r["log_hash"], r["detail"],
+                                    r["created_at"])
+        if r["prev_hash"] != prev or r["entry_hash"] != expect:
+            return {"ok": False, "events": n, "brokenAtEventId": r["id"], "runId": r["run_id"]}
+        prev = r["entry_hash"]
+    return {"ok": True, "events": n, "brokenAtEventId": None, "runId": None}
+
+
+RELEASE_LABELS = {
+    "pending_review": "Pending review", "pending_release": "Awaiting QA release", "released": "Released",
+    "returned": "Returned for correction", "rejected": "Rejected - on hold", "legacy": "Released (pre-process)",
+    "amending": "Under amendment",
+}
+
+
 def fg_public(r):
     return {"id": r["id"], "lot": r["fg_lot_number"], "sku": r["sku_code"],
             "runId": r["run_id"], "packageSize": r["package_size"], "qty": r["qty"],
@@ -1458,9 +1785,10 @@ def run_public(r):
 # HTTP plumbing
 # --------------------------------------------------------------------------- #
 class ApiError(Exception):
-    def __init__(self, status, message):
+    def __init__(self, status, message, code=None):
         self.status = status
         self.message = message
+        self.code = code
 
 
 CONTENT_TYPES = {
@@ -1767,7 +2095,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(result if result is not None else {"ok": True})
         except ApiError as e:
             conn.rollback()
-            self._send_json({"error": e.message}, status=e.status)
+            self._send_json({"error": e.message, **({"code": e.code} if e.code else {})}, status=e.status)
         except Exception as e:  # pragma: no cover
             conn.rollback()
             self._send_json({"error": "Server error: %s" % e}, status=500)
@@ -1805,7 +2133,14 @@ class Handler(BaseHTTPRequestHandler):
         if seg[:2] == ["api", "cip"]:
             return self.route_cip(method, seg, conn, user)
         if seg[:2] == ["api", "production"]:
+            # A finalized run's production log is locked: writes need an open
+            # amendment (documents and the yield-analysis flag are exempt).
+            self._amend_guard(conn, method, seg, user)
             return self.route_production(method, seg, conn, user)
+        if seg[:2] == ["api", "integrity"]:
+            return self.route_integrity(method, seg, conn, user)
+        if seg[:2] == ["api", "release"]:
+            return self.route_release(method, seg, query, conn, user)
         if seg[:2] == ["api", "fg"]:
             return self.route_fg(method, seg, query, conn)
         if seg[:2] == ["api", "customers"]:
@@ -1839,17 +2174,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def _me(self, row):
         return {"id": row["id"], "name": row["name"], "email": row["email"],
-                "role": row["role"], "mustChange": bool(row["must_change_password"])}
+                "role": row["role"], "mustChange": bool(row["must_change_password"]),
+                "isProductionManager": bool(row["is_production_manager"]),
+                "isQualityManager": bool(row["is_quality_manager"]),
+                "canAmendLog": bool(row["can_amend_log"])}
 
     # ---- users / admin ---------------------------------------------------- #
     def _user_public(self, r):
         return {"id": r["id"], "name": r["name"], "email": r["email"], "role": r["role"],
                 "active": bool(r["active"]), "mustChange": bool(r["must_change_password"]),
+                "isProductionManager": bool(r["is_production_manager"]),
+                "isQualityManager": bool(r["is_quality_manager"]),
+                "canAmendLog": bool(r["can_amend_log"]),
                 "createdAt": r["created_at"]}
 
     def _users(self, conn):
         return [self._user_public(r) for r in conn.execute(
             "SELECT * FROM users ORDER BY active DESC, role DESC, email")]
+
+    def _log_permission(self, conn, uid, email, perm, old, new, actor):
+        conn.execute(
+            "INSERT INTO user_permission_log (user_id,user_email,permission,old_value,new_value,changed_by,changed_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (uid, email, perm, old, new, actor["name"] if actor else None, now_iso()))
 
     def _active_admin_count(self, conn, exclude_id=None):
         return conn.execute(
@@ -1887,10 +2234,15 @@ class Handler(BaseHTTPRequestHandler):
                 if conn.execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone():
                     raise ApiError(409, "A user with that email already exists")
                 must_change = 0 if d.get("mustChange") is False else 1
-                conn.execute(
-                    "INSERT INTO users (name,email,password_hash,role,must_change_password,active,created_at)"
-                    " VALUES (?,?,?,?,?,1,?)",
-                    (name, email, hash_password(pw), role, must_change, now_iso()))
+                pm, qm = int(bool(d.get("isProductionManager"))), int(bool(d.get("isQualityManager")))
+                am = int(bool(d.get("canAmendLog")))
+                cur = conn.execute(
+                    "INSERT INTO users (name,email,password_hash,role,must_change_password,active,created_at,"
+                    "is_production_manager,is_quality_manager,can_amend_log) VALUES (?,?,?,?,?,1,?,?,?,?)",
+                    (name, email, hash_password(pw), role, must_change, now_iso(), pm, qm, am))
+                for perm, val in (("Production Manager", pm), ("Quality Manager", qm), ("Production Log Amender", am)):
+                    if val:
+                        self._log_permission(conn, cur.lastrowid, email, perm, 0, 1, user)
                 return {"users": self._users(conn)}
         if len(seg) >= 3 and seg[2].isdigit():
             uid = int(seg[2])
@@ -1920,6 +2272,14 @@ class Handler(BaseHTTPRequestHandler):
                 conn.execute("UPDATE users SET name=?, role=?, active=? WHERE id=?",
                              ((d["name"].strip() if d.get("name") else target["name"]),
                               new_role, new_active, uid))
+                for key, col, perm in (("isProductionManager", "is_production_manager", "Production Manager"),
+                                       ("isQualityManager", "is_quality_manager", "Quality Manager"),
+                                       ("canAmendLog", "can_amend_log", "Production Log Amender")):
+                    if key in d:
+                        new_v = int(bool(d[key]))
+                        if new_v != int(target[col] or 0):
+                            conn.execute("UPDATE users SET %s=? WHERE id=?" % col, (new_v, uid))
+                            self._log_permission(conn, uid, target["email"], perm, int(target[col] or 0), new_v, user)
                 return {"users": self._users(conn)}
         raise ApiError(404, "Unknown users endpoint")
 
@@ -1961,7 +2321,7 @@ class Handler(BaseHTTPRequestHandler):
         return {"species": species, "sites": sites, "locations": locations,
                 "skus": skus, "customers": customers, "sops": sops,
                 "settings": get_settings(conn), "containers": containers,
-                "qcFields": qc_fields}
+                "qcFields": qc_fields, "requiredFields": required_keys_by_stage()}
 
     # ---- settings: admin-editable constants used by calculated fields ----- #
     def route_settings(self, method, seg, conn, user):
@@ -2855,15 +3215,21 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "Not enough %s on hand (%.1f < %.1f)" % (name, row["on_hand"], -delta))
         self._consume(conn, row["id"], delta, reason, ref, user_name)
 
-    def _commit_packaging_stock(self, conn, run_id, user_name=None):
+    def _commit_packaging_stock(self, conn, run_id, user_name=None, sku=None):
         """Nets the Packaging table's container/qty edits since the last
         commit into at most one consumable_txns line per container -- adding
         rows, bumping a qty a few times, then settling on a final number all
         collapse into a single "Packaging saved" entry reflecting the total
         change; a container whose total qty is unchanged since the last
-        commit is skipped entirely (no entry, no on-hand touch)."""
-        lot_row = conn.execute("SELECT processing_lot FROM production_runs WHERE id=?", (run_id,)).fetchone()
+        commit is skipped entirely (no entry, no on-hand touch).
+
+        The matching finished-good label (item mapped to the run's SKU + that
+        container) is consumed with it, one per container, using the same
+        net-change idea (see _commit_label_stock). `sku` overrides the run's
+        stored SKU -- finalize passes the SKU it is about to save."""
+        lot_row = conn.execute("SELECT processing_lot, sku_code FROM production_runs WHERE id=?", (run_id,)).fetchone()
         lot = lot_row["processing_lot"] if lot_row else None
+        sku = sku or (lot_row["sku_code"] if lot_row else None)
         current = {r["container_unit"]: (r["total"] or 0) for r in conn.execute(
             "SELECT container_unit, SUM(qty) total FROM run_packaging_entries"
             " WHERE run_id=? AND container_unit IS NOT NULL GROUP BY container_unit", (run_id,))}
@@ -2882,6 +3248,31 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 conn.execute("INSERT INTO run_packaging_commits (run_id,container_unit,committed_qty)"
                              " VALUES (?,?,?)", (run_id, unit, new_total))
+        self._commit_label_stock(conn, run_id, lot, sku, current, user_name)
+
+    def _commit_label_stock(self, conn, run_id, lot, sku, container_totals, user_name=None):
+        """One finished-good label per container consumed: nets the labels the
+        run should now have used (container totals mapped through the run's SKU
+        to label items) against run_label_commits, as one ledger line per label
+        item. No label item for a SKU + container means it simply isn't tracked.
+        A shortage never blocks (same as before), it shows as low/negative."""
+        want = {}
+        if sku:
+            for unit, qty in container_totals.items():
+                row = conn.execute("SELECT id FROM consumables WHERE label_sku_code=? AND label_package=?",
+                                   (sku, unit)).fetchone()
+                if row and qty:
+                    want[row["id"]] = want.get(row["id"], 0) + qty
+        have = {r["consumable_id"]: r["committed_qty"] for r in conn.execute(
+            "SELECT consumable_id, committed_qty FROM run_label_commits WHERE run_id=?", (run_id,))}
+        for cid in set(want) | set(have):
+            new_qty, old_qty = want.get(cid, 0), have.get(cid, 0)
+            if new_qty == old_qty:
+                continue
+            self._consume(conn, cid, old_qty - new_qty, "FG labels (packaging saved)", lot, user_name)
+            conn.execute("INSERT INTO run_label_commits (run_id,consumable_id,committed_qty) VALUES (?,?,?)"
+                         " ON CONFLICT(run_id,consumable_id) DO UPDATE SET committed_qty=excluded.committed_qty",
+                         (run_id, cid, new_qty))
 
     # Reagents deducted from the Dilution & Preservation entries: consumable
     # name -> the production_runs column holding that run's running total kg.
@@ -3150,28 +3541,776 @@ class Handler(BaseHTTPRequestHandler):
         ("qty", "qty", "num"),
     ]
 
+    def _run_full(self, conn, r):
+        """A completed run with its whole production log attached -- the
+        Production list payload, and (minus volatile/non-log keys, see
+        _release_snapshot_hash) the snapshot a release sign-off attests to."""
+        d = run_public(r)
+        d["inputTotes"] = [row["lot_number"] for row in conn.execute(
+            "SELECT t.lot_number FROM run_inputs ri JOIN tote_lots t ON t.id=ri.tote_lot_id "
+            "WHERE ri.run_id=? ORDER BY t.lot_number", (r["id"],))]
+        d["fgLots"] = [fg_public(row) for row in conn.execute(
+            "SELECT * FROM fg_lots WHERE run_id=? ORDER BY package_size", (r["id"],))]
+        d["edits"] = self._run_edits(conn, r["id"])
+        d["attachments"] = self._attachments(conn, r["id"])
+        d["qcSummary"] = {
+            "recorded": sum(1 for f in QC_FIELD_REGISTRY if r[f[0]] is not None),
+            "total": len(QC_FIELD_REGISTRY),
+        }
+        d["inputs"] = self._run_inputs_public(conn, r["id"])
+        d["dilutions"] = self._dilutions_public(conn, r["id"])
+        d["samplePoints"] = self._sample_points_public(conn, r["id"])
+        d["packagingEntries"] = self._packaging_entries_public(conn, r["id"])
+        d["release"] = {"state": r["release_state"], "label": RELEASE_LABELS.get(r["release_state"], "—"),
+                        "finalizedBy": r["finalized_by"]}
+        am = self._open_amendment(conn, r["id"])
+        d["amendment"] = self._amendment_public(am) if am else None
+        d["progress"] = self._run_progress(conn, r)
+        d["revisions"] = self._run_revisions_public(conn, r)
+        d["revision"] = d["revisions"][-1]["rev"] if d["revisions"] else 1
+        return d
+
+    # ---- production log: required fields + section progress ---------------- #
+    def _run_progress(self, conn, r):
+        """Per-section completeness against the required-field registry: how
+        many required fields have a value and which are still missing. A
+        section is `done` (green dot) only when none are missing."""
+        rid = r["id"]
+        stages = run_public(r)["stages"]
+        sections = []
+        for sec in PROGRESS_SECTIONS:
+            items = []   # (label, filled?)
+            if sec["key"] == "feedstock":
+                if r["status"] == "draft":
+                    try:
+                        dd = json.loads(r["draft_data"]) if r["draft_data"] else {}
+                    except ValueError:
+                        dd = {}
+                    tote_ids = [int(x) for x in (dd.get("toteIds") or [])]
+                    rows = {x["toteLotId"]: x for x in self._run_inputs_public(conn, rid)}
+                else:
+                    rows = {x["toteLotId"]: x for x in self._run_inputs_public(conn, rid)
+                            if x["decision"] != "rejected"}
+                    tote_ids = list(rows)
+                if not tote_ids:
+                    items.append(("At least one tote", False))
+                for tid in tote_ids:
+                    row = rows.get(tid) or {}
+                    lot = conn.execute("SELECT lot_number FROM tote_lots WHERE id=?", (tid,)).fetchone()
+                    name = lot["lot_number"] if lot else str(tid)
+                    for key, label in REQUIRED_FEEDSTOCK:
+                        items.append(("%s: %s" % (name, label), _has_value(row.get(key))))
+            else:
+                for stage, key, label in sec["fields"]:
+                    items.append((label, _has_value(stages[stage].get(key))))
+                if sec.get("sample_rows"):
+                    n = conn.execute("SELECT COUNT(*) c FROM run_sample_points WHERE run_id=? AND stage='packaging'",
+                                     (rid,)).fetchone()["c"]
+                    items.append((sec["sample_rows"], n > 0))
+                if sec.get("packaging_entries"):
+                    n = conn.execute("SELECT COUNT(*) c FROM run_packaging_entries WHERE run_id=? AND COALESCE(qty,0)>0",
+                                     (rid,)).fetchone()["c"]
+                    items.append((sec["packaging_entries"], n > 0))
+            missing = [l for l, ok in items if not ok]
+            filled = len(items) - len(missing)
+            sections.append({"key": sec["key"], "label": sec["label"], "total": len(items), "filled": filled,
+                             "missing": missing, "done": bool(items) and not missing, "started": filled > 0})
+        return {"sections": sections,
+                "requiredTotal": sum(x["total"] for x in sections),
+                "requiredFilled": sum(x["filled"] for x in sections),
+                "complete": all(x["done"] for x in sections)}
+
+    def _required_problems(self, conn, r):
+        """'' when every required field has a value, else a readable list."""
+        parts = []
+        init = []
+        if not r["sku_code"]:
+            init.append("Product SKU")
+        if not r["run_date"]:
+            init.append("Run date")
+        if not (r["location"] or "").strip():
+            init.append("Production location")
+        if not (r["operators"] or "").strip():
+            init.append("Operators")
+        if init:
+            parts.append("Initiation: " + ", ".join(init))
+        for sec in self._run_progress(conn, r)["sections"]:
+            if not sec["missing"]:
+                continue
+            if sec["key"] == "feedstock":
+                # "<tote lot>: <field>" items -> one line per tote
+                per = {}
+                for m in sec["missing"]:
+                    lot, _sep, field = m.partition(": ")
+                    per.setdefault(lot, []).append(field or lot)
+                for lot, fields in per.items():
+                    parts.append("Feedstock %s: %s" % (lot, ", ".join(fields)))
+            else:
+                parts.append("%s: %s" % (sec["label"], ", ".join(sec["missing"])))
+        return ("\n• " + "\n• ".join(parts)) if parts else ""
+
+    # ---- production log: revision tracker ----------------------------------- #
+    def _item_label(self, section, item):
+        if section == "inputs":
+            return "Feedstock %s" % (item.get("toteLot") or "#%s" % item["id"])
+        if section == "dilutions":
+            return "Dilution tank %s" % (item.get("tank") or "#%s" % item["id"])
+        if section == "samplePoints":
+            return "Sample point (%s)" % (" ".join(x for x in (item.get("stage"), item.get("type"), item.get("description")) if x) or "#%s" % item["id"])
+        if section == "packagingEntries":
+            return "Packaging entry %s" % (item.get("containerUnit") or "#%s" % item["id"])
+        if section == "attachments":
+            return "Document %s" % (item.get("filename") or "#%s" % item["id"])
+        return "%s #%s" % (humanize_key(section), item["id"])
+
+    def _flatten_snapshot(self, d):
+        flat, items = {}, {}
+
+        def walk(path, v, item):
+            if isinstance(v, dict):
+                for k, x in v.items():
+                    walk(path + (k,), x, item)
+            elif isinstance(v, list):
+                if all(isinstance(i, dict) and "id" in i for i in v):
+                    for i in v:
+                        ik = (path[0], i["id"])
+                        items[ik] = self._item_label(path[0], i)
+                        for k, x in i.items():
+                            if k != "id":
+                                walk(path + ("#%s" % i["id"], k), x, ik)
+                else:
+                    flat[path] = (_canon(v), item)
+            else:
+                flat[path] = (v, item)
+        walk((), d, None)
+        return flat, items
+
+    def _path_label(self, path, items, item):
+        if path[0] == "stages" and len(path) >= 3:
+            return "%s \u203a %s" % (STAGE_LABELS.get(path[1], humanize_key(path[1])), humanize_key(path[2]))
+        if item is not None:
+            return "%s \u203a %s" % (items.get(item, humanize_key(path[0])), humanize_key(path[-1]))
+        return humanize_key(path[0]) if len(path) == 1 else " \u203a ".join(humanize_key(x) for x in path)
+
+    def _snapshot_diff(self, before, after):
+        fb, ib = self._flatten_snapshot(before)
+        fa, ia = self._flatten_snapshot(after)
+        added, removed = set(ia) - set(ib), set(ib) - set(ia)
+        changes = [{"field": ia[k], "old": None, "new": "added"} for k in sorted(added, key=str)]
+        changes += [{"field": ib[k], "old": "present", "new": "removed"} for k in sorted(removed, key=str)]
+        for path in sorted(set(fb) | set(fa), key=str):
+            vb, itb = fb.get(path, (None, None))
+            va, ita = fa.get(path, (None, None))
+            item = ita if ita is not None else itb
+            if item in added or item in removed:
+                continue
+            if _fmtval(vb) == _fmtval(va):
+                continue
+            changes.append({"field": self._path_label(path, {**ib, **ia}, item),
+                            "old": _fmtval(vb) or None, "new": _fmtval(va) or None})
+        return changes
+
+    def _add_revision(self, conn, rid, kind, user, summary, changes, log_hash=None,
+                      category=None, reason=None, amendment_id=None):
+        last = conn.execute("SELECT MAX(rev_no) m FROM run_revisions WHERE run_id=?", (rid,)).fetchone()["m"]
+        rev = 1 if (last is None and kind == "finalized") else (last or 1) + 1
+        conn.execute(
+            "INSERT INTO run_revisions (run_id,rev_no,kind,user_name,created_at,summary,changes,log_hash,"
+            "category,reason,amendment_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (rid, rev, kind, user["name"] if user else None, now_iso(), summary,
+             json.dumps(changes) if changes else None, log_hash, category, reason, amendment_id))
+        return rev
+
+    def _run_revisions_public(self, conn, r):
+        rows = [{"rev": x["rev_no"], "kind": x["kind"], "by": x["user_name"], "at": x["created_at"],
+                 "summary": x["summary"], "changes": json.loads(x["changes"]) if x["changes"] else [],
+                 "logHash": x["log_hash"], "reason": x["reason"],
+                 "category": self.AMEND_CATEGORIES.get(x["category"], x["category"]) if x["category"] else None}
+                for x in conn.execute("SELECT * FROM run_revisions WHERE run_id=? ORDER BY rev_no, id", (r["id"],))]
+        if not any(x["rev"] == 1 for x in rows):
+            rows.insert(0, {"rev": 1, "kind": "original", "by": r["finalized_by"],
+                            "at": r["finalized_at"] or r["created_at"],
+                            "summary": "Original record" + ("" if r["release_state"] != "legacy"
+                                                            else " (finalized before revision tracking)"),
+                            "changes": [], "logHash": None})
+        return rows
+
+    # ---- product release: review + Quality sign-off ----------------------- #
+    # Finalizing a run holds its finished goods in 'pending_release'. A
+    # Production or Quality Manager reviews the production log and signs it
+    # off (pending_review -> pending_release), then a Quality Manager signs
+    # to release (-> released, lots become 'on_hand' and sellable). Every
+    # step re-asks for the signer's password, records who/when/what they
+    # attested to and the SHA-256 of the log they saw, and is appended to
+    # the hash-chained release_events table. Any later change to the log
+    # voids a review/release, returning the run (and its unsold lots) to
+    # pending review.
+    # Fields that don't belong to the production log itself (audit list, FG
+    # inventory movements, the analysis-exclusion flag, release bookkeeping):
+    # excluded so moving or selling a lot never "changes the log".
+    # Documents are not production-log entries, so they never change the log hash
+    # (and never need an amendment).
+    _RELEASE_HASH_SKIP = ("edits", "fgLots", "release", "excludeFromStats", "excludeReason",
+                          "progress", "revisions", "revision", "attachments", "amendment")
+
+    def _release_snapshot(self, conn, rid):
+        r = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
+        d = self._run_full(conn, r)
+        for k in self._RELEASE_HASH_SKIP:
+            d.pop(k, None)
+        return d
+
+    def _release_snapshot_hash(self, conn, rid):
+        return hashlib.sha256(_canon(self._release_snapshot(conn, rid)).encode("utf-8")).hexdigest()
+
+    def _release_lots(self, conn, rid):
+        return [fg_public(x) for x in conn.execute(
+            "SELECT * FROM fg_lots WHERE run_id=? ORDER BY package_size, fg_lot_number", (rid,))]
+
+    def _set_lot_status(self, conn, rid, from_statuses, to_status):
+        """Move this run's lots between statuses; returns what moved."""
+        moved = []
+        for lot in conn.execute("SELECT * FROM fg_lots WHERE run_id=? AND status IN (%s)"
+                                % ",".join("?" * len(from_statuses)), (rid, *from_statuses)).fetchall():
+            conn.execute("UPDATE fg_lots SET status=? WHERE id=?", (to_status, lot["id"]))
+            moved.append({"lot": lot["fg_lot_number"], "qty": lot["qty"], "from": lot["status"], "to": to_status})
+        return moved
+
+    # ---- amend run: controlled changes to a finalized production log ---------- #
+    # A finalized run's production log is LOCKED. To change any log entry the
+    # user opens an AMENDMENT (reason + category). While it is open the run is
+    # 'amending': prior review/release no longer stands, unsold finished goods
+    # are held (Pending Release), and the log can be edited. Submitting records
+    # ONE revision (reason + field-level diff vs the log as it was when the
+    # amendment opened) and sends the run back for review. Documents
+    # (/attachments) and the yield-analysis exclusion flag are NOT log entries
+    # and never need an amendment; printing labels is client-side only.
+    AMEND_CATEGORIES = {
+        "data_entry_error": "Data entry error (correction)",
+        "late_entry": "Late data entry (completing blank fields)",
+        "process_deviation": "Process deviation / investigation finding",
+        "other": "Other",
+    }
+    _LOG_EXEMPT_SUBPATHS = ("attachments", "amendments", "progress")
+
+    def _open_amendment(self, conn, rid):
+        return conn.execute("SELECT * FROM run_amendments WHERE run_id=? AND status='open'", (rid,)).fetchone()
+
+    def _amend_guard(self, conn, method, seg, user):
+        """Reject writes to a finalized run's production log unless an amendment is open
+        (and then only by a user with the Production Log Amender permission)."""
+        if method == "GET" or len(seg) < 3 or not seg[2].isdigit():
+            return
+        rid = int(seg[2])
+        r = conn.execute("SELECT status FROM production_runs WHERE id=?", (rid,)).fetchone()
+        if not r or r["status"] != "completed":
+            return
+        sub = seg[3] if len(seg) > 3 else None
+        if sub in self._LOG_EXEMPT_SUBPATHS:
+            return
+        if len(seg) == 3 and method == "PUT":
+            return          # edit_run decides itself (the exclusion flag is exempt)
+        if self._open_amendment(conn, rid):
+            if not user["can_amend_log"]:
+                raise ApiError(403, "Only users with the Production Log Amender permission can edit a run under amendment")
+            return
+        raise ApiError(409, "This production run is finalized and its log is locked. Use \"Amend run\" "
+                            "(with a reason) to change production-log entries.", "amendment_required")
+
+    def _amendment_public(self, a):
+        return {"id": a["id"], "runId": a["run_id"], "status": a["status"], "category": a["category"],
+                "categoryLabel": self.AMEND_CATEGORIES.get(a["category"], a["category"]), "reason": a["reason"],
+                "openedBy": a["opened_by"], "openedAt": a["opened_at"], "priorState": a["prior_state"],
+                "closedBy": a["closed_by"], "closedAt": a["closed_at"], "submitComment": a["submit_comment"],
+                "revision": a["revision_no"]}
+
+    def _amend_impact(self, conn, r):
+        state = r["release_state"]
+        return {"state": state, "stateLabel": RELEASE_LABELS.get(state, state),
+                "needsSignature": state in ("pending_release", "released", "legacy", "rejected"),
+                "lots": self._release_lots(conn, r["id"]), "shipped": self._shipped_units(conn, r["id"])}
+
+    def route_amendments(self, method, seg, conn, user):
+        rid = int(seg[2])
+        r = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
+        if not r or r["status"] != "completed":
+            raise ApiError(404, "Finalized production run not found")
+        if len(seg) == 4 and method == "GET":
+            rows = conn.execute("SELECT * FROM run_amendments WHERE run_id=? ORDER BY id DESC", (rid,)).fetchall()
+            op = self._open_amendment(conn, rid)
+            return {"amendments": [self._amendment_public(a) for a in rows],
+                    "open": self._amendment_public(op) if op else None,
+                    "impact": self._amend_impact(conn, r), "categories": self.AMEND_CATEGORIES}
+        if len(seg) == 4 and method == "POST":
+            return self._amend_open_new(conn, r, user, self._body_json())
+        if len(seg) == 6 and seg[4].isdigit():
+            a = conn.execute("SELECT * FROM run_amendments WHERE id=? AND run_id=?", (int(seg[4]), rid)).fetchone()
+            if not a:
+                raise ApiError(404, "Amendment not found")
+            if method == "GET" and seg[5] == "preview":
+                return self._amend_preview(conn, r, a)
+            if method == "POST" and seg[5] in ("submit", "cancel"):
+                return self._amend_close(conn, r, a, seg[5], user, self._body_json())
+        raise ApiError(404, "Unknown amendment endpoint")
+
+    def _amend_open_new(self, conn, r, user, d):
+        rid, state = r["id"], r["release_state"]
+        if state == "amending" or self._open_amendment(conn, rid):
+            raise ApiError(409, "This run already has an open amendment")
+        category = (d.get("category") or "").strip()
+        reason = (d.get("reason") or "").strip()
+        if category not in self.AMEND_CATEGORIES:
+            raise ApiError(400, "Choose the category of this amendment")
+        if len(reason) < 5:
+            raise ApiError(400, "Enter the reason for amending this run (what is being changed and why)")
+        if not user["can_amend_log"]:
+            raise ApiError(403, "You don't have permission to amend production logs (ask an administrator for the "
+                                "Production Log Amender permission)")
+        capacity = None
+        if state in ("pending_release", "released", "legacy", "rejected"):
+            # Amending product that was reviewed/released is a signed act: re-enter your password.
+            if not verify_password(d.get("password") or "", user["password_hash"]):
+                raise ApiError(400, "Password is incorrect - your signature was not recorded")
+            capacity = "Production Log Amender"
+        start = self._release_snapshot(conn, rid)
+        start_hash = hashlib.sha256(_canon(start).encode("utf-8")).hexdigest()
+        was_complete = 1 if self._run_progress(conn, r)["complete"] else 0
+        prior_lots = [{"id": x["id"], "status": x["status"]} for x in conn.execute(
+            "SELECT id, status FROM fg_lots WHERE run_id=?", (rid,))]
+        held = self._set_lot_status(conn, rid, ("on_hand",), "pending_release") if state in ("released", "legacy") else []
+        shipped = self._shipped_units(conn, rid)
+        cur = conn.execute(
+            "INSERT INTO run_amendments (run_id,status,category,reason,opened_by,opened_by_id,opened_at,prior_state,"
+            "prior_review_hash,prior_lots,start_snapshot,start_hash,was_complete) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (rid, "open", category, reason, user["name"], user["id"], now_iso(), state, r["release_review_hash"],
+             json.dumps(prior_lots), _canon(start), start_hash, was_complete))
+        conn.execute("UPDATE production_runs SET release_state='amending', release_review_hash=NULL WHERE id=?", (rid,))
+        release_log(conn, rid, "amendment_opened", user, capacity=capacity,
+                    meaning="Amendment opened: the production log is unlocked for correction. Any prior review/release "
+                            "no longer stands; finished goods are held until the amendment is re-reviewed.",
+                    comment="[%s] %s" % (self.AMEND_CATEGORIES[category], reason), log_hash=start_hash,
+                    detail={"from": state, "to": "amending", "amendmentId": cur.lastrowid, "lotsHeld": held,
+                            "alreadyShippedLots": shipped})
+        return {"amendment": self._amendment_public(conn.execute("SELECT * FROM run_amendments WHERE id=?", (cur.lastrowid,)).fetchone())}
+
+    def _amend_changes(self, conn, rid, a):
+        before = json.loads(a["start_snapshot"])
+        after = self._release_snapshot(conn, rid)
+        return self._snapshot_diff(before, after), after
+
+    def _amend_preview(self, conn, r, a):
+        changes, _after = self._amend_changes(conn, r["id"], a)
+        prog = self._run_progress(conn, r)
+        missing = []
+        if a["was_complete"] and not prog["complete"]:
+            missing = ["%s: %s" % (s_["label"], ", ".join(s_["missing"])) for s_ in prog["sections"] if s_["missing"]]
+        return {"amendment": self._amendment_public(a), "changes": changes, "missingRequired": missing,
+                "canSubmit": a["status"] == "open" and bool(changes) and not missing}
+
+    def _amend_close(self, conn, r, a, action, user, d):
+        rid = r["id"]
+        if a["status"] != "open":
+            raise ApiError(409, "This amendment is already %s" % a["status"])
+        can_close = bool(user["can_amend_log"] or user["is_production_manager"] or user["is_quality_manager"]
+                         or user["role"] == "admin")
+        if user["id"] != a["opened_by_id"] and not can_close:
+            raise ApiError(403, "Only the person who opened the amendment, an amender, a manager or an administrator can close it")
+        if user["id"] == a["opened_by_id"] and not user["can_amend_log"] and not can_close:
+            raise ApiError(403, "You no longer have the Production Log Amender permission")
+        comment = (d.get("comment") or "").strip() or None
+        changes, after = self._amend_changes(conn, rid, a)
+        now_hash = hashlib.sha256(_canon(after).encode("utf-8")).hexdigest()
+        if action == "cancel":
+            if changes:
+                raise ApiError(409, "Changes have already been made, so this amendment can't be cancelled - submit it "
+                                    "(a reviewer can return it) so the changes stay on record")
+            for pl in json.loads(a["prior_lots"] or "[]"):
+                cur = conn.execute("SELECT status FROM fg_lots WHERE id=?", (pl["id"],)).fetchone()
+                if cur and cur["status"] == "pending_release" and pl["status"] != "pending_release":
+                    conn.execute("UPDATE fg_lots SET status=? WHERE id=?", (pl["status"], pl["id"]))
+            conn.execute("UPDATE production_runs SET release_state=?, release_review_hash=? WHERE id=?",
+                         (a["prior_state"], a["prior_review_hash"], rid))
+            conn.execute("UPDATE run_amendments SET status='cancelled', closed_by=?, closed_at=?, submit_comment=? WHERE id=?",
+                         (user["name"], now_iso(), comment, a["id"]))
+            release_log(conn, rid, "amendment_cancelled", user, capacity=None,
+                        meaning="Amendment cancelled with no changes; the run is restored to its prior status.",
+                        comment=comment, log_hash=now_hash, detail={"amendmentId": a["id"], "restoredTo": a["prior_state"]})
+        else:
+            if not changes:
+                raise ApiError(409, "No changes were made - cancel the amendment instead")
+            if a["was_complete"]:
+                prog = self._run_progress(conn, r)
+                if not prog["complete"]:
+                    miss = "; ".join("%s: %s" % (s_["label"], ", ".join(s_["missing"])) for s_ in prog["sections"] if s_["missing"])
+                    raise ApiError(400, "This run was complete before the amendment; required fields can't be left blank. Missing: " + miss)
+            summary = "Amendment (%s): %s" % (self.AMEND_CATEGORIES[a["category"]], a["reason"])
+            rev = self._add_revision(conn, rid, "amendment", user, summary, changes, now_hash,
+                                     category=a["category"], reason=a["reason"], amendment_id=a["id"])
+            conn.execute("UPDATE run_amendments SET status='submitted', closed_by=?, closed_at=?, submit_comment=?, revision_no=? WHERE id=?",
+                         (user["name"], now_iso(), comment, rev, a["id"]))
+            conn.execute("UPDATE production_runs SET release_state='pending_review', release_review_hash=NULL WHERE id=?", (rid,))
+            release_log(conn, rid, "amendment_submitted", user, capacity=None,
+                        meaning="Amendment submitted: production log changes recorded as Rev %d and sent for re-review." % rev,
+                        comment=comment, log_hash=now_hash,
+                        detail={"amendmentId": a["id"], "revision": rev, "changes": len(changes), "to": "pending_review"})
+        return {"amendment": self._amendment_public(conn.execute("SELECT * FROM run_amendments WHERE id=?", (a["id"],)).fetchone())}
+
+    # ---- data integrity check -------------------------------------------- #
+    def _integrity_actor(self, conn, user, d):
+        if not (user["role"] == "admin" or user["is_quality_manager"]):
+            raise ApiError(403, "Only an administrator or Quality Manager can run the integrity check")
+
+    def _units_accounting(self, conn, rid):
+        """Per container unit: packaged (entries), still in FG lots, shipped, disposed."""
+        out = {}
+        for unit, tot in self._packaging_totals(conn, rid).items():
+            out.setdefault(unit, {})["entries"] = tot
+        lots = conn.execute("SELECT id, fg_lot_number, package_size, qty FROM fg_lots WHERE run_id=?", (rid,)).fetchall()
+        for l in lots:
+            u = out.setdefault(l["package_size"], {})
+            u["lots"] = u.get("lots", 0) + (l["qty"] or 0)
+            u["shipped"] = u.get("shipped", 0) + (conn.execute(
+                "SELECT COALESCE(SUM(sl.qty),0) q FROM shipment_lines sl JOIN shipments s ON s.id=sl.shipment_id"
+                " WHERE s.status!='cancelled' AND sl.fg_lot_id=?", (l["id"],)).fetchone()["q"])
+            u["disposed"] = u.get("disposed", 0) + (conn.execute(
+                "SELECT COALESCE(SUM(qty),0) q FROM disposals WHERE entity_type='fg' AND ref=?", (l["fg_lot_number"],)).fetchone()["q"])
+        for u in out.values():
+            for k in ("entries", "lots", "shipped", "disposed"):
+                u.setdefault(k, 0)
+            u["accounted"] = u["lots"] + u["shipped"] + u["disposed"]
+        return out
+
+    def _integrity_check(self, conn):
+        issues = []
+
+        def add(sev, area, run, msg, action=None, repair=None):
+            issues.append({"severity": sev, "area": area, "runId": run["id"] if run else None,
+                           "run": run["processing_lot"] if run else None, "message": msg,
+                           "action": action, "repair": repair})
+
+        unit_litres = packaging_container_litres_map(conn)
+        no_entries, incomplete = [], []
+        for r in conn.execute("SELECT * FROM production_runs WHERE status='completed' ORDER BY id").fetchall():
+            rid, state = r["id"], r["release_state"]
+            acct = self._units_accounting(conn, rid)
+            has_entries = any(u["entries"] for u in acct.values())
+            if not has_entries:
+                no_entries.append(r["processing_lot"])
+            else:
+                for unit, u in sorted(acct.items()):
+                    if abs(u["entries"] - u["accounted"]) > 1e-6:
+                        add("error", "Finished goods vs packaging", r,
+                            "%s: packaging entries total %g but finished-goods lots (%g) + shipped (%g) + disposed (%g) = %g."
+                            % (unit, u["entries"], u["lots"], u["shipped"], u["disposed"], u["accounted"]),
+                            "Resync the FG lots to the packaging entries (the packaging rows are the source of truth).",
+                            "resync_lots")
+                expected = round(sum(unit_litres[e["container_unit"]] * num(e["qty"]) for e in conn.execute(
+                    "SELECT container_unit, qty FROM run_packaging_entries WHERE run_id=?", (rid,))
+                    if e["container_unit"] in unit_litres and num(e["qty"]) > 0), 2)
+                if abs((r["output_litres"] or 0) - expected) > 0.01:
+                    add("warning", "Output litres", r, "Run output is %g L but its packaging entries total %g L."
+                        % (r["output_litres"] or 0, expected), "Recompute the run's output litres.", "recompute_output")
+                commits = {c["container_unit"]: c["committed_qty"] for c in conn.execute(
+                    "SELECT container_unit, committed_qty FROM run_packaging_commits WHERE run_id=?", (rid,))}
+                if commits:
+                    for unit, u in acct.items():
+                        if abs(commits.get(unit, 0) - u["entries"]) > 1e-6:
+                            add("warning", "Container / label stock", r,
+                                "%s: stock was last committed for %g unit(s) but the packaging entries total %g."
+                                % (unit, commits.get(unit, 0), u["entries"]),
+                                "Re-commit the net difference to container and label stock.", "recommit_stock")
+            for l in conn.execute("SELECT * FROM fg_lots WHERE run_id=?", (rid,)).fetchall():
+                if (l["qty"] or 0) < 0:
+                    add("error", "Finished goods", r, "Lot %s has a negative quantity (%g)." % (l["fg_lot_number"], l["qty"]))
+                if l["status"] == "on_hand" and state in ("pending_review", "pending_release", "returned", "amending") and (l["qty"] or 0) > 0:
+                    add("error", "Release gate", r, "Lot %s is On hand (sellable) but its run is '%s'."
+                        % (l["fg_lot_number"], RELEASE_LABELS.get(state, state)),
+                        "Return the lot to Pending Release.", "fix_lot_status")
+                if l["status"] == "pending_release" and state in ("released", "legacy"):
+                    add("warning", "Release gate", r, "Lot %s is Pending Release although its run is released."
+                        % l["fg_lot_number"], "Release the lot (status On hand).", "fix_lot_status")
+            if state in ("pending_release", "released") and r["release_review_hash"]:
+                if self._release_snapshot_hash(conn, rid) != r["release_review_hash"]:
+                    add("error", "Production log", r,
+                        "The production log no longer matches the log that was signed off - it was changed outside the amendment workflow.",
+                        "A Quality Manager should reopen the run and re-review it.")
+            op = self._open_amendment(conn, rid)
+            if op and state != "amending":
+                add("error", "Amendment", r, "An amendment is open but the run status is '%s'." % RELEASE_LABELS.get(state, state))
+            if state == "amending" and not op:
+                add("error", "Amendment", r, "The run is 'Under amendment' but no amendment is open.")
+            if op:
+                age = (datetime.datetime.utcnow() - datetime.datetime.strptime(op["opened_at"][:19], "%Y-%m-%dT%H:%M:%S")).days
+                if age >= 7:
+                    add("warning", "Amendment", r, "Amendment opened by %s %d days ago is still open - its finished goods are on hold."
+                        % (op["opened_by"], age), "Submit or cancel the amendment.")
+            if state != "legacy" and not self._run_progress(conn, r)["complete"]:
+                incomplete.append(r["processing_lot"])
+        chain = release_verify_chain(conn)
+        if not chain["ok"]:
+            issues.append({"severity": "error", "area": "Audit trail", "runId": chain["runId"], "run": None,
+                           "message": "The release audit trail hash chain is broken at event #%s." % chain["brokenAtEventId"],
+                           "action": "Restore from a backup and investigate; this indicates the audit table was altered.", "repair": None})
+        if incomplete:
+            issues.append({"severity": "info", "area": "Required fields", "runId": None, "run": None,
+                           "message": "%d finalized run(s) are missing required production-log fields: %s."
+                                      % (len(incomplete), ", ".join(incomplete)),
+                           "action": "Complete them through an Amend run (category: late data entry).", "repair": None})
+        if no_entries:
+            issues.append({"severity": "info", "area": "Finished goods vs packaging", "runId": None, "run": None,
+                           "message": "%d earlier run(s) have no packaging entries (finalized before the Packaging table), so their "
+                                      "finished goods can't be cross-checked: %s." % (len(no_entries), ", ".join(no_entries)),
+                           "action": None, "repair": None})
+        order = {"error": 0, "warning": 1, "info": 2}
+        issues.sort(key=lambda i: (order[i["severity"]], i["runId"] or 0))
+        for n, i in enumerate(issues, 1):
+            i["id"] = n
+        return {"checkedAt": now_iso(), "chain": chain,
+                "summary": {s_: sum(1 for i in issues if i["severity"] == s_) for s_ in ("error", "warning", "info")},
+                "issues": issues}
+
+    def _integrity_repair(self, conn, user, d):
+        self._integrity_actor(conn, user, d)
+        if not verify_password(d.get("password") or "", user["password_hash"]):
+            raise ApiError(400, "Password is incorrect - the repair was not applied")
+        kind = d.get("kind")
+        r = conn.execute("SELECT * FROM production_runs WHERE id=? AND status='completed'", (d.get("runId"),)).fetchone()
+        if not r:
+            raise ApiError(404, "Production run not found")
+        rid = r["id"]
+        unit_litres = packaging_container_litres_map(conn)
+        detail = {"kind": kind}
+        if kind == "resync_lots":
+            deltas = {}
+            for unit, u in self._units_accounting(conn, rid).items():
+                delta = u["entries"] - u["accounted"]
+                if abs(delta) > 1e-6:
+                    self._adjust_fg_lot(conn, r, unit, delta, unit_litres)
+                    deltas[unit] = delta
+            if not deltas:
+                raise ApiError(409, "Nothing to resync - the lots already match the packaging entries")
+            detail["lotAdjustments"] = deltas
+            self._sync_completed_output(conn, rid)
+        elif kind == "recompute_output":
+            self._sync_completed_output(conn, rid)
+        elif kind == "recommit_stock":
+            self._commit_packaging_stock(conn, rid, user["name"])
+        elif kind == "fix_lot_status":
+            moved = []
+            for l in conn.execute("SELECT * FROM fg_lots WHERE run_id=?", (rid,)).fetchall():
+                want = None
+                if l["status"] == "on_hand" and r["release_state"] in ("pending_review", "pending_release", "returned", "amending"):
+                    want = "pending_release"
+                elif l["status"] == "pending_release" and r["release_state"] in ("released", "legacy"):
+                    want = "on_hand"
+                if want:
+                    conn.execute("UPDATE fg_lots SET status=? WHERE id=?", (want, l["id"]))
+                    moved.append({"lot": l["fg_lot_number"], "from": l["status"], "to": want})
+            detail["lots"] = moved
+        else:
+            raise ApiError(400, "Unknown repair")
+        release_log(conn, rid, "integrity_repair", user, capacity="Administrator" if user["role"] == "admin" else "Quality Manager",
+                    meaning="Derived records re-synchronised with the production log by the integrity check.",
+                    comment=kind, detail=detail)
+        return self._integrity_check(conn)
+
+    def _sync_completed_output(self, conn, run_id):
+        unit_litres = packaging_container_litres_map(conn)
+        output, ibc = 0.0, 0
+        for e in conn.execute("SELECT container_unit, qty FROM run_packaging_entries WHERE run_id=?", (run_id,)):
+            qty = num(e["qty"])
+            if e["container_unit"] in unit_litres and qty > 0:
+                output += unit_litres[e["container_unit"]] * qty
+                if e["container_unit"] == "IBC":
+                    ibc += int(qty)
+        conn.execute("UPDATE production_runs SET output_litres=?, ibc_used=? WHERE id=?", (round(output, 2), ibc, run_id))
+
+    def route_integrity(self, method, seg, conn, user):
+        self._integrity_actor(conn, user, {})
+        if seg == ["api", "integrity"] and method == "GET":
+            return self._integrity_check(conn)
+        if seg == ["api", "integrity", "repair"] and method == "POST":
+            return self._integrity_repair(conn, user, self._body_json())
+        raise ApiError(404, "Unknown integrity endpoint")
+
+    def _shipped_units(self, conn, rid):
+        """Units of this run already shipped on non-cancelled shipments -- the app
+        can't recall them, so a void/reopen records them for follow-up."""
+        return [{"lot": x["fg_lot_number"], "qty": x["qty"], "shipment": x["shipment_no"]} for x in conn.execute(
+            "SELECT l.fg_lot_number, l.qty, s.shipment_no FROM shipment_lines l"
+            " JOIN shipments s ON s.id=l.shipment_id JOIN fg_lots f ON f.id=l.fg_lot_id"
+            " WHERE f.run_id=? AND s.status!='cancelled' ORDER BY s.id", (rid,))]
+
+    def _release_void(self, conn, r, user, now_hash, reason):
+        rid = r["id"]
+        was = r["release_state"]
+        # A lot already released (on_hand) goes back into quarantine; units that
+        # already shipped can't be recalled by the app, so they're listed.
+        moved = self._set_lot_status(conn, rid, ("on_hand",), "pending_release") if was == "released" else []
+        shipped = self._shipped_units(conn, rid)
+        conn.execute("UPDATE production_runs SET release_state='pending_review', release_review_hash=NULL WHERE id=?", (rid,))
+        release_log(conn, rid, "voided", user, capacity="System",
+                    meaning="Review/release voided: the production log no longer matches the log that was signed.",
+                    comment=reason, log_hash=now_hash,
+                    detail={"from": was, "to": "pending_review", "lotsReturned": moved, "alreadyShippedLots": shipped})
+
+    def _release_signer(self, conn, user, d, need_quality):
+        """Re-authenticates the signer (password) and checks their sign-off permission."""
+        if not verify_password(d.get("password") or "", user["password_hash"]):
+            raise ApiError(400, "Password is incorrect - your signature was not recorded")
+        is_qm, is_pm = bool(user["is_quality_manager"]), bool(user["is_production_manager"])
+        if need_quality:
+            if not is_qm:
+                raise ApiError(403, "Only a Quality Manager can sign this step")
+            return "Quality Manager"
+        if not (is_qm or is_pm):
+            raise ApiError(403, "Only a Production Manager or Quality Manager can sign this step")
+        want = (d.get("capacity") or "").strip()
+        if want == "Quality Manager" and is_qm:
+            return "Quality Manager"
+        if want == "Production Manager" and is_pm:
+            return "Production Manager"
+        return "Production Manager" if is_pm else "Quality Manager"
+
+    def _release_events_public(self, conn, rid):
+        return [{"id": e["id"], "type": e["event_type"], "user": e["user_name"], "email": e["user_email"],
+                 "capacity": e["capacity"], "meaning": e["meaning"], "comment": e["comment"],
+                 "logHash": e["log_hash"], "detail": json.loads(e["detail"]) if e["detail"] else None,
+                 "at": e["created_at"], "entryHash": e["entry_hash"]}
+                for e in conn.execute("SELECT * FROM release_events WHERE run_id=? ORDER BY id", (rid,))]
+
+    def _release_summary(self, conn, r):
+        lots = self._release_lots(conn, r["id"])
+        ev = self._release_events_public(conn, r["id"])
+        last = {}
+        for e in ev:
+            last[e["type"]] = e
+        return {"id": r["id"], "lot": r["processing_lot"], "sku": r["sku_code"], "runDate": r["run_date"],
+                "outputLitres": r["output_litres"], "finalizedAt": r["finalized_at"], "finalizedBy": r["finalized_by"],
+                "state": r["release_state"], "label": RELEASE_LABELS.get(r["release_state"], "—"),
+                "lots": lots,
+                "amendment": (lambda am: self._amendment_public(am) if am else None)(self._open_amendment(conn, r["id"])),
+                "reviewedBy": (last.get("review_approved") or {}).get("user"),
+                "reviewedAt": (last.get("review_approved") or {}).get("at"),
+                "releasedBy": (last.get("released") or {}).get("user"),
+                "releasedAt": (last.get("released") or {}).get("at")}
+
+    def route_release(self, method, seg, query, conn, user):
+        me = {"canReview": bool(user["is_production_manager"] or user["is_quality_manager"]),
+              "canRelease": bool(user["is_quality_manager"])}
+        if seg == ["api", "release"] and method == "GET":
+            runs = [self._release_summary(conn, r) for r in conn.execute(
+                "SELECT * FROM production_runs WHERE status='completed' AND release_state IS NOT NULL"
+                " AND release_state!='legacy' ORDER BY id DESC")]
+            return {"runs": runs, "me": me,
+                    "legacyCount": conn.execute("SELECT COUNT(*) c FROM production_runs WHERE release_state='legacy'").fetchone()["c"]}
+        if seg == ["api", "release", "verify"] and method == "GET":
+            return release_verify_chain(conn)
+        if len(seg) >= 4 and seg[2] == "runs" and seg[3].isdigit():
+            rid = int(seg[3])
+            r = conn.execute("SELECT * FROM production_runs WHERE id=? AND status='completed'", (rid,)).fetchone()
+            if not r:
+                raise ApiError(404, "Production run not found")
+            if len(seg) == 4 and method == "GET":
+                now_hash = self._release_snapshot_hash(conn, rid)
+                out = self._release_summary(conn, r)
+                out.update({"run": self._run_full(conn, r), "events": self._release_events_public(conn, rid),
+                            "me": me, "currentLogHash": now_hash, "reviewedLogHash": r["release_review_hash"],
+                            "logMatchesReview": (r["release_review_hash"] == now_hash) if r["release_review_hash"] else None,
+                            "chain": release_verify_chain(conn)})
+                return out
+            if len(seg) == 5 and method == "POST" and seg[4] in ("review", "release", "reopen", "resubmit"):
+                return self._release_action(conn, r, seg[4], self._body_json(), user)
+        raise ApiError(404, "Unknown release endpoint")
+
+    def _release_action(self, conn, r, action, d, user):
+        rid, state = r["id"], r["release_state"]
+        comment = (d.get("comment") or "").strip() or None
+        decision = (d.get("decision") or "").strip()
+
+        if action == "review":
+            if state != "pending_review":
+                raise ApiError(409, "This run is not awaiting production-log review (status: %s)" % RELEASE_LABELS.get(state, state))
+            if decision not in ("approve", "return"):
+                raise ApiError(400, "Choose approve or return for correction")
+            if decision == "return" and not comment:
+                raise ApiError(400, "Enter what needs to be corrected before returning the run")
+            capacity = self._release_signer(conn, user, d, need_quality=False)
+            now_hash = self._release_snapshot_hash(conn, rid)
+            if decision == "approve":
+                conn.execute("UPDATE production_runs SET release_state='pending_release', release_review_hash=? WHERE id=?",
+                             (now_hash, rid))
+                release_log(conn, rid, "review_approved", user, capacity=capacity,
+                            meaning="I have reviewed the production log for %s and confirm it is complete and accurate." % r["processing_lot"],
+                            comment=comment, log_hash=now_hash, detail={"from": "pending_review", "to": "pending_release"})
+            else:
+                conn.execute("UPDATE production_runs SET release_state='returned', release_review_hash=NULL WHERE id=?", (rid,))
+                release_log(conn, rid, "review_returned", user, capacity=capacity,
+                            meaning="Production log returned for correction; not approved.",
+                            comment=comment, log_hash=now_hash, detail={"from": "pending_review", "to": "returned"})
+        elif action == "resubmit":
+            if state != "returned":
+                raise ApiError(409, "Only a run returned for correction can be resubmitted")
+            if not comment:
+                raise ApiError(400, "Describe what was corrected")
+            now_hash = self._release_snapshot_hash(conn, rid)
+            conn.execute("UPDATE production_runs SET release_state='pending_review' WHERE id=?", (rid,))
+            release_log(conn, rid, "resubmitted", user, capacity=None,
+                        meaning="Corrections made; production log resubmitted for review.",
+                        comment=comment, log_hash=now_hash, detail={"from": "returned", "to": "pending_review"})
+        elif action == "release":
+            if state != "pending_release":
+                raise ApiError(409, "This run has not passed production-log review (status: %s)" % RELEASE_LABELS.get(state, state))
+            if decision not in ("release", "reject"):
+                raise ApiError(400, "Choose release or reject")
+            if decision == "reject" and not comment:
+                raise ApiError(400, "Enter the reason for rejecting this product")
+            capacity = self._release_signer(conn, user, d, need_quality=True)
+            now_hash = self._release_snapshot_hash(conn, rid)
+            if now_hash != r["release_review_hash"]:
+                # Belt and braces: a change that slipped past the edit hook.
+                self._release_void(conn, r, user, now_hash, "Production log differs from the log that was reviewed")
+                raise ApiError(409, "The production log changed after it was reviewed - it has been returned to review")
+            if decision == "release":
+                moved = self._set_lot_status(conn, rid, ("pending_release",), "on_hand")
+                conn.execute("UPDATE production_runs SET release_state='released' WHERE id=?", (rid,))
+                release_log(conn, rid, "released", user, capacity=capacity,
+                            meaning="I confirm this product conforms to specification and is released for sale.",
+                            comment=comment, log_hash=now_hash,
+                            detail={"from": "pending_release", "to": "released", "lots": moved})
+            else:
+                moved = self._set_lot_status(conn, rid, ("pending_release",), "hold")
+                conn.execute("UPDATE production_runs SET release_state='rejected' WHERE id=?", (rid,))
+                release_log(conn, rid, "release_rejected", user, capacity=capacity,
+                            meaning="Product rejected; held and not released for sale.",
+                            comment=comment, log_hash=now_hash,
+                            detail={"from": "pending_release", "to": "rejected", "lots": moved})
+        elif action == "reopen":
+            if state not in ("released", "rejected", "pending_release", "returned"):
+                raise ApiError(409, "This run is already awaiting review")
+            if not comment:
+                raise ApiError(400, "Enter the reason for reopening this run")
+            capacity = self._release_signer(conn, user, d, need_quality=True)
+            now_hash = self._release_snapshot_hash(conn, rid)
+            moved = []
+            if state == "released":
+                moved = self._set_lot_status(conn, rid, ("on_hand",), "pending_release")
+            elif state == "rejected":
+                moved = self._set_lot_status(conn, rid, ("hold",), "pending_release")
+            shipped = self._shipped_units(conn, rid)
+            conn.execute("UPDATE production_runs SET release_state='pending_review', release_review_hash=NULL WHERE id=?", (rid,))
+            release_log(conn, rid, "reopened", user, capacity=capacity,
+                        meaning="Run reopened: prior review/release no longer stands; a new review is required.",
+                        comment=comment, log_hash=now_hash,
+                        detail={"from": state, "to": "pending_review", "lotsReturned": moved, "alreadyShippedLots": shipped})
+        return self._release_summary(conn, conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone())
+
     def route_production(self, method, seg, conn, user):
         if seg == ["api", "production"] and method == "GET":
             runs = []
             for r in conn.execute(
                     "SELECT * FROM production_runs WHERE status='completed' ORDER BY run_date DESC, id DESC"):
-                d = run_public(r)
-                d["inputTotes"] = [row["lot_number"] for row in conn.execute(
-                    "SELECT t.lot_number FROM run_inputs ri JOIN tote_lots t ON t.id=ri.tote_lot_id "
-                    "WHERE ri.run_id=? ORDER BY t.lot_number", (r["id"],))]
-                d["fgLots"] = [fg_public(row) for row in conn.execute(
-                    "SELECT * FROM fg_lots WHERE run_id=? ORDER BY package_size", (r["id"],))]
-                d["edits"] = self._run_edits(conn, r["id"])
-                d["attachments"] = self._attachments(conn, r["id"])
-                d["qcSummary"] = {
-                    "recorded": sum(1 for f in QC_FIELD_REGISTRY if r[f[0]] is not None),
-                    "total": len(QC_FIELD_REGISTRY),
-                }
-                d["inputs"] = self._run_inputs_public(conn, r["id"])
-                d["dilutions"] = self._dilutions_public(conn, r["id"])
-                d["samplePoints"] = self._sample_points_public(conn, r["id"])
-                d["packagingEntries"] = self._packaging_entries_public(conn, r["id"])
-                runs.append(d)
+                runs.append(self._run_full(conn, r))
             return {"runs": runs}
         if seg == ["api", "production"] and method == "POST":
             return self.create_run(conn, user)
@@ -3187,6 +4326,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self.save_draft(conn, rid, user)
             if method == "DELETE":
                 return self.delete_draft(conn, rid, user)
+        if len(seg) >= 4 and seg[2].isdigit() and seg[3] == "amendments":
+            return self.route_amendments(method, seg, conn, user)
+        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "progress" and method == "GET":
+            r = conn.execute("SELECT * FROM production_runs WHERE id=?", (int(seg[2]),)).fetchone()
+            if not r:
+                raise ApiError(404, "Production run not found")
+            out = {"progress": self._run_progress(conn, r)}
+            if r["status"] == "completed":
+                out["revisions"] = self._run_revisions_public(conn, r)
+            return out
         if len(seg) == 5 and seg[2] == "drafts" and seg[3].isdigit() and seg[4] == "finalize" and method == "POST":
             return self.finalize_draft(conn, int(seg[3]), user)
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "qc-checks" and method == "GET":
@@ -3345,7 +4494,8 @@ class Handler(BaseHTTPRequestHandler):
                 "orpRange": r["orp_range"], "weightKg": r["weight_kg"],
                 "volumeL": r["volume_l"], "densityKgL": r["density_kg_l"],
                 "odour": r["odour"], "odourOther": r["odour_other"],
-                "odourIntensity": r["odour_intensity"], "decision": r["decision"],
+                "odourIntensity": r["odour_intensity"],
+                "decision": r["decision"] if r["decision_set"] else None,
                 "rejectionReason": r["rejection_reason"], "notes": r["notes"],
             })
         return out
@@ -3361,7 +4511,11 @@ class Handler(BaseHTTPRequestHandler):
         for col, key, kind in self.INPUT_FIELDS:
             if key not in fd:
                 continue
+            if col == "decision" and fd[key] not in ("accepted", "rejected"):
+                continue   # an undecided card never overwrites (the column is NOT NULL)
             updates[col] = numn(fd[key]) if kind == "num" else ((fd[key] or "").strip() or None)
+        if fd.get("decision") in ("accepted", "rejected"):
+            updates["decision_set"] = 1
         if fd.get("surfacePhotoId"):
             updates["surface_photo"] = fd["surfacePhotoId"]
         if fd.get("striationPhotoId"):
@@ -3380,7 +4534,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(404, "Feedstock input not found")
         d = self._body_json()
         if "decision" in d and d["decision"] not in ("accepted", "rejected"):
-            raise ApiError(400, "Invalid decision")
+            raise ApiError(400, "Choose Accepted or Rejected for the feedstock decision")
         self._apply_feedstock_detail(conn, input_id, d, row["tote_lot_id"])
         return {"inputs": self._run_inputs_public(conn, run_id)}
 
@@ -3723,6 +4877,8 @@ class Handler(BaseHTTPRequestHandler):
         # container changes -- this is the "once changes have been saved"
         # moment the ledger reflects.
         if stage == "packaging":
+            if run["status"] == "completed":
+                self._ensure_packaging_baseline(conn, rid)
             self._commit_packaging_stock(conn, rid, user["name"] if user else None)
         # Likewise Dilution & Preservation's Save commits the net change in
         # citric acid / potassium sorbate / sodium benzoate used.
@@ -3874,11 +5030,99 @@ class Handler(BaseHTTPRequestHandler):
             sets = ", ".join("%s=?" % c for c in updates)
             conn.execute("UPDATE run_packaging_entries SET %s WHERE id=?" % sets, (*updates.values(), peid))
 
+    # ---- packaging edits on a FINALIZED run ------------------------------- #
+    # A draft's Packaging rows only count once committed (Save / finalize). A
+    # finalized run's rows are the source of truth for everything derived from
+    # them -- finished-goods lots, container + label stock, output litres -- so
+    # every add/edit/remove there re-derives those in the SAME transaction
+    # (a failure, e.g. not enough stock or units already shipped, rolls the
+    # edit back). Without this the Product Release page / FG lots went stale.
+    def _run_is_completed(self, conn, run_id):
+        r = conn.execute("SELECT status FROM production_runs WHERE id=?", (run_id,)).fetchone()
+        return bool(r and r["status"] == "completed")
+
+    def _packaging_totals(self, conn, run_id):
+        return {r["container_unit"]: (r["total"] or 0) for r in conn.execute(
+            "SELECT container_unit, SUM(qty) total FROM run_packaging_entries"
+            " WHERE run_id=? AND container_unit IS NOT NULL GROUP BY container_unit", (run_id,))}
+
+    def _ensure_packaging_baseline(self, conn, run_id):
+        """A finalized run with no commit rows (finalized before the commit
+        ledger existed) already had its stock effects applied the old way:
+        record today's totals as committed -- no stock movement -- so the next
+        net-change commit only acts on the edit being made, not the whole run."""
+        if conn.execute("SELECT 1 FROM run_packaging_commits WHERE run_id=?", (run_id,)).fetchone():
+            return
+        totals = self._packaging_totals(conn, run_id)
+        run = conn.execute("SELECT sku_code FROM production_runs WHERE id=?", (run_id,)).fetchone()
+        for unit, qty in totals.items():
+            conn.execute("INSERT INTO run_packaging_commits (run_id,container_unit,committed_qty) VALUES (?,?,?)",
+                         (run_id, unit, qty))
+            label = conn.execute("SELECT id FROM consumables WHERE label_sku_code=? AND label_package=?",
+                                 (run["sku_code"], unit)).fetchone() if run else None
+            if label and qty and not conn.execute(
+                    "SELECT 1 FROM run_label_commits WHERE run_id=? AND consumable_id=?", (run_id, label["id"])).fetchone():
+                conn.execute("INSERT INTO run_label_commits (run_id,consumable_id,committed_qty) VALUES (?,?,?)",
+                             (run_id, label["id"], qty))
+
+    @staticmethod
+    def _lot_status_for_run(run):
+        st = run["release_state"]
+        if st in (None, "legacy", "released"):
+            return "on_hand"
+        return "hold" if st == "rejected" else "pending_release"
+
+    def _adjust_fg_lot(self, conn, run, unit, delta, unit_litres):
+        lot_no = "%s-%s" % (run["processing_lot"], unit)
+        lot = conn.execute("SELECT * FROM fg_lots WHERE run_id=? AND fg_lot_number=?", (run["id"], lot_no)).fetchone()
+        if not lot:
+            if delta > 0 and unit in unit_litres:
+                conn.execute(
+                    "INSERT INTO fg_lots (fg_lot_number,sku_code,run_id,package_size,qty,litres_each,produced_date,"
+                    "tds,location,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (lot_no, run["sku_code"], run["id"], unit, delta, unit_litres[unit], run["run_date"],
+                     run["target_tds"], run["location"], self._lot_status_for_run(run), now_iso()))
+            return
+        new_qty = (lot["qty"] or 0) + delta
+        if new_qty < 0:
+            raise ApiError(400, "Cannot reduce %s by %g: only %g unit(s) are still on hand (the rest were shipped, "
+                                "moved or disposed). Resolve those first." % (unit, -delta, lot["qty"] or 0))
+        status = lot["status"]
+        if new_qty > 0 and status in ("sold", "disposed"):
+            status = self._lot_status_for_run(run)
+        conn.execute("UPDATE fg_lots SET qty=?, status=? WHERE id=?", (new_qty, status, lot["id"]))
+
+    def _sync_completed_packaging(self, conn, run_id, user, before):
+        """Re-derive everything computed from a finalized run's packaging rows."""
+        uname = user["name"] if user else None
+        self._commit_packaging_stock(conn, run_id, uname)     # container + FG-label stock, net change
+        run = conn.execute("SELECT * FROM production_runs WHERE id=?", (run_id,)).fetchone()
+        after = self._packaging_totals(conn, run_id)
+        unit_litres = packaging_container_litres_map(conn)
+        for unit in set(before) | set(after):
+            delta = after.get(unit, 0) - before.get(unit, 0)
+            if delta:
+                self._adjust_fg_lot(conn, run, unit, delta, unit_litres)
+        output, ibc = 0.0, 0
+        for e in conn.execute("SELECT container_unit, qty FROM run_packaging_entries WHERE run_id=?", (run_id,)):
+            qty = num(e["qty"])
+            if e["container_unit"] in unit_litres and qty > 0:
+                output += unit_litres[e["container_unit"]] * qty
+                if e["container_unit"] == "IBC":
+                    ibc += int(qty)
+        conn.execute("UPDATE production_runs SET output_litres=?, ibc_used=? WHERE id=?",
+                     (round(output, 2), ibc, run_id))
+
     def add_packaging_entry(self, conn, run_id, user):
-        # Freely add/edit/remove rows here -- none of it touches container
-        # stock. Only committing (the Packaging section's Save button, or
-        # finalize) nets the total per container against what was last
-        # committed and logs/adjusts once (see _commit_packaging_stock).
+        # On a DRAFT, rows are freely added/edited/removed and none of it
+        # touches container stock; only committing (the Packaging section's
+        # Save button, or finalize) nets the total per container against what
+        # was last committed (see _commit_packaging_stock). On a FINALIZED run
+        # every change is applied immediately -- see _sync_completed_packaging.
+        completed = self._run_is_completed(conn, run_id)
+        if completed:
+            self._ensure_packaging_baseline(conn, run_id)
+            before = self._packaging_totals(conn, run_id)
         d = self._body_json()
         default_unit = conn.execute(
             "SELECT name FROM consumables WHERE is_container=1 AND litres_each IS NOT NULL"
@@ -3889,6 +5133,8 @@ class Handler(BaseHTTPRequestHandler):
                     (run_id, default_unit, now_iso()))
         peid = cur.lastrowid
         self._apply_packaging_entry_fields(conn, peid, d)
+        if completed:
+            self._sync_completed_packaging(conn, run_id, user, before)
         return {"packagingEntries": self._packaging_entries_public(conn, run_id)}
 
     def update_packaging_entry(self, conn, run_id, peid, user):
@@ -3896,8 +5142,14 @@ class Handler(BaseHTTPRequestHandler):
                            (peid, run_id)).fetchone()
         if not row:
             raise ApiError(404, "Packaging entry not found")
+        completed = self._run_is_completed(conn, run_id)
+        if completed:
+            self._ensure_packaging_baseline(conn, run_id)
+            before = self._packaging_totals(conn, run_id)
         d = self._body_json()
         self._apply_packaging_entry_fields(conn, peid, d)
+        if completed:
+            self._sync_completed_packaging(conn, run_id, user, before)
         return {"packagingEntries": self._packaging_entries_public(conn, run_id)}
 
     def delete_packaging_entry(self, conn, run_id, peid, user):
@@ -3905,7 +5157,13 @@ class Handler(BaseHTTPRequestHandler):
                            (peid, run_id)).fetchone()
         if not row:
             raise ApiError(404, "Packaging entry not found")
+        completed = self._run_is_completed(conn, run_id)
+        if completed:
+            self._ensure_packaging_baseline(conn, run_id)
+            before = self._packaging_totals(conn, run_id)
         conn.execute("DELETE FROM run_packaging_entries WHERE id=?", (peid,))
+        if completed:
+            self._sync_completed_packaging(conn, run_id, user, before)
         return {"packagingEntries": self._packaging_entries_public(conn, run_id)}
 
     def _run_edits(self, conn, run_id):
@@ -3945,6 +5203,13 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(400, "Enter a reason for excluding this run from the yield & usage analysis")
         if not updates:
             return {"run": run_public(run), "edits": self._run_edits(conn, rid), "changed": 0}
+        # Locked once finalized: only the yield-analysis exclusion flag may change
+        # without an amendment; run date, reagents, location, operators and notes
+        # are production-log entries.
+        if run["status"] == "completed" and not self._open_amendment(conn, rid):
+            if [c for c in updates if c not in ("exclude_from_stats", "exclude_reason")]:
+                raise ApiError(409, "This production run is finalized and its log is locked. Use \"Amend run\" "
+                                    "(with a reason) to change production-log entries.", "amendment_required")
 
         # Keep consumable stock consistent when preservative amounts are corrected.
         uname = user["name"] if user else None
@@ -4007,7 +5272,7 @@ class Handler(BaseHTTPRequestHandler):
             # Finalizing implicitly "saves" the Packaging table too, in case
             # the operator never clicked its Save button -- the ledger still
             # only gets one net-change line per container, same as a normal save.
-            self._commit_packaging_stock(conn, existing["id"], user["name"] if user else None)
+            self._commit_packaging_stock(conn, existing["id"], user["name"] if user else None, sku=sku)
             # Same for the Dilution & Preservation reagents (citric acid,
             # potassium sorbate, sodium benzoate).
             self._commit_reagent_usage(conn, existing["id"], user["name"] if user else None)
@@ -4089,18 +5354,20 @@ class Handler(BaseHTTPRequestHandler):
                 " input_kg=?, target_tds=?, output_litres=?, citric_kg=COALESCE(citric_kg,0)+?,"
                 " sorbate_kg=COALESCE(sorbate_kg,0)+?, ibc_used=?,"
                 " location=?, notes=?, operators=?, status='completed', draft_data=NULL,"
-                " finalized_at=? WHERE id=?",
+                " finalized_at=?, finalized_by=?, release_state='pending_review' WHERE id=?",
                 (lot, run_date, species, sku, input_kg, target_tds, output_litres,
-                 citric, sorbate, ibc_used, location, notes, operators, ts, run_id))
+                 citric, sorbate, ibc_used, location, notes, operators, ts,
+                 user["name"] if user else None, run_id))
         else:
             placeholder = "TEMP-" + secrets.token_hex(6)
             cur.execute(
                 "INSERT INTO production_runs (processing_lot,run_date,species_code,sku_code,input_kg,"
                 "target_tds,output_litres,citric_kg,sorbate_kg,ibc_used,location,notes,operators,"
-                "status,created_at,finalized_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'completed', ?, ?)",
+                "status,created_at,finalized_at,finalized_by,release_state)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'completed', ?, ?, ?, 'pending_review')",
                 (placeholder, run_date, species, sku, input_kg, target_tds, output_litres,
-                 citric, sorbate, ibc_used, location, notes, operators, ts, ts))
+                 citric, sorbate, ibc_used, location, notes, operators, ts, ts,
+                 user["name"] if user else None))
             run_id = cur.lastrowid
             lot = lot_number_for(ts, run_id)
             cur.execute("UPDATE production_runs SET processing_lot=? WHERE id=?", (lot, run_id))
@@ -4150,19 +5417,28 @@ class Handler(BaseHTTPRequestHandler):
             cur.execute(
                 "INSERT INTO fg_lots (fg_lot_number,sku_code,run_id,package_size,qty,litres_each,"
                 "produced_date,tds,location,status,created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?, 'on_hand', ?)",
+                " VALUES (?,?,?,?,?,?,?,?,?, 'pending_release', ?)",
                 (fg_lot, sku, run_id, unit, qty, unit_litres[unit], run_date,
                  target_tds, location, ts))
             fg_created.append(fg_lot)
-            # One finished-good label per unit, from the label item mapped to
-            # this SKU + package type (if any -- no matching item means labels
-            # simply aren't tracked for this combination). A shortage never
-            # blocks finalizing; it just shows as low/negative stock.
-            label_row = conn.execute(
-                "SELECT id FROM consumables WHERE label_sku_code=? AND label_package=?", (sku, unit)).fetchone()
-            if label_row:
-                self._consume(conn, label_row["id"], -qty, "FG labels applied", lot, uname)
+            # (FG labels were consumed with the containers by the packaging
+            # commit above -- see _commit_label_stock.)
 
+        # Required-field gate: every required production-log field must have a
+        # value. Raising here rolls the whole finalize back (single transaction),
+        # so a run missing data is never half-finalized.
+        problems = self._required_problems(
+            conn, conn.execute("SELECT * FROM production_runs WHERE id=?", (run_id,)).fetchone())
+        if problems:
+            raise ApiError(400, "Cannot finalize - required fields are missing:" + problems)
+        self._add_revision(conn, run_id, "finalized", user, "Run finalized (original record)", [],
+                           self._release_snapshot_hash(conn, run_id))
+        # Hold the finished goods for release: the run enters the review queue
+        # (its FG lots were created 'pending_release' above).
+        release_log(conn, run_id, "submitted", user, capacity=None,
+                    meaning="Production run finalized; finished goods held pending release.",
+                    log_hash=self._release_snapshot_hash(conn, run_id),
+                    detail={"to": "pending_review", "fgLots": fg_created})
         return {"processingLot": lot, "runId": run_id, "inputKg": input_kg,
                 "outputLitres": output_litres, "fgLots": fg_created}
 
@@ -4175,6 +5451,7 @@ class Handler(BaseHTTPRequestHandler):
             dd["dilutions"] = self._dilutions_public(conn, r["id"])
             dd["samplePoints"] = self._sample_points_public(conn, r["id"])
             dd["packagingEntries"] = self._packaging_entries_public(conn, r["id"])
+            dd["progress"] = self._run_progress(conn, r)
             drafts.append(dd)
         return {"drafts": drafts}
 
@@ -4193,6 +5470,7 @@ class Handler(BaseHTTPRequestHandler):
         d["dilutions"] = self._dilutions_public(conn, rid)
         d["samplePoints"] = self._sample_points_public(conn, rid)
         d["packagingEntries"] = self._packaging_entries_public(conn, rid)
+        d["progress"] = self._run_progress(conn, r)
         return {"run": d}
 
     def save_draft(self, conn, rid, user):
@@ -4291,6 +5569,9 @@ class Handler(BaseHTTPRequestHandler):
         for pc in conn.execute("SELECT container_unit, committed_qty FROM run_packaging_commits WHERE run_id=?", (rid,)):
             self._adjust_container_stock(conn, pc["container_unit"], pc["committed_qty"] or 0, note,
                                           r["processing_lot"], uname)
+        for lc in conn.execute("SELECT consumable_id, committed_qty FROM run_label_commits WHERE run_id=?", (rid,)):
+            if lc["committed_qty"]:
+                self._consume(conn, lc["consumable_id"], lc["committed_qty"], note, r["processing_lot"], uname)
         for sp in conn.execute("SELECT container, qty FROM run_sample_points WHERE run_id=?", (rid,)):
             self._adjust_container_stock(conn, sp["container"], sp["qty"] or 0, note, r["processing_lot"], uname)
         # Reagents (citric acid / potassium sorbate / sodium benzoate) commit a
@@ -4394,6 +5675,20 @@ class Handler(BaseHTTPRequestHandler):
             if len(seg) == 3 and method == "PUT":
                 d = self._body_json()
                 self._ensure_location(conn, d.get("location"))
+                # Release gate: status in/out of 'pending_release' is only changed
+                # by the sign-off process, and a lot can't be flipped to on_hand
+                # (sellable) by hand unless its run has been released.
+                new_status = d["status"] if "status" in d else it["status"]
+                if new_status != it["status"]:
+                    run_state = conn.execute("SELECT release_state FROM production_runs WHERE id=?",
+                                             (it["run_id"],)).fetchone()
+                    run_state = run_state["release_state"] if run_state else None
+                    if it["status"] == "pending_release":
+                        raise ApiError(400, "This lot is Pending Release - use Product Release to review and release it")
+                    if new_status == "pending_release":
+                        raise ApiError(400, "Pending Release is set by the release process, not by hand")
+                    if new_status == "on_hand" and run_state not in (None, "legacy", "released"):
+                        raise ApiError(400, "This lot's production run has not been released - use Product Release")
                 conn.execute(
                     "UPDATE fg_lots SET qty=?, status=?, location=?, tds=? WHERE id=?",
                     (num(d["qty"]) if "qty" in d else it["qty"],
@@ -4521,6 +5816,9 @@ class Handler(BaseHTTPRequestHandler):
             qty = num(ln.get("qty"))
             if not fg or qty <= 0:
                 continue
+            if fg["status"] != "on_hand":
+                raise ApiError(400, "%s cannot be shipped: it is not released for sale (status: %s)"
+                               % (fg["fg_lot_number"], "Pending Release" if fg["status"] == "pending_release" else fg["status"]))
             if qty > fg["qty"]:
                 raise ApiError(400, "Only %g of %s on hand (asked %g)"
                                % (fg["qty"], fg["fg_lot_number"], qty))
@@ -4564,12 +5862,19 @@ class Handler(BaseHTTPRequestHandler):
                 fg = conn.execute("SELECT * FROM fg_lots WHERE id=?", (ln["fg_lot_id"],)).fetchone()
                 if fg:
                     nq = (fg["qty"] or 0) + (ln["qty"] or 0)
+                    # Restocked units return to sellable stock only if the run is still released.
+                    rs = conn.execute("SELECT release_state FROM production_runs WHERE id=?",
+                                      (fg["run_id"],)).fetchone()
+                    back = "on_hand" if (not rs or rs["release_state"] in (None, "legacy", "released")) else "pending_release"
                     conn.execute("UPDATE fg_lots SET qty=?, status=? WHERE id=?",
-                                 (nq, "on_hand" if fg["status"] == "sold" and nq > 0 else fg["status"], fg["id"]))
+                                 (nq, back if fg["status"] == "sold" and nq > 0 else fg["status"], fg["id"]))
         elif old_status == "cancelled" and new_status != "cancelled":
             for ln in conn.execute("SELECT * FROM shipment_lines WHERE shipment_id=?", (r["id"],)):
                 fg = conn.execute("SELECT * FROM fg_lots WHERE id=?", (ln["fg_lot_id"],)).fetchone()
                 if fg:
+                    if fg["status"] in ("pending_release", "hold"):
+                        raise ApiError(400, "%s is not released for sale, so this shipment cannot be reinstated"
+                                       % fg["fg_lot_number"])
                     nq = (fg["qty"] or 0) - (ln["qty"] or 0)
                     conn.execute("UPDATE fg_lots SET qty=?, status=? WHERE id=?",
                                  (nq, "sold" if nq <= 0 else fg["status"], fg["id"]))

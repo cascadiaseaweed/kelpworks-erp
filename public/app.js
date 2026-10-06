@@ -13,7 +13,7 @@ async function api(method, path, body) {
   let data = {};
   try { data = await res.json(); } catch (e) {}
   if (res.status === 401) { logout(); throw new Error(data.error || 'Session expired'); }
-  if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+  if (!res.ok) { const err = new Error(data.error || ('HTTP ' + res.status)); err.code = data.code; throw err; }
   return data;
 }
 
@@ -99,7 +99,7 @@ function render() {
   const v = $('#view'); v.innerHTML = '';
   ({ dashboard: pageDashboard, stabilized: pageStabilized, production: pageProduction, cip: pageCIP,
      qc: pageQC, fg: pageFG, shipping: pageShipping, consumables: pageConsumables, reports: pageReports,
-     yieldusage: pageYield, calculations: pageCalculations, labels: pageLabels, admin: pageAdmin }[State.tab])(v);
+     yieldusage: pageYield, release: pageRelease, calculations: pageCalculations, labels: pageLabels, admin: pageAdmin }[State.tab])(v);
 }
 
 /* ---------------- Dashboard ---------------- */
@@ -612,12 +612,15 @@ async function pageProduction(v) {
   if (!r.runs.length && !dr.drafts.length) { v.append(el('div', { class: 'empty card' }, 'No production runs yet. Click “New production run” to process stabilized totes into finished goods.')); return; }
   if (!r.runs.length) return;
   for (const run of r.runs) {
-    const fgList = run.fgLots.map(f => `${fmt(f.qty)} × ${f.packageSize}`).join(', ') || '—';
     const card = el('div', { class: 'card' },
       el('div', { class: 'page-head', style: 'margin:0 0 8px' },
-        el('h3', { style: 'margin:0' }, mono(run.processingLot) , '  ', el('span', { class: 'pill' }, skuName(run.sku)),
-          run.excludeFromStats ? el('span', { class: 'pill', style: 'margin-left:6px', title: run.excludeReason || '' }, 'Excluded from analysis') : null),
+        el('h3', { style: 'margin:0' }, mono(run.processingLot),
+          run.excludeFromStats ? el('span', { class: 'pill', style: 'margin-left:6px', title: run.excludeReason || '' }, 'Excluded from analysis') : null,
+          run.release && run.release.state && run.release.state !== 'legacy' ? [' ', releaseBadge(run.release.state)] : null),
         el('div', { class: 'actions' },
+          canAmendLog() ? (run.amendment
+            ? el('button', { onclick: () => openRunLog(run.id) }, '✏️ Continue amendment')
+            : el('button', { onclick: () => openAmendDialog(run) }, '✏️ Amend run')) : null,
           el('button', { class: 'secondary', onclick: () => editRun(run) }, 'Edit'),
           el('button', { class: 'secondary', onclick: () => openProcessLog(run) }, '📋 Process log'),
           el('button', { class: 'secondary', onclick: () => openQcForRun(run) },
@@ -625,37 +628,266 @@ async function pageProduction(v) {
           el('button', { class: 'secondary', onclick: () => openAttachments(run) },
             '📎 Documents' + (run.attachments && run.attachments.length ? ' (' + run.attachments.length + ')' : '')),
           el('button', { class: 'secondary', onclick: () => printLabels(run.fgLots.map(f => fgLabel(f, run))) }, 'Print FG labels'))),
-      el('div', { class: 'summary-line' },
-        sl('Run date', run.runDate), sl('Input', fmt(run.inputKg, 1) + ' kg'),
-        sl('Output', fmt(run.outputLitres, 0) + ' L'),
-        sl('Conversion factor', run.inputKg ? (run.outputLitres / run.inputKg).toFixed(2) + ' L/kg' : '—'),
-        sl('Target TDS', run.targetTds != null ? run.targetTds + '%' : '—'),
-        sl('Citric', fmt(run.citricKg, 1) + ' kg'), sl('Sorbate', fmt(run.sorbateKg, 1) + ' kg'),
-        sl('Na benzoate', fmt(run.nabenzoateKg, 1) + ' kg'),
-        sl('New IBCs filled', fmt(run.ibcUsed)), sl('Used IBCs freed', fmt(run.inputTotes.length)),
-        sl('Packaged', fgList), run.operators ? sl('Operators', run.operators) : null),
-      stageProgress(run),
-      el('div', { class: 'muted', style: 'margin-top:8px;font-size:12px' },
-        `Consumed ${run.inputTotes.length} tote(s): `, el('span', { class: 'mono' }, run.inputTotes.join(', '))),
-      run.notes ? el('div', { class: 'muted', style: 'margin-top:4px;font-size:12px' }, '“' + run.notes + '”') : null,
-      run.edits && run.edits.length ? editHistoryBlock(run.edits) : null);
+      run.amendment ? amendBanner(run) : null,
+      runSummaryGrid(run),
+      stageProgress(run, { onSelect: key => openProcessLog(run, key) }),
+      revisionTracker(run));
     v.append(card);
   }
 }
-// Small at-a-glance progress dots for the 7 process-log sections a run can carry.
-function stageProgress(run) {
-  const stages = run.stages || {};
-  const items = [
-    ['Feedstock', (run.inputs || []).some(i => i.ph != null || i.surfacePhoto || i.striationPhoto || i.decision === 'rejected')],
-    ['Homogenization', !!(stages.homogenization && stages.homogenization.startedAt)],
-    ['Extraction', !!(stages.extraction && stages.extraction.startedAt)],
-    ['Separation', !!(stages.separation && stages.separation.startedAt)],
-    ['Pasteurization', !!(stages.pasteurization && stages.pasteurization.startedAt)],
-    ['Dilution & Preservation', (run.dilutions || []).length > 0],
-    ['Packaging', !!(stages.packaging && stages.packaging.startedAt)],
-  ];
-  return el('div', { class: 'stage-progress' }, ...items.map(([label, done]) =>
-    el('span', { class: 'stage-dot' + (done ? ' done' : ''), title: label + (done ? ' — logged' : ' — not yet logged') }, done ? '●' : '○')));
+// The key production figures shown on a run's summary card, all derived from the run's
+// own log: feedstock farms, IBCs (totes) consumed, weights, volume out, final QC, extraction
+// efficiency and the two conversion rates (process = measured weights, harvest = stored
+// batch-average weight -- the same definitions as the Yield & Usage report).
+function runSummaryStats(run) {
+  const inputs = (run.inputs || []).filter(i => i.decision !== 'rejected');
+  const siteCodes = inputs.length ? inputs.map(i => i.site) : (run.inputTotes || []).map(l => String(l).split('-')[0]);
+  const farms = [...new Set(siteCodes.filter(Boolean).map(siteName))];
+  const toteCount = inputs.length || (run.inputTotes || []).length;
+  const measuredKg = inputs.length && inputs.every(i => i.weightKg != null) ? inputs.reduce((a, i) => a + i.weightKg, 0) : null;
+  const out = run.outputLitres || 0;
+  const st = run.stages || {};
+  const tdsBefore = st.homogenization && st.homogenization.tdsPct, tdsAfter = st.extraction && st.extraction.tdsPct;
+  return {
+    farms, toteCount, measuredKg, out,
+    finalPh: st.packaging ? st.packaging.qcPh : null, finalTds: st.packaging ? st.packaging.tdsPct : null,
+    extractionEff: (tdsBefore && tdsAfter != null) ? (tdsAfter - tdsBefore) / tdsBefore * 100 : null,
+    processRate: measuredKg && out > 0 ? out / measuredKg : null,
+    harvestRate: run.inputKg > 0 && out > 0 ? out / run.inputKg : null,
+  };
+}
+function runSummaryGrid(run) {
+  const x = runSummaryStats(run);
+  const fgList = (run.fgLots || []).map(f => fmt(f.qty) + ' × ' + f.packageSize).join(', ') || '—';
+  const cell = (k, v, cls) => el('div', { class: 'rs' + (cls ? ' ' + cls : '') }, el('span', { class: 'rs-k' }, k), el('span', { class: 'rs-v' }, v));
+  const dash = '—';
+  return el('div', { class: 'run-stats' },
+    cell('Run date', run.runDate || dash),
+    cell('Operators', run.operators || dash),
+    cell('Product', skuName(run.sku)),
+    cell('Feedstock farms', x.farms.join(', ') || dash, 'rs-wide'),
+    cell('IBCs consumed', x.toteCount ? fmt(x.toteCount) : dash),
+    cell('Total feedstock weight', x.measuredKg != null ? [fmt(x.measuredKg, 1) + ' kg', el('small', {}, 'measured')]
+      : (run.inputKg ? [fmt(run.inputKg, 1) + ' kg', el('small', {}, 'batch-average')] : dash)),
+    cell('Packaged', fgList, 'rs-wide'),
+    cell('Product volume out', x.out ? fmt(x.out, 0) + ' L' : dash),
+    cell('Final pH', x.finalPh != null ? fmt(x.finalPh, 2) : dash),
+    cell('Final TDS', x.finalTds != null ? fmt(x.finalTds, 2) + ' %' : dash),
+    cell('Extraction efficiency', x.extractionEff != null ? fmt(x.extractionEff, 1) + ' %' : dash),
+    cell('Conversion rate — process', x.processRate != null ? [fmt(x.processRate, 3), el('small', {}, 'L/kg · measured weight')] : dash),
+    cell('Conversion rate — harvest', x.harvestRate != null ? [fmt(x.harvestRate, 3), el('small', {}, 'L/kg · batch-average weight')] : dash));
+}
+// Required-field marking. The server owns the list of required fields
+// (State.ref.requiredFields, from REQUIRED_FIELDS/PROGRESS_SECTIONS in
+// kelp_erp_server.py) so the asterisks, the progress chips and the finalize
+// check can never disagree. A red * follows the label of every required field.
+function isReq(stage, key) {
+  const r = State.ref && State.ref.requiredFields;
+  return !!(r && Array.isArray(r[stage]) && r[stage].includes(key));
+}
+function reqLabel(label) { return el('span', { class: 'req-label' }, label); }
+function rfield(stage, key, label, control) { return field(isReq(stage, key) ? reqLabel(label) : label, control); }
+function reqLegend() {
+  return el('div', { class: 'help req-legend' }, el('span', { class: 'req-star' }, '*'),
+    ' Required to finalize the run. Notes and the Homogenization, Separation and Pasteurization sample points are optional.');
+}
+// At-a-glance progress for the production log's 7 sections: one labelled chip each --
+// green with a tick only once every required field in that section has a value,
+// amber with "filled/total" while partly done, grey when not started. Hover a chip
+// to see exactly which required fields are still missing.
+function stageProgress(run, opts) {
+  opts = opts || {};
+  const prog = run.progress;
+  if (!prog || !(prog.sections || []).length) return null;
+  const pct = prog.requiredTotal ? Math.round(prog.requiredFilled / prog.requiredTotal * 100) : 0;
+  return el('div', { class: 'stage-progress' },
+    el('div', { class: 'stage-steps' }, ...prog.sections.map(sec => {
+      const state = sec.done ? 'done' : (sec.started ? 'partial' : 'empty');
+      const tip = sec.done ? sec.label + ' — all ' + sec.total + ' required fields complete'
+        : sec.label + ' — ' + (sec.total - sec.filled) + ' of ' + sec.total + ' required field(s) missing:\n• ' + sec.missing.join('\n• ');
+      // With opts.onSelect each chip is a button that opens/jumps to its section.
+      return el(opts.onSelect ? 'button' : 'span', Object.assign({ class: 'stage-step ' + state, title: tip + (opts.onSelect ? '\n(click to open this section)' : '') },
+        opts.onSelect ? { type: 'button', onclick: () => opts.onSelect(sec.key) } : {}),
+        el('span', { class: 'stage-dot' }, sec.done ? '✓' : (sec.started ? sec.filled + '/' + sec.total : '')),
+        el('span', { class: 'stage-name' }, sec.label));
+    })),
+    el('div', { class: 'stage-meter' + (prog.complete ? ' complete' : '') },
+      el('span', { class: 'stage-meter-track' }, el('span', { class: 'stage-meter-bar', style: 'width:' + pct + '%' })),
+      el('span', {}, prog.complete ? 'All required fields complete — ready to finalize'
+        : prog.requiredFilled + ' of ' + prog.requiredTotal + ' required fields complete')));
+}
+// ---- Amend run: a finalized run's production log is locked; changing it needs an
+// amendment (reason + category). Documents and label printing never do. ----
+async function openRunLog(id, section) {
+  const run = (await api('GET', '/production')).runs.find(x => x.id === id);
+  if (run) openProcessLog(run, section);
+}
+function closeAllModals() { document.querySelectorAll('#modalRoot .modal-bg').forEach(m => m.remove()); }
+// Greys out every control in a production-log view. Progress chips, the amend
+// banner and per-sample label printing stay usable; controls added later (tables
+// redrawn) are locked too.
+function lockLogBody(root) {
+  const apply = () => root.querySelectorAll('input, select, textarea, button').forEach(c => {
+    if (!c.closest('.allow-locked') && !c.classList.contains('stage-step')) c.disabled = true;
+  });
+  apply();
+  new MutationObserver(apply).observe(root, { childList: true, subtree: true });
+}
+function logLockBanner(run, extra) {
+  if (run.amendment && !canAmendLog()) {
+    return el('div', { class: 'lock-banner allow-locked' }, el('span', {},
+      '🔒 Under amendment by ' + (run.amendment.openedBy || '—') + ' — read only. Only users with the Production Log Amender permission can edit it.'));
+  }
+  if (run.amendment) {
+    return el('div', { class: 'amend-banner allow-locked' },
+      el('b', {}, '✏️ Amendment open'), ' — ' + (run.amendment.categoryLabel || '') + ': ' + run.amendment.reason
+      + ' (opened by ' + (run.amendment.openedBy || '—') + '). Edit below, then submit the amendment. Product stays on hold until it is re-reviewed.',
+      el('div', { class: 'actions' }, el('button', { type: 'button', onclick: () => openSubmitAmendment(run) }, 'Submit amendment…')));
+  }
+  return el('div', { class: 'lock-banner allow-locked' },
+    el('span', {}, '🔒 Finalized — read only. ' + (extra || 'To change any production-log entry, the run must be amended (a reason is required and the change is recorded as a revision). Documents and printing labels are not affected.')
+      + (canAmendLog() ? '' : ' You don’t have the Production Log Amender permission — ask an administrator.')),
+    canAmendLog() ? el('button', { type: 'button', onclick: () => openAmendDialog(run) }, '✏️ Amend run…') : null);
+}
+function amendBanner(run) {
+  const a = run.amendment;
+  return el('div', { class: 'amend-banner' },
+    el('b', {}, 'Under amendment'), ' — ' + (a.categoryLabel || '') + ': ' + a.reason + '  (opened ' + fmtWhen(a.openedAt) + ' by ' + (a.openedBy || '—') + ')',
+    el('div', { class: 'help', style: 'color:inherit' }, 'The log is unlocked for editing; unsold finished goods are held (Pending Release) until the amendment is submitted and re-reviewed.'),
+    canAmendLog() ? el('div', { class: 'actions' },
+      el('button', { onclick: () => openRunLog(run.id) }, 'Continue editing'),
+      el('button', { class: 'secondary', onclick: () => openSubmitAmendment(run) }, 'Submit amendment…'),
+      el('button', { class: 'secondary', onclick: async () => {
+        if (!confirm('Cancel this amendment? Only possible if nothing has been changed; the run returns to its previous status.')) return;
+        try { await api('POST', '/production/' + run.id + '/amendments/' + a.id + '/cancel', {}); toast('Amendment cancelled'); render(); }
+        catch (e) { toast(e.message, true); }
+      } }, 'Cancel amendment')) : null);
+}
+async function openAmendDialog(run) {
+  const info = await api('GET', '/production/' + run.id + '/amendments');
+  const imp = info.impact;
+  const me = State.user || {};
+  const catSel = selectFrom('', [['', 'Select a category…'], ...Object.entries(info.categories)]);
+  const reason = el('textarea', { rows: '3', placeholder: 'What is being changed, and why?' });
+  const pw = el('input', { type: 'password', autocomplete: 'off', placeholder: 'Your password (signature)' });
+  const heldUnits = imp.lots.filter(l => l.status === 'on_hand').reduce((a, l) => a + (l.qty || 0), 0);
+  const effects = [
+    'The production log is unlocked for editing until the amendment is submitted.',
+    'Changes are recorded as ONE revision with this reason and a field-by-field before/after.',
+    ['pending_release', 'released', 'legacy', 'rejected'].includes(imp.state) ? 'The current review / release sign-off no longer stands; the run is re-reviewed after you submit.' : 'The run goes back to production-log review after you submit.',
+    heldUnits > 0 ? fmt(heldUnits) + ' unsold unit(s) will be held (Pending Release) until re-released.' : null,
+  ].filter(Boolean);
+  const body = el('div', {},
+    el('div', { class: 'summary-line' }, sl('Run', run.processingLot), el('span', {}, 'Status: ', releaseBadge(imp.state))),
+    el('ul', { style: 'margin:6px 0 10px 18px;font-size:13px' }, ...effects.map(t => el('li', {}, t))),
+    imp.shipped.length ? el('div', { class: 'amend-banner' }, '⚠ ' + imp.shipped.reduce((a, x) => a + x.qty, 0) + ' unit(s) from this run have already shipped ('
+      + imp.shipped.map(x => x.qty + ' × ' + x.lot + ' on ' + x.shipment).join('; ') + '). The app cannot recall them — Quality should decide whether a deviation notice is needed.') : null,
+    field(reqLabel('Category'), catSel), field(reqLabel('Reason'), reason),
+    imp.needsSignature ? el('div', {},
+      el('div', { class: 'help' }, 'This run has been reviewed/released, so amending it is a signed act: re-enter your password. It is re-reviewed before product can be sold again.'),
+      field(reqLabel('Password'), pw)) : null);
+  modal('Amend run — ' + run.processingLot, body, async () => {
+    if (!catSel.value) throw new Error('Choose a category.');
+    if (reason.value.trim().length < 5) throw new Error('Enter the reason for the amendment.');
+    await api('POST', '/production/' + run.id + '/amendments', { category: catSel.value, reason: reason.value.trim(), password: pw.value || undefined });
+    toast('Amendment opened — the production log is now editable.');
+    closeAllModals(); render(); openRunLog(run.id);
+  }, 'Open amendment');
+}
+async function openSubmitAmendment(run) {
+  const a = run.amendment;
+  const pv = await api('GET', '/production/' + run.id + '/amendments/' + a.id + '/preview');
+  const comment = el('textarea', { rows: '2', placeholder: 'Optional note for the reviewer' });
+  const body = el('div', {},
+    el('div', { class: 'summary-line' }, sl('Run', run.processingLot), sl('Category', a.categoryLabel), sl('Reason', a.reason)),
+    el('h3', { style: 'margin:10px 0 4px;font-size:14px' }, 'Changes in this amendment (' + pv.changes.length + ')'),
+    pv.changes.length ? el('div', { class: 'tablewrap' }, el('table', {},
+      el('thead', {}, el('tr', {}, el('th', {}, 'Field'), el('th', {}, 'From'), el('th', {}, 'To'))),
+      el('tbody', {}, ...pv.changes.map(c => el('tr', {}, el('td', {}, c.field), el('td', { class: 'muted' }, c.old ?? '—'), el('td', {}, el('b', {}, c.new ?? '—')))))))
+      : el('div', { class: 'help' }, 'No changes have been made yet. If none are needed, cancel the amendment instead.'),
+    pv.missingRequired.length ? el('div', { class: 'error' }, 'This run was complete before the amendment — required fields can’t be left blank: ' + pv.missingRequired.join('; ')) : null,
+    field('Note', comment),
+    el('div', { class: 'help' }, 'On submit the changes become a new revision and the run goes back for production-log review; finished goods stay on hold until it is re-released.'));
+  modal('Submit amendment — ' + run.processingLot, body, async () => {
+    if (!pv.changes.length) throw new Error('No changes have been made — cancel the amendment instead.');
+    if (pv.missingRequired.length) throw new Error('Required fields are missing — complete them first.');
+    await api('POST', '/production/' + run.id + '/amendments/' + a.id + '/submit', { comment: comment.value || null });
+    toast('Amendment submitted for review.');
+    closeAllModals(); render();
+  }, 'Submit for review');
+}
+// ---- Data integrity check (admin / Quality Manager) ----
+function askPassword(title, message) {
+  return new Promise(resolve => {
+    const pw = el('input', { type: 'password', autocomplete: 'off' });
+    modal(title, el('div', {}, el('div', { class: 'help' }, message), field('Password', pw)), async () => {
+      if (!pw.value) throw new Error('Enter your password.');
+      resolve(pw.value);
+    }, 'Confirm');
+  });
+}
+async function openIntegrityCheck() {
+  const host = el('div', {});
+  async function draw(r) {
+    host.innerHTML = '';
+    const sev = { error: 'low', warning: 'hold', info: 'wip' };
+    host.append(el('div', { class: 'summary-line' }, sl('Checked', fmtWhen(r.checkedAt)),
+      sl('Errors', r.summary.error), sl('Warnings', r.summary.warning), sl('Info', r.summary.info),
+      el('span', {}, 'Audit chain: ', badge(r.chain.ok ? 'on_hand' : 'low', r.chain.ok ? 'intact (' + r.chain.events + ' events)' : 'BROKEN'))));
+    if (!r.issues.length) { host.append(el('div', { class: 'empty card' }, '✓ No inconsistencies found.')); return; }
+    host.append(table(['', 'Area', 'Run', 'Finding', ''], r.issues.map(i => [
+      el('span', { class: 'int-sev' }, badge(sev[i.severity], i.severity)), i.area, i.run ? mono(i.run) : '—',
+      el('div', {}, i.message, i.action ? el('div', { class: 'help' }, '→ ' + i.action) : null),
+      i.repair ? el('button', { class: 'secondary', onclick: async () => {
+        const pwd = await askPassword('Repair — ' + i.area, 'Applies the fix and records it in the audit trail. Enter your password to confirm.');
+        try { draw(await api('POST', '/integrity/repair', { kind: i.repair, runId: i.runId, password: pwd })); toast('Repair applied'); }
+        catch (e) { toast(e.message, true); }
+      } }, 'Repair') : null]), [false, false, false, false, false]));
+  }
+  const body = el('div', {}, el('div', { class: 'help' }, 'Cross-checks each finalized run against the records derived from it: finished-goods lots vs packaging entries, output litres, container/label stock commits, release status vs lot status, the signed log vs the current log, open amendments and the audit chain. Documents are not part of the check.'),
+    host);
+  modal('Data integrity check', body, async () => {}, 'Close', { wide: true, noCancel: true });
+  host.append(el('div', { class: 'help' }, 'Checking…'));
+  try { await draw(await api('GET', '/integrity')); } catch (e) { host.innerHTML = ''; host.append(el('div', { class: 'error' }, e.message)); }
+}
+const canAmendLog = () => !!(State.user && State.user.canAmendLog);
+const canIntegrity = () => !!(State.user && (State.user.role === 'admin' || State.user.isQualityManager));
+
+// Opens (and scrolls to) one section of a production-log modal: sections are the
+// top-level accordions, identified by their summary text.
+const LOG_SECTION_TITLES = { feedstock: 'Feedstock', homogenization: 'Homogenization', extraction: 'Extraction',
+  separation: 'Separation', pasteurization: 'Pasteurization', dilution: 'Dilution & Preservation', packaging: 'Packaging' };
+function jumpToSection(root, key) {
+  const title = LOG_SECTION_TITLES[key];
+  const target = [...root.querySelectorAll(':scope > details.accordion')]
+    .find(d => (d.querySelector('summary')?.textContent || '').trim() === title);
+  if (!target) return;
+  target.open = true;
+  setTimeout(() => target.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
+}
+// Revision tracker for a finalized run's production log: Rev 1 is the finalized
+// record; every later change (any section) adds a revision with who/when and a
+// field-by-field old -> new diff.
+function revisionTracker(run) {
+  const revs = (run.revisions || []).slice().reverse();   // newest first
+  const latest = run.revision || 1;
+  const head = revs[0];
+  const wrap = el('details', { class: 'rev-tracker' },
+    el('summary', {}, el('span', { class: 'rev-badge' }, 'Rev ' + latest), 'Revision tracker',
+      el('span', { class: 'muted', style: 'font-weight:normal' },
+        latest > 1 && head ? '  ·  last changed ' + fmtWhen(head.at) + ' by ' + (head.by || '—') : '  ·  no changes since finalized')));
+  revs.forEach((r, i) => {
+    const n = (r.changes || []).length;
+    wrap.append(el('details', { class: 'rev-item' + (i === 0 ? ' current' : '') },
+      el('summary', {}, el('span', { class: 'rev-badge', style: 'background:' + (i === 0 ? 'var(--teal-dark)' : '#8aa39f') }, 'Rev ' + r.rev),
+        el('b', {}, fmtWhen(r.at)), ' · ', r.by || '—', ' — ', el('span', { class: 'muted' }, r.summary || (r.kind === 'finalized' ? 'Finalized' : ''))),
+      n ? el('div', { class: 'rev-body' },
+        el('div', { class: 'tablewrap' }, el('table', {},
+        el('thead', {}, el('tr', {}, el('th', {}, 'Field'), el('th', {}, 'From'), el('th', {}, 'To'))),
+        el('tbody', {}, ...r.changes.map(c => el('tr', {}, el('td', {}, c.field),
+          el('td', { class: 'muted' }, c.old ?? '—'), el('td', {}, el('b', {}, c.new ?? '—')))))))) : null));
+  });
+  return wrap;
 }
 function draftCard(d) {
   const pkgSummary = (d.packages || []).filter(p => p.qty > 0).map(p => `${fmt(p.qty)} × ${p.size}`).join(', ') || '—';
@@ -669,7 +901,8 @@ function draftCard(d) {
       sl('Run date', d.runDate), sl('SKU', d.sku ? skuName(d.sku) : '—'),
       sl('Totes selected', d.toteLots.length ? d.toteLots.join(', ') : '—'),
       sl('Packaging', pkgSummary), d.operators ? sl('Operators', d.operators) : null),
-    stageProgress(d),
+    stageProgress(d, { onSelect: key => openRun(d, { section: key }) }),
+    el('div', { class: 'muted', style: 'margin-top:6px;font-size:12px' }, 'Click a section above to open it. Revision tracking starts when the run is finalized.'),
     d.notes ? el('div', { class: 'muted', style: 'margin-top:4px;font-size:12px' }, '“' + d.notes + '”') : null);
 }
 async function discardDraft(d) {
@@ -677,16 +910,6 @@ async function discardDraft(d) {
   await api('DELETE', '/production/drafts/' + d.id);
   toast('Draft discarded');
   render();
-}
-function editHistoryBlock(edits) {
-  const wrap = el('details', { class: 'edit-history' },
-    el('summary', {}, `Edit history (${edits.length} change${edits.length === 1 ? '' : 's'})`));
-  wrap.append(el('div', { class: 'tablewrap', style: 'margin-top:8px' }, el('table', {},
-    el('thead', {}, el('tr', {}, el('th', {}, 'When'), el('th', {}, 'User'), el('th', {}, 'Field'), el('th', {}, 'From'), el('th', {}, 'To'))),
-    el('tbody', {}, ...edits.map(e => el('tr', {},
-      el('td', { class: 'muted' }, fmtWhen(e.at)), el('td', {}, e.user || '—'),
-      el('td', {}, e.field), el('td', { class: 'muted' }, e.old || '—'), el('td', {}, el('b', {}, e.new || '—'))))))));
-  return wrap;
 }
 // Every timestamp we display is stamped in UTC (now_iso() / Date#toISOString())
 // — render it in Pacific time (DST-aware) rather than showing raw UTC, which
@@ -724,8 +947,13 @@ async function editRun(run) {
     field('Reason for excluding', el('input', { id: 'e_excl_reason', value: run.excludeReason || '', placeholder: 'required when excluded' })),
     el('div', { class: 'help' }, 'These kg totals include what was logged under Dilution & Preservation. Changing citric / sorbate / benzoate adjusts reagent stock by the difference. Every change is logged with your name.'));
   body.querySelector('#e_excl').checked = !!run.excludeFromStats;
+  const locked = !run.amendment || !canAmendLog();
+  if (locked) {
+    body.prepend(logLockBanner(run, 'The run date, reagent totals, location, operators and notes are production-log entries. Only the yield-analysis exclusion below can be changed without an amendment.'));
+    body.querySelectorAll('input, select, textarea, button').forEach(c => { if (!c.closest('.allow-locked') && !['e_excl', 'e_excl_reason'].includes(c.id)) c.disabled = true; });
+  }
   modal('Edit run — ' + run.processingLot, body, async () => {
-    const r = await api('PUT', '/production/' + run.id, {
+    const full = {
       runDate: body.querySelector('#e_date').value,
       citricKg: body.querySelector('#e_citric').value || 0,
       sorbateKg: body.querySelector('#e_sorbate').value || 0,
@@ -735,7 +963,9 @@ async function editRun(run) {
       notes: body.querySelector('#e_notes').value,
       excludeFromStats: body.querySelector('#e_excl').checked ? 1 : 0,
       excludeReason: body.querySelector('#e_excl_reason').value
-    });
+    };
+    const r = await api('PUT', '/production/' + run.id,
+      locked ? { excludeFromStats: full.excludeFromStats, excludeReason: full.excludeReason } : full);
     State.ref = await api('GET', '/refdata');
     toast(r.changed ? r.changed + ' change' + (r.changed === 1 ? '' : 's') + ' logged' : 'No changes');
     render();
@@ -1046,7 +1276,7 @@ function buildPasteurizationSection(getRunId, values, samplePoints, processingLo
     buildSamplePointsSection(samplePoints, getRunId, processingLot, () => postCollectedInp.value, 'pasteurization_post'));
 
   const status = el('span', { class: 'help' });
-  const saveBtn = el('button', { type: 'button', class: 'secondary', onclick: save }, 'Save');
+  const saveBtn = el('button', { type: 'button', class: 'secondary section-save', onclick: save }, 'Save');
   async function save() {
     status.textContent = ''; saveBtn.disabled = true;
     try {
@@ -1068,11 +1298,12 @@ function buildPasteurizationSection(getRunId, values, samplePoints, processingLo
     box: el('details', { class: 'accordion' }, el('summary', {}, 'Pasteurization'),
       el('div', { class: 'accordion-body' },
         el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Start Conditions'),
-        el('div', { class: 'form-row' }, field('Started at', startedAt)),
+        el('div', { class: 'form-row' }, rfield('pasteurization', 'startedAt', 'Started at', startedAt)),
         // Standard 2-column form-row (not the compact 108px fields) so both
         // labels fit on one line and the two input boxes stay level.
         el('div', { class: 'form-row' },
-          field('Product set-point (°C)', productSetpointInp), field('Boiler set-point (°C)', boilerSetpointInp)),
+          rfield('pasteurization', 'productSetpointC', 'Product set-point (°C)', productSetpointInp),
+          rfield('pasteurization', 'boilerSetpointC', 'Boiler set-point (°C)', boilerSetpointInp)),
         el('div', { class: 'qc-check-section-title' }, 'Pasteurization In'),
         dilutionProcessCheckBox,
         el('div', { class: 'qc-check-section-title' }, 'Pasteurization Out'),
@@ -1121,21 +1352,26 @@ function buildQualityCheckBox(subtitle, values, opts) {
     solidsLoadingInp = pctInput();
     if (values.solidsLoadingPct != null) solidsLoadingInp.value = formatQcValue(values.solidsLoadingPct, 1);
   }
+  // Asterisk a field when the server's required-field registry lists it for
+  // opts.reqStage (opts.keyMap renames keys, e.g. Separation's liquid* fields).
+  const qf = (key, label, input) => opts.reqStage
+    ? rfield(opts.reqStage, (opts.keyMap || {})[key] || key, label, input) : field(label, input);
   const boxChildren = [
     el('div', { class: 'qc-check-title' }, 'QC Check'),
     el('div', { class: 'qc-check-subtitle' }, subtitle),
     el('div', { class: 'qc-check-section-title' }, 'Liquid'),
     el('div', { class: 'form-row-compact' },
-      field('pH', qcPhInp), field('TDS (%)', tdsInp), field('Brix (%)', brixInp), field('Mannitol (%)', mannitolInp)),
+      qf('qcPh', 'pH', qcPhInp), qf('tdsPct', 'TDS (%)', tdsInp), qf('brixPct', 'Brix (%)', brixInp),
+      qf('mannitolPct', 'Mannitol (%)', mannitolInp)),
     el('div', { class: 'qc-check-section-title' }, 'Total Solids'),
     el('div', { class: 'form-row-compact' },
-      field('TSliquid (%)', tsLiquidInp),
-      ...(opts.omitSlurrySolids ? [] : [field('TSslurry (%)', tsSlurryInp), field(moistureSolidsLabel(), tsSolidsInp)]),
-      ...(opts.showSolidsLoading ? [field('Solids Loading (%)', solidsLoadingInp)] : [])),
+      qf('tsLiquidPct', 'TSliquid (%)', tsLiquidInp),
+      ...(opts.omitSlurrySolids ? [] : [qf('tsSlurryPct', 'TSslurry (%)', tsSlurryInp), qf('tsSolidsPct', moistureSolidsLabel(), tsSolidsInp)]),
+      ...(opts.showSolidsLoading ? [qf('solidsLoadingPct', 'Solids Loading (%)', solidsLoadingInp)] : [])),
     el('div', { class: 'qc-check-section-title' }, 'Density'),
     el('div', { class: 'form-row-compact' },
-      ...(opts.omitSlurrySolids ? [] : [field('ρslurry (g/mL)', rhoSlurryInp)]),
-      field('ρliquid (g/mL)', rhoLiquidInp)),
+      ...(opts.omitSlurrySolids ? [] : [qf('rhoSlurryGMl', 'ρslurry (g/mL)', rhoSlurryInp)]),
+      qf('rhoLiquidGMl', 'ρliquid (g/mL)', rhoLiquidInp)),
   ];
   const box = el('div', { class: 'qc-check-box theme-quality' }, ...boxChildren);
   function getPayload() {
@@ -1181,10 +1417,10 @@ function buildExtractionSection(getRunId, values, onSaved) {
   attachNumericMask(startingPowerInp, 2);
   if (values.startingPowerW != null) startingPowerInp.value = formatQcValue(values.startingPowerW, 2);
 
-  const qcCheck = buildQualityCheckBox('Extraction Performance', values);
+  const qcCheck = buildQualityCheckBox('Extraction Performance', values, { reqStage: 'extraction' });
 
   const status = el('span', { class: 'help' });
-  const saveBtn = el('button', { type: 'button', class: 'secondary', onclick: save }, 'Save');
+  const saveBtn = el('button', { type: 'button', class: 'secondary section-save', onclick: save }, 'Save');
   async function save() {
     status.textContent = ''; saveBtn.disabled = true;
     try {
@@ -1211,14 +1447,15 @@ function buildExtractionSection(getRunId, values, onSaved) {
   return el('details', { class: 'accordion' }, el('summary', {}, 'Extraction'),
     el('div', { class: 'accordion-body' },
       el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Start Conditions'),
-      el('div', { class: 'form-row' }, field('Started at', startedAt)),
+      el('div', { class: 'form-row' }, rfield('extraction', 'startedAt', 'Started at', startedAt)),
       el('div', { class: 'form-row-compact' },
-        field('Amplitude (%)', amplitudeInp), field('Flow rate (L/min)', flowrateInp)),
+        rfield('extraction', 'amplitudePct', 'Amplitude (%)', amplitudeInp),
+        rfield('extraction', 'flowrateLpm', 'Flow rate (L/min)', flowrateInp)),
       // Pressure/Starting power each get the full row width (not shared
       // 2-up, not the compact 108px fields above) so their long SOP-target
       // placeholder text is never clipped.
-      field('Pressure (psi)', pressureInp),
-      field('Starting power (W)', startingPowerInp),
+      rfield('extraction', 'pressurePsi', 'Pressure (psi)', pressureInp),
+      rfield('extraction', 'startingPowerW', 'Starting power (W)', startingPowerInp),
       el('div', { class: 'qc-check-section-title' }, 'Extraction Out'),
       qcCheck.box,
       el('div', { style: 'margin-top:6px' }, saveBtn, status)));
@@ -1253,8 +1490,8 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot) {
   const solidsQcBox = el('div', { class: 'qc-check-box theme-quality' },
     el('div', { class: 'qc-check-title' }, 'QC Check'),
     el('div', { class: 'qc-check-subtitle' }, 'Solids characterization'),
-    field(el('span', { html: '%Moisture<sub>centrifuge_solids</sub>' }), moistureInp),
-    field(el('span', { html: '%Moisture<sub>screw_solids</sub>' }), moistureScrewInp));
+    rfield('separation', 'pctMoisture', el('span', { html: '%Moisture<sub>centrifuge_solids</sub>' }), moistureInp),
+    rfield('separation', 'pctMoistureScrew', el('span', { html: '%Moisture<sub>screw_solids</sub>' }), moistureScrewInp));
   const solidsCollectedInp = el('input', { type: 'datetime-local',
     value: values.solidsSampleCollectedAt ? values.solidsSampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
   const solidsSamplePointBox = el('div', { class: 'qc-check-box theme-sample' },
@@ -1268,10 +1505,12 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot) {
     qcPh: values.liquidQcPh, tdsPct: values.liquidTdsPct, brixPct: values.liquidBrixPct,
     mannitolPct: values.liquidMannitolPct, tsLiquidPct: values.liquidTsLiquidPct,
     rhoLiquidGMl: values.liquidRhoLiquidGMl,
-  }, { omitSlurrySolids: true });
+  }, { omitSlurrySolids: true, reqStage: 'separation', keyMap: {
+    qcPh: 'liquidQcPh', tdsPct: 'liquidTdsPct', brixPct: 'liquidBrixPct', mannitolPct: 'liquidMannitolPct',
+    tsLiquidPct: 'liquidTsLiquidPct', rhoLiquidGMl: 'liquidRhoLiquidGMl' } });
 
   const status = el('span', { class: 'help' });
-  const saveBtn = el('button', { type: 'button', class: 'secondary', onclick: save }, 'Save');
+  const saveBtn = el('button', { type: 'button', class: 'secondary section-save', onclick: save }, 'Save');
   async function save() {
     status.textContent = ''; saveBtn.disabled = true;
     try {
@@ -1296,11 +1535,12 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot) {
   return el('details', { class: 'accordion' }, el('summary', {}, 'Separation'),
     el('div', { class: 'accordion-body' },
       el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Start Conditions'),
-      el('div', { class: 'form-row' }, field('Started at', startedAt)),
+      el('div', { class: 'form-row' }, rfield('separation', 'startedAt', 'Started at', startedAt)),
       el('div', { class: 'form-row-compact' },
-        field('Flow rate (L/min)', flowrateInp), field('Mesh size (micron)', meshInp)),
+        rfield('separation', 'flowrateLpm', 'Flow rate (L/min)', flowrateInp),
+        rfield('separation', 'meshMicron', 'Mesh size (micron)', meshInp)),
       el('div', { class: 'qc-check-section-title' }, 'Solids Out'),
-      field('Total wet-solids weight (kg)', wetSolidsWtInp),
+      rfield('separation', 'wetSolidsWtKg', 'Total wet-solids weight (kg)', wetSolidsWtInp),
       solidsQcBox,
       solidsSamplePointBox,
       el('div', { class: 'qc-check-section-title' }, 'Liquid Out'),
@@ -1349,7 +1589,8 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
     el('div', { class: 'qc-check-result' },
       el('span', { class: 'qc-check-result-label' }, '%Wet-Solids, (g/g)'), resultValue),
     el('div', { class: 'form-row' },
-      field('Wet-solids-wt (g)', wetInp), field('Liquid-wt (g)', liquidInp)),
+      rfield('homogenization', 'wetSolidsWtG', 'Wet-solids-wt (g)', wetInp),
+      rfield('homogenization', 'liquidWtG', 'Liquid-wt (g)', liquidInp)),
     sopLinkEl('wet_solids_sop'));
 
   // Output: a target %Wet-Solids to dilute the tank down to, and the
@@ -1391,7 +1632,7 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
   // QC Check (lot characterization): liquid-phase and slurry/solids-phase
   // readings, each its own compact wrapping row -- shared with Extraction
   // Out, which uses the same card under its own subtitle.
-  const qcCheck = buildQualityCheckBox('Lot characterization', values, { showSolidsLoading: true });
+  const qcCheck = buildQualityCheckBox('Lot characterization', values, { showSolidsLoading: true, reqStage: 'homogenization' });
   const qcCheckBox = qcCheck.box;
 
   // Sample Point (lot input): a repeatable table of samples taken at this
@@ -1405,7 +1646,7 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
     buildSamplePointsSection(samplePoints, getRunId, processingLot, () => collectedInp.value, 'homogenization'));
 
   const status = el('span', { class: 'help' });
-  const saveBtn = el('button', { type: 'button', class: 'secondary', onclick: save }, 'Save');
+  const saveBtn = el('button', { type: 'button', class: 'secondary section-save', onclick: save }, 'Save');
   async function save() {
     status.textContent = ''; saveBtn.disabled = true;
     try {
@@ -1430,14 +1671,16 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
   return el('details', { class: 'accordion' }, el('summary', {}, 'Homogenization'),
     el('div', { class: 'accordion-body' },
       el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Homogenization In'),
-      el('div', { class: 'form-row' }, field('Started at', startedAt)),
+      el('div', { class: 'form-row' }, rfield('homogenization', 'startedAt', 'Started at', startedAt)),
       el('div', { class: 'form-row' },
-        field('Rinse water (L)', rinsingInp), field('Tank level (L)', tankInp)),
+        rfield('homogenization', 'rinsingWaterL', 'Rinse water (L)', rinsingInp),
+        rfield('homogenization', 'slurryL', 'Tank level (L)', tankInp)),
       processCheck1Box,
       el('div', { class: 'qc-check-section-title' }, 'Homogenization Out'),
       el('div', { class: 'form-row' },
-        field('Target %Wet-Solids', targetPctField), field('Target fill level, Tank 2A/B (L)', dilutionTargetValue)),
-      el('div', { class: 'form-row' }, field('Dilution water added (L)', dilutionInp)),
+        rfield('homogenization', 'targetPctWetSolids', 'Target %Wet-Solids', targetPctField),
+        field('Target fill level, Tank 2A/B (L)', dilutionTargetValue)),
+      el('div', { class: 'form-row' }, rfield('homogenization', 'dilutionWaterL', 'Dilution water added (L)', dilutionInp)),
       qcCheckBox,
       samplePointBox,
       el('div', { style: 'margin-top:6px' }, saveBtn, status)));
@@ -1506,7 +1749,7 @@ function buildSamplePointsSection(initial, getRunId, processingLot, getCollected
       });
       const containerSel = selectCell(sampleContainerOptions(), it.container, () => patch(it.id, { container: containerSel.value }));
       const printBtn = el('button', {
-        type: 'button', class: 'secondary', title: 'Print label(s) for this sample', onclick: () => {
+        type: 'button', class: 'secondary allow-locked', title: 'Print label(s) for this sample', onclick: () => {
           const qty = Math.max(1, Math.min(10, +qtyInp.value || 1));
           const labels = [];
           for (let i = 1; i <= qty; i++) labels.push(samplePointLabel(processingLot, it, i, qty, getCollectedAt()));
@@ -1541,7 +1784,8 @@ function buildSamplePointsSection(initial, getRunId, processingLot, getCollected
       el('thead', {}, el('tr', {}, el('th', {}, 'Type'), el('th', {}, 'Description'), el('th', {}, 'Qty'),
         el('th', {}, 'Container'), el('th', {}, ''))),
       tbody),
-    el('div', { style: 'margin-top:8px' }, addBtn), status);
+    el('div', { style: 'margin-top:8px' }, addBtn),
+    stage === 'packaging' ? el('div', { class: 'help' }, reqLabel('At least one sample is required')) : null, status);
 }
 
 // Packaging: a run may package output across several container units and
@@ -1573,7 +1817,12 @@ function buildPackagingEntriesSection(initial, getRunId) {
       const r = await api('PUT', '/production/' + rid + '/packaging-entries/' + id, payload);
       items = r.packagingEntries;
       status.textContent = '';
-    } catch (e) { status.textContent = e.message; }
+    } catch (e) {
+      // The server rolled the change back (e.g. not enough stock, or units already
+      // shipped): show what is actually saved, not what was typed.
+      status.textContent = e.message;
+      try { const rid = await getRunId(); items = (await api('GET', '/production/' + rid + '/packaging-entries')).packagingEntries; draw(); } catch (_) { /* keep message */ }
+    }
   }
   function draw() {
     tbody.innerHTML = '';
@@ -1611,6 +1860,7 @@ function buildPackagingEntriesSection(initial, getRunId) {
   }, '+');
   return {
     box: el('div', {},
+      el('div', { class: 'help' }, reqLabel('At least one packaged output quantity is required')),
       el('table', { class: 'qc-check-checklist' },
         el('thead', {}, el('tr', {}, el('th', {}, 'Container unit'), el('th', {}, 'Qty'), el('th', {}, ''))),
         tbody),
@@ -1737,7 +1987,7 @@ function buildOperatorsSelect(initialValue) {
 function buildFeedstockCard(opts) {
   const v = Object.assign({ loadedAt: '', ph: null, phMeasuredAt: null, orp: null, orpRange: '', odour: '',
     odourIntensity: '', weightKg: null, volumeL: null, densityKgL: null,
-    decision: 'accepted', rejectionReason: '', notes: '',
+    decision: opts.markRequired ? '' : 'accepted', rejectionReason: '', notes: '',
     surfacePhotoId: null, striationPhotoId: null }, opts.initial || {});
 
   const loadedAt = el('input', { type: 'datetime-local', value: v.loadedAt ? v.loadedAt.replace('Z', '').slice(0, 16) : '' });
@@ -1765,8 +2015,11 @@ function buildFeedstockCard(opts) {
     { placeholder: 'Select odour(s)…', otherPlaceholder: 'Other odour', otherFieldLabel: 'Other odour' });
   const intensitySel = el('select', {}, ...ODOUR_INTENSITIES.map(i => el('option', { value: i }, i || '—')));
   intensitySel.value = v.odourIntensity || '';
-  const decisionSel = el('select', {}, el('option', { value: 'accepted' }, 'Accepted'), el('option', { value: 'rejected' }, 'Rejected'));
-  decisionSel.value = v.decision || 'accepted';
+  // In a production log the accept/reject decision is a required, explicit choice
+  // (no preselected answer); Feedstock Inventory's own card keeps its default.
+  const decisionSel = el('select', {}, ...(opts.markRequired ? [el('option', { value: '' }, 'Select…')] : []),
+    el('option', { value: 'accepted' }, 'Accepted'), el('option', { value: 'rejected' }, 'Rejected'));
+  decisionSel.value = v.decision || (opts.markRequired ? '' : 'accepted');
   const reasonInp = el('input', { placeholder: 'Reason for rejection', value: v.rejectionReason || '' });
   const reasonField = field('Rejection reason', reasonInp);
   reasonField.classList.toggle('hidden', decisionSel.value !== 'rejected');
@@ -1784,7 +2037,7 @@ function buildFeedstockCard(opts) {
       densityKgL: calcDensity(),
       odour: odourMultiSelect.value || null,
       odourIntensity: intensitySel.value || null,
-      decision: decisionSel.value,
+      decision: decisionSel.value || null,
       rejectionReason: reasonInp.value.trim() || null,
       notes: notesInp.value.trim() || null,
       surfacePhotoId: v.surfacePhotoId, striationPhotoId: v.striationPhotoId
@@ -1833,8 +2086,9 @@ function buildFeedstockCard(opts) {
     }
     fileInput.addEventListener('change', () => { handle(fileInput.files[0]); fileInput.value = ''; });
     cameraInput.addEventListener('change', () => { handle(cameraInput.files[0]); cameraInput.value = ''; });
+    const photoKey = slotKey === 'surfacePhotoId' ? 'surfacePhoto' : 'striationPhoto';
     return el('div', { class: 'photo-slot', style: 'flex:1 1 160px' },
-      el('div', { class: 'help' }, label), img, fileInput, cameraInput,
+      el('div', { class: 'help' }, opts.markRequired && isReq('feedstock', photoKey) ? reqLabel(label) : label), img, fileInput, cameraInput,
       el('div', { style: 'display:flex;gap:6px;margin-top:4px' },
         el('button', { type: 'button', class: 'secondary', onclick: () => fileInput.click() }, 'Upload'),
         el('button', { type: 'button', class: 'secondary', onclick: () => cameraInput.click() }, '📷 Photo')),
@@ -1845,17 +2099,20 @@ function buildFeedstockCard(opts) {
   // live in the "Current pH/ORP" summary and quick-update fields just above
   // it in that modal instead, so the same reading isn't captured twice.
   const omit = opts.omit || [];
+  // opts.markRequired (production-log callers only -- not Feedstock Inventory's
+  // own Details card) asterisks the fields the finalize check requires.
+  const fl = (key, label, control) => opts.markRequired && isReq('feedstock', key) ? field(reqLabel(label), control) : field(label, control);
   const allFields = [
-    ['loadedAt', field('Loaded at', loadedAt)],
-    ['ph', field('pH', el('div', {}, phInp, phMeasuredNote))],
-    ['orp', field('ORP (mV)', orpInp)],
+    ['loadedAt', fl('loadedAt', 'Loaded at', loadedAt)],
+    ['ph', fl('ph', 'pH', el('div', {}, phInp, phMeasuredNote))],
+    ['orp', fl('orp', 'ORP (mV)', orpInp)],
     ['orpRange', field('ORP meter range (calculated)', orpRangeNote)],
-    ['weightKg', field('Weight (kg)', weightInp)],
-    ['volumeL', field('Volume (L)', volumeInp)],
+    ['weightKg', fl('weightKg', 'Weight (kg)', weightInp)],
+    ['volumeL', fl('volumeL', 'Volume (L)', volumeInp)],
     ['densityKgL', field('Density (calculated)', densityNote)],
-    ['odour', field('Odour', odourMultiSelect.el)],
-    ['odourIntensity', field('Odour intensity', intensitySel)],
-    ['decision', field('Decision', decisionSel)],
+    ['odour', fl('odour', 'Odour', odourMultiSelect.el)],
+    ['odourIntensity', fl('odourIntensity', 'Odour intensity', intensitySel)],
+    ['decision', fl('decision', 'Decision', decisionSel)],
   ];
   const fieldsRow = el('div', { class: 'form-row' },
     ...allFields.filter(([key]) => !omit.includes(key)).map(([, fieldEl]) => fieldEl));
@@ -2019,24 +2276,19 @@ function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsor
   nabenzoateStockInp.addEventListener('input', () => { refreshNabenzoateCalculatedL(); refreshNabenzoateAddedKg(); });
   nabenzoateAddedLInp.addEventListener('input', refreshNabenzoateAddedKg);
 
-  const status = el('span', { class: 'help' });
-  const saveBtn = el('button', { type: 'button', class: 'secondary', onclick: save }, 'Save');
+  // No Save button of its own: Dilution & Preservation has ONE Save (at the bottom of
+  // the section) that calls this and then saves the LKE QC Check + Sample Point.
   async function save() {
-    status.textContent = ''; saveBtn.disabled = true;
-    try {
-      const rid = await getRunId();
-      await api('PUT', '/production/' + rid + '/stages/dilution', {
-        fillLevelTank6abL: fillLevelInp.value.trim() === '' ? null : qcParseValue(fillLevelInp.value),
-        measuredPh: measuredPhInp.value.trim() === '' ? null : qcParseValue(measuredPhInp.value),
-        citricKg: citricInp.value.trim() === '' ? null : qcParseValue(citricInp.value),
-        ksorbateStockPct: ksorbateStockInp.value.trim() === '' ? null : qcParseValue(ksorbateStockInp.value),
-        ksorbateAddedL: ksorbateAddedLInp.value.trim() === '' ? null : qcParseValue(ksorbateAddedLInp.value),
-        nabenzoateStockPct: nabenzoateStockInp.value.trim() === '' ? null : qcParseValue(nabenzoateStockInp.value),
-        nabenzoateAddedL: nabenzoateAddedLInp.value.trim() === '' ? null : qcParseValue(nabenzoateAddedLInp.value),
-      });
-      status.textContent = 'Saved.';
-    } catch (e) { status.textContent = e.message; }
-    saveBtn.disabled = false;
+    const rid = await getRunId();
+    await api('PUT', '/production/' + rid + '/stages/dilution', {
+      fillLevelTank6abL: fillLevelInp.value.trim() === '' ? null : qcParseValue(fillLevelInp.value),
+      measuredPh: measuredPhInp.value.trim() === '' ? null : qcParseValue(measuredPhInp.value),
+      citricKg: citricInp.value.trim() === '' ? null : qcParseValue(citricInp.value),
+      ksorbateStockPct: ksorbateStockInp.value.trim() === '' ? null : qcParseValue(ksorbateStockInp.value),
+      ksorbateAddedL: ksorbateAddedLInp.value.trim() === '' ? null : qcParseValue(ksorbateAddedLInp.value),
+      nabenzoateStockPct: nabenzoateStockInp.value.trim() === '' ? null : qcParseValue(nabenzoateStockInp.value),
+      nabenzoateAddedL: nabenzoateAddedLInp.value.trim() === '' ? null : qcParseValue(nabenzoateAddedLInp.value),
+    });
   }
 
   refreshTargetPh();
@@ -2049,23 +2301,23 @@ function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsor
     box: el('div', {},
       el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Dilution'),
       el('div', { class: 'form-row' },
-        field('Fill level, Tank 6A/B (L)', fillLevelInp),
+        rfield('dilution', 'fillLevelTank6abL', 'Fill level, Tank 6A/B (L)', fillLevelInp),
         field('Dilution water added, TDS', dilutionWaterAddedValue)),
       el('div', { class: 'form-row-3' },
-        field('Measured pH', measuredPhInp), field('Target pH', targetPhValue),
-        field('Citric acid added (kg)', citricInp)),
+        rfield('dilution', 'measuredPh', 'Measured pH', measuredPhInp), field('Target pH', targetPhValue),
+        rfield('dilution', 'citricKg', 'Citric acid added (kg)', citricInp)),
       el('div', { class: 'qc-check-section-title' }, 'Preservatives'),
       el('div', { class: 'form-row' },
-        field('Ksorbate stock concentration (w/v)', ksorbateStockField),
+        rfield('dilution', 'ksorbateStockPct', 'Ksorbate stock concentration (w/v)', ksorbateStockField),
         field('Ksorbate, calculated (L)', ksorbateCalculatedLValue)),
-      field('Ksorbate added (L)', ksorbateAddedLInp),
+      rfield('dilution', 'ksorbateAddedL', 'Ksorbate added (L)', ksorbateAddedLInp),
       field('Ksorbate added (kg)', ksorbateAddedKgValue),
       el('div', { class: 'form-row' },
-        field('Nabenzoate stock concentration (w/v)', nabenzoateStockField),
+        rfield('dilution', 'nabenzoateStockPct', 'Nabenzoate stock concentration (w/v)', nabenzoateStockField),
         field('Nabenzoate, calculated (L)', nabenzoateCalculatedLValue)),
-      field('Sodium benzoate added (L)', nabenzoateAddedLInp),
-      field('Sodium benzoate added (kg)', nabenzoateAddedKgValue),
-      el('div', { style: 'margin-top:6px' }, saveBtn, status)),
+      rfield('dilution', 'nabenzoateAddedL', 'Sodium benzoate added (L)', nabenzoateAddedLInp),
+      field('Sodium benzoate added (kg)', nabenzoateAddedKgValue)),
+    save,
     refresh: () => { refreshTargetPh(); refreshDilutionWaterAdded(); refreshKsorbateCalculatedL(); refreshNabenzoateCalculatedL(); }
   };
 }
@@ -2167,13 +2419,14 @@ async function openNewRun() {
   const operatorsSelect = buildOperatorsSelect('');
   const body = el('div', {},
     el('div', { class: 'form-row' },
-      field('Product SKU (required)', skuSel),
-      field('Run date (required)', dateInp)),
+      field(reqLabel('Product SKU'), skuSel),
+      field(reqLabel('Run date'), dateInp)),
     specPanel,
     el('div', { class: 'form-row', style: 'margin-top:8px' },
-      field('Production Location (required)', locSel),
-      field('Operators (required)', operatorsSelect.el)),
+      field(reqLabel('Production Location'), locSel),
+      field(reqLabel('Operators'), operatorsSelect.el)),
     field('Notes', el('textarea', { id: 'nr_notes', rows: '2', placeholder: 'Optional batch notes' })),
+    el('div', { class: 'help req-legend' }, el('span', { class: 'req-star' }, '*'), ' Required.'),
     el('div', { class: 'help' },
       'Feedstock, process stages and packaging open up once the run is created and a run code is assigned.'));
   modal('New production run', body, async () => {
@@ -2344,6 +2597,7 @@ async function openRun(draftSummary, opts) {
     if (!chosen.length) { feedstockHost.append(el('div', { class: 'help' }, 'Select totes above to characterize the feedstock.')); return; }
     for (const t of chosen) {
       feedstockHost.append(buildFeedstockCard({
+        markRequired: true,
         label: t.lot + (t.site ? '  ·  ' + t.site : ''),
         initial: feedstockState[t.id],
         mode: 'draft',
@@ -2421,20 +2675,21 @@ async function openRun(draftSummary, opts) {
   // Dilution & Preservation -- still packaging-stage columns/endpoints under
   // the hood (unchanged), just relocated in the UI, so they get their own
   // Save action separate from packagedAt's.
-  const packagingQcCheck = buildQualityCheckBox('LKE characterization', stages.packaging || {}, { omitSlurrySolids: true });
+  const packagingQcCheck = buildQualityCheckBox('LKE characterization', stages.packaging || {}, { omitSlurrySolids: true, reqStage: 'packaging' });
   const packagingSampleCollectedInp = el('input', { type: 'datetime-local',
     value: stages.packaging?.sampleCollectedAt ? stages.packaging.sampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
   const packagingSamplePointBox = el('div', { class: 'qc-check-box theme-sample' },
     el('div', { class: 'qc-check-title' }, 'Sample Point'),
     el('div', { class: 'qc-check-subtitle' }, 'LKE characterization'),
-    field('Collection date and time', packagingSampleCollectedInp),
+    rfield('packaging', 'sampleCollectedAt', 'Collection date and time', packagingSampleCollectedInp),
     buildSamplePointsSection(draft?.samplePoints || [], ensureRunId, draft?.processingLot,
       () => packagingSampleCollectedInp.value, 'packaging'));
   const packagingQcStatus = el('span', { class: 'help' });
   const packagingQcSaveBtn = el('button', {
-    type: 'button', class: 'secondary', onclick: async () => {
+    type: 'button', class: 'secondary section-save', onclick: async () => {
       packagingQcStatus.textContent = ''; packagingQcSaveBtn.disabled = true;
       try {
+        await dilutionSummary.save();
         const rid = await ensureRunId();
         await api('PUT', '/production/' + rid + '/stages/packaging', {
           ...packagingQcCheck.getPayload(),
@@ -2447,7 +2702,7 @@ async function openRun(draftSummary, opts) {
   }, 'Save');
   const packagingStatus = el('span', { class: 'help' });
   const packagingSaveBtn = el('button', {
-    type: 'button', class: 'secondary', onclick: async () => {
+    type: 'button', class: 'secondary section-save', onclick: async () => {
       packagingStatus.textContent = ''; packagingSaveBtn.disabled = true;
       try {
         const rid = await ensureRunId();
@@ -2460,23 +2715,36 @@ async function openRun(draftSummary, opts) {
     }
   }, 'Save');
 
+  // Section progress (chips + overall meter) at the top of the log; refreshed from
+  // the server after saves so the chips only turn green once a section's required
+  // fields are all saved.
+  const progressHost = el('div', {});
+  function drawProgress(prog) { progressHost.innerHTML = ''; const p = stageProgress({ progress: prog }, { onSelect: key => jumpToSection(body, key) }); if (p) progressHost.append(p); }
+  drawProgress(draft?.progress);
+  let progressTimer = null;
+  async function refreshProgress() {
+    if (!draftId) return;
+    try { drawProgress((await api('GET', '/production/' + draftId + '/progress')).progress); } catch (e) { /* non-critical */ }
+  }
   const body = el('div', {},
     draft ? el('div', { class: 'summary-line', style: 'margin-bottom:10px' },
       sl('Run code', mono(draft.processingLot)), sl('SKU', skuName(draft.sku))) : null,
+    progressHost, reqLegend(),
     el('details', { class: 'accordion' }, el('summary', {}, 'Initiation'),
       el('div', { class: 'accordion-body' },
         el('div', { class: 'form-row' },
-          field('Product SKU', skuSel),
-          field('Run date', el('input', { type: 'date', id: 'r_date', value: draft?.runDate || new Date().toISOString().slice(0, 10) }))),
+          field(reqLabel('Product SKU'), skuSel),
+          field(reqLabel('Run date'), el('input', { type: 'date', id: 'r_date', value: draft?.runDate || new Date().toISOString().slice(0, 10) }))),
         specPanel,
         el('div', { class: 'form-row', style: 'margin-top:8px' },
-          field('Production Location', productionLocationSelect('r_loc', draft?.location)),
-          field('Operators', operatorsSelect.el)),
+          field(reqLabel('Production Location'), productionLocationSelect('r_loc', draft?.location)),
+          field(reqLabel('Operators'), operatorsSelect.el)),
         field('Notes', el('textarea', { id: 'r_notes', rows: '2', placeholder: 'Optional batch notes' }, draft?.notes || '')))),
     el('details', { class: 'accordion', ...(fresh ? { open: '' } : {}) }, el('summary', {}, 'Feedstock'),
       el('div', { class: 'accordion-body' },
         field('Filter totes', generalFilterInp),
-        field('Stabilization method', stabFilterSel), pickHost, summary,
+        field('Stabilization method', stabFilterSel),
+        el('div', { class: 'help' }, reqLabel('Select at least one tote')), pickHost, summary,
         el('h4', { style: 'margin:14px 0 4px;font-size:13px' }, 'Feedstock characterization'), feedstockHost)),
     homogenizationSection, extractionSection, separationSection,
     pasteurizationSection.box,
@@ -2488,12 +2756,15 @@ async function openRun(draftSummary, opts) {
         el('div', { style: 'margin-top:6px' }, packagingQcSaveBtn, packagingQcStatus))),
     el('details', { class: 'accordion' }, el('summary', {}, 'Packaging'),
       el('div', { class: 'accordion-body' },
-        field('Packaging date and time', packagingPackagedInp),
+        rfield('packaging', 'packagedAt', 'Packaging date and time', packagingPackagedInp),
         packagingEntriesSection.box,
         el('div', { style: 'margin-top:6px' }, packagingSaveBtn, packagingStatus))));
   filterTotes();
   renderFeedstockCards();
   renderSpecPanel();
+  ['click', 'change'].forEach(ev => body.addEventListener(ev, () => {
+    clearTimeout(progressTimer); progressTimer = setTimeout(refreshProgress, 1200);
+  }));
 
   function buildPayload() {
     return {
@@ -2543,6 +2814,19 @@ async function openRun(draftSummary, opts) {
     const payload = buildPayload();
     if (!payload.toteIds.length) throw new Error('Select at least one tote.');
     if (!packagingEntriesSection.hasEntries()) throw new Error('Enter at least one packaged output quantity in the Packaging table.');
+    // Required fields are checked server-side against what is saved, so first
+    // save the run header + feedstock, then press every section's own Save
+    // (so anything typed but not yet saved counts), and stop if one fails.
+    await saveDraft(true);
+    const failed = [];
+    for (const btn of body.querySelectorAll('button.section-save')) {
+      btn.click();
+      for (let i = 0; i < 400 && btn.disabled; i++) await new Promise(r => setTimeout(r, 50));
+      const msg = btn.nextElementSibling ? btn.nextElementSibling.textContent.trim() : '';
+      if (msg && msg !== 'Saved.') failed.push(msg);
+    }
+    await refreshProgress();
+    if (failed.length) throw new Error('A section could not be saved: ' + failed[0]);
     const r = draftId
       ? await api('POST', '/production/drafts/' + draftId + '/finalize', payload)
       : await api('POST', '/production', payload);
@@ -2551,17 +2835,19 @@ async function openRun(draftSummary, opts) {
   }
   modal(draft ? 'Production run — ' + draft.processingLot : 'New production run', body, finalizeRun, 'Finalize run',
     { extraLabel: 'Save & close', onExtra: saveDraft, wide: true });
+  if (opts && opts.section) jumpToSection(body, opts.section);
 }
 
 // Post-finalize view: feedstock characterization + process stages can still be
 // filled in or corrected at any time (matching how the real paper logs are
 // often completed days after the run), independent of the locked-in
 // tote-consumption / packaging numbers (corrected via the separate Edit modal).
-async function openProcessLog(run) {
+async function openProcessLog(run, section) {
   const stages = run.stages || {};
   const feedstockHost = el('div', {});
   (run.inputs || []).forEach(inp => {
     feedstockHost.append(buildFeedstockCard({
+      markRequired: true,
       label: inp.toteLot + (inp.site ? '  ·  ' + inp.site : ''),
       initial: inp,
       mode: 'completed',
@@ -2607,20 +2893,21 @@ async function openProcessLog(run) {
   // Dilution & Preservation -- still packaging-stage columns/endpoints under
   // the hood (unchanged), just relocated in the UI, so they get their own
   // Save action separate from packagedAt's.
-  const packagingQcCheck = buildQualityCheckBox('LKE characterization', stages.packaging || {}, { omitSlurrySolids: true });
+  const packagingQcCheck = buildQualityCheckBox('LKE characterization', stages.packaging || {}, { omitSlurrySolids: true, reqStage: 'packaging' });
   const packagingSampleCollectedInp = el('input', { type: 'datetime-local',
     value: stages.packaging?.sampleCollectedAt ? stages.packaging.sampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
   const packagingSamplePointBox = el('div', { class: 'qc-check-box theme-sample' },
     el('div', { class: 'qc-check-title' }, 'Sample Point'),
     el('div', { class: 'qc-check-subtitle' }, 'LKE characterization'),
-    field('Collection date and time', packagingSampleCollectedInp),
+    rfield('packaging', 'sampleCollectedAt', 'Collection date and time', packagingSampleCollectedInp),
     buildSamplePointsSection(run.samplePoints || [], getRunId, run.processingLot,
       () => packagingSampleCollectedInp.value, 'packaging'));
   const packagingQcStatus = el('span', { class: 'help' });
   const packagingQcSaveBtn = el('button', {
-    type: 'button', class: 'secondary', onclick: async () => {
+    type: 'button', class: 'secondary section-save', onclick: async () => {
       packagingQcStatus.textContent = ''; packagingQcSaveBtn.disabled = true;
       try {
+        await dilutionSummary.save();
         await api('PUT', '/production/' + run.id + '/stages/packaging', {
           ...packagingQcCheck.getPayload(),
           sampleCollectedAt: packagingSampleCollectedInp.value || null,
@@ -2633,7 +2920,7 @@ async function openProcessLog(run) {
   }, 'Save');
   const packagingStatus = el('span', { class: 'help' });
   const packagingSaveBtn = el('button', {
-    type: 'button', class: 'secondary', onclick: async () => {
+    type: 'button', class: 'secondary section-save', onclick: async () => {
       packagingStatus.textContent = ''; packagingSaveBtn.disabled = true;
       try {
         await api('PUT', '/production/' + run.id + '/stages/packaging', {
@@ -2646,9 +2933,15 @@ async function openProcessLog(run) {
     }
   }, 'Save');
 
+  const logProgressHost = el('div', { class: 'allow-locked' });
+  const drawLogProgress = prog => { logProgressHost.innerHTML = ''; const p = stageProgress({ progress: prog }, { onSelect: key => jumpToSection(body, key) }); if (p) logProgressHost.append(p); };
+  drawLogProgress(run.progress);
+  let logTimer = null;
   const body = el('div', {},
     el('div', { class: 'summary-line' }, sl('Run', run.processingLot), sl('SKU', skuName(run.sku)),
       el('span', { class: 'muted' }, 'Each section saves independently and can be filled in or corrected any time.')),
+    logProgressHost, reqLegend(),
+    logLockBanner(run),
     el('details', { class: 'accordion' }, el('summary', {}, 'Feedstock characterization'),
       el('div', { class: 'accordion-body' }, feedstockHost)),
     homogenizationSection, extractionSection, separationSection,
@@ -2661,11 +2954,219 @@ async function openProcessLog(run) {
         el('div', { style: 'margin-top:6px' }, packagingQcSaveBtn, packagingQcStatus))),
     el('details', { class: 'accordion' }, el('summary', {}, 'Packaging'),
       el('div', { class: 'accordion-body' },
-        field('Packaging date and time', packagingPackagedInp),
+        rfield('packaging', 'packagedAt', 'Packaging date and time', packagingPackagedInp),
         packagingEntriesSection.box,
         el('div', { style: 'margin-top:6px' }, packagingSaveBtn, packagingStatus))));
 
+  ['click', 'change'].forEach(ev => body.addEventListener(ev, () => {
+    clearTimeout(logTimer);
+    logTimer = setTimeout(async () => {
+      try { drawLogProgress((await api('GET', '/production/' + run.id + '/progress')).progress); } catch (e) { /* non-critical */ }
+    }, 1200);
+  }));
   modal('Process log — ' + run.processingLot, body, async () => { render(); }, 'Done', { wide: true });
+  if (!run.amendment || !canAmendLog()) lockLogBody(body);   // finalized: read-only unless an amendment is open and you may amend
+  if (section) jumpToSection(body, section);
+}
+
+/* ---------------- Product release (review + Quality sign-off) ---------------- */
+// Finalizing a run holds its finished goods in "Pending Release". A Production
+// or Quality Manager reviews the production log and signs it off, then a Quality
+// Manager signs to release for sale. Every signature re-asks for the password and
+// is recorded server-side (who, when, what they attested to, hash of the log they
+// saw) in an append-only, hash-chained trail; any later change to the log voids
+// the sign-off.
+const FG_STATUS = { pending_release: 'Pending Release', on_hand: 'On hand', hold: 'Hold', sold: 'Sold', disposed: 'Disposed' };
+const fgStatusLabel = s => FG_STATUS[s] || s;
+const fgStatusBadge = s => badge(s, fgStatusLabel(s));
+const RELEASE_STATES = {
+  pending_review: ['wip', 'Pending review'], pending_release: ['pending_release', 'Awaiting QA release'],
+  released: ['on_hand', 'Released'], returned: ['low', 'Returned for correction'],
+  rejected: ['low', 'Rejected — on hold'], legacy: ['sold', 'Released (pre-process)'],
+  amending: ['hold', 'Under amendment'],
+};
+const releaseBadge = st => { const [c, t] = RELEASE_STATES[st] || ['sold', st || '—']; return badge(c, t); };
+const RELEASE_EVENTS = {
+  submitted: 'Run finalized — submitted', review_approved: 'Production log review APPROVED', review_returned: 'Returned for correction',
+  resubmitted: 'Resubmitted for review', released: 'RELEASED for sale', release_rejected: 'Release REJECTED',
+  reopened: 'Reopened', voided: 'Sign-off VOIDED (log changed)', legacy_release: 'Grandfathered as released',
+  amendment_opened: 'Amendment OPENED (log unlocked)', amendment_submitted: 'Amendment submitted for review',
+  amendment_cancelled: 'Amendment cancelled', integrity_repair: 'Integrity repair applied',
+  rebaseline: 'Log hash re-baselined (snapshot format change)',
+};
+const shortHash = h => h ? h.slice(0, 10) + '…' : '—';
+async function pageRelease(v) {
+  const r = await api('GET', '/release');
+  v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Product Release'),
+    el('div', { class: 'actions' },
+      canIntegrity() ? el('button', { class: 'secondary', onclick: openIntegrityCheck }, 'Data integrity check') : null,
+      el('button', { class: 'secondary', onclick: async () => {
+        const c = await api('GET', '/release/verify');
+        toast(c.ok ? 'Audit trail verified — ' + c.events + ' events, hash chain intact.'
+          : 'AUDIT TRAIL BROKEN at event #' + c.brokenAtEventId + ' (run ' + c.runId + ')', !c.ok);
+      } }, 'Verify audit trail'))));
+  v.append(el('div', { class: 'help', style: 'margin-bottom:10px' },
+    'Finished goods stay Pending Release (cannot be shipped) until the production log is reviewed and signed off by a Production or Quality Manager, '
+    + 'and then released by a Quality Manager. Your permissions: '
+    + (r.me.canReview ? (State.user.isQualityManager ? 'Quality Manager (review + release)' : 'Production Manager (review)') : 'none — view only')
+    + (r.legacyCount ? '. ' + r.legacyCount + ' earlier run(s) pre-date this process and are treated as released.' : '.')));
+  const groups = [
+    ['Under amendment', ['amending']],
+    ['Awaiting production-log review', ['pending_review']],
+    ['Awaiting Quality release', ['pending_release']],
+    ['Returned for correction / rejected', ['returned', 'rejected']],
+    ['Released', ['released']],
+  ];
+  for (const [title, states] of groups) {
+    const rows = r.runs.filter(x => states.includes(x.state));
+    v.append(el('h3', { style: 'margin:16px 0 6px' }, title + ' (' + rows.length + ')'));
+    if (!rows.length) { v.append(el('div', { class: 'help' }, 'Nothing here.')); continue; }
+    v.append(table(['Run', 'Product', 'Finalized', 'Finished goods', 'Litres', 'Status', 'Reviewed', 'Released'],
+      rows.map(x => [mono(x.lot), skuName(x.sku), fmtWhen(x.finalizedAt) + (x.finalizedBy ? ' · ' + x.finalizedBy : ''),
+        x.lots.map(l => fmt(l.qty) + ' × ' + l.packageSize).join(', ') || '—',
+        num(fmt(x.lots.reduce((a, l) => a + (l.litres || 0), 0), 0)), releaseBadge(x.state),
+        x.reviewedBy ? x.reviewedBy + ' · ' + fmtWhen(x.reviewedAt) : '—',
+        x.releasedBy ? x.releasedBy + ' · ' + fmtWhen(x.releasedAt) : '—']),
+      [false, false, false, false, true, false, false, false], i => openReleaseRun(rows[i].id)));
+  }
+  v.append(el('div', { class: 'help', style: 'margin-top:10px' }, 'Click a row to review the production log, sign, and see the full audit trail.'));
+}
+const humanKey = k => k.replace(/([A-Z])/g, ' $1').replace(/^./, c => c.toUpperCase());
+function releaseLogSummary(run) {
+  const kv = (obj) => Object.entries(obj).filter(([, x]) => x !== null && x !== undefined && x !== '' && typeof x !== 'object');
+  const box = (title, rows) => el('details', { class: 'accordion' }, el('summary', {}, title),
+    el('div', { class: 'accordion-body' }, rows));
+  const kvTable = obj => { const e = kv(obj); return e.length ? table(['Field', 'Value'], e.map(([k, x]) => [humanKey(k), String(x === true ? 'Yes' : x === false ? 'No' : x)]), [false, false])
+    : el('div', { class: 'help' }, 'Nothing recorded.'); };
+  const out = el('div', {});
+  out.append(box('Run summary', kvTable({ processingLot: run.processingLot, sku: skuName(run.sku), runDate: run.runDate, finalizedAt: run.finalizedAt,
+    finalizedBy: run.release && run.release.finalizedBy, operators: run.operators, inputKg: run.inputKg, outputLitres: run.outputLitres,
+    targetTds: run.targetTds, citricKg: run.citricKg, sorbateKg: run.sorbateKg, nabenzoateKg: run.nabenzoateKg, ibcUsed: run.ibcUsed,
+    location: run.location, notes: run.notes, qcRecorded: run.qcSummary ? run.qcSummary.recorded + ' of ' + run.qcSummary.total + ' QC fields' : null })));
+  out.append(box('Feedstock (' + (run.inputs || []).length + ' tote(s))', (run.inputs || []).length
+    ? table(['Tote', 'Decision', 'Weight kg', 'pH', 'ORP', 'Odour', 'Notes'],
+      run.inputs.map(i => [mono(i.toteLot), i.decision || '—', i.weightKg != null ? fmt(i.weightKg, 1) : '—', i.ph ?? '—', i.orp ?? '—', i.odour || '—', i.notes || '—']),
+      [false, false, true, true, true, false, false]) : el('div', { class: 'help' }, 'No feedstock characterization recorded.')));
+  for (const [key, label] of [['homogenization', 'Homogenization'], ['extraction', 'Extraction'], ['separation', 'Separation'], ['pasteurization', 'Pasteurization'], ['dilution', 'Dilution & Preservation (summary)'], ['packaging', 'Packaging / LKE characterization']]) {
+    out.append(box(label, kvTable((run.stages || {})[key] || {})));
+  }
+  out.append(box('Dilution tanks (' + (run.dilutions || []).length + ')', (run.dilutions || []).length
+    ? table(['Tank', 'Initial L', 'Water L', 'Final L', 'Sorbate kg', 'Benzoate kg', 'Citric kg', 'Preservatives added', 'Notes'],
+      run.dilutions.map(d => [d.tank || '—', d.volumeInitialL ?? '—', d.waterRequiredL ?? '—', d.volumeFinalL ?? '—', d.sorbateRequiredKg ?? '—',
+        d.benzoateRequiredKg ?? '—', d.citricKg ?? '—', d.preservativesAdded ? 'Yes' : 'No', d.notes || '—']), [false, true, true, true, true, true, true, false, false])
+    : el('div', { class: 'help' }, 'None.')));
+  out.append(box('Sample points (' + (run.samplePoints || []).length + ')', (run.samplePoints || []).length
+    ? table(['Stage', 'Type', 'Description', 'Qty', 'Container'], run.samplePoints.map(s => [s.stage || '—', s.type || '—', s.description || '—', s.qty ?? '—', s.container || '—']), [false, false, false, true, false])
+    : el('div', { class: 'help' }, 'None.')));
+  out.append(box('Packaging entries (' + (run.packagingEntries || []).length + ')', (run.packagingEntries || []).length
+    ? table(['Container', 'Qty'], run.packagingEntries.map(p => [p.containerUnit || '—', fmt(p.qty)]), [false, true]) : el('div', { class: 'help' }, 'None.')));
+  out.append(box('Revision history (Rev ' + (run.revision || 1) + ')', revisionTracker(run)));
+  out.append(box('Documents (' + (run.attachments || []).length + ')', (run.attachments || []).length
+    ? table(['File', 'Type'], run.attachments.map(a => [a.filename || a.name || '—', a.contentType || a.type || '—']), [false, false]) : el('div', { class: 'help' }, 'None attached.')));
+  return out;
+}
+function releaseAuditCsv(d) {
+  const lines = [];
+  const add = (...c) => lines.push(c.map(x => '"' + String(x == null ? '' : x).replace(/"/g, '""') + '"').join(','));
+  add('Product release audit trail', d.lot, d.label);
+  add('Event #', 'When (UTC)', 'Event', 'Signed by', 'Email', 'Capacity', 'Statement', 'Comment', 'Production-log hash (SHA-256)', 'Detail', 'Entry hash');
+  d.events.forEach(e => add(e.id, e.at, RELEASE_EVENTS[e.type] || e.type, e.user, e.email, e.capacity, e.meaning, e.comment, e.logHash, e.detail ? JSON.stringify(e.detail) : '', e.entryHash));
+  const a = el('a', { href: URL.createObjectURL(new Blob([lines.join('\n')], { type: 'text/csv' })), download: 'release-audit-' + d.lot + '.csv' });
+  document.body.append(a); a.click(); a.remove();
+}
+function printReleaseRecord(d) {
+  const w = window.open('', '_blank');
+  if (!w) return toast('Allow pop-ups to print.', true);
+  const esc = x => String(x == null ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  w.document.write('<html><head><title>Release record ' + esc(d.lot) + '</title><style>body{font-family:Segoe UI,Arial,sans-serif;margin:24px;font-size:12px}'
+    + 'table{border-collapse:collapse;width:100%}td,th{border:1px solid #888;padding:4px 6px;text-align:left;vertical-align:top}.h{font-family:monospace;font-size:10px;word-break:break-all}</style></head><body>'
+    + '<h2>Product release record — ' + esc(d.lot) + '</h2><p>Product: ' + esc(skuName(d.sku)) + ' · Status: <b>' + esc(d.label) + '</b> · Finalized: '
+    + esc(d.finalizedAt) + ' by ' + esc(d.finalizedBy) + '</p><p>Finished goods: ' + esc(d.lots.map(l => l.lot + ' (' + l.qty + ' × ' + l.packageSize + ', ' + fgStatusLabel(l.status) + ')').join('; '))
+    + '</p><p>Current production-log hash: <span class="h">' + esc(d.currentLogHash) + '</span><br>Hash at review: <span class="h">' + esc(d.reviewedLogHash || '—')
+    + '</span><br>Audit chain: ' + (d.chain.ok ? 'verified (' + d.chain.events + ' events)' : 'BROKEN at event ' + d.chain.brokenAtEventId) + '</p>'
+    + '<table><tr><th>#</th><th>When (UTC)</th><th>Event</th><th>Signed by</th><th>Statement / comment</th><th>Log hash</th></tr>'
+    + d.events.map(e => '<tr><td>' + e.id + '</td><td>' + esc(e.at) + '</td><td>' + esc(RELEASE_EVENTS[e.type] || e.type) + '</td><td>' + esc(e.user) + (e.capacity ? '<br>' + esc(e.capacity) : '')
+      + '</td><td>' + esc(e.meaning) + (e.comment ? '<br><i>' + esc(e.comment) + '</i>' : '') + '</td><td class="h">' + esc(e.logHash || '') + '</td></tr>').join('')
+    + '</table><p>Generated ' + new Date().toISOString() + '</p></body></html>');
+  w.document.close(); w.focus(); w.print();
+}
+async function openReleaseRun(id) {
+  const d = await api('GET', '/release/runs/' + id);
+  const me = d.me;
+  const body = el('div', {});
+  const refresh = async () => { body.closest('.modal-bg')?.remove(); await openReleaseRun(id); if (State.tab === 'release') { /* list refreshes on next visit */ } };
+  body.append(el('div', { class: 'summary-line' }, sl('Run', d.lot), sl('Product', skuName(d.sku)), el('span', {}, 'Status: ', releaseBadge(d.state)),
+    sl('Finalized', fmtWhen(d.finalizedAt) + (d.finalizedBy ? ' by ' + d.finalizedBy : ''))));
+  body.append(table(['FG lot', 'Pack', 'Units', 'Litres', 'Status'], d.lots.map(l => [mono(l.lot), l.packageSize, fmt(l.qty), num(fmt(l.litres, 0)), fgStatusBadge(l.status)]), [false, false, true, true, false]));
+  const integrity = [];
+  if (d.logMatchesReview === true) integrity.push('Production log unchanged since review (hash ' + shortHash(d.reviewedLogHash) + ').');
+  if (d.logMatchesReview === false) integrity.push('WARNING: the production log no longer matches the log that was reviewed.');
+  integrity.push(d.chain.ok ? 'Audit trail hash chain verified (' + d.chain.events + ' events).' : 'WARNING: audit trail hash chain is BROKEN at event #' + d.chain.brokenAtEventId + '.');
+  body.append(el('div', { class: 'help', style: 'margin:8px 0;' + (d.logMatchesReview === false || !d.chain.ok ? 'color:var(--danger);font-weight:600' : '') }, integrity.join(' ')));
+  body.append(el('div', { style: 'margin:6px 0' },
+    el('button', { type: 'button', class: 'secondary', onclick: () => openProcessLog(d.run) }, '📋 Open full process log'), ' ',
+    el('span', { class: 'help' }, 'Review the log first, then sign below.')));
+  body.append(releaseLogSummary(d.run));
+
+  function signBox(title, attest, decisions, endpoint, opts = {}) {
+    const decSel = decisions.length > 1 ? selectFrom('', decisions) : null;
+    const cap = (!opts.quality && State.user.isProductionManager && State.user.isQualityManager) ? selectFrom('', [['Production Manager', 'Production Manager'], ['Quality Manager', 'Quality Manager']]) : null;
+    const comment = el('textarea', { rows: '2', placeholder: opts.commentHint || 'Comment (required when returning/rejecting/reopening)' });
+    const pw = el('input', { type: 'password', autocomplete: 'off', placeholder: 'Re-enter your password to sign' });
+    const err = el('div', { class: 'error' });
+    const btn = el('button', { type: 'button' }, opts.button || 'Sign');
+    btn.addEventListener('click', async () => {
+      err.textContent = ''; btn.disabled = true;
+      try {
+        await api('POST', '/release/runs/' + id + '/' + endpoint, {
+          decision: decSel ? decSel.value : decisions[0][0], comment: comment.value || null, password: pw.value,
+          capacity: cap ? cap.value : undefined });
+        toast('Signature recorded'); await refresh();
+      } catch (e) { err.textContent = e.message; btn.disabled = false; }
+    });
+    return el('div', { class: 'sign-box' }, el('h4', {}, title),
+      el('div', { class: 'sign-attest' }, attest),
+      decSel ? field('Decision', decSel) : null, cap ? field('Signing as', cap) : null,
+      field('Comment', comment), field('Password', pw), err, btn);
+  }
+  if (d.state === 'pending_review') {
+    body.append(me.canReview ? signBox('Production-log review sign-off',
+      'By signing I confirm I have reviewed the production log for ' + d.lot + ' and that it is complete and accurate (or I am returning it for correction).',
+      [['approve', 'Approve — log reviewed'], ['return', 'Return for correction']], 'review', { button: 'Sign review' })
+      : el('div', { class: 'help sign-box' }, 'Awaiting review by a Production Manager or Quality Manager. You do not have review permission.'));
+  } else if (d.state === 'returned') {
+    const c = el('textarea', { rows: '2', placeholder: 'What was corrected?' }), e2 = el('div', { class: 'error' });
+    const b = el('button', { type: 'button', onclick: async () => {
+      e2.textContent = '';
+      try { await api('POST', '/release/runs/' + id + '/resubmit', { comment: c.value }); toast('Resubmitted for review'); await refresh(); }
+      catch (e) { e2.textContent = e.message; } } }, 'Resubmit for review');
+    body.append(el('div', { class: 'sign-box' }, el('h4', {}, 'Returned for correction'),
+      el('div', { class: 'help' }, 'The production log is locked: on the Production tab use “Amend run” (category: data entry error / late entry) to make the corrections and submit the amendment — that sends it back for review. If nothing needs changing, describe why here and resubmit.'), field('Corrections made', c), e2, b));
+  } else if (d.state === 'pending_release') {
+    body.append(me.canRelease ? signBox('Quality release sign-off',
+      'By signing I confirm this product conforms to specification and is released for sale — or I am rejecting it and holding the lot(s).',
+      [['release', 'Release for sale'], ['reject', 'Reject — hold']], 'release', { quality: true, button: 'Sign release' })
+      : el('div', { class: 'help sign-box' }, 'Review is complete. Awaiting release by a Quality Manager. You do not have release permission.'));
+  }
+  if (['released', 'rejected', 'pending_release', 'returned'].includes(d.state) && me.canRelease) {
+    body.append(el('details', { class: 'accordion' }, el('summary', {}, 'Reopen this run (Quality Manager)'),
+      el('div', { class: 'accordion-body' }, el('div', { class: 'help' }, 'Voids the existing review/release and returns unsold lots to Pending Release. Units already shipped are recorded in the trail.'),
+        signBox('Reopen', 'By signing I confirm the prior review/release no longer stands and a new review is required.', [['reopen', 'Reopen']], 'reopen', { quality: true, button: 'Sign & reopen', commentHint: 'Reason for reopening (required)' }))));
+  }
+  body.append(el('h3', { style: 'margin:14px 0 6px;font-size:14px' }, 'Audit trail'));
+  body.append(el('div', { class: 'tablewrap' }, el('table', {},
+    el('thead', {}, el('tr', {}, ...['#', 'When', 'Event', 'Signed by', 'Statement / comment', 'Log hash'].map(h => el('th', {}, h)))),
+    el('tbody', {}, ...d.events.map(e => el('tr', {},
+      el('td', { class: 'muted' }, e.id), el('td', { class: 'muted' }, fmtWhen(e.at)), el('td', {}, el('b', {}, RELEASE_EVENTS[e.type] || e.type)),
+      el('td', {}, e.user || '—', e.capacity ? el('div', { class: 'muted' }, e.capacity) : null),
+      el('td', {}, e.meaning || '', e.comment ? el('div', {}, '“' + e.comment + '”') : null,
+        e.detail && e.detail.alreadyShippedLots && e.detail.alreadyShippedLots.length
+          ? el('div', { class: 'muted' }, 'Already shipped: ' + e.detail.alreadyShippedLots.map(x => x.qty + ' × ' + x.lot + ' (' + x.shipment + ')').join('; ')) : null),
+      el('td', { class: 'hashtxt', title: e.logHash || '' }, shortHash(e.logHash))))))));
+  body.append(el('div', { style: 'margin-top:8px' },
+    el('button', { type: 'button', class: 'secondary', onclick: () => releaseAuditCsv(d) }, '⬇ Audit trail CSV'), ' ',
+    el('button', { type: 'button', class: 'secondary', onclick: () => printReleaseRecord(d) }, '🖨 Print release record')));
+  modal('Product release — ' + d.lot, body, async () => { render(); }, 'Close', { wide: true, noCancel: true });
 }
 
 /* ---------------- Finished goods ---------------- */
@@ -2704,7 +3205,7 @@ async function pageFG(v) {
         rowCheck(f, selected, updateBulk),
         mono(f.lot), skuName(f.sku), f.packageSize, fmt(f.qty), num(fmt(f.litres, 0)),
         f.tds != null ? f.tds + '%' : '—', f.producedDate || '—', f.location || '—',
-        badge(f.status, f.status), rowActions([
+        fgStatusBadge(f.status), rowActions([
           f.status !== 'sold' ? ['Move', () => moveFG(f)] : null,
           ['Label', () => printLabels([fgLabel(f)])],
           ['Edit', () => editFG(f)]
@@ -2740,13 +3241,15 @@ function editFG(f) {
   const body = el('div', {},
     el('div', { class: 'form-row' },
       field('Units on hand', el('input', { type: 'number', id: 'f_qty', value: f.qty, min: '0' })),
-      field('Status', selectFrom('', [['on_hand', 'On hand'], ['hold', 'Hold / QA'], ['sold', 'Sold / shipped']], null, 'f_status'))),
+      f.status === 'pending_release'
+        ? field('Status', el('div', {}, fgStatusBadge(f.status), el('div', { class: 'help' }, 'Set by the Product Release process (Product Release tab).')))
+        : field('Status', selectFrom('', [['on_hand', 'On hand'], ['hold', 'Hold / QA'], ['sold', 'Sold / shipped']], null, 'f_status'))),
     el('div', { class: 'form-row' },
       field('TDS (%)', el('input', { type: 'number', step: '0.1', id: 'f_tds', value: f.tds ?? '' })),
       field('Location', el('input', { id: 'f_loc', value: f.location || '' }))));
-  body.querySelector('#f_status').value = f.status;
+  if (f.status !== 'pending_release') body.querySelector('#f_status').value = f.status;
   modal('Edit FG lot ' + f.lot, body, async () => {
-    await api('PUT', '/fg/' + f.id, { qty: +body.querySelector('#f_qty').value, status: body.querySelector('#f_status').value, tds: body.querySelector('#f_tds').value || null, location: body.querySelector('#f_loc').value });
+    await api('PUT', '/fg/' + f.id, { qty: +body.querySelector('#f_qty').value, status: f.status === 'pending_release' ? f.status : body.querySelector('#f_status').value, tds: body.querySelector('#f_tds').value || null, location: body.querySelector('#f_loc').value });
     toast('Updated'); render();
   }, 'Save');
 }
@@ -3184,7 +3687,7 @@ async function pageConsumables(v) {
       el('div', { class: 'actions' },
         isAdmin ? el('button', { onclick: addFgLabel }, '+ Add FG label') : null)));
     host.append(el('div', { class: 'help', style: 'margin-bottom:10px' },
-      'One label item per product SKU + package type, with its own on-hand inventory. Finalizing a production run deducts one label per finished unit '
+      'One label item per product SKU + package type, with its own on-hand inventory. Saving a run’s Packaging section (or finalizing) deducts one label per container consumed '
       + 'from the matching item. ' + (isAdmin ? '' : 'Ask an admin to add a new FG label.')));
     host.append(itemsTable(labels, { showLabelMap: true, wholeUnits: true, history: true }));
     updateBulk();
@@ -3308,8 +3811,8 @@ function addContainerType() {
 }
 // Admin-only: a finished-good label item, mapped to one product SKU + one
 // package type (a packaging container with a volume). Named automatically
-// ("FG Label - <SKU> - <package>"); deducted 1 per finished unit when a run
-// is finalized. Unrelated to the Labels tab (internal barcode printing).
+// ("FG Label - <SKU> - <package>"); deducted 1 per container consumed when a run's Packaging is saved
+// or finalized. Unrelated to the Labels tab (internal barcode printing).
 function addFgLabel() {
   const locs = State.ref.locations.map(l => [l, l]);
   const skuSel = selectFrom('', (State.ref.skus || []).filter(s => s.active).map(s => [s.code, s.name]));
@@ -3864,9 +4367,9 @@ const CALCULATIONS = [
   },
   {
     title: 'Finished-good label usage (inventory deduction)',
-    formula: 'Labels deducted = Σ entry qty, per (SKU, package type) that has an FG label item',
-    description: 'When a run is finalized, one finished-good label is deducted for every finished unit packaged, from the label item mapped to that product SKU and package type (Inventory Items → Finished-good labels). No matching label item means nothing is deducted.',
-    location: 'Production → Packaging section, applied when a run is finalized',
+    formula: 'Labels consumed = Σ Packaging entry qty per container, for the label item mapped to (run SKU, container)',
+    description: 'Whenever the Packaging section’s container usage is committed (its Save button, or finalize), one finished-good label is consumed for every container, from the label item mapped to the run’s product SKU and that container (Inventory Items → Finished-good labels; each SKU has one for the 1,000 L IBC and one for the 55 gal drum). Only the net change since the last save is applied, so editing quantities or discarding a draft adjusts or refunds the labels. No matching label item means nothing is deducted; a shortage never blocks.',
+    location: 'Production → Packaging section (Save / finalize)',
     settings: [],
   },
   {
@@ -4109,23 +4612,29 @@ function changePasswordModal(forced) {
 async function pageAdmin(v) {
   v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Admin — Users'),
     el('div', { class: 'actions' },
+      el('button', { class: 'secondary', onclick: openIntegrityCheck }, 'Data integrity check'),
       el('button', { class: 'secondary', onclick: downloadDbBackup }, '⬇ Download database backup'),
       el('button', { onclick: addUser }, '+ Add user'))));
   const r = await api('GET', '/users');
   v.append(table(
-    ['Name', 'Email', 'Role', 'Status', 'Actions'],
+    ['Name', 'Email', 'Role', 'Permissions', 'Status', 'Actions'],
     r.users.map(u => [
       u.name, mono(u.email),
       badge(u.role === 'admin' ? 'hold' : 'on_hand', u.role === 'admin' ? 'Admin' : 'User'),
+      el('span', {}, u.isProductionManager ? badge('wip', 'Production Mgr') : null, ' ',
+        u.isQualityManager ? badge('on_hand', 'Quality Mgr') : null, ' ',
+        u.canAmendLog ? badge('hold', 'Log Amender') : null,
+        !u.isProductionManager && !u.isQualityManager && !u.canAmendLog ? el('span', { class: 'muted' }, '—') : null),
       u.active ? badge('on_hand', u.mustChange ? 'Must reset' : 'Active') : badge('disposed', 'Inactive'),
       rowActions([
         ['Reset password', () => resetUserPassword(u)],
         ['Edit', () => editUser(u)],
         u.active ? ['Deactivate', () => setUserActive(u, false), 'danger'] : ['Activate', () => setUserActive(u, true)]
       ])
-    ]), [false, false, false, false, false]));
+    ]), [false, false, false, false, false, false]));
   v.append(el('div', { class: 'help', style: 'margin-top:10px' },
-    'New users and password resets require the person to set a new password on next sign-in.'));
+    'New users and password resets require the person to set a new password on next sign-in. '
+    + 'Permissions: only users flagged Production Manager / Quality Manager can sign product-release steps, and only users flagged Production Log Amender can amend a finalized production log (being an administrator does not grant any of them); changes to these flags are logged.'));
 
   // SOP documents: controlled documents a production-log QC Check links to
   // by a stable reference key (never the display name, so a rename here is
@@ -4236,25 +4745,50 @@ function downloadDbBackup() {
   document.body.append(a); a.click(); a.remove();
   toast('Backup downloading…');
 }
+// Permissions checklist for Add / Edit user: one tidy row per permission (checkbox, name,
+// plain-language description). Admin role alone grants none of these.
+const USER_PERMISSIONS = [
+  ['pm', 'isProductionManager', 'Production Manager', 'Reviews and signs off finalized production logs (Product Release).'],
+  ['qm', 'isQualityManager', 'Quality Manager', 'Reviews logs, releases or rejects finished goods for sale, and can run the data integrity check.'],
+  ['am', 'canAmendLog', 'Production Log Amender', 'Can amend a finalized run’s production log (open an amendment, edit it, submit it for re-review).'],
+];
+function permissionChecklist(prefix, u) {
+  const list = el('div', { class: 'perm-list' }, ...USER_PERMISSIONS.map(([id, key, name, desc]) => {
+    const cb = el('input', { type: 'checkbox', id: prefix + '_' + id });
+    cb.checked = !!(u && u[key]);
+    const row = el('label', { class: 'perm-item' + (cb.checked ? ' on' : '') }, cb,
+      el('span', { class: 'perm-text' }, el('b', {}, name), el('small', {}, desc)));
+    cb.addEventListener('change', () => row.classList.toggle('on', cb.checked));
+    return row;
+  }));
+  return el('div', { class: 'perm-box' }, el('div', { class: 'perm-title' }, 'Permissions'), list,
+    el('div', { class: 'perm-note' }, 'Being an administrator does not grant any of these. Every change is logged, and signatures re-ask for the signer’s password.'));
+}
+const permissionValues = (body, prefix) => Object.fromEntries(USER_PERMISSIONS.map(([id, key]) => [key, body.querySelector('#' + prefix + '_' + id).checked]));
 function addUser() {
   const body = el('div', {},
     el('div', { class: 'form-row' }, field('Name', el('input', { id: 'u_name' })),
       field('Email', el('input', { id: 'u_email', type: 'email' }))),
     el('div', { class: 'form-row' }, field('Temporary password', el('input', { id: 'u_pw', value: 'Cascadia123!' })),
       field('Role', selectFrom('', [['user', 'User'], ['admin', 'Administrator']], null, 'u_role'))),
+    permissionChecklist('u'),
     el('div', { class: 'help' }, 'They’ll be required to change this password on first sign-in.'));
   modal('Add user', body, async () => {
-    await api('POST', '/users', { name: body.querySelector('#u_name').value, email: body.querySelector('#u_email').value, password: body.querySelector('#u_pw').value, role: body.querySelector('#u_role').value });
+    await api('POST', '/users', { name: body.querySelector('#u_name').value, email: body.querySelector('#u_email').value, password: body.querySelector('#u_pw').value, role: body.querySelector('#u_role').value,
+      ...permissionValues(body, 'u') });
     toast('User created'); render();
   }, 'Create');
 }
 function editUser(u) {
-  const body = el('div', { class: 'form-row' },
-    field('Name', el('input', { id: 'ue_name', value: u.name })),
-    field('Role', selectFrom('', [['user', 'User'], ['admin', 'Administrator']], null, 'ue_role')));
+  const body = el('div', {},
+    el('div', { class: 'form-row' },
+      field('Name', el('input', { id: 'ue_name', value: u.name })),
+      field('Role', selectFrom('', [['user', 'User'], ['admin', 'Administrator']], null, 'ue_role'))),
+    permissionChecklist('ue', u));
   body.querySelector('#ue_role').value = u.role;
   modal('Edit ' + u.email, body, async () => {
-    await api('PUT', '/users/' + u.id, { name: body.querySelector('#ue_name').value, role: body.querySelector('#ue_role').value });
+    await api('PUT', '/users/' + u.id, { name: body.querySelector('#ue_name').value, role: body.querySelector('#ue_role').value,
+      ...permissionValues(body, 'ue') });
     toast('Updated'); render();
   }, 'Save');
 }
