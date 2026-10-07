@@ -96,14 +96,28 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .wrap { max-width: 1440px; margin: 0 auto; padding: 20px 18px 60px; }
 /* Feedstock Inventory: full window width and roomier rows, so the many columns read cleanly. */
 .wrap.wrap-wide { max-width: none; padding-left: 28px; padding-right: 28px; }
+/* One type scale for the whole table: 14px body / 13px header + filters / 12.5px badges + buttons,
+   all in the UI font (lot numbers included), vertically centred with even spacing. */
 .wrap-wide .tablewrap.sticky-actions { max-height: 78vh; }
-.wrap-wide .tablewrap.sticky-actions table { font-size: 14px; }
-.wrap-wide .tablewrap.sticky-actions th, .wrap-wide .tablewrap.sticky-actions td { padding: 10px 12px; }
-.wrap-wide .tablewrap.sticky-actions .filter-row th { padding: 8px 10px; }
+.wrap-wide .tablewrap.sticky-actions table { font-size: 14px; line-height: 20px; }
+.wrap-wide .tablewrap.sticky-actions th, .wrap-wide .tablewrap.sticky-actions td {
+  padding: 12px 12px; vertical-align: middle; font-family: inherit; font-size: 14px; line-height: 20px; }
+.wrap-wide .tablewrap.sticky-actions thead tr:first-child th { font-size: 13px; font-weight: 600; letter-spacing: .2px; padding-top: 14px; padding-bottom: 14px; }
+.wrap-wide .tablewrap.sticky-actions th.checkcol, .wrap-wide .tablewrap.sticky-actions td.checkcol { width: 44px; padding-left: 16px; padding-right: 6px; }
+.wrap-wide .tablewrap.sticky-actions td.mono { font-family: inherit; font-size: 14px; font-weight: 500; font-variant-numeric: tabular-nums; letter-spacing: .15px; }
+.wrap-wide .tablewrap.sticky-actions td.num, .wrap-wide .tablewrap.sticky-actions th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.wrap-wide .tablewrap.sticky-actions .filter-row th { padding: 8px 12px; font-size: 13px; }
+.wrap-wide .tablewrap.sticky-actions .filter-row th input, .wrap-wide .tablewrap.sticky-actions .filter-row th select {
+  font-size: 13px; line-height: 20px; padding: 6px 8px; height: 34px; box-sizing: border-box; width: 100%; min-width: 64px; }
+.wrap-wide .tablewrap.sticky-actions .badge { font-size: 12.5px; font-weight: 600; line-height: 18px; padding: 2px 10px; }
+.wrap-wide .tablewrap.sticky-actions .muted { color: var(--muted); }
 .wrap-wide .tablewrap.sticky-actions tbody tr:nth-child(even) { background: #fafcfc; }
 .wrap-wide .tablewrap.sticky-actions tbody tr.clickable:hover { background: #e9f4f1; }
-.wrap-wide .sticky-actions .row-actions { display: flex; flex-wrap: nowrap; gap: 5px; }
-.wrap-wide .sticky-actions .row-actions button { padding: 4px 9px; font-size: 12px; }
+.wrap-wide .sticky-actions .row-actions { display: flex; flex-wrap: nowrap; gap: 6px; align-items: center; }
+.wrap-wide .sticky-actions .row-actions button { padding: 0 9px; height: 30px; font-size: 12.5px; font-weight: 600; line-height: 30px; }
+.wrap-wide .info-btn { font-size: 15px; line-height: 20px; vertical-align: middle; padding: 0 0 0 8px; }
+.wrap-wide .toolbar { font-size: 13.5px; }
+.wrap-wide .toolbar .muted { font-size: 13.5px; }
 .page-head { display:flex; align-items:center; justify-content:space-between; margin-bottom: 16px; gap: 12px; flex-wrap: wrap; }
 .page-head h2 { margin: 0; font-size: 20px; color: var(--teal-dark); }
 .page-head .actions { display:flex; gap: 8px; flex-wrap: wrap; }
