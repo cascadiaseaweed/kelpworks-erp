@@ -487,3 +487,7 @@ button.stage-step:focus-visible { outline: 2px solid var(--teal); outline-offset
   border-radius: 10px; box-shadow: var(--shadow); padding: 8px 12px; display: grid; gap: 6px; min-width: 210px; }
 .col-menu-panel label { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; margin: 0; }
 .col-menu-panel input { width: auto; }
+
+/* Over-stock note shown directly under a reagent field in the production log */
+.stock-note { color: var(--danger, #b3261e); font-size: 12.5px; line-height: 1.4; margin-top: 4px; }
+.stock-note.hidden { display: none; }

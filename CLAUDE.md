@@ -67,6 +67,18 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
   per container consumed by the Packaging commit (`_commit_label_stock`, net-change via
   `run_label_commits`) -- not the Labels tab, which prints internal
   barcodes), Reagents = the rest. `item_number` is an optional admin-set Item #.
+- **Stock never blocks a run.** Every consumable deduction in a production run (reagents, sample containers, packaging, FG labels,
+  and Pre-Processing pack-out via `_adjust_container_stock`) just lets `on_hand` go negative (the item shows LOW); nothing raises "Not
+  enough ... on hand". **Sample Point defaults** (`_sample_point_defaults`, applied when the description/type is changed, never over a
+  value sent in the same request, new rows start Slurry/Microbial): Microbial -> qty 1 + 50 mL falcon tube; Metals & Nutrients -> qty 2 +
+  50 mL falcon tube; type Solid -> 100 g sample bag.
+- **Reagent types** (`consumables.reagent_type`: Citric Acid / Potassium Sorbate / Sodium Benzoate, set in Inventory Items > Edit; backfilled
+  from the item names once) group inventory items that are the same reagent. A run stores which item it draws each reagent from
+  (`production_runs.dilution_{citric,ksorbate,nabenzoate}_item_id`, shown in the log only when set so old signed snapshots don't change;
+  default = the item named like the type, else the first of that type); `_commit_reagent_usage` deducts from that item and, if the choice
+  changes, refunds the old item and charges the new one (`run_reagent_commits.consumable_id`). `GET /api/reagents[?runId=]` feeds the
+  pickers; `buildReagentWatch` (app.js) renders the pickers and the "Exceeds inventory" note under each reagent field (stock = on-hand + what
+  this run already deducted from that item). Pre-Processing's citric acid picks an item the same way (`preproc_batches.citric_item_id`).
 - **Reagent usage** (Citric Acid, Potassium Sorbate, Sodium Benzoate) is deducted
   by `_commit_reagent_usage` from the Dilution & Preservation entries on that
   section's Save and at finalize: one net-change ledger line per reagent
@@ -153,6 +165,27 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
   output containers, and returns the emptied source IBCs to the Used IBC pool. A completed batch is read-only (no amend flow). Traceability:
   `preproc_inputs` + `GET /api/totes/:id/trace` (Feedstock Inventory "Trace" action); fine lots print a `blendLabel`. Output weight = blend
   mass (shredded kg + water) split by fill volume. `MIX` is hidden from harvest check-in; species-specific SKUs won't offer `MIX` lots in the run picker.
+- **Samples (catalogue, retention inventory, lab cart, requisitions)** (the "Samples" tab, `pageSamples`; backend `route_samples` /
+  `route_cart` / `route_requisitions` / `route_labs`). `samples` = one row per physical unit of a FINALIZED run's Sample Point rows
+  (qty 4 -> 4 samples, stable code `<processing lot>-<STG>-<NN>`), kept in step by `sync_samples` (called after every non-GET
+  `/api/production/...` write and `sync_pending_samples` at boot, which also backfills older runs); a unit whose row was
+  removed/shrunk is dropped only while it is still available/in_cart -- submitted/removed samples are history. Status: available ->
+  in_cart -> submitted (on a requisition) | removed (reason required, `sample_events` is the append-only history). Retention
+  inventory = samples whose description is `Retention`; discard-by = collection date + `sample_retention_months`. Labs + their
+  analyses (`labs`, `lab_analyses`) and an optional per-lab Word template (stored under `LAB_DIR`) are admin-maintained in Admin >
+  Labs & analyses. The cart (`sample_cart`) holds a lab + analysis ids per sample; "Create requisitions" makes one
+  `lab_requisitions` row per run + lab, fills the lab's .docx with `docx_fill` (stdlib `zipfile` + regex on the XML: `{{tokens}}`
+  anywhere, and the one table row containing `{{sample.*}}` tokens is repeated per sample; `{{sample.check:Analysis}}` gives a
+  checkbox column; labs without a template use `build_starter_docx`), saves it as a `run_attachments` document on the run (a paragraph with `{{analysis.name}}` repeats once per requested test, `{{po_number}}`
+  / `{{date_long}}` are scalars; a lab flagged `sample_sheet` -- e.g. Food Assure, whose form says "see attached spreadsheet" -- also gets an
+  `.xlsx` sample list from `build_sample_sheet_xlsx`; ready-to-upload token copies of the Food Assure and SGS forms live in `docs/requisition-templates/` -- see its README; analyses carry an optional `method` printed by `{{sample.methods}}`; repeated rows get unique `permStart/permEnd` / sdt ids so protected forms stay valid)
+  (exempt from the amend lock and the release hash), marks the samples submitted and empties them from the cart.
+- **Production Log Summary PDF** (`GET /api/production/<id>/summary.pdf[?dl=1&token=]`, completed runs only; the "Production log summary" card at
+  the top of a run's Documents window). Generated on demand from the current log by `_run_summary_data` -> `build_run_summary_pdf` -- a
+  stdlib-only PDF writer (`PdfBuilder`: standard Helvetica fonts via a built-in width table, WinAnsi/cp1252 text, tables, KPI cards, the logo
+  decoded from `public/logo.png` once). Key results only, grouped: headline KPIs, a stage-by-stage "Process at a glance", a Quality scorecard
+  (metric x stage matrix with target / final-vs-target instead of per-stage QC dumps), a Samples & lab work matrix (process point x sample
+  type from the `samples` catalogue + requisitions), materials from the ledger, FG lots and sign-off. Not stored as a run attachment (never stale).
 - **Packaging edits after finalize** re-derive everything computed from the packaging rows in the
   same transaction (`_sync_completed_packaging`): container + FG-label stock (net-change commit),
   the run's FG lots (`_adjust_fg_lot`, refuses to go below units already shipped/moved), and
@@ -207,7 +240,7 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
 ## Domain model (key tables)
 
 `species`, `sites`, `tote_lots` (stabilized totes; status in_stock/wip/hold/consumed/
-disposed; `grind` Coarse|Fine), `preproc_batches` / `preproc_inputs` / `preproc_packaging`, `production_runs` + `run_inputs`, `fg_lots`, `consumables` +
+disposed; `grind` Coarse|Fine), `preproc_batches` / `preproc_inputs` / `preproc_packaging`, `samples` / `sample_events` / `sample_cart` / `labs` / `lab_analyses` / `lab_requisitions`, `production_runs` + `run_inputs`, `fg_lots`, `consumables` +
 `consumable_txns`, `run_reagent_commits`, `release_events`, `cip_events` / `cip_event_chemicals`,
 `customers` / `shipments` /
 `shipment_lines`, `disposals`, `run_attachments`, `run_edits`, `location_moves`,

@@ -99,7 +99,7 @@ async function boot() {
 function render() {
   const v = $('#view'); v.innerHTML = '';
   v.classList.toggle('wrap-wide', State.tab === 'stabilized');   // Feedstock Inventory uses the full window width
-  ({ dashboard: pageDashboard, stabilized: pageStabilized, preproc: pagePreproc, production: pageProduction, cip: pageCIP,
+  ({ dashboard: pageDashboard, stabilized: pageStabilized, preproc: pagePreproc, samples: pageSamples, production: pageProduction, cip: pageCIP,
      qc: pageQC, fg: pageFG, shipping: pageShipping, consumables: pageConsumables, reports: pageReports,
      yieldusage: pageYield, release: pageRelease, calculations: pageCalculations, labels: pageLabels, admin: pageAdmin }[State.tab])(v);
 }
@@ -1057,6 +1057,9 @@ function uploadAtt(rid, file) {
     reader.readAsDataURL(file);
   });
 }
+function summaryPdfUrl(rid, dl) {
+  return '/api/production/' + rid + '/summary.pdf?' + (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(State.token);
+}
 async function openAttachments(run) {
   const listHost = el('div', {});
   const status = el('div', { class: 'help' });
@@ -1090,9 +1093,18 @@ async function openAttachments(run) {
   }
   fileInput.addEventListener('change', async () => { await handleFiles(fileInput.files); fileInput.value = ''; });
   cameraInput.addEventListener('change', async () => { await handleFiles(cameraInput.files); cameraInput.value = ''; });
+  // The Production Log Summary is generated on demand from the current log (never stale), so it sits above the uploaded files.
+  const summaryCard = run.status === 'completed' ? el('div', { class: 'card', style: 'margin:10px 0;padding:12px 14px' },
+    el('div', { style: 'display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap' },
+      el('div', {}, el('b', {}, '📄 Production log summary (PDF)'),
+        el('div', { class: 'help' }, 'Key results for every section, a quality scorecard and a sample summary — generated from the current log each time.')),
+      el('div', { style: 'display:flex;gap:8px' },
+        el('button', { type: 'button', onclick: () => window.open(summaryPdfUrl(run.id, false), '_blank') }, 'View'),
+        el('button', { type: 'button', class: 'secondary', onclick: () => { const l = el('a', { href: summaryPdfUrl(run.id, true), download: run.processingLot + '_Production-Log-Summary.pdf' }); document.body.append(l); l.click(); l.remove(); } }, '⬇ Download')))) : null;
   const body = el('div', {},
     el('div', { class: 'summary-line' }, sl('Run', run.processingLot),
       el('span', { class: 'muted' }, 'lab results, paper logs, images — PDF, images, Office docs (max 25 MB each)')),
+    summaryCard,
     el('label', {}, 'Attached documents'), listHost,
     el('div', { style: 'margin-top:16px' },
       el('label', {}, 'Add documents'),
@@ -1857,6 +1869,9 @@ function buildSamplePointsSection(initial, getRunId, processingLot, getCollected
       const r = await api('PUT', '/production/' + rid + '/sample-points/' + id, payload);
       items = filterStage(r.samplePoints);
       status.textContent = '';
+      // description / type changes set a default qty + container (Microbial: 1 x 50 mL falcon tube;
+      // Metals & Nutrients: 2 x 50 mL falcon tube; Solid: 100 g sample bag) -- show what was saved
+      if ('description' in payload || 'type' in payload) draw();
     } catch (e) { status.textContent = e.message; }
   }
   function draw() {
@@ -2276,7 +2291,55 @@ function buildFeedstockCard(opts) {
 // reagent deduction) are the sums. `getPlan` returns the Pasteurization plan (receiving tanks,
 // starting levels, TDS) live. Everything here saves together through the "dilution" stage
 // endpoint, called by the section's single Save.
-function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsorbateTarget, getPlan, getNabenzoateTarget) {
+// Reagent type -> inventory items. A run draws each reagent (citric acid, potassium sorbate, sodium benzoate) from the
+// inventory item picked here (default: the type's original item), and every field that adds a reagent shows a note
+// directly under it when the run's total would exceed what is in stock (the run still proceeds; stock goes negative).
+const REAGENT_TYPES = ['Citric Acid', 'Potassium Sorbate', 'Sodium Benzoate'];
+function buildReagentWatch(runId, selected) {
+  const w = { runId: runId || null, types: {}, commits: {}, selected: Object.assign({}, selected), usage: {}, subs: [], loadSubs: [] };
+  const items = t => (w.types[t] && w.types[t].items) || [];
+  w.item = t => items(t).find(i => i.id === w.selected[t]) || items(t).find(i => i.id === (w.types[t] || {}).defaultItemId) || null;
+  w.itemId = t => { const i = w.item(t); return i ? i.id : null; };
+  // what this run can still draw: the item's on-hand plus what this run already deducted from that same item
+  w.available = t => { const i = w.item(t); if (!i) return null; const c = w.commits[t]; return i.onHand + (c && c.itemId === i.id ? c.kg : 0); };
+  w.total = t => Object.values(w.usage[t] || {}).reduce((a, b) => a + (b || 0), 0);
+  w.notify = () => w.subs.forEach(f => f());
+  w.setUsage = (t, key, kg) => { (w.usage[t] = w.usage[t] || {})[key] = kg || 0; w.notify(); };
+  w.clearUsage = prefix => { Object.values(w.usage).forEach(m => Object.keys(m).forEach(k => { if (k.startsWith(prefix)) delete m[k]; })); w.notify(); };
+  w.load = async () => {
+    try {
+      const r = await api('GET', '/reagents' + (w.runId ? '?runId=' + w.runId : ''));
+      w.types = {}; r.types.forEach(t => { w.types[t.type] = t; }); w.commits = r.commits || {};
+      w.loadSubs.forEach(f => f()); w.notify();
+    } catch (e) { /* the notes simply stay hidden */ }
+  };
+  w.noteEl = t => {
+    const n = el('div', { class: 'stock-note hidden' });
+    w.subs.push(() => {
+      const it = w.item(t), avail = w.available(t), tot = w.total(t);
+      const over = !!it && avail != null && tot > avail + 1e-6;
+      n.classList.toggle('hidden', !over);
+      n.textContent = over ? '⚠ Exceeds inventory: this run uses ' + fmt(tot, 2) + ' ' + it.unit + ' of ' + it.name + ' but only '
+        + fmt(Math.max(avail, 0), 2) + ' ' + it.unit + ' is in stock. The run can continue; inventory will go to ' + fmt(avail - tot, 2) + ' ' + it.unit + '.' : '';
+    });
+    return n;
+  };
+  w.itemSelect = t => {
+    const sel = el('select', {});
+    const rebuild = () => {
+      const list = items(t), cur = w.itemId(t);
+      sel.innerHTML = '';
+      if (!list.length) sel.append(el('option', { value: '' }, 'No ' + t + ' item in Inventory Items'));
+      list.forEach(i => sel.append(el('option', { value: i.id }, i.name + (i.itemNumber ? ' (#' + i.itemNumber + ')' : '') + ' — ' + fmt(i.onHand, 1) + ' ' + i.unit + ' on hand')));
+      if (cur != null) sel.value = String(cur);
+    };
+    sel.addEventListener('change', () => { w.selected[t] = sel.value ? +sel.value : null; w.notify(); });
+    w.loadSubs.push(rebuild); rebuild();
+    return sel;
+  };
+  return w;
+}
+function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsorbateTarget, getPlan, getNabenzoateTarget, runId) {
   values = values || {};
   const numOf = inp => inp.value.trim() === '' ? null : qcParseValue(inp.value);
   const lvl = (v, ph) => { const i = el('input', { inputmode: 'decimal', placeholder: ph || 'Measured using level sensor' }); attachNumericMask(i, 2); if (v != null) i.value = formatQcValue(v, 2); return i; };
@@ -2287,6 +2350,12 @@ function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsor
   if (values.measuredPh != null) measuredPhInp.value = formatQcValue(values.measuredPh, 1);
   const citricInp = el('input', { inputmode: 'decimal', placeholder: 'kg' }); attachNumericMask(citricInp, 2);
   if (values.citricKg != null) citricInp.value = formatQcValue(values.citricKg, 2);
+  const reagentWatch = buildReagentWatch(runId, { 'Citric Acid': values.citricItemId, 'Potassium Sorbate': values.ksorbateItemId, 'Sodium Benzoate': values.nabenzoateItemId });
+  reagentWatch.load();
+  const citricNote = reagentWatch.noteEl('Citric Acid'), ksNote = reagentWatch.noteEl('Potassium Sorbate'), nbNote = reagentWatch.noteEl('Sodium Benzoate');
+  const citricItemSel = reagentWatch.itemSelect('Citric Acid'), ksItemSel = reagentWatch.itemSelect('Potassium Sorbate'), nbItemSel = reagentWatch.itemSelect('Sodium Benzoate');
+  citricInp.addEventListener('input', () => reagentWatch.setUsage('Citric Acid', 'main', numOf(citricInp)));
+  reagentWatch.setUsage('Citric Acid', 'main', numOf(citricInp));
   const targetPhValue = el('span', { class: 'help' });
   function refreshTargetPh() {
     const targetPh = getTargetPh();
@@ -2401,6 +2470,8 @@ function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsor
     setTile(ksTotalKg, kL != null && ksPct != null ? formatQcValue(kL * ksPct / 100, 2) + ' kg' : null);
     setTile(nbTotalL, nL != null ? formatQcValue(nL, 2) + ' L' : null);
     setTile(nbTotalKg, nL != null && nbPct != null ? formatQcValue(nL * nbPct / 100, 2) + ' kg' : null);
+    reagentWatch.setUsage('Potassium Sorbate', 'main', kL != null && ksPct != null ? kL * ksPct / 100 : 0);
+    reagentWatch.setUsage('Sodium Benzoate', 'main', nL != null && nbPct != null ? nL * nbPct / 100 : 0);
     changeCbs.forEach(cb => cb());
   }
   // Product still in Tank 5A/5B after this (first) pass: what the plan saw there minus what was
@@ -2425,6 +2496,8 @@ function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsor
     const payload = {
       measuredPh: numOf(measuredPhInp), citricKg: numOf(citricInp),
       ksorbateStockPct: numOf(ksorbateStockInp), nabenzoateStockPct: numOf(nabenzoateStockInp),
+      citricItemId: reagentWatch.itemId('Citric Acid'), ksorbateItemId: reagentWatch.itemId('Potassium Sorbate'),
+      nabenzoateItemId: reagentWatch.itemId('Sodium Benzoate'),
     };
     // Per-tank fields only exist once the receiving tank(s) are chosen; a run still on the older
     // single-total layout keeps its existing totals untouched.
@@ -2439,10 +2512,13 @@ function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsor
       });
     }
     await api('PUT', '/production/' + rid + '/stages/dilution', payload);
+    reagentWatch.runId = rid;
+    await reagentWatch.load();          // stock + what this run has now deducted
   }
 
   refresh();
   return {
+    reagentWatch,
     box: el('div', {},
       el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Dilution'),
       noPlanNote,
@@ -2464,6 +2540,7 @@ function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsor
       el('div', { class: 'form-row' },
         rfield('dilution', 'ksorbateStockPct', 'Ksorbate stock concentration (w/v)', ksorbateStockField),
         rfield('dilution', 'nabenzoateStockPct', 'Nabenzoate stock concentration (w/v)', nabenzoateStockField)),
+      el('div', { class: 'form-row' }, field('Potassium sorbate item (inventory)', ksItemSel), field('Sodium benzoate item (inventory)', nbItemSel)),
       el('div', { class: 'help' }, 'Doses are sized to the volume in each tank. Enter the stock solution added to each tank.'),
       el('div', { class: 'tablewrap' }, el('table', { class: 'qc-check-checklist tank-table' },
         el('thead', {}, el('tr', {}, el('th', {}, 'Tank'), el('th', { class: 'num' }, 'Final volume'),
@@ -2471,12 +2548,14 @@ function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsor
           el('th', { class: 'num' }, 'Benzoate calc.'), el('th', {}, reqLabel('Benzoate added (L)')))),
         el('tbody', {}, rowT['6A'].tr, rowT['6B'].tr))),
       el('div', { class: 'qc-check-box' },
-        resultRow('Ksorbate added, total', el('span', {}, ksTotalL, ' ', ksTotalKg)),
-        resultRow('Sodium benzoate added, total', el('span', {}, nbTotalL, ' ', nbTotalKg))),
+        resultRow('Ksorbate added, total', el('span', {}, ksTotalL, ' ', ksTotalKg)), ksNote,
+        resultRow('Sodium benzoate added, total', el('span', {}, nbTotalL, ' ', nbTotalKg)), nbNote),
       el('div', { class: 'qc-check-section-title' }, 'pH Balancing'),
-      el('div', { class: 'form-row-3' },
-        rfield('dilution', 'measuredPh', 'Measured pH', measuredPhInp), field('Target pH', targetPhValue),
-        rfield('dilution', 'citricKg', 'Citric acid added (kg)', citricInp))),
+      el('div', { class: 'form-row' },
+        rfield('dilution', 'measuredPh', 'Measured pH', measuredPhInp), field('Target pH', targetPhValue)),
+      el('div', { class: 'form-row' },
+        field('Citric acid item (inventory)', citricItemSel),
+        rfield('dilution', 'citricKg', 'Citric acid added (kg)', el('div', {}, citricInp, citricNote)))),
     save,
     refresh,
     getRemaining, getStock,
@@ -2508,6 +2587,8 @@ function buildDilutionPassCard(pass, ctx) {
   if (pass.measuredPh != null) phInp.value = formatQcValue(pass.measuredPh, 1);
   const citricInp = el('input', { inputmode: 'decimal', placeholder: 'kg' }); attachNumericMask(citricInp, 2);
   if (pass.citricKg != null) citricInp.value = formatQcValue(pass.citricKg, 2);
+  const rw = ctx.reagentWatch, pk = 'pass' + pass.id;
+  const cNote = rw ? rw.noteEl('Citric Acid') : null, kNote = rw ? rw.noteEl('Potassium Sorbate') : null, bNote = rw ? rw.noteEl('Sodium Benzoate') : null;
   const targetPhTile = el('span', { class: 'help' });
   const tile = () => el('span', { class: 'help' });
   const setTile = (span, text) => { span.className = text != null ? 'qc-check-result-value' : 'help'; span.textContent = text != null ? text : '—'; };
@@ -2587,6 +2668,11 @@ function buildDilutionPassCard(pass, ctx) {
     const kL = addedSum(ks), nL = addedSum(nb), st = ctx.getStock();
     setTile(ksTotal, kL != null ? formatQcValue(kL, 2) + ' L' + (st.ksPct != null ? '  ·  ' + formatQcValue(kL * st.ksPct / 100, 2) + ' kg' : '') : null);
     setTile(nbTotal, nL != null ? formatQcValue(nL, 2) + ' L' + (st.nbPct != null ? '  ·  ' + formatQcValue(nL * st.nbPct / 100, 2) + ' kg' : '') : null);
+    if (rw) {
+      rw.setUsage('Citric Acid', pk, numOf(citricInp));
+      rw.setUsage('Potassium Sorbate', pk, kL != null && st.ksPct != null ? kL * st.ksPct / 100 : 0);
+      rw.setUsage('Sodium Benzoate', pk, nL != null && st.nbPct != null ? nL * st.nbPct / 100 : 0);
+    }
     if (ctx.onChanged) ctx.onChanged();
   }
   [t5a, t5b, s6a, s6b, productInp, waterInp, f6a, f6b, ks['6A'], ks['6B'], nb['6A'], nb['6B'], phInp, citricInp].forEach(i => i.addEventListener('input', refresh));
@@ -2610,6 +2696,7 @@ function buildDilutionPassCard(pass, ctx) {
         measuredPh: numOf(phInp), citricKg: numOf(citricInp),
       });
       if (ctx.onItems) ctx.onItems(r.dilutionPasses);
+      if (rw) rw.load();
       status.textContent = 'Saved.';
     } catch (e) { status.textContent = e.message; }
     saveBtn.disabled = false;
@@ -2638,10 +2725,10 @@ function buildDilutionPassCard(pass, ctx) {
       el('thead', {}, el('tr', {}, el('th', {}, 'Tank'), el('th', { class: 'num' }, 'Final volume'), el('th', { class: 'num' }, 'Ksorbate calc.'),
         el('th', {}, reqLabel('Ksorbate added (L)')), el('th', { class: 'num' }, 'Benzoate calc.'), el('th', {}, reqLabel('Benzoate added (L)')))),
       el('tbody', {}, rowT['6A'].tr, rowT['6B'].tr))),
-    resultRow('Ksorbate added, this pass', ksTotal), resultRow('Sodium benzoate added, this pass', nbTotal),
+    resultRow('Ksorbate added, this pass', ksTotal), kNote, resultRow('Sodium benzoate added, this pass', nbTotal), bNote,
     el('div', { class: 'qc-check-section-title' }, 'pH Balancing (this pass)'),
     el('div', { class: 'form-row-3' }, field(reqLabel('Measured pH'), phInp), field('Target pH', targetPhTile),
-      field(reqLabel('Citric acid added (kg)'), citricInp)),
+      field(reqLabel('Citric acid added (kg)'), el('div', {}, citricInp, cNote))),
     el('div', { style: 'margin-top:8px;display:flex;gap:10px;align-items:center' }, saveBtn, status, removeBtn));
   return { box, getRemaining, refresh };
 }
@@ -2652,14 +2739,15 @@ function buildDilutionPassesSection(initial, getRunId, ctx) {
   let cards = [];
   function draw() {
     host.innerHTML = ''; cards = [];
+    if (ctx.reagentWatch) ctx.reagentWatch.clearUsage('pass');   // cards below re-register their own amounts
     items.forEach((p, i) => {
       const card = buildDilutionPassCard(p, {
-        getRunId, getTdsConc: ctx.getTdsConc, getTdsTarget: ctx.getTdsTarget, getStock: ctx.getStock, getTargetPh: ctx.getTargetPh,
+        reagentWatch: ctx.reagentWatch, getRunId, getTdsConc: ctx.getTdsConc, getTdsTarget: ctx.getTdsTarget, getStock: ctx.getStock, getTargetPh: ctx.getTargetPh,
         getPrevRemaining: () => i === 0 ? ctx.getPass1Remaining() : (cards[i - 1] ? cards[i - 1].getRemaining() : null),
         isLast: i === items.length - 1, onChanged: () => refreshAdd(), onItems: list => { items = list; },
         onRemove: async () => {
           if (!confirm('Remove dilution pass ' + p.passNo + '? Its preservative additions are refunded to stock.')) return;
-          try { items = (await api('DELETE', '/production/' + await getRunId() + '/dilution-passes/' + p.id)).dilutionPasses; draw(); }
+          try { items = (await api('DELETE', '/production/' + await getRunId() + '/dilution-passes/' + p.id)).dilutionPasses; draw(); if (ctx.reagentWatch) ctx.reagentWatch.load(); }
           catch (e) { toast(e.message, true); }
         },
       });
@@ -3031,10 +3119,11 @@ async function openRun(draftSummary, opts) {
     () => skus.find(x => x.code === skuSel.value)?.phTarget,
     () => skus.find(x => x.code === skuSel.value)?.ksorbateTarget,
     () => pasteurizationSection.getPlan(),
-    () => skus.find(x => x.code === skuSel.value)?.nabenzoateTarget);
+    () => skus.find(x => x.code === skuSel.value)?.nabenzoateTarget, draft && draft.id);
   pasteurizationSection.onPlanChange(() => dilutionSummary.refresh());
   dilutionSummary.refresh();
   const dilutionPasses = buildDilutionPassesSection(draft?.dilutionPasses || [], ensureRunId, {
+    reagentWatch: dilutionSummary.reagentWatch,
     getTdsConc: () => stages.separation?.liquidTdsPct, getTdsTarget: () => skus.find(x => x.code === skuSel.value)?.tdsTarget,
     ensureSaved: async () => {
       const b = pasteurizationSection.box.querySelector('button.section-save');
@@ -3262,10 +3351,11 @@ async function openProcessLog(run, section) {
     () => State.ref.skus.find(s => s.code === run.sku)?.phTarget,
     () => State.ref.skus.find(s => s.code === run.sku)?.ksorbateTarget,
     () => pasteurizationSection.getPlan(),
-    () => State.ref.skus.find(s => s.code === run.sku)?.nabenzoateTarget);
+    () => State.ref.skus.find(s => s.code === run.sku)?.nabenzoateTarget, run.id);
   pasteurizationSection.onPlanChange(() => dilutionSummary.refresh());
   dilutionSummary.refresh();
   const dilutionPasses = buildDilutionPassesSection(run.dilutionPasses || [], getRunId, {
+    reagentWatch: dilutionSummary.reagentWatch,
     getTdsConc: () => stages.separation?.liquidTdsPct, getTdsTarget: () => run.targetTds,
     ensureSaved: async () => {
       const b = pasteurizationSection.box.querySelector('button.section-save');
@@ -4058,12 +4148,14 @@ async function pageConsumables(v) {
     allCb.checked = items.length > 0 && items.every(c => selected.has(c.id));
     const headers = [allCb, 'Item #', 'Item'];
     const bools = [false, false, false];
+    if (opts.showType) { headers.push('Type'); bools.push(false); }
     if (opts.showVolume) { headers.push('Volume (L)'); bools.push(true); }
     if (opts.showLabelMap) { headers.push('SKU', 'Package'); bools.push(false, false); }
     headers.push('Location', 'On hand', 'Reorder at', 'Cost/unit', '', 'Actions');
     bools.push(false, true, true, true, false, false);
     return table(headers, items.map(c => {
       const row = [rowCheck(c, selected, updateBulk), c.itemNumber || '—', c.name];
+      if (opts.showType) row.push(c.reagentType || '—');
       if (opts.showVolume) row.push(c.litresEach != null ? fmt(c.litresEach, c.litresEach % 1 ? 2 : 0) : '—');
       if (opts.showLabelMap) row.push(skuName(c.labelSku), c.labelPackage || '—');
       // Packaging items and labels are counted in whole units (totes,
@@ -4084,7 +4176,9 @@ async function pageConsumables(v) {
     const reagents = r.consumables.filter(c => !c.isContainer && !c.labelSku);
     host.append(el('div', { class: 'page-head' }, el('h2', {}, 'Reagents'),
       el('div', { class: 'actions' }, el('button', { onclick: addConsumable }, '+ Add reagent'))));
-    host.append(itemsTable(reagents, { history: true }));
+    host.append(itemsTable(reagents, { history: true, showType: true }));
+    host.append(el('div', { class: 'help', style: 'margin-top:6px' },
+      'Type groups items that are the same reagent (e.g. several Citric Acid grades or suppliers): the production log offers every item of a type and deducts from the one chosen. Set it with Edit.'));
     host.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Packaging'),
       el('div', { class: 'actions' },
         isAdmin ? el('button', { class: 'secondary', onclick: openContainerBulkImport }, '📤 Bulk import CSV') : null,
@@ -4126,8 +4220,12 @@ function editC(c) {
     : null;
   const sampleCb = c.isContainer ? el('input', { type: 'checkbox' }) : null;
   if (sampleCb) sampleCb.checked = !!c.isSampleContainer;
+  const isPlainReagent = !c.isContainer && !c.labelSku;
+  const typeSel = isPlainReagent ? selectFrom('', [['', '— none —'], ...REAGENT_TYPES.map(t => [t, t])]) : null;
+  if (typeSel) typeSel.value = c.reagentType || '';
   const body = el('div', {},
     field('Item #', el('input', { id: 'c_itemno', value: c.itemNumber ?? '', placeholder: 'optional stock / part number' })),
+    typeSel ? field('Reagent type (items of one type are offered together in the production log)', typeSel) : null,
     el('div', { class: 'form-row' },
       field('Reorder level', el('input', { type: 'number', id: 'c_re', value: c.reorderLevel, step: '0.1' })),
       field('Cost per unit', el('input', { type: 'number', id: 'c_cost', value: c.costPerUnit ?? '', step: '0.01' }))),
@@ -4143,6 +4241,7 @@ function editC(c) {
       payload.litresEach = litresInp.value.trim() === '' ? null : +litresInp.value;
       payload.isSampleContainer = sampleCb.checked;
     }
+    if (typeSel) payload.reagentType = typeSel.value || null;
     await api('PUT', '/consumables/' + c.id, payload);
     State.ref = await api('GET', '/refdata');
     toast('Updated'); render();
@@ -4178,8 +4277,10 @@ function addConsumable() {
   const locs = State.ref.locations.map(l => [l, l]);
   // Admin-only: a CIP cleaning agent is offered on CIP Log chemical lines.
   const cipCb = State.user.role === 'admin' ? el('input', { type: 'checkbox' }) : null;
+  const typeSel = selectFrom('', [['', '— none —'], ...REAGENT_TYPES.map(t => [t, t])]);
   const body = el('div', {},
     el('div', { class: 'form-row' }, field('Name', el('input', { id: 'n_name' })), field('Unit', el('input', { id: 'n_unit', value: 'kg' }))),
+    field('Reagent type (items of one type are offered together in the production log)', typeSel),
     field('Item #', el('input', { id: 'n_itemno', placeholder: 'optional stock / part number' })),
     el('div', { class: 'form-row' }, field('On hand', el('input', { type: 'number', id: 'n_oh', value: '0' })),
       field('Reorder level', el('input', { type: 'number', id: 'n_re', value: '0' }))),
@@ -4188,7 +4289,7 @@ function addConsumable() {
     cipCb ? field('CIP cleaning agent (offered on CIP Log lines)', cipCb) : null);
   modal('Add reagent', body, async () => {
     await api('POST', '/consumables', { name: body.querySelector('#n_name').value, unit: body.querySelector('#n_unit').value, onHand: +body.querySelector('#n_oh').value, reorderLevel: +body.querySelector('#n_re').value, costPerUnit: body.querySelector('#n_cost').value || null, location: body.querySelector('#n_loc').value,
-      itemNumber: body.querySelector('#n_itemno').value, isCipAgent: cipCb ? cipCb.checked : false });
+      itemNumber: body.querySelector('#n_itemno').value, isCipAgent: cipCb ? cipCb.checked : false, reagentType: typeSel.value || null });
     State.ref = await api('GET', '/refdata');
     toast('Added'); render();
   }, 'Add');
@@ -4735,6 +4836,13 @@ const CALCULATIONS = [
     settings: [],
   },
   {
+    title: 'Retention sample discard-by date',
+    formula: 'Discard-by = Collection date + Retention shelf life (months)',
+    description: 'Each Retention sample in the Samples tab’s Retention inventory is flagged as expiring within 30 days, or expired, against this date. Only Retention samples have one.',
+    location: 'Samples → Retention inventory',
+    settings: ['sample_retention_months'],
+  },
+  {
     title: 'Pre-processing: output IBC weight',
     formula: 'Output IBC weight (kg) = (Shredded mass + Dilution water added) × (that IBC fill ÷ Total packed)',
     description: 'Each output IBC lot is stored in Feedstock Inventory with its share of the blend mass as its weight, so downstream yield figures use the blend mass.',
@@ -4929,6 +5037,377 @@ async function pageCalculations(v) {
 }
 
 /* ---------------- Labels ---------------- */
+/* ---------------- Samples: catalogue, retention inventory, lab cart, requisitions ---------------- */
+const SAMPLE_REMOVE_REASONS = ['Consumed in analysis', 'Disposed', 'Expired', 'Lost / damaged', 'Sent to lab (outside the app)', 'Other'];
+const SAMPLE_STATUS_LABELS = { available: 'In inventory', in_cart: 'In cart', submitted: 'Sent to lab', removed: 'Removed' };
+const SAMPLE_STATUS_BADGE = { available: 'on_hand', in_cart: 'wip', submitted: 'pending_release', removed: 'consumed' };
+const sampleStatusBadge = s => badge(SAMPLE_STATUS_BADGE[s.status] || 'consumed', SAMPLE_STATUS_LABELS[s.status] || s.status);
+const reqDocUrl = (runId, attId, dl) => attDownloadUrl(runId, attId, dl);
+const reqDocLinks = q => el('span', { style: 'display:flex;gap:12px;flex-wrap:wrap' },
+  q.attachmentId ? el('a', { href: reqDocUrl(q.runId, q.attachmentId, true), onclick: e => e.stopPropagation() }, '⬇ ' + (q.filename || 'Requisition')) : null,
+  q.sheetAttachmentId ? el('a', { href: reqDocUrl(q.runId, q.sheetAttachmentId, true), onclick: e => e.stopPropagation() }, '⬇ ' + (q.sheetFilename || 'Sample spreadsheet')) : null);
+const sampleWhen = iso => iso ? String(iso).replace('T', ' ').replace('Z', '').slice(0, 16) : '—';
+
+async function pageSamples(v) {
+  const views = [['catalogue', 'Catalogue'], ['retention', 'Retention inventory'], ['cart', 'Cart'], ['requisitions', 'Requisitions']];
+  if (!views.some(x => x[0] === State.samplesView)) State.samplesView = 'catalogue';
+  const cartCount = (await api('GET', '/cart')).items.length;
+  v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Samples'),
+    el('div', { class: 'actions' }, ...views.map(([k, label]) => el('button', {
+      class: State.samplesView === k ? '' : 'secondary', onclick: () => { State.samplesView = k; render(); }
+    }, k === 'cart' ? 'Cart (' + cartCount + ')' : label)))));
+  const host = el('div', {}); v.append(host);
+  if (State.samplesView === 'catalogue') await drawSampleCatalogue(host);
+  else if (State.samplesView === 'retention') await drawRetentionInventory(host);
+  else if (State.samplesView === 'cart') await drawSampleCart(host);
+  else await drawRequisitions(host);
+}
+
+// Bulk actions shared by the catalogue and retention views.
+function sampleBulkBar(selected, byId) {
+  const bar = el('div', { class: 'bulkbar hidden' });
+  return {
+    el: bar,
+    update() {
+      const ids = [...selected];
+      bar.classList.toggle('hidden', !ids.length); bar.innerHTML = '';
+      if (!ids.length) return;
+      const cartable = ids.filter(i => byId(i) && byId(i).status === 'available');
+      const removable = ids.filter(i => byId(i) && ['available', 'in_cart'].includes(byId(i).status));
+      bar.append(el('span', {}, el('b', {}, ids.length), ' selected'),
+        cartable.length ? el('button', { onclick: async () => { await api('POST', '/cart', { sampleIds: cartable }); toast(cartable.length + ' sample(s) added to the cart'); render(); } }, 'Add to cart (' + cartable.length + ')') : null,
+        el('button', { class: 'secondary', onclick: () => setSampleLocationModal(ids) }, 'Set location'),
+        removable.length ? el('button', { class: 'danger', onclick: () => removeSamplesModal(removable) }, 'Remove from inventory (' + removable.length + ')') : null,
+        el('button', { class: 'secondary', onclick: () => { selected.clear(); render(); } }, 'Clear'));
+    }
+  };
+}
+
+function setSampleLocationModal(ids) {
+  const inp = el('input', { placeholder: 'e.g. Freezer 2, shelf B' });
+  modal('Set storage location', el('div', {}, el('div', { class: 'help' }, ids.length + ' sample(s)'), field('Location', inp)), async () => {
+    await api('POST', '/samples/location', { ids, location: inp.value });
+    toast('Location updated'); render();
+  }, 'Save');
+}
+
+function removeSamplesModal(ids) {
+  const reason = el('select', {}, ...SAMPLE_REMOVE_REASONS.map(r => el('option', { value: r }, r)));
+  const note = el('input', { placeholder: 'Optional note' });
+  modal('Remove from inventory', el('div', {},
+    el('div', { class: 'help', style: 'margin-bottom:8px' }, ids.length + ' sample(s) will no longer be available for analysis. The removal is logged with your name and the reason.'),
+    field('Reason', reason), field('Note', note)), async () => {
+    for (const id of ids) await api('POST', '/samples/' + id + '/remove', { reason: reason.value, note: note.value });
+    toast(ids.length + ' sample(s) removed'); render();
+  }, 'Remove');
+}
+
+async function openSampleDetails(id) {
+  const s = await api('GET', '/samples/' + id);
+  const loc = el('input', { value: s.location || '', placeholder: 'e.g. Freezer 2, shelf B' });
+  const notes = el('textarea', { rows: '2', placeholder: 'Notes' }, s.notes || '');
+  const rows = [['Sample ID', mono(s.code)], ['Production run', mono(s.processingLot) ], ['Run date', s.runDate], ['Product', skuName(s.sku)],
+    ['Process point', s.stageLabel], ['Type', s.type || '—'], ['Description', s.description || '—'], ['Container', s.container || '—'],
+    ['Collected', sampleWhen(s.collectedAt)], ['Status', sampleStatusBadge(s)]];
+  if (s.isRetention) rows.push(['Retention discard-by', s.discardBy ? s.discardBy + (s.expired ? '  (expired)' : '') : '—']);
+  if (s.reqNumber) rows.push(['Requisition', s.reqAttachmentId
+    ? el('a', { href: reqDocUrl(s.runId, s.reqAttachmentId, true) }, s.reqNumber + ' · ' + (s.reqLab || '')) : s.reqNumber]);
+  if (s.status === 'removed') rows.push(['Removed', sampleWhen(s.removedAt) + ' by ' + (s.removedBy || '—') + ' — ' + (s.removedReason || '')]);
+  const actions = el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;margin-top:12px' },
+    s.status === 'available' ? el('button', { onclick: async () => { await api('POST', '/cart', { sampleIds: [s.id] }); toast('Added to the cart'); document.querySelector('.modal-bg')?.remove(); render(); } }, 'Add to cart') : null,
+    ['available', 'in_cart'].includes(s.status) ? el('button', { class: 'danger', onclick: () => { document.querySelector('.modal-bg')?.remove(); removeSamplesModal([s.id]); } }, 'Remove from inventory') : null,
+    s.status === 'removed' ? el('button', { class: 'secondary', onclick: async () => { await api('POST', '/samples/' + s.id + '/restore'); toast('Sample restored'); document.querySelector('.modal-bg')?.remove(); render(); } }, 'Undo removal') : null);
+  const body = el('div', {}, table(['Field', 'Value'], rows),
+    el('div', { class: 'form-row', style: 'margin-top:10px' }, field('Storage location', loc), field('Notes', notes)),
+    actions, el('h4', { style: 'margin:14px 0 6px' }, 'History'),
+    table(['When', 'Event', 'Detail', 'By'], s.events.map(e => [sampleWhen(e.at), e.type.replace('_', ' '), e.detail || '—', e.by || '—'])));
+  modal('Sample — ' + s.code, body, async () => {
+    await api('PUT', '/samples/' + s.id, { location: loc.value, notes: notes.value });
+    toast('Sample updated'); render();
+  }, 'Save changes', { wide: true });
+}
+
+function sampleFilterBar(f, samples, onChange, extra) {
+  const uniq = k => [...new Set(samples.map(s => s[k]).filter(Boolean))].sort();
+  const sel = (key, label, opts) => {
+    const s = el('select', {}, el('option', { value: '' }, label), ...opts.map(o => el('option', { value: o[0] }, o[1])));
+    s.value = f[key] || ''; s.addEventListener('change', () => { f[key] = s.value; onChange(); }); return s;
+  };
+  const q = el('input', { placeholder: 'Search sample ID, run, location…', value: f.q || '' });
+  q.addEventListener('input', () => { f.q = q.value; onChange(); });
+  return el('div', { class: 'toolbar' }, q,
+    sel('run', 'All runs', uniq('processingLot').map(x => [x, x])),
+    ...(extra || []).map(k => k === 'status' ? sel('status', 'All statuses', Object.entries(SAMPLE_STATUS_LABELS))
+      : k === 'stage' ? sel('stage', 'All process points', [...new Set(samples.map(s => s.stageLabel))].sort().map(x => [x, x]))
+      : sel('desc', 'All descriptions', uniq('description').map(x => [x, x]))));
+}
+function sampleMatches(s, f) {
+  const q = (f.q || '').toLowerCase();
+  return (!f.run || s.processingLot === f.run) && (!f.status || s.status === f.status) && (!f.stage || s.stageLabel === f.stage) &&
+    (!f.desc || s.description === f.desc) &&
+    (!q || (s.code + ' ' + s.processingLot + ' ' + (s.location || '') + ' ' + (s.description || '')).toLowerCase().includes(q));
+}
+
+async function drawSampleCatalogue(host) {
+  const { samples } = await api('GET', '/samples');
+  const f = State.sampleFilters = State.sampleFilters || {};
+  const selected = State.sampleSel = State.sampleSel || new Set();
+  const byId = id => samples.find(s => s.id === id);
+  const bulk = sampleBulkBar(selected, byId);
+  const tableHost = el('div', {}), count = el('span', { class: 'muted' });
+  function draw() {
+    const rows = samples.filter(s => sampleMatches(s, f));
+    count.textContent = rows.length + ' of ' + samples.length + ' samples';
+    tableHost.innerHTML = '';
+    const selectable = rows.filter(s => ['available', 'in_cart'].includes(s.status));
+    const all = el('input', { type: 'checkbox', onchange: () => { selectable.forEach(s => all.checked ? selected.add(s.id) : selected.delete(s.id)); draw(); bulk.update(); } });
+    all.checked = selectable.length > 0 && selectable.every(s => selected.has(s.id));
+    const tb = el('tbody', {});
+    if (!rows.length) tb.append(el('tr', {}, el('td', { colspan: 12, class: 'empty' }, 'No samples match.')));
+    rows.forEach(s => {
+      const cb = ['available', 'in_cart'].includes(s.status) ? el('input', { type: 'checkbox', onclick: e => e.stopPropagation(),
+        onchange: () => { cb.checked ? selected.add(s.id) : selected.delete(s.id); bulk.update(); } }) : null;
+      if (cb) cb.checked = selected.has(s.id);
+      tb.append(el('tr', { class: 'clickable', onclick: () => openSampleDetails(s.id) },
+        el('td', { class: 'checkcol' }, cb), el('td', { class: 'mono' }, s.code), el('td', {}, s.runDate), el('td', {}, s.stageLabel),
+        el('td', {}, s.type || '—'), el('td', {}, s.description || '—'), el('td', {}, s.container || '—'), el('td', {}, sampleWhen(s.collectedAt)),
+        el('td', {}, s.location || '—'), el('td', {}, sampleStatusBadge(s)), el('td', {}, s.reqNumber || '—')));
+    });
+    tableHost.append(el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {},
+      el('th', { class: 'checkcol' }, all), ...['Sample ID', 'Run date', 'Process point', 'Type', 'Description', 'Container', 'Collected', 'Location', 'Status', 'Requisition'].map(h => el('th', {}, h)))), tb)));
+  }
+  host.append(sampleFilterBar(f, samples, draw, ['status', 'stage', 'desc']), el('div', { style: 'margin:6px 0' }, count), bulk.el, tableHost,
+    el('div', { class: 'help', style: 'margin-top:8px' }, 'Every tube / bag logged in a finalized run’s Sample Point boxes is catalogued here with its own ID. Click a row for its full history; tick samples to add them to the lab cart or set their storage location.'));
+  draw(); bulk.update();
+}
+
+async function drawRetentionInventory(host) {
+  const { samples, retentionMonths } = await api('GET', '/samples?retention=1');
+  const f = State.retentionFilters = State.retentionFilters || {};
+  const selected = State.retentionSel = State.retentionSel || new Set();
+  const inInv = samples.filter(s => ['available', 'in_cart'].includes(s.status));
+  const soon = inInv.filter(s => s.discardBy && !s.expired && s.discardBy <= new Date(Date.now() + 30 * 864e5).toISOString().slice(0, 10));
+  const showAll = el('input', { type: 'checkbox' }); showAll.checked = !!f.showRemoved;
+  showAll.addEventListener('change', () => { f.showRemoved = showAll.checked; draw(); });
+  const byId = id => samples.find(s => s.id === id);
+  const bulk = sampleBulkBar(selected, byId);
+  const tableHost = el('div', {});
+  function draw() {
+    const rows = samples.filter(s => (f.showRemoved || ['available', 'in_cart'].includes(s.status)) && sampleMatches(s, f));
+    tableHost.innerHTML = '';
+    const tb = el('tbody', {});
+    if (!rows.length) tb.append(el('tr', {}, el('td', { colspan: 10, class: 'empty' }, 'No retention samples.')));
+    rows.forEach(s => {
+      const cb = ['available', 'in_cart'].includes(s.status) ? el('input', { type: 'checkbox', onclick: e => e.stopPropagation(),
+        onchange: () => { cb.checked ? selected.add(s.id) : selected.delete(s.id); bulk.update(); } }) : null;
+      if (cb) cb.checked = selected.has(s.id);
+      tb.append(el('tr', { class: 'clickable', onclick: () => openSampleDetails(s.id) },
+        el('td', { class: 'checkcol' }, cb), el('td', { class: 'mono' }, s.code), el('td', {}, s.processingLot), el('td', {}, s.stageLabel),
+        el('td', {}, sampleWhen(s.collectedAt)),
+        el('td', {}, s.expired ? el('span', { class: 'var-flag' }, (s.discardBy || '') + ' · expired') : (s.discardBy || '—')),
+        el('td', {}, s.container || '—'), el('td', {}, s.location || '—'), el('td', {}, sampleStatusBadge(s)),
+        el('td', {}, s.status === 'removed' ? (s.removedReason || '') : (s.status === 'submitted' ? (s.reqNumber || '') : ''))));
+    });
+    tableHost.append(el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {},
+      el('th', { class: 'checkcol' }, ''), ...['Sample ID', 'Run', 'Process point', 'Collected', 'Discard by', 'Container', 'Location', 'Status', 'Removed / sent'].map(h => el('th', {}, h)))), tb)));
+  }
+  host.append(el('div', { class: 'tiles' },
+    tile('In inventory', inInv.length, 'retention samples', true), tile('Expiring in 30 days', soon.length, 'samples'),
+    tile('Past discard-by', inInv.filter(s => s.expired).length, 'samples'),
+    tile('No longer available', samples.length - inInv.length, 'removed or sent to a lab')),
+    sampleFilterBar(f, samples, draw, ['status']),
+    el('label', { style: 'display:flex;gap:6px;align-items:center;margin:6px 0;font-size:13px' }, showAll, 'Show removed / sent samples'),
+    bulk.el, tableHost,
+    el('div', { class: 'help', style: 'margin-top:8px' }, 'A Retention sample leaves this inventory when it is removed (with a reason), or when it is put on a lab requisition. Discard-by = collection date + ' + retentionMonths + ' months (Admin → Settings: “Retention sample shelf life”).'));
+  draw(); bulk.update();
+}
+
+async function drawSampleCart(host) {
+  const { items, labs } = await api('GET', '/cart');
+  if (!items.length) { host.append(el('div', { class: 'empty card' }, 'The cart is empty. Add samples from the Catalogue or the Retention inventory, then choose a lab and analyses for each.')); return; }
+  if (!labs.length) host.append(el('div', { class: 'card', style: 'margin-bottom:10px' }, 'No active labs yet — an administrator adds labs and their analyses under Admin → Labs & analyses.'));
+  const selected = new Set();
+  const redraw = async () => { host.innerHTML = ''; await drawSampleCart(host); };
+  async function assign(sampleId, labId, analysisIds) {
+    try { await api('PUT', '/cart/' + sampleId, { labId: labId || null, analysisIds }); }
+    catch (e) { toast(e.message, true); }
+  }
+  // bulk assign
+  const bulkLab = el('select', {}, el('option', { value: '' }, 'Choose lab…'), ...labs.map(l => el('option', { value: l.id }, l.name)));
+  const bulkChecks = el('span', { style: 'display:flex;gap:10px;flex-wrap:wrap' });
+  const bulkSet = new Set();
+  bulkLab.addEventListener('change', () => {
+    bulkSet.clear(); bulkChecks.innerHTML = '';
+    const lab = labs.find(l => String(l.id) === bulkLab.value);
+    if (lab) lab.analyses.filter(a => a.active).forEach(a => {
+      const cb = el('input', { type: 'checkbox', onchange: () => { cb.checked ? bulkSet.add(a.id) : bulkSet.delete(a.id); } });
+      bulkChecks.append(el('label', { style: 'display:flex;gap:4px;align-items:center;font-size:13px' }, cb, a.name));
+    });
+  });
+  const bulkBtn = el('button', { onclick: async () => {
+    if (!selected.size) return toast('Tick the samples to assign.', true);
+    if (!bulkLab.value) return toast('Choose a lab.', true);
+    try { await api('POST', '/cart/assign', { sampleIds: [...selected], labId: +bulkLab.value, analysisIds: [...bulkSet] }); await redraw(); }
+    catch (e) { toast(e.message, true); }
+  } }, 'Apply to selected');
+  host.append(el('div', { class: 'card', style: 'margin-bottom:10px' }, el('b', {}, 'Assign several samples at once'),
+    el('div', { style: 'display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:8px' }, bulkLab, bulkChecks, bulkBtn)));
+  // one row per sample
+  const tb = el('tbody', {});
+  const allCb = el('input', { type: 'checkbox', onchange: () => { tb.querySelectorAll('input.cartsel').forEach(c => { c.checked = allCb.checked; c.dispatchEvent(new Event('change')); }); } });
+  items.forEach(it => {
+    const sel = el('input', { type: 'checkbox', class: 'cartsel', onchange: () => { sel.checked ? selected.add(it.id) : selected.delete(it.id); } });
+    const labSel = el('select', {}, el('option', { value: '' }, 'Choose lab…'), ...labs.map(l => el('option', { value: l.id }, l.name)));
+    labSel.value = it.cartLabId || '';
+    const chosen = new Set(it.cartAnalyses);
+    const checks = el('span', { style: 'display:flex;gap:12px;flex-wrap:wrap' });
+    const lab = labs.find(l => l.id === it.cartLabId);
+    if (lab) lab.analyses.filter(a => a.active).forEach(a => {
+      const cb = el('input', { type: 'checkbox' }); cb.checked = chosen.has(a.id);
+      cb.addEventListener('change', () => { cb.checked ? chosen.add(a.id) : chosen.delete(a.id); assign(it.id, lab.id, [...chosen]).then(updateSummary); it.cartAnalyses = [...chosen]; });
+      checks.append(el('label', { style: 'display:flex;gap:4px;align-items:center;font-size:13px' }, cb, a.name));
+    });
+    else checks.append(el('span', { class: 'muted' }, 'Pick a lab to see its analyses'));
+    labSel.addEventListener('change', async () => { await assign(it.id, labSel.value ? +labSel.value : null, []); await redraw(); });
+    tb.append(el('tr', {}, el('td', { class: 'checkcol' }, sel), el('td', { class: 'mono' }, it.code),
+      el('td', {}, el('div', {}, it.description || '—'), el('div', { class: 'help' }, it.stageLabel + ' · ' + (it.container || ''))),
+      el('td', {}, labSel), el('td', { style: 'white-space:normal' }, checks),
+      el('td', {}, el('button', { class: 'secondary', title: 'Take out of the cart', onclick: async () => { await api('DELETE', '/cart/' + it.id); render(); } }, '✕'))));
+  });
+  host.append(el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {}, el('th', { class: 'checkcol' }, allCb),
+    ...['Sample ID', 'Sample', 'Lab', 'Analyses', ''].map(h => el('th', {}, h)))), tb)));
+  // requisition summary + create
+  const summary = el('div', { style: 'margin:12px 0' }), notes = el('input', { placeholder: 'Notes for the lab (optional)', style: 'max-width:420px' }),
+    poInp = el('input', { placeholder: 'PO / reference # (optional)', style: 'max-width:220px' });
+  const createBtn = el('button', { onclick: async () => {
+    createBtn.disabled = true;
+    try {
+      const r = await api('POST', '/cart/requisitions', { notes: notes.value, poNumber: poInp.value });
+      const body = el('div', {}, el('div', { class: 'help', style: 'margin-bottom:8px' }, 'The filled requisitions were saved as documents on their production runs and the samples were taken out of the cart.'),
+        table(['Requisition', 'Run', 'Lab', 'Samples', 'Documents'], r.requisitions.map(q => [mono(q.reqNumber), mono(q.processingLot), q.labName, q.samples.length,
+          reqDocLinks(q)])));
+      modal('Requisitions created', body, async () => {}, 'Close', { noCancel: true, wide: true });
+      await redraw(); render();
+    } catch (e) { toast(e.message, true); createBtn.disabled = false; }
+  } }, 'Create requisitions');
+  function updateSummary() {
+    const groups = {};
+    let notReady = 0;
+    items.forEach(it => {
+      if (!it.cartLabId || !it.cartAnalyses.length) { notReady++; return; }
+      const k = it.runId + '|' + it.cartLabId; (groups[k] = groups[k] || { lot: it.processingLot, lab: (labs.find(l => l.id === it.cartLabId) || {}).name, n: 0 }).n++;
+    });
+    summary.innerHTML = '';
+    const g = Object.values(groups);
+    summary.append(el('div', {}, el('b', {}, g.length + ' requisition(s) ready'), g.length ? ': ' + g.map(x => x.lab + ' · ' + x.lot + ' (' + x.n + ')').join(' ; ') : ''),
+      notReady ? el('div', { class: 'help' }, notReady + ' sample(s) still need a lab and at least one analysis and will stay in the cart.') : null);
+    createBtn.disabled = !g.length;
+  }
+  host.append(summary, el('div', { style: 'display:flex;gap:10px;flex-wrap:wrap;align-items:center' }, poInp, notes, createBtn),
+    el('div', { class: 'help', style: 'margin-top:8px' }, 'One requisition is created per production run and lab, filled from that lab’s template and saved as a document on the run (Production → run → Documents). Samples leave the cart — and a Retention sample leaves the retention inventory — once its requisition is created.'));
+  updateSummary();
+}
+
+async function drawRequisitions(host) {
+  const { requisitions } = await api('GET', '/requisitions');
+  host.append(table(['Requisition', 'Created', 'Run', 'Lab', 'PO #', 'Samples', 'By', 'Documents'],
+    requisitions.map(q => [mono(q.reqNumber), fmtWhen(q.createdAt), mono(q.processingLot), q.labName, q.poNumber || '—', q.samples.length, q.createdBy || '—',
+      reqDocLinks(q)]),
+    [false, false, false, false, false, true, false, false],
+    ri => {
+      const q = requisitions[ri];
+      modal('Requisition ' + q.reqNumber, el('div', {},
+        el('div', { class: 'summary-line' }, sl('Lab', q.labName), sl('Run', q.processingLot), sl('PO #', q.poNumber || '—'), sl('Created', fmtWhen(q.createdAt) + ' by ' + (q.createdBy || '—'))),
+        q.notes ? el('div', { class: 'help' }, 'Notes: ' + q.notes) : null,
+        table(['Sample', 'Process point', 'Description', 'Analyses'], q.samples.map(s => [mono(s.code), s.stageLabel, s.description || '—', s.analyses.join(', ')]))),
+        async () => {}, 'Close', { noCancel: true, wide: true });
+    }));
+  if (!requisitions.length) host.append(el('div', { class: 'help', style: 'margin-top:8px' }, 'Requisitions appear here once created from the cart.'));
+}
+
+/* ---- Admin: labs, their analyses and requisition templates ---- */
+async function drawAdminLabs(v) {
+  v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Labs & analyses'),
+    el('div', { class: 'actions' }, el('button', { class: 'secondary', onclick: () => { window.location = '/api/labs/starter-template/download?token=' + encodeURIComponent(State.token); } }, '⬇ Starter requisition template'),
+      el('button', { onclick: () => editLab(null) }, '+ Add lab'))));
+  const { labs } = await api('GET', '/labs');
+  if (!labs.length) { v.append(el('div', { class: 'empty card' }, 'No labs yet.')); }
+  else v.append(table(['Lab', 'Contact', 'Analyses', 'Requisition template', 'Status', ''],
+    labs.map(l => [el('b', {}, l.name), el('span', {}, l.contact || '—', l.email ? el('div', { class: 'help' }, l.email) : null),
+      el('span', {}, l.analyses.filter(a => a.active).map(a => a.name).join(', ') || el('span', { class: 'muted' }, 'none yet')),
+      el('span', {}, l.hasTemplate ? '📄 ' + l.templateName : el('span', { class: 'muted' }, 'Built-in layout'), l.sampleSheet ? el('div', { class: 'help' }, '+ sample spreadsheet') : null),
+      l.active ? badge('on_hand', 'Active') : badge('disposed', 'Inactive'),
+      rowActions([['Edit', () => editLab(l)], ['Analyses', () => manageLabAnalyses(l.id)], ['Template', () => labTemplateModal(l)]])]),
+    [false, false, false, false, false, false]));
+  v.append(el('div', { class: 'help', style: 'margin-top:10px' }, 'Each lab lists the analyses it can perform; the Samples cart offers those as checkboxes. A lab’s requisition template is a Word (.docx) file with {{placeholders}} that the app fills in and saves on the production run.'));
+}
+function editLab(l) {
+  const f = k => el('input', { id: 'lb_' + k, value: (l && l[k]) || '' });
+  const active = el('input', { type: 'checkbox', id: 'lb_active' }); active.checked = l ? l.active : true;
+  const sheetCb = el('input', { type: 'checkbox' }); sheetCb.checked = l ? l.sampleSheet : false;
+  const body = el('div', {},
+    el('div', { class: 'form-row' }, field('Lab name', f('name')), field('Contact person', f('contact'))),
+    el('div', { class: 'form-row' }, field('Email', f('email')), field('Phone', f('phone'))),
+    field('Address', f('address')), field('Notes', f('notes')),
+    el('label', { style: 'display:flex;gap:6px;align-items:center;margin-top:8px' }, active, 'Active (offered in the cart)'),
+    el('label', { style: 'display:flex;gap:6px;align-items:center;margin-top:6px' }, sheetCb, 'Also generate a sample spreadsheet (sample ID, description, tests per sample) with each requisition'));
+  modal(l ? 'Edit lab' : 'Add lab', body, async () => {
+    const p = {}; ['name', 'contact', 'email', 'phone', 'address', 'notes'].forEach(k => p[k] = body.querySelector('#lb_' + k).value);
+    p.active = active.checked; p.sampleSheet = sheetCb.checked;
+    if (l) await api('PUT', '/labs/' + l.id, p); else await api('POST', '/labs', p);
+    toast('Lab saved'); render();
+  }, 'Save');
+}
+async function manageLabAnalyses(labId) {
+  const { labs } = await api('GET', '/labs'); const l = labs.find(x => x.id === labId);
+  const host = el('div', {});
+  const name = el('input', { placeholder: 'Analysis name, e.g. Total Plate Count' }), code = el('input', { placeholder: 'Code (optional)', style: 'max-width:110px' }),
+    method = el('input', { placeholder: 'Method / spec (optional)', style: 'max-width:170px' });
+  async function draw() {
+    const fresh = (await api('GET', '/labs')).labs.find(x => x.id === labId);
+    host.innerHTML = '';
+    host.append(table(['Analysis', 'Code', 'Method / spec', 'Status', ''], fresh.analyses.map(a => [a.name, a.code || '—', a.method || '—', a.active ? badge('on_hand', 'Offered') : badge('disposed', 'Hidden'),
+      rowActions([[a.active ? 'Hide' : 'Show', async () => { await api('PUT', '/labs/' + labId + '/analyses/' + a.id, { active: !a.active }); draw(); }],
+        ['Edit', () => {
+          const n = el('input', { value: a.name }), c = el('input', { value: a.code || '' }), m = el('input', { value: a.method || '' });
+          modal('Edit analysis', el('div', {}, field('Name', n), el('div', { class: 'form-row' }, field('Code', c), field('Method / specification', m))), async () => {
+            await api('PUT', '/labs/' + labId + '/analyses/' + a.id, { name: n.value, code: c.value, method: m.value }); draw();
+          }, 'Save');
+        }],
+        ['Delete', async () => { if (confirm('Delete “' + a.name + '”? Past requisitions keep their record of it.')) { await api('DELETE', '/labs/' + labId + '/analyses/' + a.id); draw(); } }, 'danger']])])));
+  }
+  const add = el('button', { onclick: async () => {
+    if (!name.value.trim()) return;
+    try { await api('POST', '/labs/' + labId + '/analyses', { name: name.value, code: code.value, method: method.value }); name.value = ''; code.value = ''; method.value = ''; draw(); }
+    catch (e) { toast(e.message, true); }
+  } }, '+ Add');
+  modal('Analyses — ' + l.name, el('div', {}, host, el('div', { style: 'display:flex;gap:8px;margin-top:10px;flex-wrap:wrap' }, name, code, method, add),
+    el('div', { class: 'help', style: 'margin-top:8px' }, 'A template checkbox column uses {{sample.check:Analysis name}} (or the code). Hiding an analysis removes it from the cart without deleting it.')),
+    async () => { render(); }, 'Close', { noCancel: true, wide: true });
+  draw();
+}
+function labTemplateModal(l) {
+  const file = el('input', { type: 'file', accept: '.docx' }), out = el('div', { class: 'help', style: 'margin-top:8px' });
+  const tokens = '{{req_number}} {{date}} {{date_long}} {{po_number}} {{po_check}} {{company}} {{lab_name}} {{lab_contact}} {{lab_email}} {{lab_phone}} {{lab_address}} {{processing_lot}} {{run_date}} {{product}} {{requested_by}} {{requested_by_email}} {{sample_count}} {{analyses}} {{notes}}';
+  const body = el('div', {},
+    el('div', { class: 'help' }, l.hasTemplate ? 'Current template: ' + l.templateName : 'No template uploaded — requisitions use the built-in layout.'),
+    l.hasTemplate ? el('div', { style: 'margin:6px 0' }, el('a', { href: '/api/labs/' + l.id + '/template/download?token=' + encodeURIComponent(State.token) }, '⬇ Download current template'),
+      '  ', el('button', { class: 'secondary', onclick: async () => { await api('DELETE', '/labs/' + l.id + '/template'); toast('Template removed'); document.querySelector('.modal-bg')?.remove(); render(); } }, 'Remove')) : null,
+    field('Upload a Word template (.docx)', file), out,
+    el('details', { style: 'margin-top:10px' }, el('summary', {}, 'Placeholders you can use in the template'),
+      el('div', { class: 'help', style: 'margin-top:6px' }, 'Anywhere in the document: ' + tokens + '.'),
+      el('div', { class: 'help', style: 'margin-top:6px' }, 'Put these in ONE table row — that row is repeated for every sample: {{sample.n}} {{sample.id}} {{sample.stage}} {{sample.type}} {{sample.description}} {{sample.container}} {{sample.collected}} {{sample.analyses}} {{sample.location}}. {{sample.report_description}} and {{sample.methods}} (the methods of that sample’s analyses) are also available. For a column of analysis checkboxes use {{sample.check:Analysis name}} (☒ / ☐).'),
+      el('div', { class: 'help', style: 'margin-top:6px' }, 'A paragraph containing {{analysis.name}} (also {{analysis.code}}, {{analysis.count}}) is repeated once for each test requested on the requisition — use it for a “Tests requested” list. A value with several lines can be placed with {{analyses}} (comma separated).')));
+  modal('Requisition template — ' + l.name, body, async () => {
+    if (!file.files[0]) throw new Error('Choose a .docx file to upload.');
+    const b64 = await readFileAsBase64(file.files[0]);
+    const r = await api('POST', '/labs/' + l.id + '/template', { filename: file.files[0].name, dataB64: b64 });
+    if (r.report.warnings.length) { alert('Template saved with notes:\n\n• ' + r.report.warnings.join('\n• ')); }
+    else toast('Template saved');
+    render();
+  }, 'Upload template', { wide: true });
+}
+
 /* ---------------- Pre-Processing (shred + blend + pack back into feedstock) ---------------- */
 // Recommended dilution water (L) and blend mass for a batch: bring the shredded mass from its measured
 // % solids down to the target % solids (1 kg of water = 1 L). Documented on the Calculations page.
@@ -5128,10 +5607,16 @@ async function openPreprocBatch(v, id) {
 
   /* 4. pH balancing */
   const phInp = preNumInput(B.measuredPh, 1, 'pH'), tphInp = preNumInput(B.targetPh, 1, 'pH'), citricInp = preNumInput(B.citricKg, 2, 'kg');
+  const reagentWatch = buildReagentWatch(null, { 'Citric Acid': B.citricItemId });
+  reagentWatch.load();
+  citricInp.addEventListener('input', () => reagentWatch.setUsage('Citric Acid', 'batch', preNumOf(citricInp)));
+  reagentWatch.setUsage('Citric Acid', 'batch', preNumOf(citricInp));
   const sPh = preSection('pH balancing', [
-    el('div', { class: 'form-row' }, field(reqLabel('Measured pH (final)'), phInp), field(reqLabel('Target pH'), tphInp), field(reqLabel('Citric acid added (kg)'), citricInp)),
+    el('div', { class: 'form-row' }, field(reqLabel('Measured pH (final)'), phInp), field(reqLabel('Target pH'), tphInp)),
+    el('div', { class: 'form-row' }, field('Citric acid item (inventory)', reagentWatch.itemSelect('Citric Acid')),
+      field(reqLabel('Citric acid added (kg)'), el('div', {}, citricInp, reagentWatch.noteEl('Citric Acid')))),
     el('div', { class: 'help' }, 'Citric acid is deducted from Inventory Items when the batch is completed.')],
-    () => put({ measuredPh: preNumOf(phInp), targetPh: preNumOf(tphInp), citricKg: preNumOf(citricInp) }));
+    () => put({ measuredPh: preNumOf(phInp), targetPh: preNumOf(tphInp), citricKg: preNumOf(citricInp), citricItemId: reagentWatch.itemId('Citric Acid') }));
 
   /* 5. Pack-out into IBCs */
   const containers = (await api('GET', '/consumables')).consumables.filter(c => c.isContainer && !c.isSampleContainer);
@@ -5449,6 +5934,7 @@ async function pageAdmin(v) {
     ]), [false, false, false, false], ri => showSopHistory(sr.sops[ri])));
   v.append(el('div', { class: 'help', style: 'margin-top:10px' },
     'A QC Check in the production log links to an SOP by its reference key, not its name — renaming a document here is picked up everywhere it’s linked. Click a row to see its change history.'));
+  await drawAdminLabs(v);
 }
 function readFileAsBase64(file) {
   return new Promise((resolve, reject) => {
