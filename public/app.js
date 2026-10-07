@@ -77,9 +77,8 @@ $('#logout').addEventListener('click', logout);
 $('#changePw').addEventListener('click', () => changePasswordModal(false));
 $('#tabs').addEventListener('click', e => { const b = e.target.closest('button'); if (b) selectTab(b.dataset.tab); });
 function selectTab(tab) {
-  if (tab === 'preproc' && State.tab === 'preproc') State.preprocId = null;  // re-clicking the tab returns to the batch list
   State.tab = tab;
-  [...$('#tabs').children].forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  $('#tabs').querySelectorAll('button[data-tab]').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   render();
 }
 
@@ -88,7 +87,7 @@ async function boot() {
     State.user = (await api('GET', '/me'));
     State.ref = await api('GET', '/refdata');
     $('#whoName').textContent = State.user.name;
-    $('#tabs [data-tab=admin]').classList.toggle('hidden', State.user.role !== 'admin');
+    $('#tabs [data-tab=admin]').closest('.tab-group').classList.toggle('hidden', State.user.role !== 'admin');
     if (State.tab === 'admin' && State.user.role !== 'admin') State.tab = 'dashboard';
     show('app'); selectTab(State.tab);
     if (State.user.mustChange) changePasswordModal(true);
@@ -98,10 +97,10 @@ async function boot() {
 /* ---------------- Router ---------------- */
 function render() {
   const v = $('#view'); v.innerHTML = '';
-  v.classList.toggle('wrap-wide', State.tab === 'stabilized');   // Feedstock Inventory uses the full window width
+  v.classList.toggle('wrap-wide', State.tab === 'stabilized');   // scopes the Feedstock Inventory table styling (page width stays the standard .wrap, like Inventory Items)
   ({ dashboard: pageDashboard, stabilized: pageStabilized, preproc: pagePreproc, samples: pageSamples, production: pageProduction, cip: pageCIP,
      qc: pageQC, fg: pageFG, shipping: pageShipping, consumables: pageConsumables, reports: pageReports,
-     yieldusage: pageYield, release: pageRelease, calculations: pageCalculations, labels: pageLabels, admin: pageAdmin }[State.tab])(v);
+     yieldusage: pageYield, release: pageRelease, calculations: pageCalculations, admin: pageAdmin }[State.tab])(v);
 }
 
 /* ---------------- Dashboard ---------------- */
@@ -121,7 +120,14 @@ async function pageDashboard(v) {
     fgRows.length ? table(['SKU', 'Pack', 'Units', 'Litres'], fgRows, [false, false, true, true]) : el('div', { class: 'empty' }, 'No finished goods yet — run a production batch.'));
   v.append(el('div', { class: 'grid2' }, left, right));
 
-  const consRows = d.consumables.map(c => [c.name, fmt(c.onHand, 1) + ' ' + c.unit, badge(c.low ? 'low' : 'ok', c.low ? 'LOW' : 'OK')]);
+  // Reagents & packaging: two groups (finished-good labels are not listed here), each sorted from the lowest on-hand quantity up
+  const consRows = [];
+  [['reagent', 'Reagents', 1], ['packaging', 'Packaging', 0]].forEach(([cat, title, dec]) => {
+    const list = d.consumables.filter(c => c.category === cat).sort((a, b) => (a.onHand - b.onHand) || a.name.localeCompare(b.name));
+    if (!list.length) return;
+    consRows.push({ group: el('span', { class: 'group-title' }, el('b', {}, title), el('span', { class: 'muted' }, '  ·  lowest stock first')) });
+    list.forEach(c => consRows.push([c.name, fmt(c.onHand, dec) + ' ' + c.unit, badge(c.low ? 'low' : 'ok', c.low ? 'LOW' : 'OK')]));
+  });
   const cons = el('div', { class: 'card' }, el('h3', {}, 'Reagents & packaging'), table(['Item', 'On hand', ''], consRows, [false, true, false]));
   const runRows = d.recentRuns.map(r => [mono(r.processingLot), r.runDate, skuName(r.sku), fmt(r.outputLitres, 0) + ' L']);
   const runs = el('div', { class: 'card' }, el('h3', {}, 'Recent production runs'),
@@ -137,9 +143,25 @@ function statusLabel(s) { return STATUS_LABELS[s] || s || '—'; }
 // One entry per real table column (checkbox + actions are handled separately).
 // `value(t)` is what's sorted/filtered on — the human-readable form, so a
 // filter/sort on "Site" or "Status" matches what's actually displayed.
+// Whole weeks (nearest week) a tote stabilized: from its harvest date to today while it is still in inventory, fixed at the
+// processing date once it is consumed and at the disposal date once it is disposed. null when a date it needs is missing.
+function stabilizationWeeks(t) {
+  // start of the clock: harvest date, or for a fine-grind blend its Pre-Processing batch date
+  const startDate = t.preprocBatchId ? t.batchDate : t.harvestDate;
+  if (!startDate) return null;
+  const h = new Date(String(startDate).slice(0, 10) + 'T00:00:00');
+  if (isNaN(h)) return null;
+  let end;
+  if (t.status === 'consumed') end = t.processedDate ? new Date(String(t.processedDate).slice(0, 10) + 'T00:00:00') : null;
+  else if (t.status === 'disposed') end = t.disposedDate ? new Date(String(t.disposedDate).slice(0, 10) + 'T00:00:00') : null;
+  else { const now = new Date(); end = new Date(now.getFullYear(), now.getMonth(), now.getDate()); }
+  if (!end || isNaN(end)) return null;
+  const days = Math.round((end - h) / 86400000);
+  return days < 0 ? null : Math.round(days / 7);
+}
 const STAB_COLUMNS = [
   { key: 'lot', label: 'Lot number', value: t => t.lot,
-    cell: t => el('span', {}, t.lot, el('button', { type: 'button', class: 'info-btn', title: 'Feedstock details',
+    cell: t => el('span', {}, t.lot, el('button', { type: 'button', class: 'stab-info-btn', title: 'Feedstock details',
       onclick: e => { e.stopPropagation(); showToteDetails(t); } }, 'ⓘ')) },
   { key: 'site', label: 'Site', value: t => siteName(t.site), options: () => (State.ref.sites || []).map(s => s.name),
     cell: t => siteName(t.site) },
@@ -150,17 +172,19 @@ const STAB_COLUMNS = [
   { key: 'stabMethod', label: 'Stabilization method', value: t => t.stabilizationMethod || '',
     options: () => ['Citric acid', 'Fresh'], cell: t => t.stabilizationMethod || '—', hidden: true },
   { key: 'harvestDate', label: 'Harvest date', value: t => t.harvestDate || '', cell: t => t.harvestDate || '—' },
-  { key: 'receivedDate', label: 'Received date', value: t => t.receivedDate || '', cell: t => t.receivedDate || '—' },
+  { key: 'stabWeeks', label: 'Stabilization period (weeks)', value: t => stabilizationWeeks(t), numeric: true, center: true, wrapHead: true,
+    cell: t => { const w = stabilizationWeeks(t); return w == null ? '—' : String(w); } },
+  { key: 'receivedDate', label: 'Received date', value: t => t.receivedDate || '', cell: t => t.receivedDate || '—', hidden: true },
   { key: 'avgKg', label: 'Avg kg', value: t => t.avgWeightKg, numeric: true, cell: t => fmt(t.avgWeightKg, 1), hidden: true },
-  { key: 'ph', label: 'pH', value: t => t.ph, numeric: true, cell: t => phCell(t) },
-  { key: 'orp', label: 'ORP (mV)', value: t => t.orp, numeric: true, cell: t => orpCell(t) },
+  { key: 'ph', label: 'pH', value: t => t.ph, numeric: true, center: true, cell: t => phCell(t) },
+  { key: 'orp', label: 'ORP (mV)', value: t => t.orp, numeric: true, center: true, cell: t => orpCell(t) },
   { key: 'lastUpdated', label: 'Last updated', value: t => t.lastUpdated ? fmtWhen(t.lastUpdated) : '',
     cell: t => t.lastUpdated ? fmtWhen(t.lastUpdated) : '—', hidden: true },
   { key: 'location', label: 'Location', value: t => t.location || '', cell: t => t.location || '—' },
   { key: 'status', label: 'Status', value: t => statusLabel(t.status), options: () => Object.values(STATUS_LABELS),
     cell: t => badge(t.status, statusLabel(t.status)) },
 ];
-// Which columns are shown is a per-browser preference. Stabilization method, Avg kg and Last updated
+// Which columns are shown is a per-browser preference. Stabilization method, Received date, Avg kg and Last updated
 // start hidden (they live in each row's ⓘ details window) and can be switched on from "Columns".
 const STAB_COLS_KEY = 'kelp.stabCols';
 function loadStabCols() {
@@ -173,7 +197,9 @@ function showToteDetails(t) {
     ['Grind', t.grind || 'Coarse'], ['Stabilization method', t.stabilizationMethod || '—'],
     ['Storage unit', t.storageUnit || '—'], ['Avg weight', t.avgWeightKg != null ? fmt(t.avgWeightKg, 1) + ' kg' : '—'],
     ['Volume', t.volumeL != null ? fmt(t.volumeL, 0) + ' L' : '—'],
-    ['Harvest date', t.harvestDate || '—'], ['Received date', t.receivedDate || '—'],
+    ['Harvest date', t.harvestDate || '—'],
+    ['Stabilization period', stabilizationWeeks(t) != null ? stabilizationWeeks(t) + ' week' + (stabilizationWeeks(t) === 1 ? '' : 's') : '—'],
+    ['Received date', t.receivedDate || '—'],
     ['pH', t.ph != null ? t.ph + (t.phUpdated ? '  (' + t.phUpdated + ')' : '') : '—'],
     ['ORP (mV)', t.orp != null ? t.orp + (t.orpUpdated ? '  (' + t.orpUpdated + ')' : '') : '—'],
     ['Solids', t.solidsPct != null ? fmt(t.solidsPct, 2) + ' %' : '—'],
@@ -199,7 +225,8 @@ async function pageStabilized(v) {
   const host = el('div', {});
   v.append(bar, bulkBar, host);
   const selected = new Set();
-  const filters = {};
+  // Consumed and disposed totes are hidden by default (their status is un-ticked); tick them in the Status filter to include them.
+  const filters = { status: Object.entries(STATUS_LABELS).filter(([k]) => k !== 'consumed' && k !== 'disposed').map(([, label]) => label) };
   let sortKey = null, sortDir = 1;
   let visibleSelectable = [];
   let shownCols = loadStabCols();
@@ -231,8 +258,56 @@ async function pageStabilized(v) {
       el('button', { class: 'danger', onclick: () => disposeSimple('tote', [...selected], 'tote') }, 'Dispose / write off'),
       el('button', { class: 'secondary', onclick: () => { selected.clear(); drawStab(); } }, 'Clear'));
   }
+  // Multi-select dropdown filters. The panel lives on <body> (position: fixed) so the scrolling table can't clip it, and
+  // stays open while boxes are ticked even though every change redraws the table (placeMultiFilter re-anchors it).
+  let multiPanel = null;
+  function closeMultiFilter() {
+    if (!multiPanel) return;
+    multiPanel.el.remove(); multiPanel = null;
+    document.removeEventListener('mousedown', outsideMultiFilter, true);
+    window.removeEventListener('scroll', placeMultiFilter, true); window.removeEventListener('resize', placeMultiFilter);
+  }
+  function outsideMultiFilter(e) { if (multiPanel && !multiPanel.el.contains(e.target) && !e.target.closest('.ms-filter')) closeMultiFilter(); }
+  function placeMultiFilter() {
+    if (!multiPanel) return;
+    const btn = host.querySelector('button.ms-filter[data-key="' + multiPanel.key + '"]');
+    if (!btn) { closeMultiFilter(); return; }
+    const r = btn.getBoundingClientRect();
+    multiPanel.el.style.left = Math.max(4, Math.min(r.left, innerWidth - 230)) + 'px';
+    multiPanel.el.style.top = (r.bottom + 2) + 'px';
+    multiPanel.el.style.minWidth = Math.max(r.width, 170) + 'px';
+  }
+  function openMultiFilter(c) {
+    if (multiPanel && multiPanel.key === c.key) { closeMultiFilter(); return; }
+    closeMultiFilter();
+    const panel = el('div', { class: 'ms-panel' });
+    const fill = () => {
+      panel.innerHTML = '';
+      panel.append(el('button', { type: 'button', class: 'ghost ms-clear', onclick: () => { filters[c.key] = []; drawStab(); fill(); } }, 'Clear selection'),
+        ...c.options().map(o => {
+          const cb = el('input', { type: 'checkbox' });
+          cb.checked = (filters[c.key] || []).includes(o);
+          cb.addEventListener('change', () => {
+            const cur = new Set(filters[c.key] || []);
+            cb.checked ? cur.add(o) : cur.delete(o);
+            filters[c.key] = [...cur]; drawStab();
+          });
+          return el('label', {}, cb, ' ' + o);
+        }));
+    };
+    fill();
+    document.body.append(panel);
+    multiPanel = { key: c.key, el: panel };
+    document.addEventListener('mousedown', outsideMultiFilter, true);
+    window.addEventListener('scroll', placeMultiFilter, true); window.addEventListener('resize', placeMultiFilter);
+    placeMultiFilter();
+  }
   function drawStab() {
     let rows = stabCache.filter(t => cols().every(c => {
+      if (c.options) {      // dropdown filters are multi-select: a row matches if its value is any of the ticked ones
+        const sel = filters[c.key];
+        return !sel || !sel.length || sel.includes(String(c.value(t) ?? ''));
+      }
       const f = (filters[c.key] || '').toLowerCase();
       if (!f) return true;
       return String(c.value(t) ?? '').toLowerCase().includes(f);
@@ -263,19 +338,25 @@ async function pageStabilized(v) {
       ...cols().map(c => {
         const arrow = sortKey === c.key ? (sortDir === 1 ? ' ▲' : ' ▼') : '';
         return el('th', {
-          class: (c.numeric ? 'num ' : '') + 'sortable', title: 'Click to sort',
+          class: (c.center ? 'ctr ' : (c.numeric ? 'num ' : '')) + (c.wrapHead ? 'wraphead ' : '') + 'sortable', title: 'Click to sort',
           onclick: () => { sortKey === c.key ? (sortDir = -sortDir) : (sortKey = c.key, sortDir = 1); drawStab(); }
         }, c.label + arrow);
-      }), el('th', {}, ''));
+      }), el('th', { class: 'actions-head' }, 'Actions'));
 
     const filterRow = el('tr', { class: 'filter-row' }, el('th', {}, ''),
       ...cols().map(c => {
         const cell = el('th', {});
         if (c.options) {
-          const sel = el('select', {}, el('option', { value: '' }, 'All'), ...c.options().map(o => el('option', { value: o }, o)));
-          sel.value = filters[c.key] || '';
-          sel.addEventListener('change', () => { filters[c.key] = sel.value; drawStab(); });
-          cell.append(sel);
+          const chosen = filters[c.key] || [];
+          cell.append(el('button', { type: 'button', class: 'ms-filter' + (chosen.length ? ' active' : ''), 'data-key': c.key,
+            title: chosen.length ? chosen.join(', ') : 'Filter (pick one or more)',
+            onclick: e => { e.stopPropagation(); openMultiFilter(c); } },
+            el('span', {}, (() => {
+              if (!chosen.length) return 'All';
+              if (chosen.length <= 2) return chosen.join(', ');
+              const left = c.options().filter(o => !chosen.includes(o));
+              return left.length && left.length <= 2 ? 'All except ' + left.join(', ') : chosen.length + ' selected';
+            })()), el('span', { class: 'ms-caret' }, '▾')));
         } else {
           const inp = el('input', { placeholder: 'Filter…', value: filters[c.key] || '' });
           inp.addEventListener('input', () => { filters[c.key] = inp.value; drawStab(); });
@@ -294,7 +375,7 @@ async function pageStabilized(v) {
         onclick: e => { if (!e.target.closest('.checkcol, .row-actions')) showHistory(t); }
       },
         el('td', { class: 'checkcol' }, rowCheck(t, selected, updateBulk)),
-        ...cols().map(c => el('td', { class: c.key === 'lot' ? 'mono' : (c.numeric ? 'num' : '') }, c.cell(t))),
+        ...cols().map(c => el('td', { class: c.key === 'lot' ? 'mono' : (c.center ? 'ctr' : (c.numeric ? 'num' : '')) }, c.cell(t))),
         el('td', {}, rowActions([
           movable ? ['Move', () => moveTote(t)] : null,
           movable ? ['Update', () => updateCondition(t)] : null,
@@ -304,9 +385,15 @@ async function pageStabilized(v) {
         ]))));
     });
 
-    host.append(el('div', { class: 'tablewrap sticky-actions' },
-      el('table', {}, el('thead', {}, headRow, filterRow), tbody)));
+    const wrapEl = el('div', { class: 'tablewrap sticky-actions' },
+      el('table', {}, el('thead', {}, headRow, filterRow), tbody));
+    host.append(wrapEl);
+    // the filter row freezes directly under the column headings: offset it by the heading row's height
+    const pinFilters = () => wrapEl.style.setProperty('--stab-head-h', headRow.getBoundingClientRect().height + 'px');
+    pinFilters();
+    if (window.ResizeObserver) new ResizeObserver(pinFilters).observe(headRow);
     updateBulk();
+    placeMultiFilter();
   }
   drawStab();
 }
@@ -737,8 +824,9 @@ function stageProgress(run, opts) {
   return el('div', { class: 'stage-progress' },
     el('div', { class: 'stage-steps' }, ...prog.sections.map(sec => {
       const state = sec.done ? 'done' : (sec.started ? 'partial' : 'empty');
-      const tip = sec.done ? sec.label + ' — all ' + sec.total + ' required fields complete'
-        : sec.label + ' — ' + (sec.total - sec.filled) + ' of ' + sec.total + ' required field(s) missing:\n• ' + sec.missing.join('\n• ');
+      const kind = sec.optional ? 'optional' : 'required';
+      const tip = sec.done ? sec.label + ' — all ' + sec.total + ' ' + kind + ' fields complete'
+        : sec.label + ' — ' + (sec.total - sec.filled) + ' of ' + sec.total + ' ' + kind + ' field(s) missing:\n• ' + sec.missing.join('\n• ');
       // With opts.onSelect each chip is a button that opens/jumps to its section.
       return el(opts.onSelect ? 'button' : 'span', Object.assign({ class: 'stage-step ' + state, title: tip + (opts.onSelect ? '\n(click to open this section)' : '') },
         opts.onSelect ? { type: 'button', onclick: () => opts.onSelect(sec.key) } : {}),
@@ -747,7 +835,7 @@ function stageProgress(run, opts) {
     })),
     el('div', { class: 'stage-meter' + (prog.complete ? ' complete' : '') },
       el('span', { class: 'stage-meter-track' }, el('span', { class: 'stage-meter-bar', style: 'width:' + pct + '%' })),
-      el('span', {}, prog.complete ? 'All required fields complete — ready to finalize'
+      el('span', {}, prog.complete ? (opts.readyText || 'All required fields complete — ready to finalize')
         : prog.requiredFilled + ' of ' + prog.requiredTotal + ' required fields complete')));
 }
 // ---- Amend run: a finalized run's production log is locked; changing it needs an
@@ -4125,6 +4213,10 @@ async function openCipModal(ev, events) {
 async function pageConsumables(v) {
   const isAdmin = State.user.role === 'admin';
   v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Inventory Items')));
+  v.append(el('div', { class: 'help', style: 'margin:-8px 0 10px' },
+    'Item # = category + sequence, assigned automatically and never reused: ',
+    el('b', {}, 'RGT'), ' reagent · ', el('b', {}, 'CIP'), ' cleaning agent · ', el('b', {}, 'PKG'), ' packaging · ',
+    el('b', {}, 'SMP'), ' sample container · ', el('b', {}, 'LBL'), ' finished-good label (e.g. RGT-001).'));
   const r = await api('GET', '/consumables');
   const bulkBar = el('div', { class: 'bulkbar hidden' });
   const host = el('div', {});
@@ -4146,18 +4238,25 @@ async function pageConsumables(v) {
       items.forEach(c => allCb.checked ? selected.add(c.id) : selected.delete(c.id)); draw();
     } });
     allCb.checked = items.length > 0 && items.every(c => selected.has(c.id));
-    const headers = [allCb, 'Item #', 'Item'];
-    const bools = [false, false, false];
+    // opts.labelGroup ('sku' | 'package' | 'none'): finished-good labels, grouped under a heading per SKU or per package type
+    // (the grouped-by column is dropped from the rows); 'none' lists them flat with both columns.
+    const lg = opts.labelGroup;
+    const headers = [allCb, 'Item #'];
+    if (lg === 'sku') headers.push('Package'); else if (lg === 'package') headers.push('SKU'); else if (lg === 'none') headers.push('SKU', 'Package'); else headers.push('Item');
+    const bools = headers.map(() => false);
     if (opts.showType) { headers.push('Type'); bools.push(false); }
     if (opts.showVolume) { headers.push('Volume (L)'); bools.push(true); }
-    if (opts.showLabelMap) { headers.push('SKU', 'Package'); bools.push(false, false); }
     headers.push('Location', 'On hand', 'Reorder at', 'Cost/unit', '', 'Actions');
     bools.push(false, true, true, true, false, false);
-    return table(headers, items.map(c => {
-      const row = [rowCheck(c, selected, updateBulk), c.itemNumber || '—', c.name];
+    const rowItems = [];                         // row index -> item (null for a group heading), for the row-click history
+    const makeRow = c => {
+      const row = [rowCheck(c, selected, updateBulk), c.itemNumber ? mono(c.itemNumber) : '—'];
+      if (lg === 'sku') row.push(c.labelPackage || c.name);
+      else if (lg === 'package') row.push(skuName(c.labelSku));
+      else if (lg === 'none') row.push(skuName(c.labelSku), c.labelPackage || '—');
+      else row.push(c.name);
       if (opts.showType) row.push(c.reagentType || '—');
       if (opts.showVolume) row.push(c.litresEach != null ? fmt(c.litresEach, c.litresEach % 1 ? 2 : 0) : '—');
-      if (opts.showLabelMap) row.push(skuName(c.labelSku), c.labelPackage || '—');
       // Packaging items and labels are counted in whole units (totes,
       // bottles, labels ...), so their on-hand quantity displays with no
       // decimals; reagents (kg of Citric Acid, etc.) keep their fractional display.
@@ -4167,7 +4266,27 @@ async function pageConsumables(v) {
         rowActions([['Receive', () => adjustC(c, 1)], ['Use', () => adjustC(c, -1)],
           ['Dispose', () => disposeConsumables([c]), 'danger'], ['Edit', () => editC(c)]]));
       return row;
-    }), bools, opts.history ? (ri => showConsumableHistory(items[ri])) : null);
+    };
+    let rows = [];
+    const cmpSku = (a, b) => skuName(a.labelSku).localeCompare(skuName(b.labelSku)) || (a.labelPackage || '').localeCompare(b.labelPackage || '');
+    if (lg === 'sku' || lg === 'package') {
+      const groups = new Map();
+      items.forEach(c => { const k = (lg === 'sku' ? c.labelSku : c.labelPackage) || ''; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(c); });
+      const title = k => lg === 'sku' ? skuName(k) : (k || 'No package');
+      [...groups.entries()].sort((a, b) => title(a[0]).localeCompare(title(b[0]))).forEach(([k, list]) => {
+        list.sort(lg === 'sku' ? ((a, b) => (a.labelPackage || '').localeCompare(b.labelPackage || '')) : cmpSku);
+        const onHand = list.reduce((a, c) => a + (c.onHand || 0), 0), low = list.filter(c => c.low).length;
+        rows.push({ group: el('span', { class: 'group-title' }, el('b', {}, title(k)), el('span', { class: 'muted' },
+          '  ·  ' + list.length + ' label type' + (list.length === 1 ? '' : 's') + '  ·  ' + fmt(onHand, 0) + ' on hand' + (low ? '  ·  ' + low + ' low' : ''))) });
+        rowItems.push(null);
+        list.forEach(c => { rows.push(makeRow(c)); rowItems.push(c); });
+      });
+    } else if (lg === 'none') {
+      items.slice().sort(cmpSku).forEach(c => { rows.push(makeRow(c)); rowItems.push(c); });
+    } else {
+      items.forEach(c => { rows.push(makeRow(c)); rowItems.push(c); });
+    }
+    return table(headers, rows, bools, opts.history ? (ri => { if (rowItems[ri]) showConsumableHistory(rowItems[ri]); }) : null);
   }
   function draw() {
     host.innerHTML = '';
@@ -4189,14 +4308,19 @@ async function pageConsumables(v) {
         : 'Ask an admin to bulk-upload counts or add a new container type.')));
     host.append(itemsTable(containers, { showVolume: true, wholeUnits: true, history: true }));
     // Finished-good labels are the physical labels stuck on each finished
-    // package -- not the internal barcode labels printed from the Labels tab.
+    // package -- not the internal barcode labels printed from a row's Label button.
+    const grpSel = selectFrom('', [['sku', 'Group by SKU'], ['package', 'Group by package'], ['none', 'No grouping']], () => {
+      State.labelGroup = grpSel.value; try { localStorage.setItem('kelp.labelGroup', grpSel.value); } catch (e) { /* ignore */ } draw();
+    });
+    if (!State.labelGroup) { try { State.labelGroup = localStorage.getItem('kelp.labelGroup') || 'sku'; } catch (e) { State.labelGroup = 'sku'; } }
+    grpSel.value = State.labelGroup;
     host.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Finished-good labels'),
-      el('div', { class: 'actions' },
+      el('div', { class: 'actions' }, grpSel,
         isAdmin ? el('button', { onclick: addFgLabel }, '+ Add FG label') : null)));
     host.append(el('div', { class: 'help', style: 'margin-bottom:10px' },
       'One label item per product SKU + package type, with its own on-hand inventory. Saving a run’s Packaging section (or finalizing) deducts one label per container consumed '
       + 'from the matching item. ' + (isAdmin ? '' : 'Ask an admin to add a new FG label.')));
-    host.append(itemsTable(labels, { showLabelMap: true, wholeUnits: true, history: true }));
+    host.append(itemsTable(labels, { labelGroup: State.labelGroup || 'sku', wholeUnits: true, history: true }));
     updateBulk();
   }
   draw();
@@ -4224,7 +4348,7 @@ function editC(c) {
   const typeSel = isPlainReagent ? selectFrom('', [['', '— none —'], ...REAGENT_TYPES.map(t => [t, t])]) : null;
   if (typeSel) typeSel.value = c.reagentType || '';
   const body = el('div', {},
-    field('Item #', el('input', { id: 'c_itemno', value: c.itemNumber ?? '', placeholder: 'optional stock / part number' })),
+    field('Item #', el('input', { id: 'c_itemno', value: c.itemNumber ?? '', placeholder: 'Auto-assigned (e.g. RGT-008) — leave blank' })),
     typeSel ? field('Reagent type (items of one type are offered together in the production log)', typeSel) : null,
     el('div', { class: 'form-row' },
       field('Reorder level', el('input', { type: 'number', id: 'c_re', value: c.reorderLevel, step: '0.1' })),
@@ -4281,7 +4405,7 @@ function addConsumable() {
   const body = el('div', {},
     el('div', { class: 'form-row' }, field('Name', el('input', { id: 'n_name' })), field('Unit', el('input', { id: 'n_unit', value: 'kg' }))),
     field('Reagent type (items of one type are offered together in the production log)', typeSel),
-    field('Item #', el('input', { id: 'n_itemno', placeholder: 'optional stock / part number' })),
+    field('Item #', el('input', { id: 'n_itemno', placeholder: 'Auto-assigned (e.g. RGT-008) — leave blank' })),
     el('div', { class: 'form-row' }, field('On hand', el('input', { type: 'number', id: 'n_oh', value: '0' })),
       field('Reorder level', el('input', { type: 'number', id: 'n_re', value: '0' }))),
     el('div', { class: 'form-row' }, field('Cost per unit', el('input', { type: 'number', id: 'n_cost', step: '0.01' })),
@@ -4304,7 +4428,7 @@ function addContainerType() {
   const body = el('div', {},
     el('div', { class: 'form-row' }, field('Name', el('input', { id: 'n_name', placeholder: 'e.g. 4 L' })),
       field('Unit', el('input', { id: 'n_unit', value: 'ea' }))),
-    field('Item #', el('input', { id: 'n_itemno', placeholder: 'optional stock / part number' })),
+    field('Item #', el('input', { id: 'n_itemno', placeholder: 'Auto-assigned (e.g. RGT-008) — leave blank' })),
     el('div', { class: 'form-row' }, field('On hand', el('input', { type: 'number', id: 'n_oh', value: '0' })),
       field('Reorder level', el('input', { type: 'number', id: 'n_re', value: '0' }))),
     el('div', { class: 'form-row' }, field('Cost per unit', el('input', { type: 'number', id: 'n_cost', step: '0.01' })),
@@ -4326,14 +4450,14 @@ function addContainerType() {
 // Admin-only: a finished-good label item, mapped to one product SKU + one
 // package type (a packaging container with a volume). Named automatically
 // ("FG Label - <SKU> - <package>"); deducted 1 per container consumed when a run's Packaging is saved
-// or finalized. Unrelated to the Labels tab (internal barcode printing).
+// or finalized. Unrelated to the internal barcode labels printed from a row's Label button.
 function addFgLabel() {
   const locs = State.ref.locations.map(l => [l, l]);
   const skuSel = selectFrom('', (State.ref.skus || []).filter(s => s.active).map(s => [s.code, s.name]));
   const pkgSel = selectFrom('', (State.ref.containers || []).filter(c => c.litresEach != null).map(c => [c.name, c.name]));
   const body = el('div', {},
     el('div', { class: 'form-row' }, field('Product SKU', skuSel), field('Package type', pkgSel)),
-    field('Item #', el('input', { id: 'n_itemno', placeholder: 'optional stock / part number' })),
+    field('Item #', el('input', { id: 'n_itemno', placeholder: 'Auto-assigned (e.g. RGT-008) — leave blank' })),
     el('div', { class: 'form-row' }, field('On hand', el('input', { type: 'number', id: 'n_oh', value: '0' })),
       field('Reorder level', el('input', { type: 'number', id: 'n_re', value: '0' }))),
     el('div', { class: 'form-row' }, field('Cost per unit', el('input', { type: 'number', id: 'n_cost', step: '0.01' })),
@@ -4822,17 +4946,24 @@ const CALCULATIONS = [
     settings: ['dilution_tank_capacity_each_l'],
   },
   {
-    title: 'Pre-processing: recommended dilution water and blend mass',
-    formula: 'Shredded mass (kg) = Σ weight of the totes in the pick list.  Recommended water (L) = Shredded mass × (Starting % solids ÷ Target % solids − 1), 0 if the starting % is not above the target.  Blend mass (kg) = Shredded mass + Recommended water (1 kg water = 1 L)',
+    title: 'Pre-processing: recommended dilution water and expected blend volume',
+    formula: 'Estimated weight (kg) = Σ weight of the totes in the pick list.  Recommended water (L) = Estimated weight × (Starting % solids ÷ Target % solids − 1), 0 if the starting % is not above the target.  Expected blend volume (L) = Σ tote volume (L) + dilution water (the amount added, or the recommended amount until it is entered; 1 kg water = 1 L)',
     description: 'Solids loading of a shred-and-blend batch: the shredded kelp is diluted from its measured % solids to the target % solids. The target defaults from the setting and can be changed per batch. All Blend fields are optional.',
     location: 'Pre-Processing → batch → Blend — solids loading',
     settings: ['preproc_target_solids_pct'],
   },
   {
     title: 'Pre-processing: final % solids (calculated)',
-    formula: 'Final % solids = Starting % solids × Shredded mass ÷ (Shredded mass + Dilution water added)',
+    formula: 'Final % solids = Starting % solids × Estimated weight ÷ (Estimated weight + Dilution water added)',
     description: 'What the blend solids loading works out to given the water actually added; stored on each output IBC lot.',
     location: 'Pre-Processing → batch → Blend — solids loading; Feedstock Inventory → Trace',
+    settings: [],
+  },
+  {
+    title: 'Stabilization period (weeks)',
+    formula: 'Stabilization period = round((End date − Start date) ÷ 7 days) to the nearest whole week, where Start date = Harvest date (for a fine-grind blend: its Pre-Processing batch date) and End date = today (in stock / hold / WIP), the processing date (consumed) or the disposal date (disposed)',
+    description: 'How long a feedstock tote stabilized. A fine-grind blend counts from the date it was blended (its batch date) rather than the harvest dates of its source totes. While a tote is still in inventory the count runs to today; once it is consumed it is fixed at the date it was processed (its production run’s finalize date, or its Pre-Processing batch’s completion date); once disposed it is fixed at the disposal date. Blank when a needed date is missing.',
+    location: 'Feedstock Inventory → Stabilization period (weeks)',
     settings: [],
   },
   {
@@ -4843,8 +4974,15 @@ const CALCULATIONS = [
     settings: ['sample_retention_months'],
   },
   {
+    title: 'Pre-processing: final % solids (estimated from actuals)',
+    formula: 'Product volume = Final blend volume − Dilution water added.  Product mass = Product volume × (Estimated weight ÷ Σ tote volume)  (1 kg/L if tote volumes are missing).  Final % solids = Starting % solids × Product mass ÷ (Product mass + Dilution water added)',
+    description: 'A check on the blend using what was actually measured: the level-sensor final volume and the dilution water really added, rather than the estimated weights alone. Shown beside the calculated final % solids; blank until the starting %, water added and blend volume are entered.',
+    location: 'Pre-Processing → batch → Blend — solids loading',
+    settings: [],
+  },
+  {
     title: 'Pre-processing: output IBC weight',
-    formula: 'Output IBC weight (kg) = (Shredded mass + Dilution water added) × (that IBC fill ÷ Total packed)',
+    formula: 'Output IBC weight (kg) = (Estimated weight + Dilution water added) × (that IBC fill ÷ Total packed)',
     description: 'Each output IBC lot is stored in Feedstock Inventory with its share of the blend mass as its weight, so downstream yield figures use the blend mass.',
     location: 'Pre-Processing → batch → Pack-out; Feedstock Inventory → Avg kg',
     settings: [],
@@ -5440,33 +5578,77 @@ const preResult = (label, node) => el('div', { class: 'qc-check-result' }, el('s
 function preTile(span, text, warn) { span.className = text != null ? 'qc-check-result-value' + (warn ? ' var-flag' : '') : 'help'; span.textContent = text != null ? text : '—'; }
 
 async function pagePreproc(v) {
-  if (State.preprocId) return openPreprocBatch(v, State.preprocId);
   v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Pre-Processing'),
     el('div', { class: 'actions' }, el('button', { onclick: async () => {
-      const b = await api('POST', '/preproc'); State.preprocId = b.id; render();
+      const b = await api('POST', '/preproc'); await openPreprocBatch(b.id);
     } }, '+ New batch'))));
-  v.append(el('div', { class: 'help', style: 'margin-bottom:8px' },
-    'Pull coarse-ground feedstock totes (pick list), shred them to a fine grind, blend in a tank (solids loading set with dilution water, pH set with citric acid) and pack the blend into IBCs that go back into Feedstock Inventory as fine-grind lots, traceable to the original totes.'));
   const { batches } = await api('GET', '/preproc');
-  v.append(table(['Batch lot', 'Date', 'Status', 'Totes in', 'Input kg', 'IBCs out', 'Packed (L)', 'Final pH', 'Final % solids'],
-    batches.map(b => [mono(b.batchLot), b.batchDate || '—', badge(b.status === 'completed' ? 'ok' : 'low', b.status === 'completed' ? 'Completed' : 'Draft'),
-      b.inputCount, fmt(b.inputKg, 1), b.outputCount || '—', b.packedL != null ? fmt(b.packedL, 0) : '—',
-      b.measuredPh != null ? fmt(b.measuredPh, 1) : '—', b.finalSolidsPct != null ? fmt(b.finalSolidsPct, 1) : '—']),
-    [false, false, false, true, true, true, true, true, true],
-    ri => { State.preprocId = batches[ri].id; render(); }));
+  const drafts = batches.filter(b => b.status === 'draft'), done = batches.filter(b => b.status === 'completed');
+  if (!batches.length) {
+    v.append(el('div', { class: 'empty card' }, 'No pre-processing batches yet. Click “New batch” to pull coarse-ground totes, shred and blend them, and pack the blend into IBCs that go back into Feedstock Inventory as fine-grind lots (traceable to the original totes).'));
+    return;
+  }
+  if (drafts.length) {
+    v.append(el('h3', { style: 'margin:0 0 8px' }, 'In progress'));
+    drafts.forEach(b => v.append(preprocDraftCard(b)));
+  }
+  if (done.length) {
+    if (drafts.length) v.append(el('h3', { style: 'margin:14px 0 8px' }, 'Completed'));
+    done.forEach(b => v.append(preprocDoneCard(b)));
+  }
+}
+function preprocDraftCard(b) {
+  return el('div', { class: 'card' },
+    el('div', { class: 'page-head', style: 'margin:0 0 8px' },
+      el('h3', { style: 'margin:0' }, mono(b.batchLot), '  ', el('span', { class: 'badge hold' }, 'Not yet completed')),
+      el('div', { class: 'actions' },
+        el('button', { onclick: () => openPreprocBatch(b.id) }, 'Resume'),
+        el('button', { class: 'danger', onclick: async () => {
+          if (!confirm('Discard this draft batch? Every tote pulled into it goes back into stock.')) return;
+          await api('DELETE', '/preproc/' + b.id); toast('Draft discarded'); render();
+        } }, 'Discard'))),
+    el('div', { class: 'summary-line' },
+      sl('Batch date', b.batchDate || '—'), sl('Operators', b.operators || '—'),
+      sl('Totes pulled', b.inputCount ? b.inputCount + ' · ' + fmt(b.inputKg, 1) + ' kg' : '—'),
+      sl('Output location', b.location || '—')),
+    stageProgress(b, { onSelect: key => openPreprocBatch(b.id, key), readyText: 'All required fields complete — ready to complete the batch' }),
+    el('div', { class: 'muted', style: 'margin-top:6px;font-size:12px' }, 'Click a section above to open it. Completing the batch adds its fine-grind IBCs to Feedstock Inventory.'));
+}
+function preprocDoneCard(b) {
+  const cell = (k, v, cls) => el('div', { class: 'rs' + (cls ? ' ' + cls : '') }, el('span', { class: 'rs-k' }, k), el('span', { class: 'rs-v' }, v));
+  const dash = '—', opt = (x, d, u) => x != null ? fmt(x, d) + ' ' + u : dash;
+  const lots = b.outputCount ? (b.outputCount === 1 ? b.batchLot + '-01' : b.batchLot + '-01 … -' + String(b.outputCount).padStart(2, '0')) : dash;
+  return el('div', { class: 'card' },
+    el('div', { class: 'page-head', style: 'margin:0 0 8px' },
+      el('h3', { style: 'margin:0' }, mono(b.batchLot), '  ', el('span', { class: 'badge in_stock' }, 'Completed')),
+      el('div', { class: 'actions' },
+        el('button', { class: 'secondary', onclick: () => openPreprocBatch(b.id) }, '📋 Batch record'),
+        el('button', { class: 'secondary', onclick: async () => {
+          const f = await api('GET', '/preproc/' + b.id); const src = f.inputs.map(i => i.lot);
+          printLabels(f.outputs.map(o => blendLabel(o, src)));
+        } }, 'Print labels'))),
+    el('div', { class: 'run-stats' },
+      cell('Batch date', b.batchDate || dash), cell('Operators', b.operators || dash), cell('Completed', b.completedAt ? fmtWhen(b.completedAt) : dash),
+      cell('Source totes', b.inputCount ? fmt(b.inputCount) : dash), cell('Feedstock weight', b.inputCount ? fmt(b.inputKg, 1) + ' kg' : dash),
+      cell('Dilution water', opt(b.waterAddedL, 0, 'L')),
+      cell('Final solids', opt(b.finalSolidsPct, 2, '%')), cell('pH', b.measuredPh != null ? fmt(b.measuredPh, 1) + (b.targetPh != null ? ' (target ' + fmt(b.targetPh, 1) + ')' : '') : dash),
+      cell('Citric acid', opt(b.citricKg, 2, 'kg')),
+      cell('Fine-grind IBCs', b.outputCount ? fmt(b.outputCount) : dash), cell('Volume packed', b.packedL != null ? fmt(b.packedL, 0) + ' L' : dash),
+      cell('Stored at', b.location || dash),
+      cell('Output lots', lots, 'rs-wide')));
 }
 
-async function openPreprocBatch(v, id) {
+async function openPreprocBatch(id, section) {
   let B = await api('GET', '/preproc/' + id);
-  const toList = () => { State.preprocId = null; render(); };
-  const head = el('div', { class: 'page-head' }, el('h2', {}, 'Pre-Processing — ' + B.batchLot),
-    el('div', { class: 'actions' }, el('button', { class: 'secondary', onclick: toList }, '← All batches'),
-      B.status === 'draft' ? el('button', { class: 'danger', onclick: async () => {
-        if (!confirm('Discard this draft batch? Every tote pulled into it goes back into stock.')) return;
-        await api('DELETE', '/preproc/' + id); toast('Draft discarded'); toList();
-      } }, 'Discard draft') : null));
-  v.append(head);
-  if (B.status === 'completed') return drawPreprocCompleted(v, B);
+  const v = el('div', {});            // the batch window's body (a wide window, like a production run's Process log)
+  if (B.status === 'completed') {
+    modal('Batch record — ' + B.batchLot, v, async () => { render(); }, 'Done', { wide: true, closeX: true, onClose: () => render() });
+    return drawPreprocCompleted(v, B);
+  }
+  // Footer buttons call these once the sections below exist: "Save & close" saves every section; "Complete batch" saves then completes.
+  let saveAllFn = async () => { throw new Error('Still loading — try again in a moment.'); }, completeFn = saveAllFn;
+  modal('Pre-Processing batch — ' + B.batchLot, v, () => completeFn(), 'Complete batch',
+    { wide: true, closeX: true, onClose: () => render(), extraLabel: 'Save & close', onExtra: async () => { await saveAllFn(); render(); } });
 
   const problemsHost = el('div', {});
   const drawProblems = () => {
@@ -5526,12 +5708,13 @@ async function openPreprocBatch(v, id) {
     try { apply(await api('POST', '/preproc/' + id + '/inputs', { toteIds: [...picks] })); picks.clear(); addBtn.textContent = 'Add selected (0)'; await loadPickTotes(); drawPicked(); }
     catch (e) { toast(e.message, true); }
   } }, 'Add selected (0)');
-  const charCache = {};
+  const charCache = {}, pickInputs = {};
   async function drawPicked() {
     pickedHost.innerHTML = '';
+    Object.keys(pickInputs).forEach(k => delete pickInputs[k]);
     const kg = B.inputs.reduce((a, i) => a + (i.weightKg || 0), 0);
     pickSummary.innerHTML = '';
-    pickSummary.append(sl('Totes', B.inputs.length), sl('Input', fmt(kg, 1) + ' kg'));
+    pickSummary.append(sl('Totes', B.inputs.length), sl('Input', fmt(kg, 1) + ' kg'), sl('Volume', fmt(B.inputs.reduce((a, i) => a + (i.volumeL || 0), 0), 0) + ' L'));
     if (!B.inputs.length) { pickedHost.append(el('div', { class: 'help' }, 'Add totes from the pick list above.')); return; }
     for (const i of B.inputs) {
       if (!(i.toteLotId in charCache)) {
@@ -5540,6 +5723,9 @@ async function openPreprocBatch(v, id) {
       }
       const wInp = preNumInput(i.weightKg, 1, 'kg');
       wInp.addEventListener('change', async () => { try { apply(await api('PUT', '/preproc/' + id + '/inputs/' + i.toteLotId, { weightKg: preNumOf(wInp) })); updatePickSummary(); } catch (e) { toast(e.message, true); } });
+      const vInp = preNumInput(i.volumeL, 1, 'L');
+      pickInputs[i.toteLotId] = { wInp, vInp };
+      vInp.addEventListener('change', async () => { try { apply(await api('PUT', '/preproc/' + id + '/inputs/' + i.toteLotId, { volumeL: preNumOf(vInp) })); updatePickSummary(); } catch (e) { toast(e.message, true); } });
       const rm = el('button', { type: 'button', class: 'secondary', onclick: async () => {
         apply(await api('DELETE', '/preproc/' + id + '/inputs/' + i.toteLotId)); await loadPickTotes(); drawPicked();
       } }, 'Remove from batch');
@@ -5563,42 +5749,65 @@ async function openPreprocBatch(v, id) {
       pickedHost.append(el('div', { class: 'card', style: 'margin:8px 0;padding:10px' },
         el('div', { style: 'display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap' },
           el('div', {}, el('b', { class: 'mono' }, i.lot), el('div', { class: 'help' }, siteName(i.site) + ' · ' + speciesName(i.species) + ' · avg ' + fmt(i.avgWeightKg, 1) + ' kg')),
-          field(reqLabel('Weight shredded (kg)'), wInp), rm), card));
+          field(reqLabel('Weight tote (kg)'), wInp), field('Volume tote (L)', vInp), rm), card));
     }
   }
   const updatePickSummary = () => {
-    const kg = B.inputs.reduce((a, i) => a + (i.weightKg || 0), 0);
-    pickSummary.innerHTML = ''; pickSummary.append(sl('Totes', B.inputs.length), sl('Input', fmt(kg, 1) + ' kg'));
+    const kg = B.inputs.reduce((a, i) => a + (i.weightKg || 0), 0), vol = B.inputs.reduce((a, i) => a + (i.volumeL || 0), 0);
+    pickSummary.innerHTML = ''; pickSummary.append(sl('Totes', B.inputs.length), sl('Input', fmt(kg, 1) + ' kg'), sl('Volume', fmt(vol, 0) + ' L'));
   };
   const sPick = preSection('Feedstock pick list', [
     el('div', { class: 'help', style: 'margin-bottom:6px' }, 'Only coarse-grind totes in stock (not on QAQC Hold) are offered. Pulled totes are locked to this batch until it is completed or discarded.'),
     el('div', { class: 'form-row' }, field('Search', qInp), field('Species', spSel), field('Site', siteSel)),
     pickHost, el('div', { style: 'margin:8px 0' }, addBtn),
-    pickSummary, pickedHost], null);
+    pickSummary, pickedHost],
+    async () => {
+      // weight / volume save as you tab out of each box; this writes every pulled tote's current values in one go
+      for (const [tid, c] of Object.entries(pickInputs))
+        apply(await api('PUT', '/preproc/' + id + '/inputs/' + tid, { weightKg: preNumOf(c.wInp), volumeL: preNumOf(c.vInp) }));
+      updatePickSummary();
+    });
 
-  /* 3. Blend: solids loading (all fields optional; shredded mass = the pulled totes' weights) */
+  /* 3. Blend: solids loading (all fields optional; estimated weight = the pulled totes' weights) */
   const startInp = preNumInput(B.startSolidsPct, 2, '%'), targetInp = preNumInput(B.targetSolidsPct, 2, '%');
-  const waterInp = preNumInput(B.waterAddedL, 1, 'L'), volInp = preNumInput(B.blendVolumeL, 1, 'L');
-  const shredKgT = el('span', { class: 'help' }), recWaterT = el('span', { class: 'help' }), blendKgT = el('span', { class: 'help' }), finalT = el('span', { class: 'help' });
+  const waterInp = preNumInput(B.waterAddedL, 1, 'L'), volInp = preNumInput(B.blendVolumeL, 1, 'Measured from level sensor');
+  const shredKgT = el('span', { class: 'help' }), recWaterT = el('span', { class: 'help' }), expVolT = el('span', { class: 'help' }), finalT = el('span', { class: 'help' }),
+    finalEstT = el('span', { class: 'help' });
+  // total volume of the pulled totes (needs every tote's volume); expected blend volume = that + the dilution water
+  const toteVolume = () => (B.inputs.length && B.inputs.every(i => i.volumeL != null)) ? B.inputs.reduce((a, i) => a + i.volumeL, 0) : null;
   const shreddedKg = () => B.inputKg > 0 ? B.inputKg : null;
   const finalSolids = () => {
     const sh = shreddedKg(), st = preNumOf(startInp), w = preNumOf(waterInp);
     return (sh > 0 && st > 0 && w != null) ? st * sh / (sh + w) : null;
   };
+  // Final % solids estimated from the ACTUALS: the measured final blend volume less the water actually added is the product
+  // volume; its mass follows the totes' density (estimated weight / tote volume, 1 kg/L if volumes are missing); solids are the
+  // starting % of that mass, spread over (product mass + water).
+  const finalSolidsEst = () => {
+    const sh = shreddedKg(), st = preNumOf(startInp), w = preNumOf(waterInp), V = preNumOf(volInp), tv = toteVolume();
+    if (!(sh > 0 && st > 0 && w != null && V > 0) || V - w <= 0) return null;
+    const mp = (V - w) * (tv > 0 ? sh / tv : 1);
+    return st * mp / (mp + w);
+  };
   function calcBlend() {
     const c = preprocPlanCalc(shreddedKg(), preNumOf(startInp), preNumOf(targetInp));
     preTile(shredKgT, shreddedKg() != null ? fmt(shreddedKg(), 1) + ' kg' : null);
-    preTile(recWaterT, c ? fmt(c.waterL, 0) + ' L' : null); preTile(blendKgT, c ? fmt(c.blendKg, 0) + ' kg' : null);
+    preTile(recWaterT, c ? fmt(c.waterL, 0) + ' L' : null);
+    const water = preNumOf(waterInp) != null ? preNumOf(waterInp) : (c ? c.waterL : null), tv = toteVolume();
+    preTile(expVolT, (tv != null && water != null) ? fmt(tv + water, 0) + ' L' : null);
     const f = finalSolids(); preTile(finalT, f != null ? fmt(f, 2) + ' %' : null);
+    const fe = finalSolidsEst(); preTile(finalEstT, fe != null ? fmt(fe, 2) + ' %' : null);
     return c;
   }
-  [startInp, targetInp, waterInp].forEach(i => i.addEventListener('input', calcBlend));
+  [startInp, targetInp, waterInp, volInp].forEach(i => i.addEventListener('input', calcBlend));
   const sBlend = preSection('Blend — solids loading', [
-    el('div', { class: 'help', style: 'margin-bottom:6px' }, 'Shredded mass is the total weight of the totes in the pick list. Recommended water = shredded kg × (starting % ÷ target % − 1), taking 1 kg of water = 1 L. Final % solids = starting % × shredded kg ÷ (shredded kg + water added).'),
-    el('div', { class: 'form-row' }, field('Starting % solids (shredded mass)', startInp), field('Target % solids', targetInp)),
-    preResult('Shredded mass', shredKgT), preResult('Recommended dilution water', recWaterT), preResult('Expected blend mass', blendKgT),
+    el('div', { class: 'help', style: 'margin-bottom:6px' }, 'Estimated weight is the total weight of the totes in the pick list. Recommended water = estimated kg × (starting % ÷ target % − 1), taking 1 kg of water = 1 L. Expected blend volume = total tote volume + dilution water (the amount added, or the recommended amount until it is entered). Final % solids = starting % × estimated kg ÷ (estimated kg + water added).'),
+    el('div', { class: 'form-row' }, field('Starting % solids', startInp), field('Target % solids', targetInp)),
+    preResult('Estimated weight', shredKgT), preResult('Recommended dilution water', recWaterT), preResult('Expected blend volume', expVolT),
     el('div', { class: 'form-row', style: 'margin-top:8px' }, field('Dilution water added (L)', waterInp), field('Blend volume (L)', volInp)),
-    preResult('Final % solids (calculated)', finalT)],
+    preResult('Final % solids (calculated)', finalT),
+    preResult('Final % solids (estimated from actuals)', finalEstT),
+    el('div', { class: 'help' }, 'Estimated from actuals = starting % × product mass ÷ (product mass + water added), where product volume = final blend volume − water actually added, and its mass uses the totes’ weight ÷ volume.')],
     async () => {
       const c = calcBlend(), f = finalSolids();
       await put({ startSolidsPct: preNumOf(startInp), targetSolidsPct: preNumOf(targetInp), recommendedWaterL: c ? Math.round(c.waterL * 10) / 10 : null,
@@ -5655,21 +5864,21 @@ async function openPreprocBatch(v, id) {
     });
 
   const sections = [sInit, sPick, sBlend, sPh, sPack];
-  const completeBtn = el('button', { onclick: async () => {
-    completeBtn.disabled = true; errBox.textContent = '';
-    try {
-      for (const s of sections) if (s.save && s !== sPick && !(await s.save())) throw new Error('Fix the section that failed to save, then complete again.');
-      const done = await api('POST', '/preproc/' + id + '/complete');
-      State.ref = await api('GET', '/refdata');
-      toast('Batch ' + done.batchLot + ' completed — ' + done.outputCount + ' fine-grind IBC lot(s) added to Feedstock Inventory.');
-      render();
-    } catch (e) { errBox.textContent = e.message; completeBtn.disabled = false; }
-  } }, 'Complete batch');
-  const errBox = el('div', { class: 'error' });
+  saveAllFn = async () => {
+    for (const sec of sections) if (sec.save && !(await sec.save())) throw new Error('A section could not be saved — see the message under its Save button.');
+  };
+  completeFn = async () => {
+    await saveAllFn();
+    const done = await api('POST', '/preproc/' + id + '/complete');
+    State.ref = await api('GET', '/refdata');
+    toast('Batch ' + done.batchLot + ' completed — ' + done.outputCount + ' fine-grind IBC lot(s) added to Feedstock Inventory.');
+    render();
+  };
   function refreshAll() { updatePickSummary(); calcBlend(); calcPack(); }
-  v.append(...sections.map(s => s.box), problemsHost,
-    el('div', { style: 'margin:12px 0' }, completeBtn, errBox));
+  ['initiation', 'pick', 'blend', 'ph', 'pack'].forEach((k, i) => { sections[i].box.dataset.sec = k; });
+  v.append(...sections.map(s => s.box), problemsHost);
   drawProblems(); refreshAll(); await loadPickTotes(); await drawPicked();
+  if (section) { const t = v.querySelector('[data-sec="' + section + '"]'); if (t) t.scrollIntoView({ block: 'start' }); }
 }
 
 function drawPreprocCompleted(v, B) {
@@ -5677,12 +5886,12 @@ function drawPreprocCompleted(v, B) {
   v.append(el('div', { class: 'summary-line' }, sl('Status', 'Completed'), sl('Date', B.batchDate || '—'), sl('Operators', B.operators || '—'),
     sl('Completed', B.completedAt ? fmtWhen(B.completedAt) + (B.completedBy ? ' by ' + B.completedBy : '') : '—')));
   const opt = (x, d, u) => x != null ? fmt(x, d) + u : '—';
-  v.append(el('div', { class: 'summary-line' }, sl('Shredded', opt(B.shreddedKg, 1, ' kg')), sl('Start solids', opt(B.startSolidsPct, 2, ' %')),
+  v.append(el('div', { class: 'summary-line' }, sl('Estimated weight', opt(B.shreddedKg, 1, ' kg')), sl('Start solids', opt(B.startSolidsPct, 2, ' %')),
     sl('Target solids', opt(B.targetSolidsPct, 2, ' %')), sl('Water added', opt(B.waterAddedL, 0, ' L')), sl('Blend volume', opt(B.blendVolumeL, 0, ' L')),
     sl('Final solids (calc.)', opt(B.finalSolidsPct, 2, ' %')), sl('pH', fmt(B.measuredPh, 1) + ' (target ' + fmt(B.targetPh, 1) + ')'), sl('Citric acid', fmt(B.citricKg, 2) + ' kg')));
   v.append(el('h3', {}, 'Source totes (coarse grind)'),
-    table(['Lot', 'Site', 'Species', 'Harvest date', 'Weight shredded (kg)'],
-      B.inputs.map(i => [mono(i.lot), siteName(i.site), speciesName(i.species), i.harvestDate || '—', fmt(i.weightKg, 1)]), [false, false, false, false, true]));
+    table(['Lot', 'Site', 'Species', 'Harvest date', 'Weight tote (kg)', 'Volume tote (L)'],
+      B.inputs.map(i => [mono(i.lot), siteName(i.site), speciesName(i.species), i.harvestDate || '—', fmt(i.weightKg, 1), i.volumeL != null ? fmt(i.volumeL, 0) : '—']), [false, false, false, false, true, true]));
   v.append(el('div', { class: 'page-head', style: 'margin-top:14px' }, el('h3', {}, 'Fine-grind output IBCs'),
     el('div', { class: 'actions' }, el('button', { onclick: () => printLabels(B.outputs.map(o => blendLabel(o, sources))) }, '🖨 Print all labels'))));
   v.append(table(['Lot', 'Volume (L)', 'Weight (kg)', '% solids', 'pH', 'Location', 'Status', ''],
@@ -5701,44 +5910,10 @@ async function showPreprocTrace(t) {
       ? t.lot + ' is a fine-grind blend made in batch ' + b.batchLot + ' from these coarse-grind totes:'
       : t.lot + ' was shredded in batch ' + b.batchLot + ' and now lives in these fine-grind lots:'),
     el('div', {}, el('b', {}, 'Source totes')),
-    table(['Lot', 'Site', 'Species', 'Harvest date', 'kg shredded'], b.inputs.map(i => [mono(i.lot), siteName(i.site), speciesName(i.species), i.harvestDate || '—', fmt(i.weightKg, 1)]), [false, false, false, false, true]),
+    table(['Lot', 'Site', 'Species', 'Harvest date', 'Weight (kg)'], b.inputs.map(i => [mono(i.lot), siteName(i.site), speciesName(i.species), i.harvestDate || '—', fmt(i.weightKg, 1)]), [false, false, false, false, true]),
     el('div', { style: 'margin-top:8px' }, el('b', {}, 'Fine-grind lots')),
     table(['Lot', 'Volume (L)', 'Location', 'Status'], b.outputs.map(o => [mono(o.lot), fmt(o.volumeL, 0), o.location || '—', badge(o.status, statusLabel(o.status))]), [false, true, false, false]));
   modal('Traceability — ' + t.lot, body, async () => {}, 'Close', { noCancel: true, wide: true });
-}
-
-async function pageLabels(v) {
-  v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Print Labels')));
-  const src = selectFrom('', [['totes', 'Stabilized totes (in stock)'], ['fg', 'Finished goods (on hand)']], load, 'lbl_src');
-  const host = el('div', {});
-  v.append(el('div', { class: 'label-controls no-print' },
-    field('Label source', src),
-    el('button', { onclick: () => selectAll(host, true) }, 'Select all'),
-    el('button', { class: 'secondary', onclick: () => selectAll(host, false) }, 'Clear'),
-    el('button', { onclick: () => doPrint(host) }, '🖨 Print selected')), host);
-  async function load() {
-    host.innerHTML = '';
-    let labels = [];
-    if (src.value === 'totes') labels = (await api('GET', '/totes?status=in_stock')).totes.map(toteLabel);
-    else labels = (await api('GET', '/fg?status=on_hand')).fg.map(f => fgLabel(f));
-    if (!labels.length) { host.append(el('div', { class: 'empty card' }, 'Nothing to label here yet.')); return; }
-    const sheet = el('div', { class: 'labels-sheet' });
-    labels.forEach((lb, i) => {
-      const wrapEl = el('label', { class: 'kelp-label', style: 'cursor:pointer' });
-      const cb = el('input', { type: 'checkbox', class: 'no-print lbl-cb', checked: 'checked', style: 'position:absolute;margin:-6px 0 0 -6px' });
-      wrapEl.dataset.idx = i; wrapEl._label = lb;
-      wrapEl.append(cb, ...labelInner(lb));
-      sheet.append(wrapEl);
-    });
-    host.append(sheet);
-  }
-  load();
-}
-function selectAll(host, on) { host.querySelectorAll('.lbl-cb').forEach(cb => cb.checked = on); }
-function doPrint(host) {
-  const chosen = [...host.querySelectorAll('.kelp-label')].filter(l => l.querySelector('.lbl-cb').checked).map(l => l._label);
-  if (!chosen.length) return toast('Select at least one label.', true);
-  printLabels(chosen);
 }
 
 /* label data builders */
@@ -5761,17 +5936,6 @@ function fgLabel(f, run) {
   return { kind: 'Finished Good — LKE', lot: f.lot, barcode: f.lot, meta: [
     ['Product', skuName(f.sku)], ['Pack', f.packageSize], ['Units', fmt(f.qty)],
     ['TDS', f.tds != null ? f.tds + '%' : '—'], ['Produced', f.producedDate || (run && run.runDate) || '—']] };
-}
-function labelInner(lb) {
-  return [
-    el('div', { class: 'll-top' },
-      el('span', { class: 'll-co' }, el('img', { src: 'logo.png', alt: '', style: 'height:16px;width:auto;margin-right:5px;vertical-align:middle' }), 'CASCADIA SEAWEED'),
-      el('span', { class: 'll-kind' }, lb.kind)),
-    el('div', { class: 'll-lot' }, lb.lot),
-    el('div', { class: 'll-meta' }, ...lb.meta.map(([k, val]) => el('span', {}, el('b', {}, k + ': '), String(val)))),
-    el('div', { class: 'svg-host', html: code128SVG(lb.barcode) }),
-    el('div', { class: 'll-human' }, lb.barcode)
-  ];
 }
 function printLabels(labels) {
   const w = window.open('', '_blank');
@@ -5801,6 +5965,8 @@ function table(headers, rows, numCols = [], rowClick = null) {
   const tb = el('tbody', {});
   if (!rows.length) tb.append(el('tr', {}, el('td', { colspan: headers.length, class: 'empty' }, 'Nothing here yet.')));
   rows.forEach((r, ri) => {
+    // a row of the form { group: node } is a full-width group heading (not a data row; it isn't clickable)
+    if (r && !Array.isArray(r) && r.group != null) { tb.append(el('tr', { class: 'group-row' }, el('td', { colspan: headers.length }, r.group))); return; }
     const cells = r.map((c, i) => el('td', { class: numCols[i] ? 'num' : '' }, c == null ? '—' : (c.nodeType ? c : String(c))));
     tb.append(el('tr', rowClick ? { class: 'clickable', onclick: () => rowClick(ri) } : {}, ...cells));
   });
