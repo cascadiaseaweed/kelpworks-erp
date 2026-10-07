@@ -48,6 +48,8 @@ import base64
 import zipfile
 import hashlib
 import sqlite3
+import struct
+import zlib
 import secrets
 import tempfile
 import datetime
@@ -68,6 +70,7 @@ UPLOAD_DIR = os.environ.get("KELP_ERP_UPLOADS", os.path.join(BASE_DIR, "uploads"
 # UPLOAD_DIR so they land on the same persistent disk in production (see
 # render.yaml) without needing a separate env var / disk mount of their own.
 SOP_DIR = os.path.join(os.path.dirname(UPLOAD_DIR), "sop_documents")
+LAB_DIR = os.path.join(os.path.dirname(UPLOAD_DIR), "lab_templates")   # lab requisition .docx templates
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB per file
 PORT = int(os.environ.get("PORT", "8002"))
 HOST = os.environ.get("HOST", "0.0.0.0")
@@ -102,6 +105,8 @@ SETTINGS_DEFAULTS = [
      " at or above it, \"Stable / safe zone\"."),
     ("dilution_tank_capacity_each_l", 5000, "Tank 6A / 6B capacity, each (L)",
      "Maximum working volume of EACH of Tank 6A and Tank 6B (6A + 6B connected = double) -- used by the Dilution plan's available space / maximum product transfer."),
+    ("sample_retention_months", 12, "Retention sample shelf life (months)",
+     "How long a Retention sample is kept: its discard-by date is the collection date plus this many months (shown in the Samples tab's Retention inventory)."),
     ("preproc_target_solids_pct", 10, "Pre-processing target blend solids (%)",
      "Default solids loading a shred-and-blend (Pre-Processing) batch is diluted to. Recommended dilution water = shredded kg x (starting % solids / target % solids - 1), taking 1 kg of water = 1 L."),
     ("preproc_target_ph", 3.7, "Pre-processing target pH",
@@ -275,6 +280,8 @@ _KEY_TOKENS = {"ph": "pH", "tds": "TDS", "orp": "ORP", "psi": "(psi)", "pct": "(
 
 
 _KEY_LABELS = {
+    "citricItemId": "Citric acid item used", "ksorbateItemId": "Potassium sorbate item used",
+    "nabenzoateItemId": "Sodium benzoate item used",
     "slurryL": "Pre-Dilution Tank Level (L)", "postDilutionTankL": "Post-Dilution Tank Level (L)",
     "dilutionWaterL": "Dilution water added (L)", "lotPctSolids": "Lot %Solids Loading, (w/w)",
     "pctWetSolids": "Measured %Solids Loading, (w/w)", "targetPctWetSolids": "Target %Solids Loading, (w/w)",
@@ -912,8 +919,9 @@ CREATE TABLE IF NOT EXISTS run_label_commits (
 -- consumable's name.
 CREATE TABLE IF NOT EXISTS run_reagent_commits (
     run_id         INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
-    reagent        TEXT NOT NULL,
+    reagent        TEXT NOT NULL,         -- the reagent TYPE (Citric Acid / Potassium Sorbate / Sodium Benzoate)
     committed_kg   REAL NOT NULL DEFAULT 0,
+    consumable_id  INTEGER,               -- the inventory item the kg were deducted from (NULL = the item named like the type)
     PRIMARY KEY (run_id, reagent)
 );
 
@@ -1051,6 +1059,90 @@ CREATE TABLE IF NOT EXISTS run_dilution_passes (
 );
 CREATE INDEX IF NOT EXISTS idx_dilpasses_run ON run_dilution_passes(run_id);
 
+-- Sample catalogue: every tube / bag logged in a finalized run's Sample Point boxes becomes one row here
+-- (a Sample Point row of qty 4 -> 4 samples), kept in sync with the run's sample rows by sync_samples().
+-- status: available (in inventory) | in_cart (assigned for lab analysis, requisition not yet created) |
+--         submitted (sent to a lab on a requisition) | removed (consumed / disposed / expired / lost).
+CREATE TABLE IF NOT EXISTS samples (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_code     TEXT NOT NULL UNIQUE,          -- <processing lot>-<STG>-<NN>, e.g. PR-20261006-053-HOM-03
+    run_id          INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+    sample_point_id INTEGER,                        -- run_sample_points.id this unit came from
+    unit_no         INTEGER,                        -- 1..qty within that row
+    stage           TEXT,
+    type            TEXT,                           -- Slurry | Liquid | Solid
+    description     TEXT,                           -- Microbial | Retention | Metals & Nutrients | ...
+    container       TEXT,
+    collected_at    TEXT,
+    status          TEXT NOT NULL DEFAULT 'available',
+    location        TEXT,                           -- where the physical sample is stored
+    notes           TEXT,
+    removed_at      TEXT, removed_by TEXT, removed_reason TEXT,
+    requisition_id  INTEGER,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_samples_run ON samples(run_id);
+CREATE INDEX IF NOT EXISTS idx_samples_status ON samples(status);
+-- Append-only history of everything that happens to a sample.
+CREATE TABLE IF NOT EXISTS sample_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id  INTEGER NOT NULL,
+    event_type TEXT NOT NULL,                       -- created | cart_add | cart_remove | assigned | requisition | removed | restored | location | note
+    detail     TEXT,
+    user_name  TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sample_events_sample ON sample_events(sample_id);
+-- Labs and the analyses each can perform (admin-maintained), plus an optional .docx requisition template per lab.
+CREATE TABLE IF NOT EXISTS labs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL UNIQUE,
+    contact         TEXT, email TEXT, phone TEXT, address TEXT, notes TEXT,
+    active          INTEGER NOT NULL DEFAULT 1,
+    template_name   TEXT,                           -- original filename of the uploaded requisition template
+    template_stored TEXT,                           -- opaque name on disk under LAB_DIR
+    sample_sheet    INTEGER NOT NULL DEFAULT 0,     -- 1 = also generate the "attached spreadsheet" (sample ID / description / tests per sample)
+    created_at      TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lab_analyses (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    lab_id  INTEGER NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+    name    TEXT NOT NULL,
+    code    TEXT, notes TEXT,
+    method  TEXT,                                   -- e.g. "ICP-MS": printed in a form's Specifications / Methods column
+    active  INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_lab_analyses_lab ON lab_analyses(lab_id);
+-- The cart: samples (from finalized runs) waiting for a lab + analyses and a requisition.
+CREATE TABLE IF NOT EXISTS sample_cart (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id INTEGER NOT NULL UNIQUE,
+    lab_id    INTEGER,
+    analyses  TEXT,                                 -- JSON list of lab_analyses ids
+    added_by  TEXT,
+    added_at  TEXT NOT NULL
+);
+-- A generated lab requisition (one per run + lab); the filled document is stored as that run's attachment.
+CREATE TABLE IF NOT EXISTS lab_requisitions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    req_number    TEXT NOT NULL UNIQUE,             -- REQ-YYYYMMDD-NNN
+    run_id        INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+    lab_id        INTEGER,
+    lab_name      TEXT,
+    attachment_id INTEGER,
+    notes         TEXT,
+    created_by    TEXT,
+    created_at    TEXT NOT NULL,
+    po_number     TEXT,                             -- PO / reference number entered when the requisition was created
+    sheet_attachment_id INTEGER                     -- the companion sample spreadsheet (labs with sample_sheet=1)
+);
+CREATE TABLE IF NOT EXISTS requisition_samples (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    requisition_id INTEGER NOT NULL REFERENCES lab_requisitions(id) ON DELETE CASCADE,
+    sample_id      INTEGER NOT NULL,
+    analyses       TEXT                             -- JSON list of analysis names as requested
+);
+
 -- Pre-Processing: coarse-ground feedstock totes are pulled (pick list), shredded to a fine grind,
 -- blended in a tank (solids loading set with dilution water, pH set with citric acid) and packed
 -- into new IBCs that go back into Feedstock Inventory (tote_lots.grind = 'Fine'). The output lots
@@ -1074,6 +1166,7 @@ CREATE TABLE IF NOT EXISTS preproc_batches (
     measured_ph         REAL,
     target_ph           REAL,
     citric_kg           REAL,
+    citric_item_id      INTEGER,                -- which Citric Acid inventory item was used
     created_by          TEXT,
     created_at          TEXT NOT NULL,
     completed_at        TEXT,
@@ -1225,7 +1318,826 @@ def init_db():
     conn.commit()
     rebaseline_release_hashes(conn)
     conn.commit()
+    sync_pending_samples(conn)
+    # a Sample Point row never edited keeps blank type/description in the log while the dropdowns show Slurry / Microbial
+    conn.execute("UPDATE samples SET description='Microbial' WHERE description IS NULL OR description=''")
+    conn.execute("UPDATE samples SET type='Slurry' WHERE type IS NULL OR type=''")
+    conn.commit()
     conn.close()
+
+
+# ---------------------------------------------------------------------------------------
+# Sample catalogue + lab requisitions
+# ---------------------------------------------------------------------------------------
+COMPANY_NAME = "Cascadia Seaweed Corp"
+# Sample Point box (stage) -> (code abbreviation, label, production_runs column holding its collection time)
+SAMPLE_STAGES = {
+    "homogenization": ("HOM", "Homogenization", "homog_sample_collected_at"),
+    "separation_solids": ("SEP", "Separation (solids)", "separation_solids_sample_collected_at"),
+    "pasteurization_pre": ("PRE", "Pasteurization (pre)", "pasteurization_pre_sample_collected_at"),
+    "pasteurization_post": ("PAS", "Pasteurization (post)", "pasteurization_post_sample_collected_at"),
+    "packaging": ("PKG", "Packaging", "packaging_sample_collected_at"),
+}
+
+
+def sample_stage_info(stage):
+    return SAMPLE_STAGES.get(stage or "homogenization") or ((stage or "OTH")[:3].upper(), stage or "Other", None)
+
+
+def add_months(iso_date, months):
+    """YYYY-MM-DD + whole months (day clamped to the month's length)."""
+    try:
+        d = datetime.date.fromisoformat((iso_date or "")[:10])
+    except ValueError:
+        return None
+    m = d.month - 1 + int(months)
+    y, m = d.year + m // 12, m % 12 + 1
+    last = (datetime.date(y + (m == 12), m % 12 + 1, 1) - datetime.timedelta(days=1)).day
+    return datetime.date(y, m, min(d.day, last)).isoformat()
+
+
+def sample_log(conn, sample_id, event_type, detail=None, user_name=None):
+    conn.execute("INSERT INTO sample_events (sample_id,event_type,detail,user_name,created_at) VALUES (?,?,?,?,?)",
+                 (sample_id, event_type, detail, user_name, now_iso()))
+
+
+def sync_samples(conn, run_id, user_name=None):
+    """Make the `samples` rows of a finalized run match its Sample Point rows: one sample per unit
+    (qty), created once with a stable code; metadata follows later edits while the sample is still
+    in inventory; units whose row was removed / shrunk are dropped only if they were never sent
+    anywhere (a submitted / removed sample is history and stays)."""
+    run = conn.execute("SELECT * FROM production_runs WHERE id=?", (run_id,)).fetchone()
+    if not run or run["status"] != "completed":
+        return
+    points = conn.execute("SELECT * FROM run_sample_points WHERE run_id=? ORDER BY created_at, id", (run_id,)).fetchall()
+    existing = {(r["sample_point_id"], r["unit_no"]): r for r in conn.execute("SELECT * FROM samples WHERE run_id=?", (run_id,))}
+    live = set()
+    for pt in points:
+        stage = pt["stage"] or "homogenization"
+        abbr, _label, col = sample_stage_info(stage)
+        collected = (run[col] if col and col in run.keys() else None) or pt["created_at"]
+        for u in range(1, max(1, int(pt["qty"] or 1)) + 1):
+            live.add((pt["id"], u))
+            row = existing.get((pt["id"], u))
+            if row:
+                if row["status"] in ("available", "in_cart"):
+                    conn.execute("UPDATE samples SET stage=?, type=?, description=?, container=?, collected_at=? WHERE id=?",
+                                 (stage, pt["type"] or "Slurry", pt["description"] or "Microbial", pt["container"], collected, row["id"]))
+                continue
+            n = conn.execute("SELECT COUNT(*) c FROM samples WHERE run_id=? AND stage=?", (run_id, stage)).fetchone()["c"] + 1
+            while True:
+                code = "%s-%s-%02d" % (run["processing_lot"], abbr, n)
+                if not conn.execute("SELECT 1 FROM samples WHERE sample_code=?", (code,)).fetchone():
+                    break
+                n += 1
+            cur = conn.execute(
+                "INSERT INTO samples (sample_code,run_id,sample_point_id,unit_no,stage,type,description,container,"
+                "collected_at,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,'available',?)",
+                (code, run_id, pt["id"], u, stage, pt["type"] or "Slurry", pt["description"] or "Microbial", pt["container"], collected, now_iso()))
+            sample_log(conn, cur.lastrowid, "created", "Logged in the production log (%s, %s)" % (
+                sample_stage_info(stage)[1], pt["description"] or "Microbial"), user_name)
+    for key, row in existing.items():
+        if key not in live and row["status"] in ("available", "in_cart"):
+            conn.execute("DELETE FROM sample_cart WHERE sample_id=?", (row["id"],))
+            conn.execute("DELETE FROM sample_events WHERE sample_id=?", (row["id"],))
+            conn.execute("DELETE FROM samples WHERE id=?", (row["id"],))
+
+
+def sync_pending_samples(conn, user_name=None):
+    """Finalized runs that have Sample Point rows but no catalogue entries yet (just finalized, or
+    finalized before the catalogue existed)."""
+    for r in conn.execute(
+            "SELECT id FROM production_runs WHERE status='completed' AND EXISTS "
+            "(SELECT 1 FROM run_sample_points p WHERE p.run_id=production_runs.id) AND NOT EXISTS "
+            "(SELECT 1 FROM samples s WHERE s.run_id=production_runs.id)").fetchall():
+        sync_samples(conn, r["id"], user_name)
+
+
+# ---- Word (.docx) requisition templates: filled with the standard library (zipfile + string/regex on the XML) ----
+_W_P = re.compile(r"<w:p(?:\s[^>]*)?>.*?</w:p>", re.S)
+_W_TR = re.compile(r"<w:tr(?:\s[^>]*)?>.*?</w:tr>", re.S)
+_W_T = re.compile(r"(<w:t(?:\s[^>]*)?>)(.*?)(</w:t>)", re.S)
+_TOKEN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+REQ_SCALAR_TOKENS = ["req_number", "date", "date_long", "po_number", "po_check", "company", "lab_name", "lab_contact", "lab_email", "lab_phone", "lab_address",
+                     "processing_lot", "run_date", "sku", "product", "requested_by", "requested_by_email",
+                     "sample_count", "analyses", "notes"]
+REQ_ANALYSIS_KEYS = ["name", "code", "method", "count", "n"]
+REQ_SAMPLE_KEYS = ["n", "id", "report_description", "stage", "type", "description", "container", "collected", "analyses", "methods", "location", "notes"]
+
+
+def _x_unescape(t):
+    return t.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&apos;", "'").replace("&amp;", "&")
+
+
+def _x_escape(t):
+    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _xml_text(xml):
+    return "".join(_x_unescape(m.group(2)) for m in _W_T.finditer(xml))
+
+
+def _fill_paragraphs(xml, resolver):
+    """Replace {{tokens}} paragraph by paragraph. Word often splits a token across several runs, so the
+    paragraph's text is joined, replaced, and written back into its first text run."""
+    def para(m):
+        pxml = m.group(0)
+        ts = list(_W_T.finditer(pxml))
+        if not ts:
+            return pxml
+        full = "".join(_x_unescape(t.group(2)) for t in ts)
+        if "{{" not in full:
+            return pxml
+        new = _TOKEN.sub(lambda mm: str(resolver(mm.group(1).strip())), full)
+        out, pos = [], 0
+        for i, t in enumerate(ts):
+            out.append(pxml[pos:t.start()])
+            out.append('<w:t xml:space="preserve">%s</w:t>' % '</w:t><w:br/><w:t xml:space="preserve">'.join(
+                _x_escape(part) for part in new.split("\n")) if i == 0 else t.group(1) + "</w:t>")
+            pos = t.end()
+        out.append(pxml[pos:])
+        return "".join(out)
+    return _W_P.sub(para, xml)
+
+
+def docx_fill(template, scalars, samples, analyses=None):
+    """template: .docx bytes. scalars: {token: value}. samples: [{n,id,stage,...,'analysis_names': [..]}].
+    Any table row containing a {{sample.*}} token is repeated once per sample; any paragraph containing an
+    {{analysis.*}} token is repeated once per requested analysis (analyses: [{name, code, count, n}])."""
+    analyses = analyses or []
+
+    def resolve(tok, s=None, a=None):
+        if tok.startswith("analysis."):
+            return (a or {}).get(tok[9:], "")
+        if tok.startswith("sample."):
+            if s is None:
+                return ""
+            key = tok[7:]
+            if key.startswith("check:"):
+                want = key[6:].strip().lower()
+                return "\u2612" if want in [a.lower() for a in s.get("analysis_names", []) + s.get("analysis_codes", [])] else "\u2610"
+            return s.get(key, "")
+        return scalars.get(tok, "")
+    zin = zipfile.ZipFile(io.BytesIO(template))
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "word/document.xml" or re.match(r"word/(header|footer)\d*\.xml$", item.filename):
+                xml = data.decode("utf-8")
+                if item.filename == "word/document.xml":
+                    def row(m):
+                        r = m.group(0)
+                        if "{{sample." not in _xml_text(r).replace(" ", ""):
+                            return r
+                        def uniq(rx, k):
+                            rr = re.sub(r'(<w:perm(?:Start|End)\s[^>]*?w:id=")(\d+)(")', lambda m: m.group(1) + str(int(m.group(2)) + k * 100000) + m.group(3), rx)
+                            return re.sub(r'(<w:id w:val=")(-?\d+)("/>)', lambda m: m.group(1) + str(int(m.group(2)) + k * 100000) + m.group(3), rr)
+                        return "".join(_fill_paragraphs(uniq(r, k), lambda tok, s=s: resolve(tok, s)) for k, s in enumerate(samples))
+                    xml = _W_TR.sub(row, xml)
+
+                    def per_analysis(m):
+                        pxml = m.group(0)
+                        if "{{analysis." not in _xml_text(pxml).replace(" ", ""):
+                            return pxml
+                        return "".join(_fill_paragraphs(pxml, lambda tok, a=a: resolve(tok, None, a)) for a in analyses)
+                    xml = _W_P.sub(per_analysis, xml)
+                xml = _fill_paragraphs(xml, resolve)
+                data = xml.encode("utf-8")
+            zout.writestr(item, data)
+    return out.getvalue()
+
+
+def docx_inspect(raw):
+    """Validate an uploaded template and report what it contains."""
+    try:
+        z = zipfile.ZipFile(io.BytesIO(raw))
+        xml = z.read("word/document.xml").decode("utf-8")
+    except Exception:
+        raise ApiError(400, "That file is not a Word (.docx) document")
+    texts = [_xml_text(m.group(0)) for m in _W_P.finditer(xml)]
+    for name in z.namelist():
+        if re.match(r"word/(header|footer)\d*\.xml$", name):
+            texts += [_xml_text(m.group(0)) for m in _W_P.finditer(z.read(name).decode("utf-8"))]
+    tokens = sorted({t.strip() for tx in texts for t in _TOKEN.findall(tx)})
+    has_row = any("{{sample." in _xml_text(m.group(0)).replace(" ", "") for m in _W_TR.finditer(xml))
+    return tokens, has_row
+
+
+def _docx_para(text, bold=False, size=None):
+    rpr = ("<w:rPr>%s%s</w:rPr>" % ("<w:b/>" if bold else "", '<w:sz w:val="%d"/>' % size if size else "")) if (bold or size) else ""
+    return '<w:p><w:r>%s<w:t xml:space="preserve">%s</w:t></w:r></w:p>' % (rpr, _x_escape(text))
+
+
+def build_starter_docx():
+    """A plain requisition layout (the same {{token}} format a lab's own template uses) that is used
+    for labs without an uploaded template, and offered to admins as a starting point."""
+    def cell(text, w, bold=False):
+        return ('<w:tc><w:tcPr><w:tcW w:w="%d" w:type="dxa"/></w:tcPr>%s</w:tc>' % (w, _docx_para(text, bold)))
+    cols = [("#", 500, "{{sample.n}}"), ("Sample ID", 2600, "{{sample.id}}"), ("Process point", 1700, "{{sample.stage}}"),
+            ("Type", 900, "{{sample.type}}"), ("Description", 1500, "{{sample.description}}"),
+            ("Container", 1500, "{{sample.container}}"), ("Collected", 1500, "{{sample.collected}}"),
+            ("Analyses requested", 2800, "{{sample.analyses}}")]
+    borders = ('<w:tblBorders>' + "".join('<w:%s w:val="single" w:sz="4" w:space="0" w:color="808080"/>' % b
+                                         for b in ("top", "left", "bottom", "right", "insideH", "insideV")) + '</w:tblBorders>')
+    tbl = ('<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/>%s</w:tblPr><w:tblGrid>%s</w:tblGrid>' % (
+        borders, "".join('<w:gridCol w:w="%d"/>' % c[1] for c in cols))
+        + "<w:tr>" + "".join(cell(c[0], c[1], True) for c in cols) + "</w:tr>"
+        + "<w:tr>" + "".join(cell(c[2], c[1]) for c in cols) + "</w:tr></w:tbl>")
+    body = "".join([
+        _docx_para("{{company}}", True, 28), _docx_para("Laboratory analysis requisition", True, 36),
+        _docx_para("Requisition no.: {{req_number}}        Date: {{date}}"),
+        _docx_para("To: {{lab_name}}"), _docx_para("Attn: {{lab_contact}}    {{lab_email}}    {{lab_phone}}"),
+        _docx_para("{{lab_address}}"), _docx_para(""),
+        _docx_para("Production run: {{processing_lot}}        Run date: {{run_date}}        Product: {{product}}"),
+        _docx_para("Requested by: {{requested_by}} ({{requested_by_email}})"),
+        _docx_para("Samples submitted: {{sample_count}}"), _docx_para(""), tbl, _docx_para(""),
+        _docx_para("Notes: {{notes}}"),
+        '<w:sectPr><w:pgSz w:w="15840" w:h="12240" w:orient="landscape"/><w:pgMar w:top="1000" w:right="900" w:bottom="1000" w:left="900"/></w:sectPr>'])
+    doc = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+           '<w:body>%s</w:body></w:document>' % body)
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                   '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>'
+                   '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>')
+        z.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>')
+        z.writestr("word/document.xml", doc)
+    return out.getvalue()
+
+
+def build_sample_sheet_xlsx(scalars, sample_rows, analyses):
+    """The "attached spreadsheet" some labs (e.g. Food Assure) ask for: one row per sample with its ID, the
+    description to use on the report, and an X under each test requested for it."""
+    T = lambda v, st=0: ("t", v, st)
+    s = XlsxSheet("Samples")
+    s.set_widths([30, 52, 18, 10, 18] + [18] * len(analyses))
+    span = 5 + len(analyses)
+    s.title("Sample list - %s" % scalars.get("req_number", ""), span)
+    s.row([T("Company", 7), T(scalars.get("company", ""))])
+    s.row([T("Lab", 7), T(scalars.get("lab_name", ""))])
+    s.row([T("Date submitted", 7), T(scalars.get("date_long", ""))])
+    s.row([T("PO#", 7), T(scalars.get("po_number", ""))])
+    s.row([T("Production run", 7), T(scalars.get("processing_lot", ""))])
+    s.row([])
+    s.row([T(h, 3) for h in ["Sample ID", "Sample description (as it should appear on the report)", "Collected", "Type", "Container"]]
+          + [T(a["name"], 3) for a in analyses])
+    for sr in sample_rows:
+        chosen = {x.lower() for x in sr["analysis_names"]}
+        s.row([T(sr["id"]), T(sr["report_description"]), T(sr["collected"]), T(sr["type"]), T(sr["container"])]
+              + [T("X" if a["name"].lower() in chosen else "") for a in analyses])
+    return xlsx_build([s])
+
+
+# ---------------------------------------------------------------------------------------
+# Production Log Summary PDF (standard library only: a small PDF writer using the built-in Helvetica fonts)
+# ---------------------------------------------------------------------------------------
+_HELV_W = {}
+_HELV_B_W = {}
+
+
+def _init_pdf_widths():
+    chars = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+    reg = [278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278,
+           556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556, 1015,
+           667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611,
+           278, 278, 278, 469, 556, 333,
+           556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556, 556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500,
+           334, 260, 334, 584]
+    bold = [278, 333, 474, 556, 556, 889, 722, 238, 333, 333, 389, 584, 278, 333, 278, 278,
+            556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 333, 333, 584, 584, 584, 611, 975,
+            722, 722, 722, 722, 667, 611, 778, 722, 278, 556, 722, 611, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611,
+            333, 278, 333, 584, 556, 333,
+            556, 611, 556, 611, 556, 333, 611, 611, 278, 278, 556, 278, 889, 611, 611, 611, 611, 389, 556, 333, 611, 556, 778, 556, 556, 500,
+            389, 280, 389, 584]
+    for i, ch in enumerate(chars):
+        _HELV_W[ch] = reg[i]
+        _HELV_B_W[ch] = bold[i]
+    for ch, w in (("°", 400), ("µ", 556), ("×", 584), ("–", 556), ("—", 1000), ("•", 350),
+                  ("±", 584), ("·", 278), ("’", 222)):
+        _HELV_W[ch] = w
+        _HELV_B_W[ch] = w if ch != "—" else 1000
+
+
+_init_pdf_widths()
+_PDF_SUBS = {"≥": ">=", "≤": "<=", "→": "->", "✓": "", "⚠": "!", "ρ": "rho", "‐": "-", "‑": "-",
+             "−": "-", " ": " ", "‘": "'", "“": '"', "”": '"', "…": "..."}
+
+
+def _pdf_safe(s):
+    s = "" if s is None else str(s)
+    for k, v in _PDF_SUBS.items():
+        s = s.replace(k, v)
+    return s.encode("cp1252", "replace").decode("cp1252")
+
+
+def pdf_text_width(s, size, bold=False):
+    tbl = _HELV_B_W if bold else _HELV_W
+    return sum(tbl.get(ch, 556) for ch in s) * size / 1000.0
+
+
+def pdf_wrap(s, width, size, bold=False):
+    s = _pdf_safe(s)
+    out = []
+    for para in s.split("\n"):
+        line = ""
+        for word in para.split(" "):
+            cand = word if not line else line + " " + word
+            if pdf_text_width(cand, size, bold) <= width or not line:
+                line = cand
+                while pdf_text_width(line, size, bold) > width and len(line) > 1:     # a single over-long word: hard split
+                    k = len(line)
+                    while k > 1 and pdf_text_width(line[:k], size, bold) > width:
+                        k -= 1
+                    out.append(line[:k])
+                    line = line[k:]
+            else:
+                out.append(line)
+                line = word
+        out.append(line)
+    return out or [""]
+
+
+_LOGO_CACHE = {}
+
+
+def _pdf_logo(path, step=4):
+    """The company logo (RGBA PNG) decoded and subsampled once, as (w, h, rgb bytes, alpha bytes); None if unavailable."""
+    if path in _LOGO_CACHE:
+        return _LOGO_CACHE[path]
+    res = None
+    try:
+        d = open(path, "rb").read()
+        pos, idat = 8, b""
+        w = h = bd = ct = il = None
+        while pos < len(d):
+            ln = struct.unpack(">I", d[pos:pos + 4])[0]
+            typ, data = d[pos + 4:pos + 8], d[pos + 8:pos + 8 + ln]
+            pos += 12 + ln
+            if typ == b"IHDR":
+                w, h, bd, ct, _c, _f, il = struct.unpack(">IIBBBBB", data)
+            elif typ == b"IDAT":
+                idat += data
+        if bd == 8 and ct == 6 and il == 0:
+            raw = zlib.decompress(idat)
+            bpp, stride = 4, w * 4
+            prev = bytearray(stride)
+            rgb, alpha, p = bytearray(), bytearray(), 0
+            ow = (w + step - 1) // step
+            oh = 0
+            for y in range(h):
+                ft = raw[p]
+                line = bytearray(raw[p + 1:p + 1 + stride])
+                p += 1 + stride
+                if ft == 1:
+                    for i in range(bpp, stride):
+                        line[i] = (line[i] + line[i - bpp]) & 255
+                elif ft == 2:
+                    line = bytearray((a + b) & 255 for a, b in zip(line, prev))
+                elif ft == 3:
+                    for i in range(stride):
+                        left = line[i - bpp] if i >= bpp else 0
+                        line[i] = (line[i] + ((left + prev[i]) >> 1)) & 255
+                elif ft == 4:
+                    for i in range(stride):
+                        a = line[i - bpp] if i >= bpp else 0
+                        b = prev[i]
+                        c = prev[i - bpp] if i >= bpp else 0
+                        pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+                        pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                        line[i] = (line[i] + pr) & 255
+                prev = line
+                if y % step == 0:
+                    oh += 1
+                    for x in range(0, w, step):
+                        o = x * 4
+                        rgb += line[o:o + 3]
+                        alpha.append(line[o + 3])
+            res = (ow, oh, bytes(rgb), bytes(alpha))
+    except Exception:
+        res = None
+    _LOGO_CACHE[path] = res
+    return res
+
+
+class PdfBuilder:
+    W, H, M = 612.0, 792.0, 40.0
+    TEAL = (0.10, 0.42, 0.39)
+    TEAL_LIGHT = (0.90, 0.95, 0.94)
+    GRAY = (0.42, 0.46, 0.46)
+    LINE = (0.80, 0.85, 0.84)
+    RED = (0.70, 0.16, 0.12)
+    AMBER = (0.70, 0.45, 0.05)
+    GREEN = (0.12, 0.50, 0.28)
+
+    def __init__(self, title, footer_left, logo=None, header_right=""):
+        self.title, self.footer_left, self.logo, self.header_right = title, footer_left, logo, header_right
+        self.pages = []
+        self.y = 0.0
+        self.add_page()
+
+    # -- low level -- #
+    @staticmethod
+    def _col(c):
+        return "%.3f %.3f %.3f" % c
+
+    def _emit(self, s):
+        self.pages[-1].append(s)
+
+    def text(self, x, y, s, size=9, bold=False, color=(0, 0, 0), align="l", width=None, italic=False):
+        s = _pdf_safe(s)
+        if align in ("r", "c") and width is not None:
+            tw = pdf_text_width(s, size, bold)
+            x = x + width - tw if align == "r" else x + (width - tw) / 2.0
+        font = "F2" if bold else ("F3" if italic else "F1")
+        esc = s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        self._emit("BT /%s %.2f Tf %s rg %.2f %.2f Td (%s) Tj ET" % (font, size, self._col(color), x, self.H - y, esc))
+
+    def rect(self, x, y, w, h, fill=None, stroke=None, lw=0.6):
+        ops = ["q"]
+        if fill:
+            ops.append("%s rg" % self._col(fill))
+        if stroke:
+            ops.append("%s RG %.2f w" % (self._col(stroke), lw))
+        ops.append("%.2f %.2f %.2f %.2f re %s Q" % (x, self.H - y - h, w, h, "B" if fill and stroke else ("f" if fill else "S")))
+        self._emit(" ".join(ops))
+
+    def hline(self, x1, x2, y, color=None, lw=0.6):
+        self._emit("q %s RG %.2f w %.2f %.2f m %.2f %.2f l S Q" % (self._col(color or self.LINE), lw, x1, self.H - y, x2, self.H - y))
+
+    # -- pages -- #
+    def add_page(self):
+        self.pages.append([])
+        n = len(self.pages)
+        self.y = self.M + (46 if n == 1 else 26)
+        return n
+
+    def space(self, h):
+        if self.y + h > self.H - self.M - 18:
+            self.add_page()
+
+    # -- components -- #
+    def heading(self, s):
+        self.space(72)          # keep a heading together with the start of what follows
+        self.y += 8
+        self.text(self.M, self.y + 9, s.upper(), 9.5, True, self.TEAL)
+        self.hline(self.M, self.W - self.M, self.y + 14, self.TEAL, 0.9)
+        self.y += 22
+
+    def note(self, s, size=7.6, color=None, italic=True):
+        for ln in pdf_wrap(s, self.W - 2 * self.M, size):
+            self.space(size + 4)
+            self.text(self.M, self.y + size, ln, size, False, color or self.GRAY, italic=italic)
+            self.y += size + 3
+
+    def kv_grid(self, pairs, cols=2, size=8.4):
+        cw = (self.W - 2 * self.M) / cols
+        for i in range(0, len(pairs), cols):
+            self.space(26)
+            for j, (k, v) in enumerate(pairs[i:i + cols]):
+                x = self.M + j * cw
+                self.text(x, self.y + 7, k.upper(), 6.4, True, self.GRAY)
+                lines = pdf_wrap(v if v not in (None, "") else "-", cw - 10, size)
+                self.text(x, self.y + 18, lines[0] if len(lines) == 1 else lines[0], size, False, (0.1, 0.1, 0.1))
+            self.y += 26
+
+    def kpis(self, cards):
+        """cards: [(label, value, sub)]"""
+        n = len(cards)
+        gap = 6.0 if n > 5 else 8.0
+        cw = (self.W - 2 * self.M - gap * (n - 1)) / n
+        pad, lsize, vsize, ssize = (6.5, 5.6, 12.5, 6.0) if n > 5 else (9, 6.2, 15, 6.6)
+        self.space(54)
+        for i, (label, value, sub) in enumerate(cards):
+            x = self.M + i * (cw + gap)
+            self.rect(x, self.y, cw, 46, fill=self.TEAL_LIGHT)
+            self.rect(x, self.y, 2.5, 46, fill=self.TEAL)
+            self.text(x + pad, self.y + 11, label.upper(), lsize, True, self.GRAY)
+            self.text(x + pad, self.y + 29, value, vsize, True, self.TEAL)
+            if sub:
+                self.text(x + pad, self.y + 40, sub, ssize, False, self.GRAY)
+        self.y += 56
+
+    def table(self, headers, rows, widths, aligns=None, size=7.8, zebra=True, bold_first=False, head_fill=None):
+        """rows: list of lists; a cell is a string or (string, {'bold':bool,'color':rgb}). Header repeats on a new page."""
+        total = sum(widths)
+        scale = (self.W - 2 * self.M) / total
+        widths = [w * scale for w in widths]
+        aligns = aligns or ["l"] * len(widths)
+        pad, lh = 3.2, size + 2.2
+
+        def head():
+            hsize = size - 0.4
+            wrapped = [pdf_wrap(h, w - 2 * pad, hsize, True) for h, w in zip(headers, widths)]
+            hh = max(len(x) for x in wrapped) * (hsize + 2.0) + 2 * pad - 1
+            self.space(hh + lh + 2 * pad + 14)
+            self.rect(self.M, self.y, sum(widths), hh, fill=head_fill or self.TEAL)
+            x = self.M
+            for lines, w, a in zip(wrapped, widths, aligns):
+                for li, ln in enumerate(lines):
+                    self.text(x + pad, self.y + pad + hsize - 1.0 + li * (hsize + 2.0), ln, hsize, True, (1, 1, 1), a, w - 2 * pad)
+                x += w
+            self.y += hh
+        head()
+        for ri, row in enumerate(rows):
+            cells = []
+            for ci, c in enumerate(row):
+                txt, st = (c if isinstance(c, tuple) else (c, {}))
+                bold = st.get("bold", bold_first and ci == 0)
+                cells.append((pdf_wrap("-" if txt in (None, "") else txt, widths[ci] - 2 * pad, size, bold), bold, st.get("color", (0.1, 0.1, 0.1))))
+            h = max(len(c[0]) for c in cells) * lh + 2 * pad - 1
+            if self.y + h > self.H - self.M - 18:
+                self.add_page()
+                head()
+            if zebra and ri % 2 == 1:
+                self.rect(self.M, self.y, sum(widths), h, fill=(0.965, 0.975, 0.972))
+            x = self.M
+            for (lines, bold, color), w, a in zip(cells, widths, aligns):
+                for li, ln in enumerate(lines):
+                    self.text(x + pad, self.y + pad + size - 1.2 + li * lh, ln, size, bold, color, a, w - 2 * pad)
+                x += w
+            self.y += h
+            self.hline(self.M, self.M + sum(widths), self.y, self.LINE, 0.4)
+        self.y += 6
+
+    def chip(self, x, y, s, color):
+        w = pdf_text_width(_pdf_safe(s), 8, True) + 14
+        self.rect(x, y, w, 15, fill=color)
+        self.text(x + 7, y + 10.8, s, 8, True, (1, 1, 1))
+        return w
+
+    # -- output -- #
+    def build(self):
+        n = len(self.pages)
+        # per-page header + footer
+        for i in range(n):
+            cur = self.pages[i]
+            saved = self.pages
+            self.pages = [cur]
+            top = self.M - 6
+            if self.logo:
+                self._emit("q 20 0 0 21 %.2f %.2f cm /Im1 Do Q" % (self.M, self.H - top - 19))
+            self.text(self.M + (26 if self.logo else 0), top + 8, "CASCADIA SEAWEED", 8.5, True, self.TEAL)
+            self.text(self.M + (26 if self.logo else 0), top + 17, "Manufacturing records", 6.8, False, self.GRAY)
+            self.text(self.M, top + 8, self.header_right, 8.5, True, (0.2, 0.2, 0.2), "r", self.W - 2 * self.M)
+            self.hline(self.M, self.W - self.M, top + 24, self.TEAL, 1.0)
+            self.hline(self.M, self.W - self.M, self.H - self.M + 2, self.LINE, 0.5)
+            self.text(self.M, self.H - self.M + 13, self.footer_left, 6.8, False, self.GRAY)
+            self.text(self.M, self.H - self.M + 13, "Page %d of %d" % (i + 1, n), 6.8, False, self.GRAY, "r", self.W - 2 * self.M)
+            self.pages = saved
+        objs = {}
+
+        def put(i, b):
+            objs[i] = b if isinstance(b, bytes) else b.encode("latin-1")
+        put(1, "<< /Type /Catalog /Pages 2 0 R >>")
+        put(3, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>")
+        put(4, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>")
+        put(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique /Encoding /WinAnsiEncoding >>")
+        nxt = 6
+        xobj = ""
+        if self.logo:
+            w, h, rgb, alpha = self.logo
+            img_id, mask_id = nxt, nxt + 1
+            nxt += 2
+            z = zlib.compress(rgb)
+            put(img_id, ("<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceRGB /BitsPerComponent 8 "
+                         "/SMask %d 0 R /Filter /FlateDecode /Length %d >>\nstream\n" % (w, h, mask_id, len(z))).encode("latin-1") + z + b"\nendstream")
+            za = zlib.compress(alpha)
+            put(mask_id, ("<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceGray /BitsPerComponent 8 "
+                          "/Filter /FlateDecode /Length %d >>\nstream\n" % (w, h, len(za))).encode("latin-1") + za + b"\nendstream")
+            xobj = " /XObject << /Im1 %d 0 R >>" % img_id
+        kids = []
+        for pg in self.pages:
+            data = zlib.compress("\n".join(pg).encode("cp1252", "replace"))      # WinAnsiEncoding == cp1252
+            cid, pid = nxt, nxt + 1
+            nxt += 2
+            put(cid, ("<< /Length %d /Filter /FlateDecode >>\nstream\n" % len(data)).encode("latin-1") + data + b"\nendstream")
+            put(pid, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %.0f %.0f] /Contents %d 0 R /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R >>%s >> >>"
+                % (self.W, self.H, cid, xobj))
+            kids.append("%d 0 R" % pid)
+        put(2, "<< /Type /Pages /Count %d /Kids [%s] >>" % (len(kids), " ".join(kids)))
+        info = nxt
+        put(info, "<< /Title (%s) /Producer (KelpWorks ERP) >>" % _pdf_safe(self.title).replace("(", "").replace(")", ""))
+        out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+        offsets = {}
+        for i in range(1, info + 1):
+            offsets[i] = len(out)
+            out += ("%d 0 obj\n" % i).encode("latin-1") + objs[i] + b"\nendobj\n"
+        xref = len(out)
+        out += ("xref\n0 %d\n0000000000 65535 f \n" % (info + 1)).encode("latin-1")
+        for i in range(1, info + 1):
+            out += ("%010d 00000 n \n" % offsets[i]).encode("latin-1")
+        out += ("trailer\n<< /Size %d /Root 1 0 R /Info %d 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (info + 1, info, xref)).encode("latin-1")
+        return bytes(out)
+
+
+def _pf(v, d=1, unit="", signed=False):
+    """number -> text ('-' when missing)"""
+    if v is None or v == "":
+        return "-"
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    s = ("{:+,.%df}" if signed else "{:,.%df}") % d
+    return s.format(x) + (" " + unit if unit else "")
+
+
+def build_run_summary_pdf(S, logo_path=None):
+    """S: the dict produced by Handler._run_summary_data. One clean document: header facts, headline numbers, a stage-by-stage
+    table of key results, a quality scorecard (metric x stage), a sample summary (process point x sample type), materials,
+    output and sign-off. Only key results -- the full production log remains the record."""
+    st = S["stages"]
+    logo = _pdf_logo(logo_path) if logo_path else None
+    pdf = PdfBuilder("Production Log Summary %s" % S["lot"], "%s  ·  Production Log Summary  ·  generated %s by %s" % (
+        S["lot"], S["generatedAt"], S["generatedBy"] or "KelpWorks"), logo, S["lot"])
+    M, W = pdf.M, pdf.W
+    # ---- title block
+    pdf.text(M, 84, "Production Log Summary", 20, True, pdf.TEAL)
+    pdf.text(M, 102, S["lot"] + "  ·  " + (S["product"] or "-"), 11, True, (0.15, 0.15, 0.15))
+    state_col = {"released": pdf.GREEN, "legacy": pdf.GREEN, "pending_review": pdf.AMBER, "pending_release": pdf.AMBER,
+                 "amending": pdf.AMBER, "rejected": pdf.RED}.get(S["releaseState"], pdf.GRAY)
+    lab = S["releaseLabel"] or "-"
+    cw = pdf_text_width(_pdf_safe(lab), 8, True) + 14
+    pdf.chip(W - M - cw, 72, lab, state_col)
+    pdf.y = 112
+    pdf.hline(M, W - M, pdf.y, pdf.LINE, 0.5)
+    pdf.y += 6
+    pdf.kv_grid([("Run date", S["runDate"]), ("Location", S["location"]),
+                 ("Operators", S["operators"]), ("Species / feedstock", S["feedstockSummary"]),
+                 ("Finalized", S["finalizedText"]), ("Log revision", S["revisionText"])], cols=3)
+    # ---- headline numbers
+    final_ph, final_tds = st["packaging"].get("qcPh"), st["packaging"].get("tdsPct")
+    conv = (S["outputL"] / S["measuredKg"]) if (S["outputL"] and S["measuredKg"]) else None
+    he0, ex0 = st["homogenization"], st["extraction"]
+    eff0 = None
+    if ex0.get("tdsPct") not in (None, "") and he0.get("tdsPct"):
+        eff0 = (ex0["tdsPct"] - he0["tdsPct"]) / he0["tdsPct"] * 100.0
+    pdf.kpis([
+        ("Feedstock", _pf(S["measuredKg"], 0, "kg"), "%d tote%s" % (S["toteCount"], "" if S["toteCount"] == 1 else "s")),
+        ("Output", _pf(S["outputL"], 0, "L"), "%s units" % _pf(S["unitsPackaged"], 0)),
+        ("Conversion", _pf(conv, 2, "L/kg"), "output / feedstock"),
+        ("Extraction eff.", _pf(eff0, 1, "%", True), "TDS gain"),
+        ("Final pH", _pf(final_ph, 2), ("target " + _pf(S["targetPh"], 1)) if S["targetPh"] is not None else ""),
+        ("Final TDS", _pf(final_tds, 2, "%"), ("target " + _pf(S["targetTds"], 2) + " %") if S["targetTds"] is not None else ""),
+        ("Dilution water", _pf(S["totalWaterL"], 0, "L"), "total added"),
+    ])
+
+    # ---- process at a glance (key results per stage)
+    pdf.heading("Process at a glance")
+    he, ex, sp, pa, di, pk = st["homogenization"], st["extraction"], st["separation"], st["pasteurization"], st["dilution"], st["packaging"]
+
+    def join(parts):
+        return "  ·  ".join(p for p in parts if p) or "Not recorded"
+
+    def when(iso):
+        return (iso or "").replace("T", " ")[:16] or "-"
+
+    def has(v):
+        return v is not None and v != ""
+    eff = None
+    if has(ex.get("tdsPct")) and has(he.get("tdsPct")) and he["tdsPct"]:
+        eff = (ex["tdsPct"] - he["tdsPct"]) / he["tdsPct"] * 100.0
+    rows = [
+        ["Feedstock", when(S["firstLoaded"]),
+         join([S["feedstockLine"], ("pH %s" % S["phRange"]) if S["phRange"] else "", S["orpLine"],
+               ("%d rejected" % S["rejectedCount"]) if S["rejectedCount"] else "all accepted"])],
+        ["Homogenization", when(he.get("startedAt")),
+         join([("slurry " + _pf(he.get("slurryL"), 0, "L")) if has(he.get("slurryL")) else "",
+               ("output " + _pf(he.get("outputL"), 0, "L")) if has(he.get("outputL")) else "",
+               ("solids loading " + _pf(he.get("solidsLoadingPct"), 1, "%")) if has(he.get("solidsLoadingPct")) else
+               (("wet solids " + _pf(he.get("pctWetSolids"), 1, "%")) if has(he.get("pctWetSolids")) else ""),
+               ("initial pH " + _pf(he.get("initialPh"), 2)) if has(he.get("initialPh")) else ""])],
+        ["Extraction", when(ex.get("startedAt")),
+         join([("amplitude " + _pf(ex.get("amplitudePct"), 0, "%")) if has(ex.get("amplitudePct")) else "",
+               ("flow " + _pf(ex.get("flowrateLpm"), 0, "L/min")) if has(ex.get("flowrateLpm")) else "",
+               ("pressure " + _pf(ex.get("pressurePsi"), 0, "psi")) if has(ex.get("pressurePsi")) else "",
+               ("power " + _pf(ex.get("startingPowerW"), 0, "W")) if has(ex.get("startingPowerW")) else ""])],
+        ["Separation", when(sp.get("startedAt")),
+         join([("wet solids " + _pf(sp.get("wetSolidsWtKg"), 1, "kg")) if has(sp.get("wetSolidsWtKg")) else "",
+               ("moisture " + _pf(sp.get("pctMoisture"), 1, "%")) if has(sp.get("pctMoisture")) else "",
+               ("screw moisture " + _pf(sp.get("pctMoistureScrew"), 1, "%")) if has(sp.get("pctMoistureScrew")) else "",
+               ("flow " + _pf(sp.get("flowrateLpm"), 0, "L/min")) if has(sp.get("flowrateLpm")) else "",
+               ("mesh " + _pf(sp.get("meshMicron"), 0, "µm")) if has(sp.get("meshMicron")) else ""])],
+        ["Pasteurization", when(pa.get("startedAt")),
+         join([("product " + _pf(pa.get("productSetpointC"), 0, "°C")) if has(pa.get("productSetpointC")) else "",
+               ("boiler " + _pf(pa.get("boilerSetpointC"), 0, "°C")) if has(pa.get("boilerSetpointC")) else "",
+               ("volume " + _pf(pa.get("totalVolumeL"), 0, "L")) if has(pa.get("totalVolumeL")) else "",
+               ("TDS " + _pf(pa.get("tdsPct"), 2, "%")) if has(pa.get("tdsPct")) else ""])],
+        ["Dilution & preservation", "",
+         join([("transferred " + _pf(di.get("productTransferredL"), 0, "L")) if has(di.get("productTransferredL")) else "",
+               ("final volume " + _pf(di.get("fillLevelTank6abL"), 0, "L")) if has(di.get("fillLevelTank6abL")) else "",
+               ("variance " + _pf(di.get("finalVariancePct"), 1, "%", True)) if has(di.get("finalVariancePct")) else "",
+               ("pH " + _pf(di.get("measuredPh"), 1)) if has(di.get("measuredPh")) else "",
+               S["reagentLine"], ("%d extra dilution pass(es)" % S["extraPasses"]) if S["extraPasses"] else ""])],
+        ["Packaging", when(pk.get("packagedAt")), join([S["packagingLine"], ("QC pH " + _pf(pk.get("qcPh"), 2)) if has(pk.get("qcPh")) else ""])],
+    ]
+    pdf.table(["Stage", "Started", "Key results"], rows, [92, 78, 362], ["l", "l", "l"], size=7.8, bold_first=True)
+
+    # ---- quality scorecard: one matrix, metric x stage
+    pdf.heading("Quality scorecard")
+    cols = ["Homog.", "Extraction", "Separation", "Pasteur.", "Dilution", "Packaging"]
+
+    def metric(label, unit, vals, target=None, dec=2):
+        v = [(_pf(x, dec) if has(x) else "") for x in vals]
+        if not any(v):
+            return None
+        final = vals[5]
+        delta = ""
+        if has(final) and target is not None:
+            d = final - target
+            delta = ("%+.*f" % (dec, d)) + (" (on target)" if abs(d) < 10 ** (-dec) / 2 else "")
+        return [(label + ((" (" + unit + ")") if unit else ""), {"bold": True}), _pf(target, dec) if target is not None else "", *v, delta]
+    qrows = [r for r in (
+        metric("pH", "", [he.get("qcPh"), ex.get("qcPh"), sp.get("liquidQcPh"), None, di.get("measuredPh"), pk.get("qcPh")], S["targetPh"], 2),
+        metric("TDS", "%", [he.get("tdsPct"), ex.get("tdsPct"), sp.get("liquidTdsPct"), pa.get("tdsPct"), None, pk.get("tdsPct")], S["targetTds"], 2),
+        metric("Brix", "%", [he.get("brixPct"), ex.get("brixPct"), sp.get("liquidBrixPct"), None, None, pk.get("brixPct")], None, 2),
+        metric("Mannitol", "%", [he.get("mannitolPct"), ex.get("mannitolPct"), sp.get("liquidMannitolPct"), None, None, pk.get("mannitolPct")], None, 2),
+        metric("Total solids, liquid", "%", [he.get("tsLiquidPct"), ex.get("tsLiquidPct"), sp.get("liquidTsLiquidPct"), None, None, pk.get("tsLiquidPct")], None, 2),
+        metric("Density, liquid", "g/mL", [he.get("rhoLiquidGMl"), ex.get("rhoLiquidGMl"), sp.get("liquidRhoLiquidGMl"), None, None, pk.get("rhoLiquidGMl")], None, 3),
+        metric("Total solids, slurry", "%", [he.get("tsSlurryPct"), ex.get("tsSlurryPct"), None, None, None, None], None, 2),
+        metric("Total solids, solids", "%", [he.get("tsSolidsPct"), ex.get("tsSolidsPct"), None, None, None, None], None, 2),
+    ) if r]
+    if qrows:
+        pdf.table(["Metric", "Target"] + cols + ["Final vs target"], qrows, [112, 38, 50, 52, 52, 46, 46, 52, 70],
+                  ["l", "r", "r", "r", "r", "r", "r", "r", "r"], size=7.6)
+    else:
+        pdf.note("No quality readings were recorded for this run.")
+    qc = S.get("qcRecorded")
+    pdf.note("Readings are listed under the stage they were taken at (blank = not measured there). %s%s" % (
+        ("%d of %d QC check fields recorded. " % (qc[0], qc[1])) if qc else "",
+        ("Feedstock pH: %s." % S["phRange"]) if S["phRange"] else ""))
+
+    # ---- samples, grouped: process point x sample type
+    pdf.heading("Samples & lab work")
+    smp = S["samples"]
+    if smp:
+        descs = ["Microbial", "Metals & Nutrients", "Retention", "Proximate Analysis", "R&D", "Other"]
+        shown = [d for d in descs if any(s["description"] == d for s in smp)] or descs[:1]
+        extra = any(s["description"] not in descs for s in smp)
+        order = []
+        for s in smp:
+            if s["stageLabel"] not in order:
+                order.append(s["stageLabel"])
+        srows = []
+        for stg in order:
+            grp = [s for s in smp if s["stageLabel"] == stg]
+            cnt = lambda d: sum(1 for s in grp if s["description"] == d)
+            srows.append([(stg, {"bold": True}), when(min((s["collectedAt"] or "") for s in grp))]
+                         + [str(cnt(d)) if cnt(d) else " " for d in shown]
+                         + ([str(sum(1 for s in grp if s["description"] not in descs))] if extra else [])
+                         + [(str(len(grp)), {"bold": True})])
+        tot = ["Total", " "] + [str(sum(1 for s in smp if s["description"] == d)) for d in shown] \
+            + ([str(sum(1 for s in smp if s["description"] not in descs))] if extra else []) + [str(len(smp))]
+        srows.append([(c, {"bold": True}) if isinstance(c, str) else c for c in tot])
+        n = len(shown) + (1 if extra else 0)
+        pdf.table(["Process point", "Collected"] + shown + (["Other types"] if extra else []) + ["Total"], srows,
+                  [112, 82] + [58] * n + [40], ["l", "l"] + ["r"] * (n + 1), size=7.6)
+        byst = {}
+        for s in smp:
+            byst[s["status"]] = byst.get(s["status"], 0) + 1
+        label = {"available": "in inventory", "in_cart": "in the lab cart", "submitted": "sent to a lab", "removed": "removed"}
+        cont = {}
+        for s in smp:
+            if s["container"]:
+                cont[s["container"]] = cont.get(s["container"], 0) + 1
+        pdf.note("%d samples: %s.  Containers: %s." % (len(smp), ", ".join("%d %s" % (v, label.get(k, k)) for k, v in byst.items()),
+                                                      ", ".join("%d x %s" % (v, k) for k, v in cont.items()) or "-"), italic=False)
+    else:
+        pdf.note("No samples were logged for this run.")
+    if S["requisitions"]:
+        pdf.table(["Requisition", "Lab", "PO #", "Samples", "Analyses requested", "Date"],
+                  [[(q["reqNumber"], {"bold": True}), q["labName"], q["poNumber"] or "", str(q["nSamples"]), q["analyses"], q["date"]]
+                   for q in S["requisitions"]], [78, 96, 52, 42, 200, 64], ["l", "l", "l", "r", "l", "l"], size=7.4)
+
+    # ---- materials + output
+    pdf.heading("Materials used")
+    if S["materials"]:
+        seen_cat = set()
+        mrows = []
+        for c, i, q, u in S["materials"]:
+            mrows.append([(c if c not in seen_cat else " ", {"bold": True}), i, _pf(q, 1 if q % 1 else 0), u])
+            seen_cat.add(c)
+        pdf.table(["Category", "Item", "Used", "Unit"], mrows,
+                  [100, 250, 80, 60], ["l", "l", "r", "l"], size=7.6)
+        pdf.note("From the inventory ledger for this run (net of refunds).")
+    else:
+        pdf.note("No inventory usage is recorded against this run.")
+    pdf.heading("Finished product")
+    if S["fgLots"]:
+        pdf.table(["Finished-goods lot", "Package", "Units", "Litres", "Location", "Status"],
+                  [[(f["lot"], {"bold": True}), f["packageSize"], _pf(f["qty"], 0), _pf(f["litres"], 0), f["location"] or "", f["statusLabel"]]
+                   for f in S["fgLots"]], [180, 100, 40, 50, 100, 62], ["l", "l", "r", "r", "l", "l"], size=7.6)
+    else:
+        pdf.note("No finished-goods lots were created.")
+
+    # ---- sign-off
+    pdf.heading("Sign-off & record")
+    pdf.kv_grid([("Finalized", S["finalizedText"]), ("Production review", S["reviewText"]), ("Quality release", S["releaseText"]),
+                 ("Required fields", S["completenessText"]), ("Revisions", S["revisionText"]), ("Documents on file", str(S["nDocuments"]))], cols=3)
+    pdf.note("This summary shows key results only. The complete production log, photos and amendment history remain the record of this run.")
+    return pdf.build()
 
 
 # What a production-log sign-off hashes (Handler._release_snapshot) is versioned. If you
@@ -1388,6 +2300,7 @@ def migrate(conn):
         ("pasteurization_tds_pct", "REAL"),
         ("dilution_fill_level_tank_6ab_l", "REAL"), ("dilution_measured_ph", "REAL"),
         ("dilution_citric_kg", "REAL"), ("dilution_ksorbate_stock_pct", "REAL"),
+        ("dilution_citric_item_id", "INTEGER"), ("dilution_ksorbate_item_id", "INTEGER"), ("dilution_nabenzoate_item_id", "INTEGER"),
         ("dilution_ksorbate_added_l", "REAL"),
         ("dilution_nabenzoate_stock_pct", "REAL"), ("dilution_nabenzoate_added_l", "REAL"),
         ("nabenzoate_kg", "REAL DEFAULT 0"),
@@ -1438,6 +2351,30 @@ def migrate(conn):
         if col not in dpcols:
             conn.execute("ALTER TABLE run_dilution_passes ADD COLUMN %s REAL" % col)
     conn.execute("DELETE FROM settings WHERE key='preproc_variance_flag_pct'")
+    # Reagent type: groups inventory items that are the same reagent (e.g. several Citric Acid grades / suppliers)
+    # so the production log can offer them all. Backfilled once, from the item names, when the column is added.
+    rtcols = {r["name"] for r in conn.execute("PRAGMA table_info(consumables)")}
+    if "reagent_type" not in rtcols:
+        conn.execute("ALTER TABLE consumables ADD COLUMN reagent_type TEXT")
+        for t in ("Citric Acid", "Potassium Sorbate", "Sodium Benzoate"):
+            conn.execute("UPDATE consumables SET reagent_type=? WHERE name LIKE ? AND COALESCE(is_container,0)=0 "
+                         "AND label_sku_code IS NULL AND COALESCE(is_cip_agent,0)=0", (t, t + "%"))
+    rccols = {r["name"] for r in conn.execute("PRAGMA table_info(run_reagent_commits)")}
+    if "consumable_id" not in rccols:
+        conn.execute("ALTER TABLE run_reagent_commits ADD COLUMN consumable_id INTEGER")
+    pbcols = {r["name"] for r in conn.execute("PRAGMA table_info(preproc_batches)")}
+    if "citric_item_id" not in pbcols:
+        conn.execute("ALTER TABLE preproc_batches ADD COLUMN citric_item_id INTEGER")
+    labcols = {r["name"] for r in conn.execute("PRAGMA table_info(labs)")}
+    if "sample_sheet" not in labcols:
+        conn.execute("ALTER TABLE labs ADD COLUMN sample_sheet INTEGER NOT NULL DEFAULT 0")
+    lacols = {r["name"] for r in conn.execute("PRAGMA table_info(lab_analyses)")}
+    if "method" not in lacols:
+        conn.execute("ALTER TABLE lab_analyses ADD COLUMN method TEXT")
+    reqcols = {r["name"] for r in conn.execute("PRAGMA table_info(lab_requisitions)")}
+    for col in ("po_number", "sheet_attachment_id"):
+        if col not in reqcols:
+            conn.execute("ALTER TABLE lab_requisitions ADD COLUMN %s %s" % (col, "INTEGER" if col.endswith("_id") else "TEXT"))
     rrcols = {r["name"] for r in conn.execute("PRAGMA table_info(run_revisions)")}
     for col, decl in (("category", "TEXT"), ("reason", "TEXT"), ("amendment_id", "INTEGER")):
         if col not in rrcols:
@@ -1923,6 +2860,10 @@ def run_public(r):
             "tsLiquidPct": r["packaging_ts_liquid_pct"], "rhoLiquidGMl": r["packaging_rho_liquid_g_ml"],
             "sampleCollectedAt": r["packaging_sample_collected_at"]},
     }
+    for key, col in (("citricItemId", "dilution_citric_item_id"), ("ksorbateItemId", "dilution_ksorbate_item_id"),
+                     ("nabenzoateItemId", "dilution_nabenzoate_item_id")):
+        if r[col] is not None:
+            d["stages"]["dilution"][key] = r[col]
     if r["status"] == "draft":
         try:
             dd = json.loads(r["draft_data"]) if r["draft_data"] else {}
@@ -2016,6 +2957,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._download_attachment(path)
         if path.startswith("/api/sop-documents/") and path.endswith("/download"):
             return self._download_sop(path)
+        if path.startswith("/api/labs/") and path.endswith("/download"):
+            return self._download_lab_template(path)
+        if path.startswith("/api/production/") and path.endswith("/summary.pdf"):
+            return self._download_run_summary(path)
         if path == "/api/reports/xlsx":
             return self._report_xlsx()
         if path == "/api/yield-usage/xlsx":
@@ -2206,6 +3151,73 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def _download_run_summary(self, path):
+        """/api/production/:id/summary.pdf -- the Production Log Summary, generated from the current log
+        (token via Authorization header or ?token= so it opens/downloads from a browser link)."""
+        conn = db()
+        try:
+            qs = parse_qs(urlparse(self.path).query)
+            header = self.headers.get("Authorization", "")
+            tok = header[7:] if header.startswith("Bearer ") else qs.get("token", [None])[0]
+            payload = read_token(tok or "")
+            if not payload:
+                return self._send_json({"error": "Invalid or missing token"}, 401)
+            user = conn.execute("SELECT * FROM users WHERE id=?", (payload["uid"],)).fetchone()
+            seg = [x for x in path.split("/") if x]
+            if len(seg) != 4 or not seg[2].isdigit():
+                return self._send_json({"error": "Unknown endpoint"}, 404)
+            try:
+                S = self._run_summary_data(conn, int(seg[2]), user)
+            except ApiError as e:
+                return self._send_json({"error": e.message}, e.status)
+            data = build_run_summary_pdf(S, os.path.join(PUBLIC_DIR, "logo.png"))
+            disp = "attachment" if qs.get("dl", [""])[0] else "inline"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", '%s; filename="%s_Production-Log-Summary.pdf"' % (disp, S["lot"]))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:  # pragma: no cover
+            self._send_json({"error": "Server error: %s" % e}, 500)
+        finally:
+            conn.close()
+
+    def _download_lab_template(self, path):
+        """/api/labs/starter-template/download or /api/labs/:id/template/download (token via header or ?token=)."""
+        conn = db()
+        try:
+            qs = parse_qs(urlparse(self.path).query)
+            header = self.headers.get("Authorization", "")
+            tok = header[7:] if header.startswith("Bearer ") else qs.get("token", [None])[0]
+            if not read_token(tok or ""):
+                return self._send_json({"error": "Invalid or missing token"}, 401)
+            seg = [x for x in path.split("/") if x]
+            if seg[2] == "starter-template":
+                data, fname = build_starter_docx(), "requisition-starter-template.docx"
+            else:
+                r = conn.execute("SELECT * FROM labs WHERE id=?", (int(seg[2]),)).fetchone()
+                if not r or not r["template_stored"]:
+                    return self._send_json({"error": "No template uploaded for this lab"}, 404)
+                full = os.path.join(LAB_DIR, r["template_stored"])
+                if not os.path.isfile(full):
+                    return self._send_json({"error": "File missing on disk"}, 404)
+                with open(full, "rb") as f:
+                    data = f.read()
+                fname = (r["template_name"] or "template.docx").replace('"', "").replace("\r", "").replace("\n", "")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", 'attachment; filename="%s"' % fname)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:  # pragma: no cover
+            self._send_json({"error": "Server error: %s" % e}, 500)
+        finally:
+            conn.close()
+
     def do_POST(self):
         return self._handle_api("POST")
 
@@ -2280,8 +3292,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.route_totes(method, seg, query, conn, user)
         if seg[:2] == ["api", "harvest"]:
             return self.route_harvest(method, seg, conn)
+        if method == "GET" and seg == ["api", "reagents"]:
+            return self.route_reagents(query, conn)
         if seg[:2] == ["api", "preproc"]:
             return self.route_preproc(method, seg, conn, user)
+        if seg[:2] == ["api", "samples"]:
+            return self.route_samples(method, seg, query, conn, user)
+        if seg[:2] == ["api", "cart"]:
+            return self.route_cart(method, seg, conn, user)
+        if seg[:2] == ["api", "requisitions"]:
+            return self.route_requisitions(method, seg, conn, user)
+        if seg[:2] == ["api", "labs"]:
+            return self.route_labs(method, seg, conn, user)
         if seg[:2] == ["api", "consumables"]:
             return self.route_consumables(method, seg, conn, user)
         if seg[:2] == ["api", "cip"]:
@@ -2290,7 +3312,14 @@ class Handler(BaseHTTPRequestHandler):
             # A finalized run's production log is locked: writes need an open
             # amendment (documents and the yield-analysis flag are exempt).
             self._amend_guard(conn, method, seg, user)
-            return self.route_production(method, seg, conn, user)
+            result = self.route_production(method, seg, conn, user)
+            if method != "GET":
+                # keep the sample catalogue in step with the run's Sample Point rows (finalize, amendments)
+                uname = user["name"] if user else None
+                if len(seg) >= 3 and seg[2].isdigit():
+                    sync_samples(conn, int(seg[2]), uname)
+                sync_pending_samples(conn, uname)
+            return result
         if seg[:2] == ["api", "integrity"]:
             return self.route_integrity(method, seg, conn, user)
         if seg[:2] == ["api", "release"]:
@@ -2885,6 +3914,533 @@ class Handler(BaseHTTPRequestHandler):
             cand = "%s#%d" % (base, n)
         return cand
 
+    # ---- Production Log Summary (PDF) data ------------------------------------------------- #
+    def _run_summary_data(self, conn, rid, user):
+        r = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
+        if not r:
+            raise ApiError(404, "Production run not found")
+        if r["status"] != "completed":
+            raise ApiError(400, "Finalize the run first -- the summary reports a completed production log")
+        run = self._run_full(conn, r)
+        rel = self._release_summary(conn, r)
+        sku = conn.execute("SELECT * FROM fg_skus WHERE code=?", (r["sku_code"],)).fetchone()
+        site_names = {x["code"]: x["name"] for x in conn.execute("SELECT code,name FROM sites")}
+        sp_names = {x["code"]: (x["common"] or x["name"]) for x in conn.execute("SELECT * FROM species")}
+        ymd = lambda iso: (iso or "")[:10]
+        inputs = run["inputs"]
+        accepted = [i for i in inputs if i.get("decision") != "rejected"]
+        weights = [i["weightKg"] for i in accepted if i.get("weightKg") is not None]
+        measured = sum(weights) if weights else (r["input_kg"] or None)
+        phs = [i["ph"] for i in accepted if i.get("ph") is not None]
+        orps = [i["orp"] for i in accepted if i.get("orp") is not None]
+        sites = sorted({site_names.get(i["site"], i["site"]) for i in accepted if i.get("site")})
+        species = sorted({sp_names.get(i["species"], i["species"]) for i in accepted if i.get("species")})
+        stages = {k: dict(v) for k, v in run["stages"].items()}
+        for k in ("homogenization", "extraction", "separation", "pasteurization", "dilution", "packaging"):
+            stages.setdefault(k, {})
+        water_parts = [stages["homogenization"].get("rinsingWaterL"), stages["homogenization"].get("dilutionWaterL"),
+                       stages["dilution"].get("waterAddedL")] + [p_.get("waterAddedL") for p_ in run["dilutionPasses"]]
+        water_vals = [w_ for w_ in water_parts if w_ not in (None, "")]
+        pk_entries = run["packagingEntries"]
+        units = sum((e.get("qty") or 0) for e in pk_entries)
+        # reagents drawn by this run (the item actually used, from the commit records)
+        parts = []
+        for rc in conn.execute("SELECT rc.reagent, rc.committed_kg, c.name FROM run_reagent_commits rc "
+                               "LEFT JOIN consumables c ON c.id=rc.consumable_id WHERE rc.run_id=?", (rid,)):
+            if rc["committed_kg"]:
+                label = {"Citric Acid": "citric acid", "Potassium Sorbate": "K-sorbate", "Sodium Benzoate": "Na benzoate"}.get(rc["reagent"], rc["reagent"])
+                item = (" (%s)" % rc["name"]) if rc["name"] and rc["name"] != rc["reagent"] else ""
+                parts.append("%s %s kg%s" % (label, ("%.1f" % rc["committed_kg"]).rstrip("0").rstrip("."), item))
+        # samples (catalogue) and lab requisitions
+        samples = [{"code": x["sample_code"], "stageLabel": sample_stage_info(x["stage"])[1], "description": x["description"] or "Microbial",
+                    "container": x["container"], "status": x["status"], "collectedAt": x["collected_at"] or x["created_at"]}
+                   for x in conn.execute("SELECT * FROM samples WHERE run_id=? ORDER BY sample_code", (rid,))]
+        reqs = []
+        for q in conn.execute("SELECT * FROM lab_requisitions WHERE run_id=? ORDER BY id", (rid,)):
+            names = []
+            n = 0
+            for rs in conn.execute("SELECT analyses FROM requisition_samples WHERE requisition_id=?", (q["id"],)):
+                n += 1
+                for a in (json.loads(rs["analyses"]) if rs["analyses"] else []):
+                    if a not in names:
+                        names.append(a)
+            reqs.append({"reqNumber": q["req_number"], "labName": q["lab_name"], "poNumber": q["po_number"], "nSamples": n,
+                         "analyses": ", ".join(names), "date": ymd(q["created_at"])})
+        # materials from the inventory ledger (ref = processing lot)
+        order = {"reagent": 0, "packaging": 1, "sample": 2, "label": 3}
+        names_c = {"reagent": "Reagents", "packaging": "Packaging", "sample": "Sample containers", "label": "FG labels"}
+        agg = {}
+        for t in conn.execute("SELECT t.delta, t.reason, c.name, c.unit, c.is_container, c.label_sku_code FROM consumable_txns t "
+                              "JOIN consumables c ON c.id=t.consumable_id WHERE t.ref=?", (r["processing_lot"],)):
+            cat = self._yu_category(t["reason"], t["is_container"], t["label_sku_code"])
+            if cat:
+                k = (cat, t["name"], t["unit"])
+                agg[k] = agg.get(k, 0) - (t["delta"] or 0)
+        materials = [(names_c[k[0]], k[1], round(v, 2), k[2]) for k, v in sorted(agg.items(), key=lambda kv: (order[kv[0][0]], kv[0][1])) if abs(v) > 1e-9]
+        prog = run["progress"]
+        tot = sum(sec["total"] for sec in prog["sections"])
+        fil = sum(sec["filled"] for sec in prog["sections"])
+        revs = run["revisions"]
+        amend = sum(1 for x in revs if x.get("kind") == "amendment")
+        fg_status = {"on_hand": "On hand", "pending_release": "Pending release", "hold": "Hold", "sold": "Sold", "disposed": "Disposed"}
+        ev = lambda who, at: ("%s  ·  %s" % (who, ymd(at))) if who else "Pending"
+        return {
+            "lot": r["processing_lot"], "runDate": r["run_date"], "product": sku["name"] if sku else r["sku_code"],
+            "location": r["location"], "operators": r["operators"],
+            "feedstockSummary": " · ".join(x for x in (", ".join(species), ", ".join(sites)) if x) or "-",
+            "releaseState": r["release_state"], "releaseLabel": RELEASE_LABELS.get(r["release_state"], "-"),
+            "finalizedText": ("%s  ·  %s" % (r["finalized_by"] or "-", ymd(r["finalized_at"]))) if r["finalized_at"] else "-",
+            "reviewText": ev(rel.get("reviewedBy"), rel.get("reviewedAt")) if r["release_state"] != "legacy" else "Before review workflow",
+            "releaseText": ev(rel.get("releasedBy"), rel.get("releasedAt")) if r["release_state"] != "legacy" else "Before release workflow",
+            "revisionText": "Rev %s%s%s" % (run.get("revision") or 1, (" (%d amendment%s)" % (amend, "" if amend == 1 else "s")) if amend else "",
+                                           "  -  OPEN AMENDMENT" if rel.get("amendment") else ""),
+            "completenessText": ("All %d required fields complete" % tot) if fil >= tot and tot else ("%d of %d (%d%%)" % (fil, tot, round(100.0 * fil / tot) if tot else 0)),
+            "nDocuments": len(run["attachments"]),
+            "stages": stages, "targetTds": r["target_tds"] if r["target_tds"] is not None else (sku["tds_target"] if sku else None),
+            "targetPh": sku["ph_target"] if sku else None,
+            "outputL": r["output_litres"], "measuredKg": measured, "toteCount": len(accepted), "rejectedCount": len(inputs) - len(accepted),
+            "totalWaterL": round(sum(water_vals), 1) if water_vals else None,
+            "unitsPackaged": units, "firstLoaded": min([i["loadedAt"] for i in accepted if i.get("loadedAt")] or [""]) or None,
+            "feedstockLine": ("%d tote%s  ·  %s kg measured" % (len(accepted), "" if len(accepted) == 1 else "s", ("%.0f" % measured) if measured else "-")),
+            "phRange": ("%.1f - %.1f (avg %.1f)" % (min(phs), max(phs), sum(phs) / len(phs))) if phs else "",
+            "orpLine": ("ORP %d to %d mV" % (min(orps), max(orps))) if orps else "",
+            "reagentLine": "  ·  ".join(parts), "extraPasses": len(run["dilutionPasses"]),
+            "packagingLine": "  ·  ".join("%s x %s" % (("%g" % e["qty"]), e["containerUnit"]) for e in pk_entries if e.get("qty")),
+            "samples": samples, "requisitions": reqs, "materials": materials,
+            "fgLots": [dict(f, statusLabel=fg_status.get(f["status"], f["status"])) for f in run["fgLots"]],
+            "qcRecorded": (run["qcSummary"]["recorded"], run["qcSummary"]["total"]) if run.get("qcSummary") else None,
+            "generatedAt": today_iso(), "generatedBy": user["name"] if user else None,
+        }
+
+    # ---- Samples: catalogue, retention inventory, cart, lab requisitions ---------------- #
+    SAMPLE_SQL = (
+        "SELECT s.*, r.processing_lot, r.run_date, r.sku_code, q.req_number, q.lab_name AS req_lab, q.attachment_id AS req_att, "
+        "c.lab_id AS cart_lab_id, c.analyses AS cart_analyses, c.added_by AS cart_by "
+        "FROM samples s JOIN production_runs r ON r.id=s.run_id "
+        "LEFT JOIN lab_requisitions q ON q.id=s.requisition_id LEFT JOIN sample_cart c ON c.sample_id=s.id")
+
+    def _sample_public(self, conn, r, months):
+        retention = (r["description"] or "") == "Retention"
+        collected = r["collected_at"] or r["created_at"]
+        discard_by = add_months(collected, months) if retention else None
+        try:
+            analyses = json.loads(r["cart_analyses"]) if r["cart_analyses"] else []
+        except ValueError:
+            analyses = []
+        return {"id": r["id"], "code": r["sample_code"], "runId": r["run_id"], "processingLot": r["processing_lot"],
+                "runDate": r["run_date"], "sku": r["sku_code"], "stage": r["stage"],
+                "stageLabel": sample_stage_info(r["stage"])[1], "type": r["type"], "description": r["description"],
+                "container": r["container"], "collectedAt": collected, "status": r["status"], "location": r["location"],
+                "notes": r["notes"], "isRetention": retention, "discardBy": discard_by,
+                "expired": bool(discard_by and discard_by < today_iso() and r["status"] in ("available", "in_cart")),
+                "removedAt": r["removed_at"], "removedBy": r["removed_by"], "removedReason": r["removed_reason"],
+                "requisitionId": r["requisition_id"], "reqNumber": r["req_number"], "reqLab": r["req_lab"],
+                "reqAttachmentId": r["req_att"],
+                "cartLabId": r["cart_lab_id"], "cartAnalyses": analyses, "inCart": r["status"] == "in_cart"}
+
+    def route_samples(self, method, seg, query, conn, user):
+        uname = user["name"] if user else None
+        months = get_setting_value(conn, "sample_retention_months", 12)
+        if seg == ["api", "samples"] and method == "GET":
+            where, params = [], []
+            if query.get("runId", [""])[0]:
+                where.append("s.run_id=?"); params.append(int(query["runId"][0]))
+            if query.get("status", [""])[0]:
+                sts = [x for x in query["status"][0].split(",") if x]
+                where.append("s.status IN (%s)" % ",".join("?" * len(sts))); params += sts
+            if query.get("retention", [""])[0]:
+                where.append("s.description='Retention'")
+            sql = self.SAMPLE_SQL + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY r.run_date DESC, r.id DESC, s.sample_code"
+            return {"samples": [self._sample_public(conn, r, months) for r in conn.execute(sql, params)],
+                    "retentionMonths": months}
+        if seg == ["api", "samples", "location"] and method == "POST":
+            d = self._body_json()
+            ids = [int(x) for x in (d.get("ids") or [])]
+            loc = (d.get("location") or "").strip() or None
+            for sid in ids:
+                row = conn.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+                if row and row["location"] != loc:
+                    conn.execute("UPDATE samples SET location=? WHERE id=?", (loc, sid))
+                    sample_log(conn, sid, "location", "%s -> %s" % (row["location"] or "none", loc or "none"), uname)
+            return {"updated": len(ids)}
+        if len(seg) >= 3 and seg[2].isdigit():
+            sid = int(seg[2])
+            row = conn.execute(self.SAMPLE_SQL + " WHERE s.id=?", (sid,)).fetchone()
+            if not row:
+                raise ApiError(404, "Sample not found")
+            if len(seg) == 3 and method == "GET":
+                d = self._sample_public(conn, row, months)
+                d["events"] = [{"type": e["event_type"], "detail": e["detail"], "by": e["user_name"], "at": e["created_at"]}
+                               for e in conn.execute("SELECT * FROM sample_events WHERE sample_id=? ORDER BY id DESC", (sid,))]
+                return d
+            if len(seg) == 3 and method == "PUT":
+                d = self._body_json()
+                if "notes" in d:
+                    conn.execute("UPDATE samples SET notes=? WHERE id=?", ((d["notes"] or "").strip() or None, sid))
+                    sample_log(conn, sid, "note", (d["notes"] or "").strip() or "(cleared)", uname)
+                if "location" in d:
+                    loc = (d["location"] or "").strip() or None
+                    if loc != row["location"]:
+                        conn.execute("UPDATE samples SET location=? WHERE id=?", (loc, sid))
+                        sample_log(conn, sid, "location", "%s -> %s" % (row["location"] or "none", loc or "none"), uname)
+                return self._sample_public(conn, conn.execute(self.SAMPLE_SQL + " WHERE s.id=?", (sid,)).fetchone(), months)
+            if len(seg) == 4 and seg[3] == "remove" and method == "POST":
+                d = self._body_json()
+                reason = (d.get("reason") or "").strip()
+                if not reason:
+                    raise ApiError(400, "A reason is required to remove a sample")
+                if row["status"] not in ("available", "in_cart"):
+                    raise ApiError(400, "This sample is already %s" % row["status"])
+                note = (d.get("note") or "").strip()
+                conn.execute("DELETE FROM sample_cart WHERE sample_id=?", (sid,))
+                conn.execute("UPDATE samples SET status='removed', removed_at=?, removed_by=?, removed_reason=? WHERE id=?",
+                             (now_iso(), uname, reason + (" - " + note if note else ""), sid))
+                sample_log(conn, sid, "removed", reason + (" - " + note if note else ""), uname)
+                return self._sample_public(conn, conn.execute(self.SAMPLE_SQL + " WHERE s.id=?", (sid,)).fetchone(), months)
+            if len(seg) == 4 and seg[3] == "restore" and method == "POST":
+                if row["status"] != "removed":
+                    raise ApiError(400, "Only a removed sample can be restored")
+                conn.execute("UPDATE samples SET status='available', removed_at=NULL, removed_by=NULL, removed_reason=NULL WHERE id=?", (sid,))
+                sample_log(conn, sid, "restored", "Removal reversed", uname)
+                return self._sample_public(conn, conn.execute(self.SAMPLE_SQL + " WHERE s.id=?", (sid,)).fetchone(), months)
+        raise ApiError(404, "Unknown samples endpoint")
+
+    # -- labs (admin-maintained) -- #
+    def _lab_public(self, conn, r):
+        return {"id": r["id"], "name": r["name"], "contact": r["contact"], "email": r["email"], "phone": r["phone"],
+                "address": r["address"], "notes": r["notes"], "active": bool(r["active"]),
+                "hasTemplate": bool(r["template_stored"]), "templateName": r["template_name"],
+                "sampleSheet": bool(r["sample_sheet"]),
+                "analyses": [{"id": a["id"], "name": a["name"], "code": a["code"], "notes": a["notes"], "method": a["method"],
+                              "active": bool(a["active"])}
+                             for a in conn.execute("SELECT * FROM lab_analyses WHERE lab_id=? ORDER BY name", (r["id"],))]}
+
+    def _labs_all(self, conn):
+        return [self._lab_public(conn, r) for r in conn.execute("SELECT * FROM labs ORDER BY name")]
+
+    def _template_report(self, conn, lab_id, raw):
+        tokens, has_row = docx_inspect(raw)
+        warnings = []
+        lab = conn.execute("SELECT sample_sheet FROM labs WHERE id=?", (lab_id,)).fetchone()
+        if not has_row and not (lab and lab["sample_sheet"]):
+            warnings.append("No table row with {{sample.*}} tokens was found, so the list of samples will not appear in the requisition "
+                            "(tick \"Also generate a sample spreadsheet\" on the lab if the lab takes the sample list as an attachment).")
+        names = {a["name"].lower() for a in conn.execute("SELECT name FROM lab_analyses WHERE lab_id=?", (lab_id,))}
+        names |= {(a["code"] or "").lower() for a in conn.execute("SELECT code FROM lab_analyses WHERE lab_id=?", (lab_id,))}
+        for t in tokens:
+            if t.startswith("sample.check:"):
+                if t[13:].strip().lower() not in names:
+                    warnings.append("Checkbox token {{%s}} does not match any analysis (name or code) for this lab." % t)
+            elif t.startswith("sample."):
+                if t[7:] not in REQ_SAMPLE_KEYS:
+                    warnings.append("Unknown sample token {{%s}}." % t)
+            elif t.startswith("analysis."):
+                if t[9:] not in REQ_ANALYSIS_KEYS:
+                    warnings.append("Unknown analysis token {{%s}}." % t)
+            elif t not in REQ_SCALAR_TOKENS:
+                warnings.append("Unknown token {{%s}} (it will be left blank)." % t)
+        return {"tokens": tokens, "hasSampleRow": has_row, "warnings": warnings}
+
+    def route_labs(self, method, seg, conn, user):
+        if seg == ["api", "labs"]:
+            if method == "GET":
+                return {"labs": self._labs_all(conn)}
+            if method == "POST":
+                self._require_admin(user)
+                d = self._body_json()
+                name = (d.get("name") or "").strip()
+                if not name:
+                    raise ApiError(400, "Lab name is required")
+                if conn.execute("SELECT 1 FROM labs WHERE name=?", (name,)).fetchone():
+                    raise ApiError(409, "A lab with that name already exists")
+                cur = conn.execute("INSERT INTO labs (name,contact,email,phone,address,notes,sample_sheet,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                                   (name, d.get("contact"), d.get("email"), d.get("phone"), d.get("address"), d.get("notes"),
+                                    1 if d.get("sampleSheet") else 0, now_iso()))
+                return self._lab_public(conn, conn.execute("SELECT * FROM labs WHERE id=?", (cur.lastrowid,)).fetchone())
+        if len(seg) >= 3 and seg[2].isdigit():
+            lid = int(seg[2])
+            lab = conn.execute("SELECT * FROM labs WHERE id=?", (lid,)).fetchone()
+            if not lab:
+                raise ApiError(404, "Lab not found")
+            if len(seg) == 3:
+                self._require_admin(user)
+                if method == "PUT":
+                    d = self._body_json()
+                    name = (d.get("name") or lab["name"]).strip()
+                    if name != lab["name"] and conn.execute("SELECT 1 FROM labs WHERE name=? AND id<>?", (name, lid)).fetchone():
+                        raise ApiError(409, "A lab with that name already exists")
+                    conn.execute("UPDATE labs SET name=?, contact=?, email=?, phone=?, address=?, notes=?, active=?, sample_sheet=? WHERE id=?",
+                                 (name, d.get("contact", lab["contact"]), d.get("email", lab["email"]), d.get("phone", lab["phone"]),
+                                  d.get("address", lab["address"]), d.get("notes", lab["notes"]),
+                                  (1 if d["active"] else 0) if "active" in d else lab["active"],
+                                  (1 if d["sampleSheet"] else 0) if "sampleSheet" in d else lab["sample_sheet"], lid))
+                    return self._lab_public(conn, conn.execute("SELECT * FROM labs WHERE id=?", (lid,)).fetchone())
+                if method == "DELETE":
+                    if conn.execute("SELECT 1 FROM lab_requisitions WHERE lab_id=?", (lid,)).fetchone() or \
+                            conn.execute("SELECT 1 FROM sample_cart WHERE lab_id=?", (lid,)).fetchone():
+                        raise ApiError(400, "This lab has requisitions or cart samples -- deactivate it instead of deleting")
+                    if lab["template_stored"]:
+                        try:
+                            os.remove(os.path.join(LAB_DIR, lab["template_stored"]))
+                        except OSError:
+                            pass
+                    conn.execute("DELETE FROM labs WHERE id=?", (lid,))
+                    return {"ok": True}
+            if len(seg) >= 4 and seg[3] == "analyses":
+                self._require_admin(user)
+                if len(seg) == 4 and method == "POST":
+                    d = self._body_json()
+                    name = (d.get("name") or "").strip()
+                    if not name:
+                        raise ApiError(400, "Analysis name is required")
+                    if conn.execute("SELECT 1 FROM lab_analyses WHERE lab_id=? AND name=?", (lid, name)).fetchone():
+                        raise ApiError(409, "That analysis already exists for this lab")
+                    conn.execute("INSERT INTO lab_analyses (lab_id,name,code,notes,method) VALUES (?,?,?,?,?)",
+                                 (lid, name, (d.get("code") or "").strip() or None, (d.get("notes") or "").strip() or None,
+                                  (d.get("method") or "").strip() or None))
+                    return self._lab_public(conn, lab)
+                if len(seg) == 5 and seg[4].isdigit():
+                    aid = int(seg[4])
+                    a = conn.execute("SELECT * FROM lab_analyses WHERE id=? AND lab_id=?", (aid, lid)).fetchone()
+                    if not a:
+                        raise ApiError(404, "Analysis not found")
+                    if method == "PUT":
+                        d = self._body_json()
+                        name = (d.get("name") or a["name"]).strip()
+                        if name != a["name"] and conn.execute("SELECT 1 FROM lab_analyses WHERE lab_id=? AND name=? AND id<>?", (lid, name, aid)).fetchone():
+                            raise ApiError(409, "That analysis already exists for this lab")
+                        conn.execute("UPDATE lab_analyses SET name=?, code=?, notes=?, method=?, active=? WHERE id=?",
+                                     (name, d.get("code", a["code"]), d.get("notes", a["notes"]), d.get("method", a["method"]),
+                                      (1 if d["active"] else 0) if "active" in d else a["active"], aid))
+                        return self._lab_public(conn, lab)
+                    if method == "DELETE":
+                        conn.execute("DELETE FROM lab_analyses WHERE id=?", (aid,))
+                        # drop it from any cart assignment that still lists it
+                        for c in conn.execute("SELECT * FROM sample_cart WHERE lab_id=?", (lid,)).fetchall():
+                            ids = [x for x in (json.loads(c["analyses"]) if c["analyses"] else []) if x != aid]
+                            conn.execute("UPDATE sample_cart SET analyses=? WHERE id=?", (json.dumps(ids), c["id"]))
+                        return self._lab_public(conn, lab)
+            if len(seg) == 4 and seg[3] == "template":
+                self._require_admin(user)
+                if method == "POST":
+                    d = self._body_json()
+                    data_b64 = d.get("dataB64") or ""
+                    if data_b64.startswith("data:") and "," in data_b64:
+                        data_b64 = data_b64.split(",", 1)[1]
+                    try:
+                        raw = base64.b64decode(data_b64)
+                    except Exception:
+                        raise ApiError(400, "Could not decode file data")
+                    report = self._template_report(conn, lid, raw)
+                    os.makedirs(LAB_DIR, exist_ok=True)
+                    stored = secrets.token_hex(8) + ".docx"
+                    with open(os.path.join(LAB_DIR, stored), "wb") as f:
+                        f.write(raw)
+                    if lab["template_stored"]:
+                        try:
+                            os.remove(os.path.join(LAB_DIR, lab["template_stored"]))
+                        except OSError:
+                            pass
+                    fname = (d.get("filename") or "template.docx").replace("\\", "/").split("/")[-1]
+                    conn.execute("UPDATE labs SET template_name=?, template_stored=? WHERE id=?", (fname, stored, lid))
+                    return {"lab": self._lab_public(conn, conn.execute("SELECT * FROM labs WHERE id=?", (lid,)).fetchone()), "report": report}
+                if method == "DELETE":
+                    if lab["template_stored"]:
+                        try:
+                            os.remove(os.path.join(LAB_DIR, lab["template_stored"]))
+                        except OSError:
+                            pass
+                    conn.execute("UPDATE labs SET template_name=NULL, template_stored=NULL WHERE id=?", (lid,))
+                    return self._lab_public(conn, conn.execute("SELECT * FROM labs WHERE id=?", (lid,)).fetchone())
+        raise ApiError(404, "Unknown labs endpoint")
+
+    # -- the cart -- #
+    def _cart_items(self, conn, months):
+        sql = self.SAMPLE_SQL + " WHERE s.status='in_cart' ORDER BY r.run_date DESC, r.id DESC, s.sample_code"
+        return [self._sample_public(conn, r, months) for r in conn.execute(sql)]
+
+    def _cart_response(self, conn):
+        return {"items": self._cart_items(conn, get_setting_value(conn, "sample_retention_months", 12)),
+                "labs": [l for l in self._labs_all(conn) if l["active"]]}
+
+    def _validate_assignment(self, conn, lab_id, analysis_ids):
+        lab = conn.execute("SELECT * FROM labs WHERE id=? AND active=1", (lab_id,)).fetchone()
+        if not lab:
+            raise ApiError(400, "Choose an active lab")
+        ok = {a["id"] for a in conn.execute("SELECT id FROM lab_analyses WHERE lab_id=? AND active=1", (lab_id,))}
+        ids = [int(x) for x in (analysis_ids or [])]
+        bad = [x for x in ids if x not in ok]
+        if bad:
+            raise ApiError(400, "Those analyses are not offered by %s" % lab["name"])
+        return sorted(set(ids))
+
+    def route_cart(self, method, seg, conn, user):
+        uname = user["name"] if user else None
+        if seg == ["api", "cart"]:
+            if method == "GET":
+                return self._cart_response(conn)
+            if method == "POST":
+                for sid in [int(x) for x in (self._body_json().get("sampleIds") or [])]:
+                    s = conn.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+                    if not s or s["status"] != "available":
+                        continue
+                    conn.execute("UPDATE samples SET status='in_cart' WHERE id=?", (sid,))
+                    conn.execute("INSERT OR IGNORE INTO sample_cart (sample_id,added_by,added_at) VALUES (?,?,?)", (sid, uname, now_iso()))
+                    sample_log(conn, sid, "cart_add", "Added to the lab cart", uname)
+                return self._cart_response(conn)
+        if seg == ["api", "cart", "assign"] and method == "POST":
+            d = self._body_json()
+            lab_id = int(d.get("labId") or 0)
+            ids = self._validate_assignment(conn, lab_id, d.get("analysisIds"))
+            lab = conn.execute("SELECT name FROM labs WHERE id=?", (lab_id,)).fetchone()
+            names = {a["id"]: a["name"] for a in conn.execute("SELECT id,name FROM lab_analyses WHERE lab_id=?", (lab_id,))}
+            for sid in [int(x) for x in (d.get("sampleIds") or [])]:
+                if conn.execute("SELECT 1 FROM sample_cart WHERE sample_id=?", (sid,)).fetchone():
+                    conn.execute("UPDATE sample_cart SET lab_id=?, analyses=? WHERE sample_id=?", (lab_id, json.dumps(ids), sid))
+                    sample_log(conn, sid, "assigned", "%s: %s" % (lab["name"], ", ".join(names[i] for i in ids) or "no analyses yet"), uname)
+            return self._cart_response(conn)
+        if seg == ["api", "cart", "requisitions"] and method == "POST":
+            return self._create_requisitions(conn, user, self._body_json())
+        if len(seg) == 3 and seg[2].isdigit():
+            sid = int(seg[2])
+            cart = conn.execute("SELECT * FROM sample_cart WHERE sample_id=?", (sid,)).fetchone()
+            if not cart:
+                raise ApiError(404, "That sample is not in the cart")
+            if method == "PUT":
+                d = self._body_json()
+                lab_id = int(d["labId"]) if d.get("labId") else None
+                ids = self._validate_assignment(conn, lab_id, d.get("analysisIds")) if lab_id else []
+                conn.execute("UPDATE sample_cart SET lab_id=?, analyses=? WHERE sample_id=?", (lab_id, json.dumps(ids), sid))
+                if lab_id:
+                    lab = conn.execute("SELECT name FROM labs WHERE id=?", (lab_id,)).fetchone()
+                    names = {a["id"]: a["name"] for a in conn.execute("SELECT id,name FROM lab_analyses WHERE lab_id=?", (lab_id,))}
+                    sample_log(conn, sid, "assigned", "%s: %s" % (lab["name"], ", ".join(names[i] for i in ids) or "no analyses yet"), uname)
+                return self._cart_response(conn)
+            if method == "DELETE":
+                conn.execute("DELETE FROM sample_cart WHERE sample_id=?", (sid,))
+                conn.execute("UPDATE samples SET status='available' WHERE id=? AND status='in_cart'", (sid,))
+                sample_log(conn, sid, "cart_remove", "Taken out of the cart", uname)
+                return self._cart_response(conn)
+        raise ApiError(404, "Unknown cart endpoint")
+
+    # -- requisitions -- #
+    def _requisition_public(self, conn, r):
+        samples = []
+        for rs in conn.execute("SELECT rs.*, s.sample_code, s.stage, s.type, s.description FROM requisition_samples rs "
+                               "JOIN samples s ON s.id=rs.sample_id WHERE rs.requisition_id=? ORDER BY s.sample_code", (r["id"],)):
+            samples.append({"sampleId": rs["sample_id"], "code": rs["sample_code"], "stageLabel": sample_stage_info(rs["stage"])[1],
+                            "type": rs["type"], "description": rs["description"],
+                            "analyses": json.loads(rs["analyses"]) if rs["analyses"] else []})
+        run = conn.execute("SELECT processing_lot FROM production_runs WHERE id=?", (r["run_id"],)).fetchone()
+        att = conn.execute("SELECT filename FROM run_attachments WHERE id=?", (r["attachment_id"],)).fetchone() if r["attachment_id"] else None
+        sheet = conn.execute("SELECT filename FROM run_attachments WHERE id=?", (r["sheet_attachment_id"],)).fetchone() if r["sheet_attachment_id"] else None
+        return {"id": r["id"], "reqNumber": r["req_number"], "runId": r["run_id"], "processingLot": run["processing_lot"] if run else None,
+                "labId": r["lab_id"], "labName": r["lab_name"], "attachmentId": r["attachment_id"],
+                "filename": att["filename"] if att else None, "poNumber": r["po_number"],
+                "sheetAttachmentId": r["sheet_attachment_id"], "sheetFilename": sheet["filename"] if sheet else None,
+                "notes": r["notes"], "createdBy": r["created_by"],
+                "createdAt": r["created_at"], "samples": samples}
+
+    def route_requisitions(self, method, seg, conn, user):
+        if seg == ["api", "requisitions"] and method == "GET":
+            return {"requisitions": [self._requisition_public(conn, r)
+                                     for r in conn.execute("SELECT * FROM lab_requisitions ORDER BY id DESC")]}
+        raise ApiError(404, "Unknown requisitions endpoint")
+
+    def _create_requisitions(self, conn, user, d):
+        """Turn every ready cart sample (lab + at least one analysis) into requisitions -- one per run + lab --
+        fill the lab's .docx template, save the document on the run, and take those samples out of the cart."""
+        uname = user["name"] if user else None
+        want = {int(x) for x in (d.get("sampleIds") or [])}
+        lab_filter = int(d["labId"]) if d.get("labId") else None
+        run_filter = int(d["runId"]) if d.get("runId") else None
+        groups = {}
+        for c in conn.execute("SELECT c.*, s.run_id FROM sample_cart c JOIN samples s ON s.id=c.sample_id ORDER BY s.sample_code"):
+            ids = json.loads(c["analyses"]) if c["analyses"] else []
+            if not c["lab_id"] or not ids:
+                continue
+            if (want and c["sample_id"] not in want) or (lab_filter and c["lab_id"] != lab_filter) or \
+                    (run_filter and c["run_id"] != run_filter):
+                continue
+            groups.setdefault((c["run_id"], c["lab_id"]), []).append((c["sample_id"], ids))
+        if not groups:
+            raise ApiError(400, "Nothing is ready: each cart sample needs a lab and at least one analysis")
+        notes = (d.get("notes") or "").strip() or None
+        po_number = (d.get("poNumber") or "").strip() or None
+        created = []
+        for (run_id, lab_id), items in groups.items():
+            run = conn.execute("SELECT * FROM production_runs WHERE id=?", (run_id,)).fetchone()
+            lab = conn.execute("SELECT * FROM labs WHERE id=?", (lab_id,)).fetchone()
+            an = {a["id"]: a for a in conn.execute("SELECT * FROM lab_analyses WHERE lab_id=?", (lab_id,))}
+            ts = now_iso()
+            cur = conn.execute("INSERT INTO lab_requisitions (req_number,run_id,lab_id,lab_name,notes,created_by,created_at,po_number) VALUES (?,?,?,?,?,?,?,?)",
+                               ("TEMP-" + secrets.token_hex(6), run_id, lab_id, lab["name"], notes, uname, ts, po_number))
+            rid = cur.lastrowid
+            req_number = "REQ-%s-%03d" % (today_iso().replace("-", ""), rid)
+            sample_rows, all_names = [], []
+            for n, (sid, ids) in enumerate(items, 1):
+                s = conn.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+                names = [an[i]["name"] for i in ids if i in an]
+                codes = [an[i]["code"] for i in ids if i in an and an[i]["code"]]
+                methods = []
+                for i in ids:
+                    if i in an and an[i]["method"] and an[i]["method"] not in methods:
+                        methods.append(an[i]["method"])
+                all_names += [x for x in names if x not in all_names]
+                sample_rows.append({"n": str(n), "id": s["sample_code"], "stage": sample_stage_info(s["stage"])[1], "type": s["type"] or "",
+                                    "description": s["description"] or "", "container": s["container"] or "",
+                                    "collected": (s["collected_at"] or "").replace("T", " ")[:16], "analyses": ", ".join(names), "methods": ", ".join(methods),
+                                    "location": s["location"] or "", "notes": s["notes"] or "",
+                                    "analysis_names": names, "analysis_codes": codes, "_sid": sid, "_names": names})
+            sku = conn.execute("SELECT name FROM fg_skus WHERE code=?", (run["sku_code"],)).fetchone()
+            product = (sku["name"] if sku else run["sku_code"]) or ""
+            for sr in sample_rows:
+                sr["report_description"] = " ".join(x for x in (product, run["processing_lot"], "-", sr["stage"], sr["type"], sr["description"]) if x)
+            # distinct analyses requested on this requisition (in lab order), with how many samples want each
+            req_analyses = []
+            for aid in sorted({i for _sid, ids in items for i in ids if i in an}, key=lambda i: i):   # the order the lab's analyses were added
+                req_analyses.append({"name": an[aid]["name"], "code": an[aid]["code"] or "", "method": an[aid]["method"] or "", "n": str(len(req_analyses) + 1),
+                                     "count": str(sum(1 for _sid, ids in items if aid in ids))})
+            d_today = datetime.date.fromisoformat(today_iso())
+            scalars = {"req_number": req_number, "date": today_iso(), "date_long": "%s %d, %d" % (d_today.strftime("%B"), d_today.day, d_today.year),
+                       "po_number": po_number or "", "po_check": "\u2612" if po_number else "\u2610", "company": COMPANY_NAME, "lab_name": lab["name"],
+                       "lab_contact": lab["contact"] or "", "lab_email": lab["email"] or "", "lab_phone": lab["phone"] or "",
+                       "lab_address": lab["address"] or "", "processing_lot": run["processing_lot"], "run_date": run["run_date"],
+                       "sku": run["sku_code"] or "", "product": product,
+                       "requested_by": uname or "", "requested_by_email": (user["email"] if user else "") or "",
+                       "sample_count": str(len(sample_rows)), "analyses": ", ".join(all_names), "notes": notes or ""}
+            template = None
+            if lab["template_stored"]:
+                try:
+                    with open(os.path.join(LAB_DIR, lab["template_stored"]), "rb") as f:
+                        template = f.read()
+                except OSError:
+                    template = None
+            doc = docx_fill(template or build_starter_docx(), scalars, sample_rows, req_analyses)
+            safe_lab = re.sub(r"[^A-Za-z0-9]+", "_", lab["name"]).strip("_")
+            att_id = self._store_attachment(conn, run_id, "%s_%s_%s.docx" % (req_number, safe_lab, run["processing_lot"]),
+                                            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                            base64.b64encode(doc).decode("ascii"), uname)
+            sheet_id = None
+            if lab["sample_sheet"]:
+                sheet_id = self._store_attachment(
+                    conn, run_id, "%s_%s_%s_samples.xlsx" % (req_number, safe_lab, run["processing_lot"]),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    base64.b64encode(build_sample_sheet_xlsx(scalars, sample_rows, req_analyses)).decode("ascii"), uname)
+            conn.execute("UPDATE lab_requisitions SET req_number=?, attachment_id=?, sheet_attachment_id=? WHERE id=?",
+                         (req_number, att_id, sheet_id, rid))
+            for sr in sample_rows:
+                sid = sr["_sid"]
+                conn.execute("INSERT INTO requisition_samples (requisition_id,sample_id,analyses) VALUES (?,?,?)",
+                             (rid, sid, json.dumps(sr["_names"])))
+                conn.execute("UPDATE samples SET status='submitted', requisition_id=? WHERE id=?", (rid, sid))
+                conn.execute("DELETE FROM sample_cart WHERE sample_id=?", (sid,))
+                sample_log(conn, sid, "requisition", "%s to %s: %s" % (req_number, lab["name"], ", ".join(sr["_names"])), uname)
+            created.append(self._requisition_public(conn, conn.execute("SELECT * FROM lab_requisitions WHERE id=?", (rid,)).fetchone()))
+        resp = self._cart_response(conn)
+        resp["requisitions"] = created
+        return resp
+
     # ---- Pre-Processing: shred + blend + pack back into feedstock inventory ---------- #
     PREPROC_FIELDS = [
         ("batch_date", "batchDate", "text"), ("location", "location", "text"), ("operators", "operators", "text"),
@@ -2893,7 +4449,7 @@ class Handler(BaseHTTPRequestHandler):
         ("target_solids_pct", "targetSolidsPct", "num"), ("recommended_water_l", "recommendedWaterL", "num"),
         ("water_added_l", "waterAddedL", "num"), ("blend_volume_l", "blendVolumeL", "num"),
         ("final_solids_pct", "finalSolidsPct", "num"), ("measured_ph", "measuredPh", "num"),
-        ("target_ph", "targetPh", "num"), ("citric_kg", "citricKg", "num"),
+        ("target_ph", "targetPh", "num"), ("citric_kg", "citricKg", "num"), ("citric_item_id", "citricItemId", "num"),
     ]
 
     def _preproc_sources(self, conn):
@@ -3106,9 +4662,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(400, "Unknown container: %s" % name)
             self._adjust_container_stock(conn, name, -qty, "Pre-processing pack-out", b["batch_lot"], uname)
         if b["citric_kg"]:
-            citric = self._consumable_by_name(conn, "Citric Acid")
+            citric = self._reagent_item(conn, "Citric Acid", b["citric_item_id"])
             if not citric:
-                raise ApiError(400, "No 'Citric Acid' reagent exists in Inventory Items")
+                raise ApiError(400, "No Citric Acid reagent exists in Inventory Items")
             self._consume(conn, citric["id"], -b["citric_kg"], "Pre-processing pH adjustment", b["batch_lot"], uname)
         used = self._consumable_by_name(conn, "Used 1,000 L IBC Tote")
         if used and inputs:
@@ -3326,7 +4882,7 @@ class Handler(BaseHTTPRequestHandler):
                     litresEach=r["litres_each"], isSampleContainer=bool(r["is_sample_container"]),
                     itemNumber=r["item_number"], labelSku=r["label_sku_code"],
                     labelPackage=r["label_package"], isCipAgent=bool(r["is_cip_agent"]),
-                    low=(r["on_hand"] <= r["reorder_level"]))
+                    reagentType=r["reagent_type"], low=(r["on_hand"] <= r["reorder_level"]))
 
     def _clean_item_number(self, conn, raw, exclude_id=None):
         """Item # is optional free text; blank clears it. Non-blank values
@@ -3384,7 +4940,10 @@ class Handler(BaseHTTPRequestHandler):
                 is_cip = 1 if (d.get("isCipAgent") and not is_container and not is_label) else 0
                 if is_cip:
                     self._require_admin(user)
-                conn.execute(
+                rtype = (d.get("reagentType") or "").strip() or None
+                if rtype and (rtype not in self.REAGENT_RUN_COLUMNS or is_container or is_label):
+                    raise ApiError(400, "Reagent type must be one of: %s" % ", ".join(self.REAGENT_RUN_COLUMNS))
+                cur = conn.execute(
                     "INSERT INTO consumables (name,unit,on_hand,reorder_level,cost_per_unit,location,"
                     "is_container,litres_each,is_sample_container,item_number,label_sku_code,label_package,"
                     "is_cip_agent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -3392,6 +4951,8 @@ class Handler(BaseHTTPRequestHandler):
                      num(d.get("reorderLevel")), numn(d.get("costPerUnit")), location,
                      1 if is_container else 0, litres_each, is_sample, item_number,
                      label_sku if is_label else None, label_package if is_label else None, is_cip))
+                if rtype:
+                    conn.execute("UPDATE consumables SET reagent_type=? WHERE id=?", (rtype, cur.lastrowid))
                 return {"ok": True}
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "history" and method == "GET":
             cid = int(seg[2])
@@ -3426,6 +4987,11 @@ class Handler(BaseHTTPRequestHandler):
             location = self._ensure_location(conn, d["location"]) if "location" in d else c["location"]
             item_number = (self._clean_item_number(conn, d["itemNumber"], cid)
                            if "itemNumber" in d else c["item_number"])
+            if "reagentType" in d:
+                rtype = (d["reagentType"] or "").strip() or None
+                if rtype and rtype not in self.REAGENT_RUN_COLUMNS:
+                    raise ApiError(400, "Reagent type must be one of: %s" % ", ".join(self.REAGENT_RUN_COLUMNS))
+                conn.execute("UPDATE consumables SET reagent_type=? WHERE id=?", (rtype, cid))
             conn.execute(
                 "UPDATE consumables SET reorder_level=?, cost_per_unit=?, location=?, litres_each=?,"
                 " is_sample_container=?, item_number=? WHERE id=?",
@@ -3642,15 +5208,13 @@ class Handler(BaseHTTPRequestHandler):
         back, edit qty/container -> the difference) and for the Packaging
         table's own net-change commit (see _commit_packaging_stock). A no-op
         if name is blank or doesn't match any consumable (e.g. a Sample Point
-        row whose container hasn't been picked yet). Raises rather than let
-        on-hand go negative -- refunds (delta > 0) never fail this check."""
+        row whose container hasn't been picked yet). Never blocks on a shortage:
+        a run proceeds and the item's on-hand simply goes negative (flagged LOW)."""
         if not name or not delta:
             return
         row = self._consumable_by_name(conn, name)
         if not row:
             return
-        if delta < 0 and row["on_hand"] + delta < 0:
-            raise ApiError(400, "Not enough %s on hand (%.1f < %.1f)" % (name, row["on_hand"], -delta))
         self._consume(conn, row["id"], delta, reason, ref, user_name)
 
     def _commit_packaging_stock(self, conn, run_id, user_name=None, sku=None):
@@ -3720,6 +5284,47 @@ class Handler(BaseHTTPRequestHandler):
         "Sodium Benzoate": "nabenzoate_kg",
     }
 
+    REAGENT_ITEM_COLUMNS = {"Citric Acid": "dilution_citric_item_id", "Potassium Sorbate": "dilution_ksorbate_item_id",
+                            "Sodium Benzoate": "dilution_nabenzoate_item_id"}
+
+    def _reagent_items(self, conn, rtype):
+        """Every inventory item of this reagent type; the one named exactly like the type (the original item) first."""
+        return conn.execute("SELECT * FROM consumables WHERE reagent_type=? ORDER BY CASE WHEN name=? THEN 0 ELSE 1 END, name",
+                            (rtype, rtype)).fetchall()
+
+    def _reagent_item(self, conn, rtype, selected_id=None):
+        """The item a run draws a reagent from: the one chosen in the production log, else the type's default (the
+        item named like the type, then the first of that type), else a legacy untyped item named like the type."""
+        if selected_id:
+            r = conn.execute("SELECT * FROM consumables WHERE id=? AND reagent_type=?", (selected_id, rtype)).fetchone()
+            if r:
+                return r
+        items = self._reagent_items(conn, rtype)
+        return items[0] if items else self._consumable_by_name(conn, rtype)
+
+    def route_reagents(self, query, conn):
+        """GET /api/reagents[?runId=] -- every reagent type with its inventory items (and, for a run, what that run has
+        already deducted and from which item) -- feeds the production log's reagent pickers and over-stock notes."""
+        types = []
+        for t in self.REAGENT_RUN_COLUMNS:
+            items = self._reagent_items(conn, t)
+            if not items:
+                legacy = self._consumable_by_name(conn, t)
+                items = [legacy] if legacy else []
+            types.append({"type": t, "defaultItemId": items[0]["id"] if items else None,
+                          "items": [{"id": i["id"], "name": i["name"], "itemNumber": i["item_number"], "unit": i["unit"],
+                                     "onHand": i["on_hand"]} for i in items]})
+        commits = {}
+        rid = query.get("runId", [""])[0]
+        if rid.isdigit():
+            for rc in conn.execute("SELECT * FROM run_reagent_commits WHERE run_id=?", (int(rid),)):
+                item_id = rc["consumable_id"]
+                if not item_id:
+                    legacy = self._consumable_by_name(conn, rc["reagent"])
+                    item_id = legacy["id"] if legacy else None
+                commits[rc["reagent"]] = {"itemId": item_id, "kg": rc["committed_kg"]}
+        return {"types": types, "commits": commits}
+
     @staticmethod
     def _dilution_reagent_kg(run):
         """kg of each reagent the run's Dilution & Preservation entries imply:
@@ -3751,25 +5356,34 @@ class Handler(BaseHTTPRequestHandler):
         extra_citric = conn.execute("SELECT COALESCE(SUM(citric_kg),0) c FROM run_dilution_passes WHERE run_id=?",
                                     (run_id,)).fetchone()["c"]
         current["Citric Acid"] = round(current["Citric Acid"] + extra_citric, 4)
-        committed = {r["reagent"]: r["committed_kg"] for r in conn.execute(
-            "SELECT reagent, committed_kg FROM run_reagent_commits WHERE run_id=?", (run_id,))}
+        committed = {r["reagent"]: (r["committed_kg"], r["consumable_id"]) for r in conn.execute(
+            "SELECT reagent, committed_kg, consumable_id FROM run_reagent_commits WHERE run_id=?", (run_id,))}
         for name, col in self.REAGENT_RUN_COLUMNS.items():
-            delta = round(current[name] - committed.get(name, 0), 4)
-            if not delta:
+            item = self._reagent_item(conn, name, run[self.REAGENT_ITEM_COLUMNS[name]])
+            if not item:
                 continue
-            row = self._consumable_by_name(conn, name)
-            if not row:
-                continue
-            if delta > 0 and row["on_hand"] < delta:
-                raise ApiError(400, "Not enough %s on hand (%.1f < %.1f)" % (name, row["on_hand"], delta))
-            self._consume(conn, row["id"], -delta, "Dilution & Preservation saved (net change)",
-                          lot, user_name)
-            conn.execute(
-                "INSERT INTO run_reagent_commits (run_id,reagent,committed_kg) VALUES (?,?,?)"
-                " ON CONFLICT(run_id, reagent) DO UPDATE SET committed_kg=excluded.committed_kg",
-                (run_id, name, current[name]))
-            conn.execute("UPDATE production_runs SET %s = ROUND(COALESCE(%s, 0) + ?, 4) WHERE id=?" % (col, col),
-                         (delta, run_id))
+            prev_kg, prev_id = committed.get(name, (0, None))
+            if prev_kg and not prev_id:                  # committed before items were selectable: the item named like the type
+                legacy = self._consumable_by_name(conn, name)
+                prev_id = legacy["id"] if legacy else item["id"]
+            total_delta = round(current[name] - (prev_kg or 0), 4)
+            base_kg = prev_kg or 0
+            if base_kg and prev_id and prev_id != item["id"]:
+                # a different item was chosen for this reagent: give back what the old item supplied, take it all from the new one
+                self._consume(conn, prev_id, base_kg, "Dilution & Preservation: %s item changed (refund)" % name, lot, user_name)
+                base_kg = 0
+            delta = round(current[name] - base_kg, 4)
+            if delta:
+                # a shortage never blocks the run -- on-hand just goes negative
+                self._consume(conn, item["id"], -delta, "Dilution & Preservation saved (net change)", lot, user_name)
+            if delta or total_delta or prev_id != item["id"] or name not in committed:
+                conn.execute(
+                    "INSERT INTO run_reagent_commits (run_id,reagent,committed_kg,consumable_id) VALUES (?,?,?,?)"
+                    " ON CONFLICT(run_id, reagent) DO UPDATE SET committed_kg=excluded.committed_kg, consumable_id=excluded.consumable_id",
+                    (run_id, name, current[name], item["id"]))
+            if total_delta:
+                conn.execute("UPDATE production_runs SET %s = ROUND(COALESCE(%s, 0) + ?, 4) WHERE id=?" % (col, col),
+                             (total_delta, run_id))
 
     # Stages that actually contain a "QC Check" container (Pasteurization and
     # Dilution & Preservation only have Process Check/Sample Point boxes).
@@ -3927,6 +5541,9 @@ class Handler(BaseHTTPRequestHandler):
             ("dilution_fill_level_tank_6ab_l", "fillLevelTank6abL", "num"),
             ("dilution_measured_ph", "measuredPh", "num"),
             ("dilution_citric_kg", "citricKg", "num"),
+            ("dilution_citric_item_id", "citricItemId", "num"),
+            ("dilution_ksorbate_item_id", "ksorbateItemId", "num"),
+            ("dilution_nabenzoate_item_id", "nabenzoateItemId", "num"),
             ("dilution_ksorbate_stock_pct", "ksorbateStockPct", "num"),
             ("dilution_ksorbate_added_l", "ksorbateAddedL", "num"),
             ("dilution_nabenzoate_stock_pct", "nabenzoateStockPct", "num"),
@@ -4274,6 +5891,7 @@ class Handler(BaseHTTPRequestHandler):
         "data_entry_error": "Data entry error (correction)",
         "late_entry": "Late data entry (completing blank fields)",
         "process_deviation": "Process deviation / investigation finding",
+        "additional_samples": "Additional samples taken (new sample entries)",
         "other": "Other",
     }
     _LOG_EXEMPT_SUBPATHS = ("attachments", "amendments", "progress")
@@ -5558,18 +7176,52 @@ class Handler(BaseHTTPRequestHandler):
             if row:
                 self._consume(conn, row["id"], -qty, "Sample point added (default)", lot, uname)
 
+    # Sample Point defaults, applied when the operator CHANGES the description / type (never overriding a value sent
+    # in the same request, and only when that container exists in Inventory Items):
+    #   description Microbial          -> qty 1, 50 mL falcon tube
+    #   description Metals & Nutrients -> qty 2, 50 mL falcon tube
+    #   type Solid                     -> 100 g sample bag
+    SAMPLE_FALCON = "50 mL falcon tube"
+    SAMPLE_BAG = "100 g sample bag"
+
+    def _sample_point_defaults(self, conn, old, d):
+        explicit = set(d)
+        d = dict(d)
+
+        def has(name):
+            return conn.execute("SELECT 1 FROM consumables WHERE name=?", (name,)).fetchone() is not None
+        desc = (d.get("description") or "").strip() if "description" in d else None
+        if desc and desc != (old["description"] if old else None):
+            rule = {"Microbial": (1, self.SAMPLE_FALCON), "Metals & Nutrients": (2, self.SAMPLE_FALCON)}.get(desc)
+            if rule:
+                if "qty" not in explicit:
+                    d["qty"] = rule[0]
+                if "container" not in explicit and has(rule[1]):
+                    d["container"] = rule[1]
+        typ = (d.get("type") or "").strip() if "type" in d else None
+        if typ == "Solid" and typ != (old["type"] if old else None):
+            if "container" not in explicit and has(self.SAMPLE_BAG):
+                d["container"] = self.SAMPLE_BAG
+        return d
+
     def add_sample_point(self, conn, run_id, user):
-        # No container is assigned yet (the operator picks one from the
-        # dropdown after adding the row), so nothing to consume here --
-        # consumption starts the moment a container is actually picked, in
-        # update_sample_point below.
+        # A new row starts as Slurry / Microbial (what the dropdowns show), so the Microbial default
+        # (qty 1, 50 mL falcon tube) applies right away and that container is consumed now.
         d = self._body_json()
         stage = (d.get("stage") or "").strip() or None
+        d.setdefault("type", "Slurry")
+        d.setdefault("description", "Microbial")
+        d = self._sample_point_defaults(conn, None, d)
         cur = conn.cursor()
         cur.execute("INSERT INTO run_sample_points (run_id,qty,stage,created_at) VALUES (?,1,?,?)",
                     (run_id, stage, now_iso()))
         spid = cur.lastrowid
         self._apply_sample_point_fields(conn, spid, d)
+        row = conn.execute("SELECT * FROM run_sample_points WHERE id=?", (spid,)).fetchone()
+        if row["container"]:
+            lot = conn.execute("SELECT processing_lot FROM production_runs WHERE id=?", (run_id,)).fetchone()["processing_lot"]
+            self._adjust_container_stock(conn, row["container"], -(row["qty"] or 1), "Sample point added", lot,
+                                         user["name"] if user else None)
         return {"samplePoints": self._sample_points_public(conn, run_id)}
 
     def update_sample_point(self, conn, run_id, spid, user):
@@ -5577,7 +7229,7 @@ class Handler(BaseHTTPRequestHandler):
                            (spid, run_id)).fetchone()
         if not row:
             raise ApiError(404, "Sample point entry not found")
-        d = self._body_json()
+        d = self._sample_point_defaults(conn, row, self._body_json())
         old_container, old_qty = row["container"], row["qty"] or 0
         new_container = ((d["container"] or "").strip() or None) if "container" in d else old_container
         if "qty" in d:
@@ -5923,15 +7575,9 @@ class Handler(BaseHTTPRequestHandler):
                 ibc_used += int(qty)
         output_litres = round(output_litres, 2)
 
-        # Check consumable availability (citric, sorbate).
+        # Consumables (citric, sorbate): a shortage never blocks the run; on-hand goes negative.
         citric_row = self._consumable_by_name(conn, "Citric Acid")
         sorbate_row = self._consumable_by_name(conn, "Potassium Sorbate")
-        if citric and citric_row and citric_row["on_hand"] < citric:
-            raise ApiError(400, "Not enough Citric Acid on hand (%.1f < %.1f)"
-                           % (citric_row["on_hand"], citric))
-        if sorbate and sorbate_row and sorbate_row["on_hand"] < sorbate:
-            raise ApiError(400, "Not enough Potassium Sorbate on hand (%.1f < %.1f)"
-                           % (sorbate_row["on_hand"], sorbate))
 
         # Processing lot number: reserved at draft creation (or, for a direct
         # one-shot run, right here) from the row's own id — see lot_number_for.
@@ -6175,8 +7821,9 @@ class Handler(BaseHTTPRequestHandler):
         # Reagents (citric acid / potassium sorbate / sodium benzoate) commit a
         # net amount on Dilution & Preservation Save/finalize, so refund
         # exactly what run_reagent_commits holds.
-        for rc in conn.execute("SELECT reagent, committed_kg FROM run_reagent_commits WHERE run_id=?", (rid,)):
-            row = self._consumable_by_name(conn, rc["reagent"])
+        for rc in conn.execute("SELECT reagent, committed_kg, consumable_id FROM run_reagent_commits WHERE run_id=?", (rid,)):
+            row = (conn.execute("SELECT * FROM consumables WHERE id=?", (rc["consumable_id"],)).fetchone()
+                   if rc["consumable_id"] else self._consumable_by_name(conn, rc["reagent"]))
             if row and rc["committed_kg"]:
                 self._consume(conn, row["id"], rc["committed_kg"], note, r["processing_lot"], uname)
         conn.execute("DELETE FROM production_runs WHERE id=?", (rid,))
