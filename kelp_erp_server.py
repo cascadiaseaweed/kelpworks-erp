@@ -107,7 +107,7 @@ SETTINGS_DEFAULTS = [
      "Maximum working volume of EACH of Tank 6A and Tank 6B (6A + 6B connected = double) -- used by the Dilution plan's available space / maximum product transfer."),
     ("sample_retention_months", 12, "Retention sample shelf life (months)",
      "How long a Retention sample is kept: its discard-by date is the collection date plus this many months (shown in the Samples tab's Retention inventory)."),
-    ("preproc_target_solids_pct", 10, "Pre-processing target blend solids (%)",
+    ("preproc_target_solids_pct", 50, "Pre-processing target blend solids (%)",
      "Default solids loading a shred-and-blend (Pre-Processing) batch is diluted to. Recommended dilution water = shredded kg x (starting % solids / target % solids - 1), taking 1 kg of water = 1 L."),
     ("preproc_target_ph", 3.7, "Pre-processing target pH",
      "Default pH a shred-and-blend batch is adjusted to with citric acid before it is packed back into inventory."),
@@ -609,7 +609,7 @@ CREATE INDEX IF NOT EXISTS idx_disposals_date ON disposals(disposed_date);
 --     either, or both.
 --   * Finished-good labels: label_sku_code + label_package both set -- one
 --     item per (SKU, package type), deducted 1 per container consumed by the
---     Packaging table's commit (Save / finalize). Unrelated to the Labels tab (internal barcode printing).
+--     Packaging table's commit (Save / finalize). Unrelated to the internal barcode labels printed from a row's Label button.
 --   * Reagents: everything else.
 -- item_number is an optional, admin-assigned stock/part number on any item.
 CREATE TABLE IF NOT EXISTS consumables (
@@ -1176,7 +1176,8 @@ CREATE TABLE IF NOT EXISTS preproc_inputs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id    INTEGER NOT NULL REFERENCES preproc_batches(id) ON DELETE CASCADE,
     tote_lot_id INTEGER NOT NULL REFERENCES tote_lots(id),
-    weight_kg   REAL                            -- this tote's weight as shredded
+    weight_kg   REAL,                           -- this tote's weight (starts as the stored average)
+    volume_l    REAL                            -- this tote's volume (L)
 );
 CREATE INDEX IF NOT EXISTS idx_preproc_inputs_batch ON preproc_inputs(batch_id);
 CREATE TABLE IF NOT EXISTS preproc_packaging (
@@ -1315,6 +1316,7 @@ def init_db():
     if conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"] == 0:
         seed(conn)
     ensure_users(conn)
+    assign_item_numbers(conn)
     conn.commit()
     rebaseline_release_hashes(conn)
     conn.commit()
@@ -2163,6 +2165,49 @@ def rebaseline_release_hashes(conn):
     conn.execute("PRAGMA user_version=%d" % RELEASE_SNAPSHOT_VERSION)
 
 
+# Item # nomenclature: <CATEGORY>-<3-digit sequence>, e.g. RGT-001. The category prefix tells people what kind of item it is at a
+# glance; the number is a plain sequence that is assigned once, never reused and never describes the item (names, sizes and
+# suppliers change -- the number doesn't). Everything an item IS lives in its name / type / unit fields instead.
+#   RGT reagent / chemical   CIP cleaning agent   PKG packaging container   SMP sample container   LBL finished-good label
+ITEM_PREFIX_ORDER = ("RGT", "CIP", "PKG", "SMP", "LBL")
+
+
+def item_category(row):
+    if row["label_sku_code"]:
+        return "LBL"
+    if row["is_container"]:
+        return "SMP" if row["is_sample_container"] else "PKG"
+    return "CIP" if row["is_cip_agent"] else "RGT"
+
+
+def next_item_number(conn, prefix):
+    n = 0
+    for r in conn.execute("SELECT item_number FROM consumables WHERE item_number LIKE ?", (prefix + "-%",)):
+        m = re.fullmatch(re.escape(prefix) + r"-(\d+)", r["item_number"] or "")
+        if m:
+            n = max(n, int(m.group(1)))
+    return "%s-%03d" % (prefix, n + 1)
+
+
+def assign_item_numbers(conn):
+    """Give every inventory item that has no Item # the next number in its category (idempotent; runs at boot and when an
+    item is created). Existing items are numbered in a tidy order: reagents by type then name, labels by SKU then package."""
+    sku_names = {r["code"]: r["name"] for r in conn.execute("SELECT code, name FROM fg_skus")}
+    rows = conn.execute("SELECT * FROM consumables WHERE item_number IS NULL OR TRIM(item_number)=''").fetchall()
+
+    def key(r):
+        cat = item_category(r)
+        if cat == "LBL":
+            sub = (sku_names.get(r["label_sku_code"], r["label_sku_code"] or "").lower(), (r["label_package"] or "").lower())
+        elif cat == "RGT":
+            sub = ((r["reagent_type"] or r["name"] or "").lower(), (r["name"] or "").lower())
+        else:
+            sub = ((r["name"] or "").lower(), "")
+        return (ITEM_PREFIX_ORDER.index(cat), sub)
+    for r in sorted(rows, key=key):
+        conn.execute("UPDATE consumables SET item_number=? WHERE id=?", (next_item_number(conn, item_category(r)), r["id"]))
+
+
 def _rename_consumable(conn, old_name, new_name):
     """One-time, idempotent rename of a consumable, propagated to every place
     that stores its name by value instead of by id (Packaging table entries,
@@ -2362,6 +2407,13 @@ def migrate(conn):
     rccols = {r["name"] for r in conn.execute("PRAGMA table_info(run_reagent_commits)")}
     if "consumable_id" not in rccols:
         conn.execute("ALTER TABLE run_reagent_commits ADD COLUMN consumable_id INTEGER")
+    picols = {r["name"] for r in conn.execute("PRAGMA table_info(preproc_inputs)")}
+    if "volume_l" not in picols:
+        conn.execute("ALTER TABLE preproc_inputs ADD COLUMN volume_l REAL")
+    # the default target blend solids moved from 10 % to 50 %: update the stored setting if nobody had changed it,
+    # and draft batches still sitting on the old default
+    conn.execute("UPDATE settings SET value=50 WHERE key='preproc_target_solids_pct' AND value=10")
+    conn.execute("UPDATE preproc_batches SET target_solids_pct=50 WHERE status='draft' AND target_solids_pct=10")
     pbcols = {r["name"] for r in conn.execute("PRAGMA table_info(preproc_batches)")}
     if "citric_item_id" not in pbcols:
         conn.execute("ALTER TABLE preproc_batches ADD COLUMN citric_item_id INTEGER")
@@ -3677,7 +3729,8 @@ class Handler(BaseHTTPRequestHandler):
         fg_litres = conn.execute(
             "SELECT COALESCE(SUM(qty*litres_each),0) l FROM fg_lots WHERE status NOT IN ('sold','disposed')").fetchone()["l"]
         consum = [dict(id=r["id"], name=r["name"], unit=r["unit"], onHand=r["on_hand"],
-                       reorderLevel=r["reorder_level"], low=(r["on_hand"] <= r["reorder_level"]))
+                       reorderLevel=r["reorder_level"], low=(r["on_hand"] <= r["reorder_level"]),
+                       category={"LBL": "label", "PKG": "packaging", "SMP": "packaging"}.get(item_category(r), "reagent"))
                   for r in conn.execute("SELECT * FROM consumables ORDER BY name")]
         runs = [run_public(r) for r in conn.execute(
             "SELECT * FROM production_runs WHERE status='completed' ORDER BY run_date DESC, id DESC LIMIT 5")]
@@ -3717,8 +3770,23 @@ class Handler(BaseHTTPRequestHandler):
                 "SELECT tote_lot_id, MAX(created_at) AS last FROM tote_stability_log GROUP BY tote_lot_id")}
             totes = []
             sources = self._preproc_sources(conn) if any(r["preproc_batch_id"] for r in rows) else {}
+            # processing date of a consumed tote (ends its stabilization period): the run's finalize date (run date
+            # for older runs), or the Pre-Processing batch's completion date
+            run_dates, pre_dates = {}, {}
+            # a fine-grind blend's stabilization clock starts at its Pre-Processing batch date, not the source totes' harvest
+            batch_dates = {x["id"]: x["batch_date"] for x in conn.execute("SELECT id, batch_date FROM preproc_batches")}                 if any(r["preproc_batch_id"] for r in rows) else {}
+            if any(r["status"] == "consumed" for r in rows):
+                run_dates = {x["id"]: (x["finalized_at"] or "")[:10] or x["run_date"] for x in conn.execute(
+                    "SELECT id, run_date, finalized_at FROM production_runs")}
+                pre_dates = {x["tote_lot_id"]: (x["completed_at"] or "")[:10] or x["batch_date"] for x in conn.execute(
+                    "SELECT pi.tote_lot_id, b.completed_at, b.batch_date FROM preproc_inputs pi "
+                    "JOIN preproc_batches b ON b.id=pi.batch_id WHERE b.status='completed'")}
             for r in rows:
                 t = tote_public(r)
+                if r["preproc_batch_id"]:
+                    t["batchDate"] = batch_dates.get(r["preproc_batch_id"])
+                if r["status"] == "consumed":
+                    t["processedDate"] = run_dates.get(r["run_id"]) or pre_dates.get(r["id"])
                 t["lastUpdated"] = last_map.get(r["id"]) or r["created_at"]
                 if r["preproc_batch_id"] and r["preproc_batch_id"] in sources:
                     t["batchLot"], t["sourceLots"] = sources[r["preproc_batch_id"]]
@@ -4465,10 +4533,10 @@ class Handler(BaseHTTPRequestHandler):
     def _preproc_inputs_public(self, conn, bid):
         return [{"toteLotId": r["id"], "lot": r["lot_number"], "site": r["site_code"],
                  "species": r["species_code"], "harvestDate": r["checkin_date"],
-                 "avgWeightKg": r["avg_weight_kg"], "weightKg": r["weight_kg"], "ph": r["ph"],
+                 "avgWeightKg": r["avg_weight_kg"], "weightKg": r["weight_kg"], "volumeL": r["in_volume_l"], "ph": r["ph"],
                  "location": r["location"], "status": r["status"]}
                 for r in conn.execute(
-                    "SELECT pi.weight_kg, t.* FROM preproc_inputs pi JOIN tote_lots t ON t.id=pi.tote_lot_id "
+                    "SELECT pi.weight_kg, pi.volume_l AS in_volume_l, t.* FROM preproc_inputs pi JOIN tote_lots t ON t.id=pi.tote_lot_id "
                     "WHERE pi.batch_id=? ORDER BY t.lot_number", (bid,))]
 
     def _preproc_public(self, conn, r, full=True):
@@ -4480,6 +4548,8 @@ class Handler(BaseHTTPRequestHandler):
         n_in = conn.execute("SELECT COUNT(*) n, COALESCE(SUM(weight_kg),0) kg FROM preproc_inputs WHERE batch_id=?",
                             (r["id"],)).fetchone()
         d["inputCount"], d["inputKg"] = n_in["n"], round(n_in["kg"], 2)
+        if r["status"] == "draft":
+            d["progress"] = self._preproc_progress(conn, r)
         outs = [tote_public(t) for t in conn.execute(
             "SELECT * FROM tote_lots WHERE preproc_batch_id=? ORDER BY tote_number", (r["id"],))]
         d["outputCount"] = len(outs)
@@ -4501,27 +4571,39 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(409, "This batch is completed and can no longer be changed")
         return r
 
-    def _preproc_problems(self, conn, b):
-        """Everything a batch needs before it can be completed (all fields are required except notes)."""
-        miss = []
-        # (the Blend / solids-loading fields are optional)
-        for col, label in [("batch_date", "Batch date"), ("location", "Output location"),
-                           ("operators", "Operators"), ("measured_ph", "Measured pH"),
-                           ("target_ph", "Target pH"), ("citric_kg", "Citric acid added (kg)")]:
-            if b[col] is None or b[col] == "":
-                miss.append(label)
+    def _preproc_progress(self, conn, b):
+        """Per-section progress for a draft batch (same shape as a production run's `progress`, so the card's chips are
+        the same component). Blend is optional; every other section's fields are required to complete the batch."""
         inputs = conn.execute("SELECT * FROM preproc_inputs WHERE batch_id=?", (b["id"],)).fetchall()
-        if not inputs:
-            miss.append("At least one feedstock tote")
-        elif any(not (i["weight_kg"] and i["weight_kg"] > 0) for i in inputs):
-            miss.append("Weight for every feedstock tote")
-        pk = conn.execute("SELECT * FROM preproc_packaging WHERE batch_id=?", (b["id"],)).fetchall()
-        if not pk:
-            miss.append("At least one pack-out row")
-        elif any(not p["container"] or not (p["qty"] and p["qty"] > 0) or not (p["litres_each"] and p["litres_each"] > 0)
-                 for p in pk):
-            miss.append("Container, quantity and fill volume on every pack-out row")
-        return miss
+        packs = conn.execute("SELECT * FROM preproc_packaging WHERE batch_id=?", (b["id"],)).fetchall()
+        has = lambda v: v is not None and v != ""
+
+        def sec(key, label, items, required=True):
+            missing = [lab for lab, ok in items if not ok]
+            total = len(items)
+            return {"key": key, "label": label, "total": total, "filled": total - len(missing), "missing": missing,
+                    "done": not missing, "started": len(missing) < total, "required": required, "optional": not required}
+        sections = [
+            sec("initiation", "Initiation", [("Batch date", has(b["batch_date"])), ("Operators", has(b["operators"]))]),
+            sec("pick", "Feedstock pick list", [
+                ("At least one feedstock tote", bool(inputs)),
+                ("Weight for every feedstock tote", bool(inputs) and all(i["weight_kg"] and i["weight_kg"] > 0 for i in inputs))]),
+            sec("blend", "Blend", [("Starting % solids", has(b["start_solids_pct"])), ("Target % solids", has(b["target_solids_pct"])),
+                                   ("Dilution water added (L)", has(b["water_added_l"])), ("Blend volume (L)", has(b["blend_volume_l"]))], False),
+            sec("ph", "pH balancing", [("Measured pH", has(b["measured_ph"])), ("Target pH", has(b["target_ph"])),
+                                       ("Citric acid added (kg)", has(b["citric_kg"]))]),
+            sec("pack", "Pack-out", [
+                ("Output location", has(b["location"])), ("At least one pack-out row", bool(packs)),
+                ("Container, quantity and fill volume on every pack-out row",
+                 bool(packs) and all(p_["container"] and p_["qty"] and p_["qty"] > 0 and p_["litres_each"] and p_["litres_each"] > 0 for p_ in packs))]),
+        ]
+        req = [x for x in sections if x["required"]]
+        return {"sections": sections, "requiredTotal": sum(x["total"] for x in req), "requiredFilled": sum(x["filled"] for x in req),
+                "complete": all(x["done"] for x in req)}
+
+    def _preproc_problems(self, conn, b):
+        """Everything a batch still needs before it can be completed (the Blend section is optional)."""
+        return [m for x in self._preproc_progress(conn, b)["sections"] if x["required"] for m in x["missing"]]
 
     def route_preproc(self, method, seg, conn, user):
         uname = user["name"] if user else None
@@ -4535,7 +4617,7 @@ class Handler(BaseHTTPRequestHandler):
                 cur.execute("INSERT INTO preproc_batches (batch_lot,batch_date,target_solids_pct,target_ph,created_by,"
                             "created_at) VALUES (?,?,?,?,?,?)",
                             ("TEMP-" + secrets.token_hex(6), today_iso(),
-                             get_setting_value(conn, "preproc_target_solids_pct", 10),
+                             get_setting_value(conn, "preproc_target_solids_pct", 50),
                              get_setting_value(conn, "preproc_target_ph", 3.7), uname, ts))
                 bid = cur.lastrowid
                 cur.execute("UPDATE preproc_batches SET batch_lot=? WHERE id=?",
@@ -4582,8 +4664,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._log_stability(conn, tid, user, "Status", "in_stock", "wip",
                                     "Pulled for pre-processing batch %s" % b["batch_lot"])
                 conn.execute("UPDATE tote_lots SET status='wip' WHERE id=?", (tid,))
-                conn.execute("INSERT INTO preproc_inputs (batch_id,tote_lot_id,weight_kg) VALUES (?,?,?)",
-                             (bid, tid, t["avg_weight_kg"]))
+                conn.execute("INSERT INTO preproc_inputs (batch_id,tote_lot_id,weight_kg,volume_l) VALUES (?,?,?,?)",
+                             (bid, tid, t["avg_weight_kg"], t["volume_l"]))
             return self._preproc_public(conn, self._preproc_get(conn, bid))
         if len(seg) == 5 and seg[3] == "inputs" and seg[4].isdigit():
             tid = int(seg[4])
@@ -4591,8 +4673,11 @@ class Handler(BaseHTTPRequestHandler):
             if not row:
                 raise ApiError(404, "That tote is not part of this batch")
             if method == "PUT":
-                conn.execute("UPDATE preproc_inputs SET weight_kg=? WHERE id=?",
-                             (numn(self._body_json().get("weightKg")), row["id"]))
+                d = self._body_json()
+                if "weightKg" in d:
+                    conn.execute("UPDATE preproc_inputs SET weight_kg=? WHERE id=?", (numn(d.get("weightKg")), row["id"]))
+                if "volumeL" in d:
+                    conn.execute("UPDATE preproc_inputs SET volume_l=? WHERE id=?", (numn(d.get("volumeL")), row["id"]))
             elif method == "DELETE":
                 self._preproc_release_tote(conn, tid, b, user)
                 conn.execute("DELETE FROM preproc_inputs WHERE id=?", (row["id"],))
@@ -4885,8 +4970,8 @@ class Handler(BaseHTTPRequestHandler):
                     reagentType=r["reagent_type"], low=(r["on_hand"] <= r["reorder_level"]))
 
     def _clean_item_number(self, conn, raw, exclude_id=None):
-        """Item # is optional free text; blank clears it. Non-blank values
-        must be unique across all inventory items (409 otherwise)."""
+        """Item # is normally auto-assigned (CAT-NNN, see assign_item_numbers); an admin may type their own. A typed value
+        must be unique across all inventory items (409 otherwise); blank = none given."""
         item_number = (raw or "").strip() or None
         if item_number:
             dup = conn.execute("SELECT id FROM consumables WHERE item_number=? AND id IS NOT ?",
@@ -4953,7 +5038,9 @@ class Handler(BaseHTTPRequestHandler):
                      label_sku if is_label else None, label_package if is_label else None, is_cip))
                 if rtype:
                     conn.execute("UPDATE consumables SET reagent_type=? WHERE id=?", (rtype, cur.lastrowid))
-                return {"ok": True}
+                if not item_number:
+                    assign_item_numbers(conn)
+                return {"ok": True, "itemNumber": conn.execute("SELECT item_number FROM consumables WHERE id=?", (cur.lastrowid,)).fetchone()["item_number"]}
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "history" and method == "GET":
             cid = int(seg[2])
             if not conn.execute("SELECT 1 FROM consumables WHERE id=?", (cid,)).fetchone():
@@ -4985,7 +5072,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(404, "Item not found")
             d = self._body_json()
             location = self._ensure_location(conn, d["location"]) if "location" in d else c["location"]
-            item_number = (self._clean_item_number(conn, d["itemNumber"], cid)
+            item_number = ((self._clean_item_number(conn, d["itemNumber"], cid) or c["item_number"])
                            if "itemNumber" in d else c["item_number"])
             if "reagentType" in d:
                 rtype = (d["reagentType"] or "").strip() or None

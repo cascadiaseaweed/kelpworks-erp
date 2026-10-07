@@ -65,8 +65,11 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
   groups told apart by flags: Packaging = `is_container`, finished-good labels =
   `label_sku_code`+`label_package` set (one item per SKU + package type, deducted 1
   per container consumed by the Packaging commit (`_commit_label_stock`, net-change via
-  `run_label_commits`) -- not the Labels tab, which prints internal
-  barcodes), Reagents = the rest. `item_number` is an optional admin-set Item #.
+  `run_label_commits`) -- not the per-row Label buttons, which print internal
+  barcodes), Reagents = the rest. **Item #** = `<CAT>-<3-digit sequence>` (RGT reagent, CIP cleaning agent, PKG packaging
+  container, SMP sample container, LBL finished-good label; `item_category` / `next_item_number` / `assign_item_numbers`): auto-assigned
+  once (boot backfills existing items in a tidy order; new items get the next number), never reused, never encodes attributes. An admin
+  may type another unique value, but an item is never left without one. The FG-label table is grouped under a heading per SKU.
 - **Stock never blocks a run.** Every consumable deduction in a production run (reagents, sample containers, packaging, FG labels,
   and Pre-Processing pack-out via `_adjust_container_stock`) just lets `on_hand` go negative (the item shows LOW); nothing raises "Not
   enough ... on hand". **Sample Point defaults** (`_sample_point_defaults`, applied when the description/type is changed, never over a
@@ -151,7 +154,7 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
   citric acid summed into the run's citric usage by `_commit_reagent_usage`). Pass items are
   required-field items in the Dilution & Preservation section, and `dilutionPasses` is part of the signed-log snapshot.
 - **Pre-Processing (shred + blend)** (`preproc_batches` / `preproc_inputs` / `preproc_packaging`, `route_preproc`,
-  `/api/preproc`, the "Pre-Processing" tab, `pagePreproc` / `openPreprocBatch`) turns coarse-grind feedstock into
+  `/api/preproc`, the "Pre-Processing" tab: batches are cards like production runs -- `pagePreproc` / `preprocDraftCard` (section chips from `_preproc_progress`, the same `stageProgress` component) / `preprocDoneCard` -- and `openPreprocBatch` opens the editor / batch record in a wide window) turns coarse-grind feedstock into
   fine-grind feedstock (harvest check-in / CSV import set `grind`, default Coarse; check-in no longer has a storage-unit source or deducts empty-IBC stock). A draft batch pulls coarse totes (`tote_lots.grind='Coarse'`, in stock, not on QAQC Hold) from a
   pick list (status -> `wip`, same lock as a run), each characterized with the shared `buildFeedstockCard`
   (`/api/totes/:id/characterize` + `/photo`, so it lands in the tote's own stability log; the shredded mass is simply the sum
@@ -234,8 +237,11 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
   (**backdrop click does not close** — only Cancel/submit). `api(method, path,
   body)` wraps fetch with the bearer token.
 - Pages are functions (`pageDashboard`, `pageProduction`, …) selected by
-  `State.tab` in `render()`. Add a tab: button in `index.html`, entry in the
-  `render()` map, and a `pageX(v)` function.
+  `State.tab` in `render()`. Add a tab: a button in the right colour group of the
+  `<nav id="tabs">` in `index.html` (groups: Overview, Inventory, Process, Quality,
+  Fulfilment, Insights, Admin -- each `.tab-group.g-*` has its own colour in
+  `styles.css`), an entry in the `render()` map, and a `pageX(v)` function.
+  There is no Labels tab: labels print from each row's Label button (`printLabels`).
 
 ## Domain model (key tables)
 

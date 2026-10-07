@@ -33,22 +33,35 @@
       <img class="logo" src="logo-white.png" alt="Cascadia Seaweed">
       <div class="title">KelpWorks<small>CASCADIA SEAWEED ERP</small></div>
       <nav class="tabs" id="tabs">
-        <button data-tab="dashboard" class="active">Dashboard</button>
-        <button data-tab="stabilized">Feedstock Inventory</button>
-        <button data-tab="preproc">Pre-Processing</button>
-        <button data-tab="production">Production</button>
-        <button data-tab="cip">CIP Log</button>
-        <button data-tab="qc">Quality Control</button>
-        <button data-tab="samples">Samples</button>
-        <button data-tab="release">Product Release</button>
-        <button data-tab="fg">Finished Goods</button>
-        <button data-tab="shipping">Shipping</button>
-        <button data-tab="consumables">Inventory Items</button>
-        <button data-tab="reports">Reports</button>
-        <button data-tab="yieldusage">Yield &amp; Usage</button>
-        <button data-tab="calculations">Calculations</button>
-        <button data-tab="labels">Labels</button>
-        <button data-tab="admin" class="hidden">Admin</button>
+        <div class="tab-group g-overview"><span class="tab-group-label">Overview</span><div class="tab-row">
+          <button data-tab="dashboard" class="active">Dashboard</button>
+        </div></div>
+        <div class="tab-group g-inventory"><span class="tab-group-label">Inventory</span><div class="tab-row">
+          <button data-tab="stabilized">Feedstock Inventory</button>
+          <button data-tab="consumables">Inventory Items</button>
+        </div></div>
+        <div class="tab-group g-process"><span class="tab-group-label">Process</span><div class="tab-row">
+          <button data-tab="preproc">Pre-Processing</button>
+          <button data-tab="production">Production</button>
+          <button data-tab="cip">CIP Log</button>
+        </div></div>
+        <div class="tab-group g-quality"><span class="tab-group-label">Quality</span><div class="tab-row">
+          <button data-tab="qc">Quality Control</button>
+          <button data-tab="samples">Samples</button>
+          <button data-tab="release">Product Release</button>
+        </div></div>
+        <div class="tab-group g-fulfil"><span class="tab-group-label">Fulfilment</span><div class="tab-row">
+          <button data-tab="fg">Finished Goods</button>
+          <button data-tab="shipping">Shipping</button>
+        </div></div>
+        <div class="tab-group g-insights"><span class="tab-group-label">Insights</span><div class="tab-row">
+          <button data-tab="reports">Reports</button>
+          <button data-tab="yieldusage">Yield &amp; Usage</button>
+          <button data-tab="calculations">Calculations</button>
+        </div></div>
+        <div class="tab-group g-admin hidden"><span class="tab-group-label">Admin</span><div class="tab-row">
+          <button data-tab="admin">Admin</button>
+        </div></div>
       </nav>
       <div class="who">
         <span id="whoName"></span>
