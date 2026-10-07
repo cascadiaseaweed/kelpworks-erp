@@ -189,6 +189,26 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
   decoded from `public/logo.png` once). Key results only, grouped: headline KPIs, a stage-by-stage "Process at a glance", a Quality scorecard
   (metric x stage matrix with target / final-vs-target instead of per-stage QC dumps), a Samples & lab work matrix (process point x sample
   type from the `samples` catalogue + requisitions), materials from the ledger, FG lots and sign-off. Not stored as a run attachment (never stale).
+- **Certificate of Analysis (lab results + specs)** (`coa_specs`, `lab_results`; `ensure_coa_specs` seeds the specs INSERT OR IGNORE so admin
+  edits stick; `coa_evaluate`, `build_coa_pdf`, `GET /api/production/<id>/coa.pdf`, `route_lab_results` = `/api/production/<id>/lab-results`,
+  `route_coa_specs` = `/api/coa-specs`; UI: the run card's "Lab results" button / `openLabResults` + `addLabReport`, the CoA card in the Documents
+  window, a lab block on the Product Release run, Admin > Certificate of Analysis specifications). Results are typed in from the uploaded lab reports
+  (one row per analyte per report: value as reported -- number, `<` number, Negative/Positive -- unit, method, lab, report number/date, optional
+  linked document) and are NEVER edited: a correction voids the row (reason required) and a new one is entered; add/void are logged to the
+  hash-chained `release_events`. Latest non-voided result per spec wins; tests with no spec are "additional analyses". Spec basis: `run` (TDS/pH from the
+  Packaging QC check), `value` (compared as reported; unit forced to the spec's -- microbial is per g), `absent` (Salmonella), `metal` (results
+  stay in the unit the lab reported, ppm or %; converted to ppm and compared with `max_val` in ppm; `max_val` is NULL = listed, not judged,
+  until the Admin "Heavy-metal limit calculator" (`POST /api/coa-specs/metal-limits`) sets it from the regulatory loading limit kept in
+  `limit_kg_ha`: ppm = kg/ha x 1e6 / `coa_application_rate_kg_ha`; a `<` result whose detection limit exceeds the limit is REVIEW, not pass).
+  `required` specs (the five microbial tests) BLOCK the Quality release (`_release_action`) until a result is on file; a FAILED result needs a
+  release comment (400 without one; the comment prints on the CoA and the out-of-spec tests go in the `released` event detail).
+  Microbial results are per gram of LIQUID product as reported (no TDS/solids conversion).
+  **Report scan** (`POST /api/production/<id>/lab-results/scan {attachmentId}`): "Add lab report" takes an uploaded (or already attached) PDF and
+  pre-fills the form -- `pdf_text_lines` is a stdlib PDF text reader (Flate streams, simple + Type0 fonts via ToUnicode/Widths, CTM/Tm positions;
+  no OCR, so a scanned image just returns "enter by hand"), `parse_lab_report` picks the header (lab, report number, date, sample ID) and the
+  rows of the "Analysis ... Result" table; names are matched to specs through `LAB_ANALYTE_ALIASES`, unknown rows become additional analyses.
+  Nothing is saved by the scan; the user reviews the form. Tested on FoodAssure and SGS reports -- add aliases there for new analytes/labs. Lab results are exempt from the amend lock (`lab-results` in `_LOG_EXEMPT_SUBPATHS`) and are not part of the release hash. The CoA
+  PDF is generated on demand (preliminary until the run is released) from the CURRENT specs.
 - **Packaging edits after finalize** re-derive everything computed from the packaging rows in the
   same transaction (`_sync_completed_packaging`): container + FG-label stock (net-change commit),
   the run's FG lots (`_adjust_fg_lot`, refuses to go below units already shipped/moved), and
@@ -248,7 +268,7 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
 `species`, `sites`, `tote_lots` (stabilized totes; status in_stock/wip/hold/consumed/
 disposed; `grind` Coarse|Fine), `preproc_batches` / `preproc_inputs` / `preproc_packaging`, `samples` / `sample_events` / `sample_cart` / `labs` / `lab_analyses` / `lab_requisitions`, `production_runs` + `run_inputs`, `fg_lots`, `consumables` +
 `consumable_txns`, `run_reagent_commits`, `release_events`, `cip_events` / `cip_event_chemicals`,
-`customers` / `shipments` /
+`coa_specs` / `lab_results`, `customers` / `shipments` /
 `shipment_lines`, `disposals`, `run_attachments`, `run_edits`, `location_moves`,
 `tote_ph_log`, `users`.
 

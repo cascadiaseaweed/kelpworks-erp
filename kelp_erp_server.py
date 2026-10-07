@@ -125,6 +125,8 @@ SETTINGS_DEFAULTS = [
      "Pre-filled value for a new run's Sodium benzoate stock concentration (w/v) field."),
     ("yield_report_min_runs", 5, "Yield & Usage minimum runs per group",
      "A Yield & Usage group with fewer completed (non-excluded) runs than this is tagged \"Low sample\"."),
+    ("coa_application_rate_kg_ha", 0, "Certificate of Analysis: product application rate (kg/ha)",
+     "Used by the Admin metal-limit calculator to turn each heavy-metal loading limit (kg metal per ha) into a ppm / % limit: ppm = limit x 1,000,000 / this application rate (kg of product per ha). Changing it here does not change the limits -- apply them from the calculator. 0 = not set."),
     ("separation_default_flowrate_lpm", 40, "Separation default Flow rate (L/min)",
      "Pre-filled value for a new run's Separation Flow rate (L/min) field."),
     ("separation_default_mesh_micron", 74, "Separation default Mesh size (micron)",
@@ -1143,6 +1145,40 @@ CREATE TABLE IF NOT EXISTS requisition_samples (
     analyses       TEXT                             -- JSON list of analysis names as requested
 );
 
+-- Certificate of Analysis: product specifications (admin-editable, seeded by ensure_coa_specs) and the lab results entered per run.
+-- A result is never edited or deleted: a correction voids it (with a reason) and a new one is entered.
+CREATE TABLE IF NOT EXISTS coa_specs (
+    code          TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    grp           TEXT NOT NULL,                    -- physical | metals | microbial
+    unit          TEXT,                             -- unit the limit is stated in (kg/ha for metals, cfu/g ...)
+    basis         TEXT NOT NULL,                    -- run | value | metal | absent
+    min_val       REAL, max_val REAL,
+    limit_kg_ha   REAL,                             -- metals: the regulatory loading limit (kg metal / ha) the ppm limit is derived from
+    max_exclusive INTEGER NOT NULL DEFAULT 0,       -- 1 = the limit is "< max"
+    required      INTEGER NOT NULL DEFAULT 0,       -- 1 = a result must be on file before Quality can release the lot
+    sort          INTEGER NOT NULL DEFAULT 0,
+    active        INTEGER NOT NULL DEFAULT 1,
+    method        TEXT
+);
+CREATE TABLE IF NOT EXISTS lab_results (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id        INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+    spec_code     TEXT,                             -- NULL = an additional analysis with no specification
+    analyte       TEXT NOT NULL,
+    lab_id        INTEGER, lab_name TEXT,
+    report_number TEXT, report_date TEXT, sample_ref TEXT,
+    method        TEXT,
+    qualifier     TEXT,                             -- '' | '<' | '>'
+    value_num     REAL,                             -- NULL for a qualitative result (Negative / Positive)
+    value_text    TEXT,
+    unit          TEXT,
+    attachment_id INTEGER,                          -- the uploaded lab report this came from
+    entered_by    TEXT, entered_at TEXT NOT NULL,
+    voided_at     TEXT, voided_by TEXT, void_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_lab_results_run ON lab_results(run_id);
+
 -- Pre-Processing: coarse-ground feedstock totes are pulled (pick list), shredded to a fine grind,
 -- blended in a tank (solids loading set with dilution water, pH set with citric acid) and packed
 -- into new IBCs that go back into Feedstock Inventory (tote_lots.grind = 'Fine'). The output lots
@@ -1317,6 +1353,7 @@ def init_db():
         seed(conn)
     ensure_users(conn)
     assign_item_numbers(conn)
+    ensure_coa_specs(conn)
     conn.commit()
     rebaseline_release_hashes(conn)
     conn.commit()
@@ -1326,6 +1363,717 @@ def init_db():
     conn.execute("UPDATE samples SET type='Slurry' WHERE type IS NULL OR type=''")
     conn.commit()
     conn.close()
+
+
+# ---------------------------------------------------------------------------------------
+# Reading text out of a lab-report PDF (stdlib only): enough of the PDF format to pull the positioned text of an ordinary
+# text-based report (Flate streams, simple TrueType/Type1 fonts or Type0 fonts with a ToUnicode map). A scanned image has no text.
+# ---------------------------------------------------------------------------------------
+_PDF_OBJ_RE = re.compile(rb"(\d+)\s+(\d+)\s+obj\b(.*?)\bendobj", re.S)
+_PDF_REF_RE = re.compile(rb"(\d+)\s+\d+\s+R\b")
+
+
+def _pdf_objects(data):
+    objs = {}
+    for m in _PDF_OBJ_RE.finditer(data):
+        body = m.group(3)
+        stream = None
+        k = body.find(b"stream")
+        head = body
+        if k >= 0 and b"endstream" in body[k:]:
+            head = body[:k]
+            raw = body[k + 6:body.rfind(b"endstream")]
+            raw = raw[2:] if raw.startswith(b"\r\n") else raw[1:] if raw[:1] in (b"\n", b"\r") else raw
+            stream = raw
+            if b"FlateDecode" in head:
+                try:
+                    stream = zlib.decompress(raw)
+                except zlib.error:
+                    try:
+                        stream = zlib.decompressobj().decompress(raw)
+                    except zlib.error:
+                        stream = b""
+        objs[int(m.group(1))] = (head, stream)
+    return objs
+
+
+def _pdf_balanced(text, start):
+    """text[start:] begins with '<<' -> the balanced '<<...>>' block."""
+    depth, i = 0, start
+    while i < len(text) - 1:
+        two = text[i:i + 2]
+        if two == b"<<":
+            depth += 1
+            i += 2
+        elif two == b">>":
+            depth -= 1
+            i += 2
+            if depth == 0:
+                return text[start:i]
+        else:
+            i += 1
+    return text[start:]
+
+
+def _pdf_value(objs, head, key):
+    """The value of /Key in a dict's text: a dict (inline or referenced), an array or a bare token, as bytes."""
+    m = re.search(rb"/" + key + rb"(?![A-Za-z0-9])\s*", head)
+    if not m:
+        return None
+    rest = head[m.end():]
+    r = re.match(rb"(\d+)\s+\d+\s+R\b", rest)
+    if r:
+        o = objs.get(int(r.group(1)))
+        return o[0] if o else None
+    if rest[:2] == b"<<":
+        return _pdf_balanced(rest, 0)
+    if rest[:1] == b"[":
+        return rest[:rest.find(b"]") + 1]
+    t = re.match(rb"[^\s/<>\[\]]+|/[^\s/<>\[\]]+", rest)
+    return t.group(0) if t else None
+
+
+def _pdf_cmap(stream):
+    """ToUnicode CMap -> ({code: text}, bytes per code)."""
+    out, width = {}, 1
+    s = stream.decode("latin-1")
+    cs = re.search(r"begincodespacerange\s*<([0-9A-Fa-f]+)>", s)
+    if cs:
+        width = len(cs.group(1)) // 2
+    for blk in re.findall(r"beginbfchar(.*?)endbfchar", s, re.S):
+        for a, b in re.findall(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]*)>", blk):
+            out[int(a, 16)] = bytes.fromhex(b).decode("utf-16-be", "replace") if b else ""
+    for blk in re.findall(r"beginbfrange(.*?)endbfrange", s, re.S):
+        for m in re.finditer(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(<[0-9A-Fa-f]*>|\[[^\]]*\])", blk):
+            lo, hi = int(m.group(1), 16), int(m.group(2), 16)
+            dst = m.group(3)
+            if dst.startswith("["):
+                for i, h in enumerate(re.findall(r"<([0-9A-Fa-f]*)>", dst)):
+                    out[lo + i] = bytes.fromhex(h).decode("utf-16-be", "replace")
+            else:
+                base = int(dst[1:-1], 16)
+                for i in range(hi - lo + 1):
+                    out[lo + i] = chr(base + i)
+    return out, width
+
+
+class _PdfFont:
+    def __init__(self, objs, head):
+        sub = _pdf_value(objs, head, b"Subtype") or b""
+        self.type0 = sub == b"/Type0"
+        self.map, self.width = {}, 2 if self.type0 else 1
+        self.mac = b"MacRomanEncoding" in head
+        tu = re.search(rb"/ToUnicode\s+(\d+)\s+\d+\s+R", head)
+        if tu and objs.get(int(tu.group(1))) and objs[int(tu.group(1))][1]:
+            self.map, self.width = _pdf_cmap(objs[int(tu.group(1))][1])
+        self.first, self.widths, self.dw, self.cw = 0, [], 1000.0, {}
+        wv = _pdf_value(objs, head, b"Widths")
+        if wv:
+            self.widths = [float(x) for x in re.findall(rb"-?\d+\.?\d*", wv)]
+            fc = _pdf_value(objs, head, b"FirstChar")
+            self.first = int(fc) if fc and fc.isdigit() else 0
+        if self.type0:
+            df = re.search(rb"/DescendantFonts\s*\[?\s*(\d+)\s+\d+\s+R", head)
+            if df and objs.get(int(df.group(1))):
+                dh = objs[int(df.group(1))][0]
+                dw = _pdf_value(objs, dh, b"DW")
+                self.dw = float(dw) if dw else 1000.0
+                w = _pdf_value(objs, dh, b"W") or b""
+                for m in re.finditer(rb"(\d+)\s*\[([^\]]*)\]|(\d+)\s+(\d+)\s+(-?\d+\.?\d*)", w):
+                    if m.group(1):
+                        for i, v in enumerate(re.findall(rb"-?\d+\.?\d*", m.group(2))):
+                            self.cw[int(m.group(1)) + i] = float(v)
+                    else:
+                        for c in range(int(m.group(3)), int(m.group(4)) + 1):
+                            self.cw[c] = float(m.group(5))
+
+    def codes(self, b):
+        n = self.width
+        return [int.from_bytes(b[i:i + n], "big") for i in range(0, len(b) - n + 1, n)]
+
+    def text(self, code):
+        if code in self.map:
+            return self.map[code]
+        if self.type0:
+            return ""
+        return bytes([code]).decode("mac_roman" if self.mac else "cp1252", "replace")
+
+    def adv(self, code):
+        if self.type0:
+            return self.cw.get(code, self.dw)
+        i = code - self.first
+        return self.widths[i] if 0 <= i < len(self.widths) else 500.0
+
+
+_PDF_TOKEN_RE = re.compile(rb"\s*(?:(\((?:\\.|[^\\()])*(?:\((?:\\.|[^\\()])*\)(?:\\.|[^\\()])*)*\))|<([0-9A-Fa-f\s]*)>|(\[)|(\])|(/[^\s/<>\[\]()]*)|(-?\d*\.?\d+)|([A-Za-z'\"*]+)|(<<|>>))", re.S)
+
+
+def _pdf_unescape(s):
+    out, i = bytearray(), 1
+    end = len(s) - 1
+    while i < end:
+        c = s[i]
+        if c == 0x5C:
+            i += 1
+            n = s[i]
+            if 0x30 <= n <= 0x37:
+                j = i
+                while j < min(i + 3, end) and 0x30 <= s[j] <= 0x37:
+                    j += 1
+                out.append(int(s[i:j], 8) & 255)
+                i = j
+                continue
+            out.append({0x6E: 10, 0x72: 13, 0x74: 9, 0x62: 8, 0x66: 12}.get(n, n))
+        else:
+            out.append(c)
+        i += 1
+    return bytes(out)
+
+
+def _pdf_page_items(objs, content, fonts):
+    """Positioned text runs [(x, y, x_end, size, text)] of one page's content stream."""
+    items = []
+    ctm, stack = (1, 0, 0, 1, 0, 0), []
+    tm = tlm = (1, 0, 0, 1, 0, 0)
+    font, size, lead, hscale = None, 1.0, 0.0, 1.0
+    ops, arr = [], None
+
+    def mul(a, b):
+        return (a[0] * b[0] + a[1] * b[2], a[0] * b[1] + a[1] * b[3], a[2] * b[0] + a[3] * b[2], a[2] * b[1] + a[3] * b[3],
+                a[4] * b[0] + a[5] * b[2] + b[4], a[4] * b[1] + a[5] * b[3] + b[5])
+
+    def show(parts):
+        nonlocal tm
+        if font is None:
+            return
+        txt, dx = "", 0.0
+        trm = mul(tm, ctm)
+        sx = trm[0] if trm[0] else 1.0
+        for p in parts:
+            if isinstance(p, (int, float)):
+                if p < -180:
+                    txt += " "
+                dx -= p / 1000.0 * size * hscale
+                continue
+            for c in font.codes(p):
+                txt += font.text(c)
+                dx += font.adv(c) / 1000.0 * size * hscale
+        x, y = trm[4], trm[5]
+        items.append((x, y, x + dx * abs(sx), size * abs(trm[3] or 1.0), txt))
+        tm = mul((1, 0, 0, 1, dx, 0), tm)
+
+    for m in _PDF_TOKEN_RE.finditer(content):
+        s, hx, lb, rb_, nm, nu, op, dd = m.groups()
+        if s is not None:
+            v = _pdf_unescape(s)
+        elif hx is not None:
+            h = re.sub(rb"\s", b"", hx)
+            v = bytes.fromhex((h + b"0" if len(h) % 2 else h).decode())
+        elif lb:
+            arr = []
+            continue
+        elif rb_:
+            if arr is not None:
+                ops.append(arr)
+                arr = None
+            continue
+        elif nm is not None:
+            v = nm.decode("latin-1")
+        elif nu is not None:
+            v = float(nu)
+        elif op is not None:
+            o = op.decode("latin-1")
+            a = [x for x in ops if not isinstance(x, list) or True]
+            try:
+                if o == "q":
+                    stack.append(ctm)
+                elif o == "Q" and stack:
+                    ctm = stack.pop()
+                elif o == "cm" and len(a) >= 6:
+                    ctm = mul(tuple(a[-6:]), ctm)
+                elif o == "BT":
+                    tm = tlm = (1, 0, 0, 1, 0, 0)
+                elif o == "Tf" and len(a) >= 2:
+                    font, size = fonts.get(a[-2]), float(a[-1])
+                elif o == "TL" and a:
+                    lead = float(a[-1])
+                elif o == "Tz" and a:
+                    hscale = float(a[-1]) / 100.0
+                elif o in ("Td", "TD") and len(a) >= 2:
+                    if o == "TD":
+                        lead = -float(a[-1])
+                    tlm = mul((1, 0, 0, 1, float(a[-2]), float(a[-1])), tlm)
+                    tm = tlm
+                elif o == "Tm" and len(a) >= 6:
+                    tm = tlm = tuple(float(x) for x in a[-6:])
+                elif o == "T*":
+                    tlm = mul((1, 0, 0, 1, 0, -lead), tlm)
+                    tm = tlm
+                elif o == "Tj" and a and isinstance(a[-1], bytes):
+                    show([a[-1]])
+                elif o == "TJ" and a and isinstance(a[-1], list):
+                    show(a[-1])
+                elif o in ("'", '"') and a and isinstance(a[-1], bytes):
+                    tlm = mul((1, 0, 0, 1, 0, -lead), tlm)
+                    tm = tlm
+                    show([a[-1]])
+            except (ValueError, TypeError, IndexError):
+                pass
+            ops = []
+            continue
+        else:
+            continue
+        if arr is not None:
+            arr.append(v)
+        else:
+            ops.append(v)
+    return items
+
+
+def pdf_text_lines(data):
+    """Lines of text (top to bottom, left to right) from every page of a text-based PDF. [] when there is no text."""
+    objs = _pdf_objects(data)
+    pages = []
+    for num, (head, _s) in sorted(objs.items()):
+        if re.search(rb"/Type\s*/Page(?![A-Za-z])", head):
+            pages.append((num, head))
+    out = []
+    for num, head in pages:
+        res, h = None, head
+        for _ in range(6):
+            res = _pdf_value(objs, h, b"Resources")
+            if res or not re.search(rb"/Parent\s+\d+", h):
+                break
+            h = objs[int(re.search(rb"/Parent\s+(\d+)", h).group(1))][0]
+        fonts = {}
+        fd = _pdf_value(objs, res or b"", b"Font") or b""
+        for name, ref in re.findall(rb"/([^\s/<>\[\]()]+)\s+(\d+)\s+\d+\s+R", fd):
+            if int(ref) in objs:
+                try:
+                    fonts["/" + name.decode("latin-1")] = _PdfFont(objs, objs[int(ref)][0])
+                except (ValueError, IndexError, KeyError):
+                    pass
+        cv = _pdf_value(objs, head, b"Contents")
+        raw = re.search(rb"/Contents\s*(\[[^\]]*\]|\d+\s+\d+\s+R)", head)
+        content = b""
+        if raw:
+            for ref in _PDF_REF_RE.findall(raw.group(1)):
+                if int(ref) in objs and objs[int(ref)][1]:
+                    content += objs[int(ref)][1] + b"\n"
+        items = _pdf_page_items(objs, content, fonts)
+        rows = []
+        for it in sorted(items, key=lambda t: -t[1]):
+            if rows and abs(rows[-1][0] - it[1]) <= max(1.5, it[3] * 0.3):
+                rows[-1][1].append(it)
+            else:
+                rows.append([it[1], [it]])
+        for _y, row in rows:
+            line, prev_end = "", None
+            for x, _yy, xe, sz, tx in sorted(row, key=lambda t: t[0]):
+                if not tx.strip():
+                    prev_end = xe if prev_end is not None else prev_end
+                    continue
+                if prev_end is not None and line and x - prev_end > 0.22 * sz and not line.endswith(" "):
+                    line += " "
+                line += tx
+                prev_end = xe
+            line = re.sub(r"\s+", " ", line).strip()
+            if line:
+                out.append(line)
+    return out
+
+
+# ---------------------------------------------------------------------------------------
+# Certificate of Analysis: lab results per run, product specifications, conformance
+# ---------------------------------------------------------------------------------------
+# ---- Lab report scan: fills the "Add lab report" form from an uploaded PDF (the user always reviews before saving) ----
+# analyte name as printed (letters only, lower case) -> spec code. A line is matched by its leading name.
+LAB_ANALYTE_ALIASES = {
+    "apc": ("aerobicplatecount", "totalplatecount", "aerobiccount", "totalaerobicplatecount", "standardplatecount", "apc"),
+    "yeast": ("yeasts", "yeast"),
+    "mold": ("molds", "mold", "moulds", "mould"),
+    "fecal": ("fecalcoliforms", "fecalcoliform", "faecalcoliforms", "faecalcoliform"),
+    "salm": ("salmonellaspp", "salmonella"),
+    "as": ("arsenic",), "cd": ("cadmium",), "cr": ("chromium",), "co": ("cobalt",), "cu": ("copper",), "pb": ("lead",),
+    "hg": ("mercury",), "mo": ("molybdenum",), "ni": ("nickel",), "se": ("selenium",), "zn": ("zinc",),
+    "potash": ("solublepotash", "potash", "k2o"),
+}
+_LAB_VALUE_RE = re.compile(r"(?<![\w.\-/])([<>]=?\s*)?(\d[\d,]*\.?\d*(?:[eE][-+]?\d+)?)(?![\w.\-/])")
+_LAB_QUAL_RE = re.compile(r"\b(Negative|Positive|Absent|Present|Not\s+Detected|ND)\b", re.I)
+_LAB_METHOD_RE = re.compile(r"\b[A-Z]{3,}-[A-Z0-9\-]*\d+(?:\s*\([A-Za-z0-9 \-]+\))?")
+_LAB_UNIT_RE = re.compile(r"^(ppm|ppb|%|mg/kg|mg/l|ug/g|g/kg|cfu/g|cfu/ml|mpn/g|mpn/ml)(?![A-Za-z0-9/])", re.I)
+_LAB_MONTHS = {m: i for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
+
+
+def lab_parse_date(text):
+    t = (text or "").strip()
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", t)
+    if m:
+        return m.group(0)
+    m = re.search(r"(\d{1,2})[- ]([A-Za-z]{3})[a-z]*[- ,]+(\d{4})", t)           # 25-Aug-2026
+    if m and m.group(2).lower() in _LAB_MONTHS:
+        return "%s-%02d-%02d" % (m.group(3), _LAB_MONTHS[m.group(2).lower()], int(m.group(1)))
+    m = re.search(r"([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2}),?\s+(\d{4})", t)           # August 20, 2026
+    if m and m.group(1).lower() in _LAB_MONTHS:
+        return "%s-%02d-%02d" % (m.group(3), _LAB_MONTHS[m.group(1).lower()], int(m.group(2)))
+    return ""
+
+
+def lab_match_alias(line):
+    """-> (spec code, matched name length in normalised letters) for a line that starts with a known analyte, else (None, 0)."""
+    norm = re.sub(r"[^a-z0-9]", "", line.lower())
+    best, blen = None, 0
+    for code, names in LAB_ANALYTE_ALIASES.items():
+        for n in names:
+            if norm.startswith(n) and len(n) > blen:
+                best, blen = code, len(n)
+    return best, blen
+
+
+def parse_lab_report(lines):
+    """Pick the report header fields and the result rows out of the text lines of a lab report. Layout-tolerant: header
+    fields come from labelled lines; result rows are the lines of the results table (between its 'Analysis ... Result' header and
+    the end of the table) that carry a value. Known analytes map to a specification; anything else is an additional analysis."""
+    text = "\n".join(lines)
+    low = text.lower()
+    out = {"lab": "", "reportNumber": "", "reportDate": "", "sampleRef": "", "rows": [], "warnings": []}
+    if "foodassure" in low or "food assure" in low:
+        out["lab"] = "FoodAssure"
+    elif re.search(r"\bsgs\b", low):
+        out["lab"] = "SGS"
+    for ln in lines:
+        if not out["reportNumber"]:
+            m = re.fullmatch(r"([A-Z]{2}\d{2}-\d{3,}\.\d+)", ln.strip())                 # SGS: VR26-05008.007
+            if m:
+                out["reportNumber"] = m.group(1)
+        if not out["reportNumber"]:
+            m = re.match(r"(?:Certificate|Report)?\s*(?:No\.?|Number|#)\s*:\s*([A-Za-z0-9][A-Za-z0-9.\-/]*)", ln)   # FoodAssure: Number: 26-AU-223.18A
+            if m:
+                out["reportNumber"] = m.group(1)
+        if not out["reportDate"]:
+            m = re.search(r"(?:Date of Report|Report Date|Date Reported|Date Issued|Issued|Completed)\s*:\s*(.+)", ln, re.I)
+            if m:
+                out["reportDate"] = lab_parse_date(m.group(1))
+        if not out["sampleRef"]:
+            m = re.search(r"(?:Client\s+)?Sample[ _]?ID\s*:\s*(.+)$", ln, re.I)
+            if m:
+                out["sampleRef"] = m.group(1).strip()
+    # the results table
+    start = None
+    for i, ln in enumerate(lines):
+        if re.match(r"Analysis\b", ln) and re.search(r"\bResults?\b", ln):
+            start = i + 1
+            break
+    region = []
+    if start is not None:
+        for ln in lines[start:]:
+            if len(re.findall(r"[A-Za-z0-9]", ln)) < 3 or re.match(r"(Date Start|NOTE|Above results|Signed|End of Report)", ln, re.I):
+                break
+            region.append(ln)
+    else:
+        region = [ln for ln in lines if lab_match_alias(ln)[0]]
+        out["warnings"].append("This report's layout was not recognised; only lines naming a known test were read. Check every value.")
+    seen = set()
+    for ln in region:
+        code, n = lab_match_alias(ln)
+        # the part of the line after the analyte's name
+        name_part = re.split(r"\s*[(<>]|\s\d|\s+[A-Z]{3,}-", ln, 1)[0].strip().rstrip("%").strip()
+        rest = ln[len(name_part):] if ln.startswith(name_part) else ln
+        value, qual = None, None
+        vm = _LAB_VALUE_RE.search(rest)
+        qm = _LAB_QUAL_RE.search(rest)
+        if vm and (not qm or vm.start() < qm.start()):
+            value = (vm.group(1) or "").replace(" ", "") + vm.group(2)
+            after = rest[vm.end():].strip()
+        elif qm:
+            value = {"nd": "Negative", "notdetected": "Negative"}.get(re.sub(r"\s", "", qm.group(1).lower()), qm.group(1).capitalize())
+            after = rest[qm.end():].strip()
+        else:
+            continue
+        um = _LAB_UNIT_RE.match(after)
+        unit = um.group(1) if um else ""
+        if not unit:
+            pm = re.search(r"\(([^()]*)\)", rest)
+            if pm and _LAB_UNIT_RE.match(pm.group(1).strip()):
+                unit = pm.group(1).strip()
+        mm = _LAB_METHOD_RE.search(rest)
+        method = mm.group(0).strip() if mm else ""
+        key = code or name_part.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if code:
+            out["rows"].append({"specCode": code, "analyte": None, "value": value, "unit": unit, "method": method})
+        elif name_part:
+            out["rows"].append({"specCode": None, "analyte": name_part, "value": value, "unit": unit, "method": method})
+    if not out["rows"]:
+        out["warnings"].append("No result rows were found. Is this a scanned image? Enter the values by hand.")
+    return out
+
+
+
+# basis: run = measured in-house (Packaging QC check), value = lab result compared as reported, metal = lab concentration
+# converted to ppm and compared with the ppm limit (derived from the kg/ha regulatory limit by the Admin limit calculator),
+# absent = qualitative (Negative / Positive).
+COA_GROUPS = (("physical", "Physical & chemical"), ("metals", "Heavy metals"), ("microbial", "Microbiological"))
+COA_SPEC_SEED = [
+    # code, name, group, unit, basis, min, max, max_exclusive, required for release, sort, default method, regulatory limit kg/ha (metals)
+    ("tds", "TDS", "physical", "%", "run", 1, 2, 0, 0, 10, "", None),
+    ("ph", "pH", "physical", "", "run", 3.0, 4.0, 0, 0, 20, "", None),
+    ("potash", "Soluble potash, K2O", "physical", "%", "value", 0.5, None, 0, 0, 30, "", None),
+    ("as", "Arsenic (As)", "metals", "ppm", "metal", None, None, 0, 0, 100, "ICP-MS", 15),
+    ("cd", "Cadmium (Cd)", "metals", "ppm", "metal", None, None, 0, 0, 110, "ICP-MS", 4),
+    ("cr", "Chromium (Cr)", "metals", "ppm", "metal", None, None, 0, 0, 120, "ICP-MS", 210),
+    ("co", "Cobalt (Co)", "metals", "ppm", "metal", None, None, 0, 0, 130, "ICP-MS", 30),
+    ("cu", "Copper (Cu)", "metals", "ppm", "metal", None, None, 0, 0, 140, "ICP-MS", 150),
+    ("pb", "Lead (Pb)", "metals", "ppm", "metal", None, None, 0, 0, 150, "ICP-MS", 100),
+    ("hg", "Mercury (Hg)", "metals", "ppm", "metal", None, None, 0, 0, 160, "ICP-MS", 1),
+    ("mo", "Molybdenum (Mo)", "metals", "ppm", "metal", None, None, 0, 0, 170, "ICP-MS", 4),
+    ("ni", "Nickel (Ni)", "metals", "ppm", "metal", None, None, 0, 0, 180, "ICP-MS", 36),
+    ("se", "Selenium (Se)", "metals", "ppm", "metal", None, None, 0, 0, 190, "ICP-MS", 2.8),
+    ("zn", "Zinc (Zn)", "metals", "ppm", "metal", None, None, 0, 0, 200, "ICP-MS", 370),
+    ("apc", "Aerobic plate count", "microbial", "cfu/g", "value", None, 500, 1, 1, 300, "MFHPB-18", None),
+    ("yeast", "Yeast", "microbial", "cfu/g", "value", None, 20, 1, 1, 310, "MFHPB-22", None),
+    ("mold", "Mold", "microbial", "cfu/g", "value", None, 20, 1, 1, 320, "MFHPB-22", None),
+    ("fecal", "Fecal coliforms", "microbial", "MPN/g", "value", None, 1.8, 1, 1, 330, "MFHPB-19", None),
+    ("salm", "Salmonella spp.", "microbial", "per 25 g", "absent", None, 1, 1, 1, 340, "MFHPB-20", None),
+]
+# Units a lab may report a metal in, as a multiplier to ppm (mg/kg). Product density is taken as 1 kg/L, so mg/L = mg/kg.
+COA_PPM_FACTORS = {"ppm": 1.0, "mg/kg": 1.0, "mg/l": 1.0, "%": 10000.0, "ppb": 0.001, "ug/kg": 0.001, "g/kg": 1000.0}
+
+
+def ensure_coa_specs(conn):
+    """Seed the product specifications (INSERT OR IGNORE: an admin's edits are never overwritten)."""
+    for code, name, grp, unit, basis, mn, mx, excl, req, sort, method, kg in COA_SPEC_SEED:
+        conn.execute("INSERT OR IGNORE INTO coa_specs (code,name,grp,unit,basis,min_val,max_val,max_exclusive,required,sort,method,limit_kg_ha)"
+                     " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (code, name, grp, unit, basis, mn, mx, excl, req, sort, method, kg))
+    # first version stored the kg/ha limit as the max: it becomes the reference limit, and the judged ppm limit waits for the calculator
+    conn.execute("UPDATE coa_specs SET limit_kg_ha=max_val, max_val=NULL, unit='ppm' WHERE basis='metal' AND unit='kg/ha'")
+    conn.execute("UPDATE settings SET label=?, description=? WHERE key='coa_application_rate_kg_ha'",
+                 ("Certificate of Analysis: product application rate (kg/ha)",
+                  "Used by the Admin metal-limit calculator to turn each heavy-metal loading limit (kg metal per ha) into a ppm / % limit: ppm = limit x 1,000,000 / this application rate (kg of product per ha). "
+                  "Changing it here does not change the limits -- apply them from the calculator. 0 = not set."))
+
+
+def coa_num(v, digits=6):
+    if v is None:
+        return ""
+    s = ("%." + str(digits) + "g") % v
+    if "e" in s:
+        s = ("%." + str(digits) + "f") % v
+    return s.rstrip("0").rstrip(".") if "." in s else s
+
+
+def parse_result_value(text):
+    """'<20', '100', '1,200', 'Negative' -> (qualifier, number, text). Raises ApiError when it is none of these."""
+    t = (text or "").strip()
+    m = re.fullmatch(r"([<>]=?)?\s*([0-9][0-9,]*\.?[0-9]*(?:[eE][-+]?[0-9]+)?|\.[0-9]+)", t)
+    if m:
+        qual = (m.group(1) or "")[:1]
+        return qual, float(m.group(2).replace(",", "")), t
+    low = t.lower()
+    if low in ("negative", "neg", "absent", "not detected", "nd", "n/d"):
+        return "", None, "Negative"
+    if low in ("positive", "pos", "present", "detected"):
+        return "", None, "Positive"
+    raise ApiError(400, "Enter a result as a number, a '<' value (e.g. <20), or Negative / Positive")
+
+
+def coa_result_text(x):
+    if x is None:
+        return ""
+    if x["value_num"] is None:
+        return x["value_text"] or ""
+    return (x["qualifier"] or "") + coa_num(x["value_num"])
+
+
+def coa_spec_text(s):
+    u = (" " + s["unit"]) if s["unit"] else ""
+    if s["code"] == "ph" and s["min_val"] is not None and s["max_val"] is not None:
+        return "%.1f - %.1f" % (s["min_val"], s["max_val"])
+    if s["basis"] == "absent":
+        return "Negative (< %s %s)" % (coa_num(s["max_val"]), s["unit"])
+    if s["basis"] == "metal":
+        if s["max_val"] is None:
+            return ("Not set (%s kg/ha)" % coa_num(s["limit_kg_ha"])) if s["limit_kg_ha"] is not None else "-"
+        return "max %s ppm (%s %%)" % (coa_num(s["max_val"], 4), coa_num(s["max_val"] / 10000.0, 4))
+    if s["min_val"] is not None and s["max_val"] is not None:
+        return "%s - %s%s" % (coa_num(s["min_val"]), coa_num(s["max_val"]), u)
+    if s["min_val"] is not None:
+        return "min %s%s" % (coa_num(s["min_val"]), u)
+    if s["max_val"] is not None:
+        return ("< %s%s" if s["max_exclusive"] else "max %s%s") % (coa_num(s["max_val"]), u)
+    return "-"
+
+
+def _coa_judge(s, qual, num, text, rate):
+    """-> (status, loading kg/ha or None, note). status: pass | fail | review | not_evaluated."""
+    if s["basis"] == "absent":
+        return ("pass" if text == "Negative" else "fail"), None, ""
+    if num is None:
+        return "review", None, "Expected a numeric result"
+    mn, mx, excl = s["min_val"], s["max_val"], bool(s["max_exclusive"])
+    loading = None
+    if qual == "<":
+        if mn is not None and num <= mn:
+            return "fail", None, ""
+        return ("pass" if (mx is None or num <= mx) else "review"), loading, ""
+    if qual == ">":
+        if mx is not None and num >= mx:
+            return "fail", None, ""
+        return ("pass" if (mn is None or num >= mn) else "review"), loading, ""
+    if mn is not None and num < mn:
+        return "fail", loading, ""
+    if mx is not None and (num >= mx if excl else num > mx):
+        return "fail", loading, ""
+    return "pass", loading, ""
+
+
+def coa_evaluate(conn, r):
+    """Conformance of one run's results against the active specifications. Returns {rows, additional, summary}."""
+    rate = float(get_setting_value(conn, "coa_application_rate_kg_ha", 0) or 0)
+    latest, additional = {}, []
+    for x in conn.execute("SELECT * FROM lab_results WHERE run_id=? AND voided_at IS NULL ORDER BY id", (r["id"],)):
+        if x["spec_code"]:
+            latest[x["spec_code"]] = x
+        else:
+            additional.append(x)
+    rows = []
+    for s in conn.execute("SELECT * FROM coa_specs WHERE active=1 ORDER BY sort, code"):
+        row = {"code": s["code"], "name": s["name"], "group": s["grp"], "unit": s["unit"], "basis": s["basis"],
+               "required": bool(s["required"]), "specText": coa_spec_text(s), "result": None, "resultText": "", "status": None,
+               "note": ""}
+        if s["basis"] == "run":
+            v = r["packaging_tds_pct"] if s["code"] == "tds" else r["packaging_qc_ph"] if s["code"] == "ph" else None
+            if v is not None:
+                row["resultText"] = coa_num(v, 4) + ((" " + s["unit"]) if s["unit"] else "")
+                row["status"] = _coa_judge(s, "", float(v), "", rate)[0]
+                row["source"] = "Production log (Packaging QC check)"
+        elif s["code"] in latest:
+            x = latest[s["code"]]
+            row["result"] = {"id": x["id"], "labName": x["lab_name"], "reportNumber": x["report_number"], "reportDate": x["report_date"],
+                             "method": x["method"], "attachmentId": x["attachment_id"], "enteredBy": x["entered_by"],
+                             "enteredAt": x["entered_at"], "unit": x["unit"], "sampleRef": x["sample_ref"]}
+            row["resultText"] = coa_result_text(x) + ((" " + x["unit"]) if x["unit"] and x["value_num"] is not None else "")
+            if s["basis"] == "metal":
+                f = COA_PPM_FACTORS.get((x["unit"] or "").strip().lower())
+                if f is None or x["value_num"] is None:
+                    row["status"], row["note"] = "review", "Unit not recognised"
+                elif s["max_val"] is None:
+                    row["status"], row["note"] = "not_evaluated", "Limit not set"
+                else:
+                    ppm = x["value_num"] * f
+                    mx = s["max_val"]
+                    if x["qualifier"] == ">":
+                        row["status"] = "fail" if ppm >= mx else "review"
+                    elif x["qualifier"] == "<":
+                        # "below the detection limit": proves compliance only when the detection limit is itself within the limit
+                        row["status"] = "pass" if ppm <= mx else "review"
+                        if row["status"] == "review":
+                            row["note"] = "Detection limit is above the specification limit"
+                    else:
+                        row["status"] = "pass" if ppm <= mx else "fail"
+            else:
+                row["status"] = _coa_judge(s, x["qualifier"] or "", x["value_num"], x["value_text"], rate)[0]
+        row["tested"] = row["status"] is not None
+        rows.append(row)
+    req = [x for x in rows if x["required"]]
+    summary = {"requiredTotal": len(req), "requiredReceived": sum(1 for x in req if x["result"]),
+               "missingRequired": [x["name"] for x in req if not x["result"]],
+               "failed": [x["name"] for x in rows if x["status"] == "fail"],
+               "review": [x["name"] for x in rows if x["status"] in ("review", "not_evaluated")],
+               "metalsReceived": sum(1 for x in rows if x["group"] == "metals" and x["result"]),
+               "metalsTotal": sum(1 for x in rows if x["group"] == "metals"),
+               "applicationRate": rate or None, "additionalCount": len(additional)}
+    return {"rows": rows, "additional": [lab_result_public(x) for x in additional], "summary": summary}
+
+
+def lab_result_public(x):
+    return {"id": x["id"], "runId": x["run_id"], "specCode": x["spec_code"], "analyte": x["analyte"], "labId": x["lab_id"],
+            "labName": x["lab_name"], "reportNumber": x["report_number"], "reportDate": x["report_date"], "sampleRef": x["sample_ref"],
+            "method": x["method"], "qualifier": x["qualifier"], "valueNum": x["value_num"], "valueText": x["value_text"],
+            "resultText": coa_result_text(x), "unit": x["unit"], "attachmentId": x["attachment_id"],
+            "enteredBy": x["entered_by"], "enteredAt": x["entered_at"], "voidedAt": x["voided_at"], "voidedBy": x["voided_by"],
+            "voidReason": x["void_reason"]}
+
+
+_COA_STATUS = {"pass": ("PASS", "GREEN"), "fail": ("FAIL", "RED"), "review": ("REVIEW", "AMBER"),
+               "not_evaluated": ("N/E", "AMBER")}
+
+
+def build_coa_pdf(S, logo_path=None):
+    """S: the dict from Handler._coa_data. A one-to-two page Certificate of Analysis: lot facts, then the results against the
+    product specification, grouped (physical & chemical / heavy metals / microbiological / additional analyses)."""
+    logo = _pdf_logo(logo_path) if logo_path else None
+    pdf = PdfBuilder("Certificate of Analysis %s" % S["lot"], "%s  ·  Certificate of Analysis  ·  generated %s by %s" % (
+        S["lot"], S["generatedAt"], S["generatedBy"] or "KelpWorks"), logo, S["lot"])
+    M, W = pdf.M, pdf.W
+    pdf.text(M, 84, "Certificate of Analysis", 20, True, pdf.TEAL)
+    pdf.text(M, 102, S["lot"] + "  ·  " + (S["product"] or "-"), 11, True, (0.15, 0.15, 0.15))
+    lab = "RELEASED" if S["released"] else "PRELIMINARY - NOT RELEASED"
+    cw = pdf_text_width(_pdf_safe(lab), 8, True) + 14
+    pdf.chip(W - M - cw, 72, lab, pdf.GREEN if S["released"] else pdf.AMBER)
+    pdf.y = 112
+    pdf.hline(M, W - M, pdf.y, pdf.LINE, 0.5)
+    pdf.y += 6
+    pdf.kv_grid([("Product", S["product"]), ("Processing lot", S["lot"]), ("Production date", S["runDate"]),
+                 ("Release status", S["releaseLabel"]), ("Date issued", S["generatedAt"])], cols=3)
+    pdf.note("Finished-goods lots: " + S["fgLots"], 8, (0.1, 0.1, 0.1), False)
+    colors = {"GREEN": pdf.GREEN, "RED": pdf.RED, "AMBER": pdf.AMBER}
+    for gcode, gname in COA_GROUPS:
+        grp = [x for x in S["rows"] if x["group"] == gcode]
+        if not grp:
+            continue
+        pdf.space(130)
+        pdf.heading(gname)
+        metals = gcode == "metals"
+        headers = ["Test", "Specification", "Result (as reported)", "Method", "Laboratory / report", "Conformance"]
+        widths = [24, 24, 20, 14, 26, 13]
+        aligns = ["l"] * len(headers)
+        out = []
+        for x in grp:
+            res = x["result"]
+            rtxt = x["resultText"] or ("Not tested" if not x["required"] else "PENDING")
+            if res:
+                src = " - ".join(p for p in (res["labName"], res["reportNumber"]) if p)
+                if res["reportDate"]:
+                    src += "  (" + res["reportDate"] + ")"
+            else:
+                src = x.get("source") or ""
+            if x["status"] in _COA_STATUS:
+                t, c = _COA_STATUS[x["status"]]
+                st = (t, {"bold": True, "color": colors[c]})
+            else:
+                st = ("Not tested" if not x["required"] else "Pending", {"color": pdf.GRAY})
+            out.append([(x["name"], {"bold": True}), x["specText"], rtxt, (res or {}).get("method") or "", src, st])
+        pdf.table(headers, out, widths, aligns, size=7.8)
+        if gcode == "metals":
+            pdf.note("Heavy-metal results are shown in the unit the laboratory reported (ppm = mg/kg; 1 % = 10,000 ppm) and compared with the limit in ppm. "
+                     "A result below the detection limit is compared at the limit."
+                     + ((" Limits derived from the regulatory loading limits (kg metal/ha) at an application rate of %s kg product/ha." % coa_num(S["applicationRate"]))
+                        if S["applicationRate"] else ""))
+        if gcode == "microbial":
+            pdf.note("Microbial results are per gram of liquid product (Salmonella per 25 g), as reported by the laboratory; '<' = below the limit of quantitation.")
+    if S["additional"]:
+        pdf.heading("Additional analyses")
+        pdf.table(["Test", "Result", "Method", "Laboratory / report"],
+                  [[(x["analyte"], {"bold": True}), (x["resultText"] + ((" " + x["unit"]) if x["unit"] and x["valueNum"] is not None else "")),
+                    x["method"] or "", " - ".join(p for p in (x["labName"], x["reportNumber"]) if p) +
+                    (("  (" + x["reportDate"] + ")") if x["reportDate"] else "")] for x in S["additional"]],
+                  [26, 20, 18, 36], size=7.8)
+    pdf.heading("Release")
+    if S["released"]:
+        pdf.kv_grid([("Released by", S["releasedBy"]), ("Release date", S["releasedAt"]), ("Statement", "Conforms to specification")], cols=3)
+    else:
+        pdf.note("This certificate is preliminary. It becomes valid when the Quality Manager releases the lot.", 8.2, pdf.AMBER, False)
+    if S["failed"]:
+        pdf.note("Results outside specification: " + ", ".join(S["failed"]) + ".", 8.2, pdf.RED, False)
+        if S["releasedComment"]:
+            pdf.note("Released with results outside specification. Reason recorded by Quality: " + S["releasedComment"], 8.2, pdf.RED, False)
+    pdf.space(30)
+    pdf.note("Results relate only to the samples tested. Laboratory reports are retained with the production record. "
+             "This certificate may not be reproduced except in full.")
+    return pdf.build()
 
 
 # ---------------------------------------------------------------------------------------
@@ -2420,6 +3168,8 @@ def migrate(conn):
     labcols = {r["name"] for r in conn.execute("PRAGMA table_info(labs)")}
     if "sample_sheet" not in labcols:
         conn.execute("ALTER TABLE labs ADD COLUMN sample_sheet INTEGER NOT NULL DEFAULT 0")
+    if "limit_kg_ha" not in {r["name"] for r in conn.execute("PRAGMA table_info(coa_specs)")}:
+        conn.execute("ALTER TABLE coa_specs ADD COLUMN limit_kg_ha REAL")
     lacols = {r["name"] for r in conn.execute("PRAGMA table_info(lab_analyses)")}
     if "method" not in lacols:
         conn.execute("ALTER TABLE lab_analyses ADD COLUMN method TEXT")
@@ -3013,6 +3763,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._download_lab_template(path)
         if path.startswith("/api/production/") and path.endswith("/summary.pdf"):
             return self._download_run_summary(path)
+        if path.startswith("/api/production/") and path.endswith("/coa.pdf"):
+            return self._download_run_summary(path, "coa")
         if path == "/api/reports/xlsx":
             return self._report_xlsx()
         if path == "/api/yield-usage/xlsx":
@@ -3203,7 +3955,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
-    def _download_run_summary(self, path):
+    def _download_run_summary(self, path, kind="summary"):
         """/api/production/:id/summary.pdf -- the Production Log Summary, generated from the current log
         (token via Authorization header or ?token= so it opens/downloads from a browser link)."""
         conn = db()
@@ -3219,15 +3971,16 @@ class Handler(BaseHTTPRequestHandler):
             if len(seg) != 4 or not seg[2].isdigit():
                 return self._send_json({"error": "Unknown endpoint"}, 404)
             try:
-                S = self._run_summary_data(conn, int(seg[2]), user)
+                S = (self._coa_data if kind == "coa" else self._run_summary_data)(conn, int(seg[2]), user)
             except ApiError as e:
                 return self._send_json({"error": e.message}, e.status)
-            data = build_run_summary_pdf(S, os.path.join(PUBLIC_DIR, "logo.png"))
+            data = (build_coa_pdf if kind == "coa" else build_run_summary_pdf)(S, os.path.join(PUBLIC_DIR, "logo.png"))
             disp = "attachment" if qs.get("dl", [""])[0] else "inline"
             self.send_response(200)
             self.send_header("Content-Type", "application/pdf")
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Content-Disposition", '%s; filename="%s_Production-Log-Summary.pdf"' % (disp, S["lot"]))
+            self.send_header("Content-Disposition", '%s; filename="%s_%s.pdf"' % (
+                disp, S["lot"], "Certificate-of-Analysis" if kind == "coa" else "Production-Log-Summary"))
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(data)
@@ -3356,6 +4109,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.route_requisitions(method, seg, conn, user)
         if seg[:2] == ["api", "labs"]:
             return self.route_labs(method, seg, conn, user)
+        if seg[:2] == ["api", "coa-specs"]:
+            return self.route_coa_specs(method, seg, conn, user)
         if seg[:2] == ["api", "consumables"]:
             return self.route_consumables(method, seg, conn, user)
         if seg[:2] == ["api", "cip"]:
@@ -4079,6 +4834,192 @@ class Handler(BaseHTTPRequestHandler):
             "qcRecorded": (run["qcSummary"]["recorded"], run["qcSummary"]["total"]) if run.get("qcSummary") else None,
             "generatedAt": today_iso(), "generatedBy": user["name"] if user else None,
         }
+
+    # ---- Certificate of Analysis ---------------------------------------------------------- #
+    def _coa_data(self, conn, rid, user):
+        r = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
+        if not r:
+            raise ApiError(404, "Production run not found")
+        if r["status"] != "completed":
+            raise ApiError(400, "Finalize the run first -- the certificate reports a completed production run")
+        ev = coa_evaluate(conn, r)
+        rel = self._release_summary(conn, r)
+        sku = conn.execute("SELECT * FROM fg_skus WHERE code=?", (r["sku_code"],)).fetchone()
+        released = r["release_state"] in ("released", "legacy")
+        return {"lot": r["processing_lot"], "product": sku["name"] if sku else r["sku_code"], "runDate": r["run_date"],
+                "fgLots": ", ".join(x["lot"] for x in rel["lots"]) or "-", "releaseLabel": RELEASE_LABELS.get(r["release_state"], "-"),
+                "released": released,
+                "releasedBy": rel.get("releasedBy") or ("Before release workflow" if r["release_state"] == "legacy" else ""),
+                "releasedAt": (rel.get("releasedAt") or "")[:10], "releasedComment": rel.get("releasedComment") or "",
+                "rows": ev["rows"], "additional": ev["additional"], "failed": ev["summary"]["failed"],
+                "applicationRate": ev["summary"]["applicationRate"],
+                "generatedAt": today_iso(), "generatedBy": user["name"] if user else None}
+
+    def _lab_results_payload(self, conn, r):
+        specs = [{"code": s["code"], "name": s["name"], "group": s["grp"], "unit": s["unit"], "basis": s["basis"],
+                  "method": s["method"], "required": bool(s["required"]), "specText": coa_spec_text(s)}
+                 for s in conn.execute("SELECT * FROM coa_specs WHERE active=1 AND basis!='run' ORDER BY sort, code")]
+        return {"results": [lab_result_public(x) for x in conn.execute("SELECT * FROM lab_results WHERE run_id=? ORDER BY id DESC", (r["id"],))],
+                "coa": coa_evaluate(conn, r), "specs": specs, "metalUnits": ["ppm", "%", "ppb", "mg/kg"]}
+
+    def route_lab_results(self, method, seg, conn, user):
+        rid = int(seg[2])
+        r = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
+        if not r:
+            raise ApiError(404, "Production run not found")
+        if len(seg) == 4 and method == "GET":
+            return self._lab_results_payload(conn, r)
+        if len(seg) == 5 and seg[4] == "scan" and method == "POST":
+            # read an uploaded lab-report PDF and propose the form's fields (nothing is saved; the user reviews them)
+            d = self._body_json()
+            a = conn.execute("SELECT * FROM run_attachments WHERE id=? AND run_id=?", (d.get("attachmentId"), rid)).fetchone()
+            if not a:
+                raise ApiError(404, "Document not found on this run")
+            if not ((a["filename"] or "").lower().endswith(".pdf") or "pdf" in (a["content_type"] or "").lower()):
+                raise ApiError(400, "Only a PDF lab report can be scanned")
+            full = os.path.join(UPLOAD_DIR, a["stored_name"])
+            if not os.path.isfile(full):
+                raise ApiError(404, "File missing on disk")
+            with open(full, "rb") as f:
+                data = f.read()
+            try:
+                lines = pdf_text_lines(data)
+            except Exception:
+                lines = []
+            if not lines:
+                raise ApiError(400, "No text could be read from this PDF (it may be a scanned image). Enter the values by hand.")
+            return parse_lab_report(lines)
+        if len(seg) == 4 and method == "POST":
+            d = self._body_json()
+            lab_name = (d.get("labName") or "").strip()
+            lab_id = d.get("labId")
+            if lab_id:
+                lb = conn.execute("SELECT name FROM labs WHERE id=?", (lab_id,)).fetchone()
+                lab_name = lb["name"] if lb else lab_name
+            report = (d.get("reportNumber") or "").strip()
+            rdate = (d.get("reportDate") or "").strip()
+            if not lab_name:
+                raise ApiError(400, "Enter the laboratory")
+            if not report:
+                raise ApiError(400, "Enter the lab report number")
+            if rdate and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", rdate):
+                raise ApiError(400, "Report date must be a date")
+            att = d.get("attachmentId")
+            if att and not conn.execute("SELECT 1 FROM run_attachments WHERE id=? AND run_id=?", (att, rid)).fetchone():
+                raise ApiError(400, "That document is not attached to this run")
+            rows = d.get("results") or []
+            if not rows:
+                raise ApiError(400, "Add at least one result")
+            now = now_iso()
+            added = []
+            for i, x in enumerate(rows, 1):
+                code = (x.get("specCode") or "").strip() or None
+                spec = None
+                if code:
+                    spec = conn.execute("SELECT * FROM coa_specs WHERE code=? AND basis!='run'", (code,)).fetchone()
+                    if not spec:
+                        raise ApiError(400, "Row %d: unknown test" % i)
+                analyte = spec["name"] if spec else (x.get("analyte") or "").strip()
+                if not analyte:
+                    raise ApiError(400, "Row %d: enter the test name" % i)
+                try:
+                    qual, num, vtext = parse_result_value(x.get("value"))
+                except ApiError as e:
+                    raise ApiError(400, "%s: %s" % (analyte, e.message))
+                unit = (x.get("unit") or "").strip()
+                if spec and spec["basis"] in ("value", "absent"):
+                    unit = spec["unit"]
+                    if spec["basis"] == "absent" and num is not None:
+                        raise ApiError(400, "%s: enter Negative or Positive" % analyte)
+                elif spec and spec["basis"] == "metal":
+                    unit = unit or "ppm"
+                    if unit.lower() not in COA_PPM_FACTORS:
+                        raise ApiError(400, "%s: unit must be ppm, %%, ppb or mg/kg" % analyte)
+                    if num is None:
+                        raise ApiError(400, "%s: enter a number" % analyte)
+                meth = (x.get("method") or "").strip() or (spec["method"] if spec else "") or None
+                conn.execute("INSERT INTO lab_results (run_id,spec_code,analyte,lab_id,lab_name,report_number,report_date,sample_ref,method,"
+                             "qualifier,value_num,value_text,unit,attachment_id,entered_by,entered_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                             (rid, code, analyte, lab_id or None, lab_name, report, rdate or None, (d.get("sampleRef") or "").strip() or None, meth,
+                              qual, num, vtext, unit or None, att or None, user["name"], now))
+                added.append(analyte)
+            release_log(conn, rid, "lab_results_added", user, capacity=None,
+                        meaning="Laboratory results entered from report %s (%s)." % (report, lab_name),
+                        detail={"report": report, "lab": lab_name, "tests": added})
+            return self._lab_results_payload(conn, r)
+        if len(seg) == 6 and seg[4].isdigit() and seg[5] == "void" and method == "POST":
+            d = self._body_json()
+            reason = (d.get("reason") or "").strip()
+            x = conn.execute("SELECT * FROM lab_results WHERE id=? AND run_id=?", (int(seg[4]), rid)).fetchone()
+            if not x:
+                raise ApiError(404, "Result not found")
+            if x["voided_at"]:
+                raise ApiError(409, "That result is already voided")
+            if not reason:
+                raise ApiError(400, "Enter the reason for voiding this result")
+            conn.execute("UPDATE lab_results SET voided_at=?, voided_by=?, void_reason=? WHERE id=?", (now_iso(), user["name"], reason, x["id"]))
+            release_log(conn, rid, "lab_result_voided", user, capacity=None,
+                        meaning="Laboratory result voided: %s (report %s)." % (x["analyte"], x["report_number"]),
+                        comment=reason, detail={"report": x["report_number"], "test": x["analyte"], "result": coa_result_text(x)})
+            return self._lab_results_payload(conn, r)
+        raise ApiError(404, "Unknown lab-results endpoint")
+
+    def route_coa_specs(self, method, seg, conn, user):
+        def pub(s):
+            return {"code": s["code"], "name": s["name"], "group": s["grp"], "unit": s["unit"], "basis": s["basis"],
+                    "minVal": s["min_val"], "maxVal": s["max_val"], "limitKgHa": s["limit_kg_ha"], "maxExclusive": bool(s["max_exclusive"]),
+                    "required": bool(s["required"]), "active": bool(s["active"]), "method": s["method"], "specText": coa_spec_text(s)}
+        if seg == ["api", "coa-specs"] and method == "GET":
+            return {"specs": [pub(s) for s in conn.execute("SELECT * FROM coa_specs ORDER BY sort, code")],
+                    "applicationRate": float(get_setting_value(conn, "coa_application_rate_kg_ha", 0) or 0)}
+        if seg == ["api", "coa-specs", "metal-limits"] and method == "POST":
+            # the limit calculator: ppm limit = loading limit (kg metal / ha) x 1,000,000 / application rate (kg product / ha)
+            self._require_admin(user)
+            d = self._body_json()
+            try:
+                rate = float(d.get("applicationRate"))
+            except (TypeError, ValueError):
+                raise ApiError(400, "Enter the application rate (kg of product per ha)")
+            if rate <= 0:
+                raise ApiError(400, "The application rate must be greater than 0")
+            limits = d.get("limits") or {}
+            for s in conn.execute("SELECT * FROM coa_specs WHERE basis='metal'").fetchall():
+                raw = limits.get(s["code"], s["limit_kg_ha"])
+                try:
+                    kg = float(raw) if raw not in (None, "") else None
+                except (TypeError, ValueError):
+                    raise ApiError(400, "%s: the limit must be a number" % s["name"])
+                if kg is not None and kg <= 0:
+                    raise ApiError(400, "%s: the limit must be greater than 0" % s["name"])
+                conn.execute("UPDATE coa_specs SET limit_kg_ha=?, max_val=?, unit='ppm' WHERE code=?",
+                             (kg, (kg * 1e6 / rate) if kg is not None else None, s["code"]))
+            conn.execute("UPDATE settings SET value=?, updated_at=? WHERE key='coa_application_rate_kg_ha'", (rate, now_iso()))
+            return {"specs": [pub(s) for s in conn.execute("SELECT * FROM coa_specs ORDER BY sort, code")], "applicationRate": rate}
+        if len(seg) == 3 and method == "PUT":
+            self._require_admin(user)
+            s = conn.execute("SELECT * FROM coa_specs WHERE code=?", (seg[2],)).fetchone()
+            if not s:
+                raise ApiError(404, "Specification not found")
+            d = self._body_json()
+
+            def num(k, cur):
+                if k not in d:
+                    return cur
+                v = d[k]
+                if v in (None, ""):
+                    return None
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    raise ApiError(400, "Limits must be numbers")
+            mn, mx = num("minVal", s["min_val"]), num("maxVal", s["max_val"])
+            if mn is not None and mx is not None and mn > mx:
+                raise ApiError(400, "Minimum cannot exceed maximum")
+            conn.execute("UPDATE coa_specs SET min_val=?, max_val=?, max_exclusive=?, required=?, active=?, method=? WHERE code=?",
+                         (mn, mx, 1 if d.get("maxExclusive", s["max_exclusive"]) else 0, 1 if d.get("required", s["required"]) else 0,
+                          1 if d.get("active", s["active"]) else 0, (d.get("method", s["method"]) or "").strip() or None, s["code"]))
+            return {"spec": pub(conn.execute("SELECT * FROM coa_specs WHERE code=?", (s["code"],)).fetchone())}
+        raise ApiError(404, "Unknown endpoint")
 
     # ---- Samples: catalogue, retention inventory, cart, lab requisitions ---------------- #
     SAMPLE_SQL = (
@@ -5981,7 +6922,7 @@ class Handler(BaseHTTPRequestHandler):
         "additional_samples": "Additional samples taken (new sample entries)",
         "other": "Other",
     }
-    _LOG_EXEMPT_SUBPATHS = ("attachments", "amendments", "progress")
+    _LOG_EXEMPT_SUBPATHS = ("attachments", "amendments", "progress", "lab-results")
 
     def _open_amendment(self, conn, rid):
         return conn.execute("SELECT * FROM run_amendments WHERE run_id=? AND status='open'", (rid,)).fetchone()
@@ -6383,7 +7324,9 @@ class Handler(BaseHTTPRequestHandler):
                 "reviewedBy": (last.get("review_approved") or {}).get("user"),
                 "reviewedAt": (last.get("review_approved") or {}).get("at"),
                 "releasedBy": (last.get("released") or {}).get("user"),
-                "releasedAt": (last.get("released") or {}).get("at")}
+                "releasedAt": (last.get("released") or {}).get("at"),
+                "releasedComment": (last.get("released") or {}).get("comment"),
+                "lab": coa_evaluate(conn, r)["summary"]}
 
     def route_release(self, method, seg, query, conn, user):
         me = {"canReview": bool(user["is_production_manager"] or user["is_quality_manager"]),
@@ -6455,6 +7398,15 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(400, "Choose release or reject")
             if decision == "reject" and not comment:
                 raise ApiError(400, "Enter the reason for rejecting this product")
+            failed = []
+            if decision == "release":
+                lab = coa_evaluate(conn, r)["summary"]
+                if lab["missingRequired"]:
+                    raise ApiError(409, "Release blocked: required lab results are not on file yet (%s). "
+                                        "Enter them with the run's Lab results button (Production tab)." % ", ".join(lab["missingRequired"]))
+                failed = lab["failed"]
+                if failed and not comment:
+                    raise ApiError(400, "Results outside specification (%s). Enter a comment explaining why this lot is being released." % ", ".join(failed))
             capacity = self._release_signer(conn, user, d, need_quality=True)
             now_hash = self._release_snapshot_hash(conn, rid)
             if now_hash != r["release_review_hash"]:
@@ -6465,9 +7417,10 @@ class Handler(BaseHTTPRequestHandler):
                 moved = self._set_lot_status(conn, rid, ("pending_release",), "on_hand")
                 conn.execute("UPDATE production_runs SET release_state='released' WHERE id=?", (rid,))
                 release_log(conn, rid, "released", user, capacity=capacity,
-                            meaning="I confirm this product conforms to specification and is released for sale.",
+                            meaning=("I release this product for sale with results outside specification (%s), for the reason given." % ", ".join(failed))
+                            if failed else "I confirm this product conforms to specification and is released for sale.",
                             comment=comment, log_hash=now_hash,
-                            detail={"from": "pending_release", "to": "released", "lots": moved})
+                            detail=dict({"from": "pending_release", "to": "released", "lots": moved}, **({"outOfSpec": failed} if failed else {})))
             else:
                 moved = self._set_lot_status(conn, rid, ("pending_release",), "hold")
                 conn.execute("UPDATE production_runs SET release_state='rejected' WHERE id=?", (rid,))
@@ -6534,6 +7487,8 @@ class Handler(BaseHTTPRequestHandler):
             return {"edits": self._run_edits(conn, int(seg[2]))}
         if len(seg) == 3 and seg[2].isdigit() and method == "PUT":
             return self.edit_run(conn, int(seg[2]), user)
+        if len(seg) >= 4 and seg[2].isdigit() and seg[3] == "lab-results":
+            return self.route_lab_results(method, seg, conn, user)
         if len(seg) >= 4 and seg[2].isdigit() and seg[3] == "attachments":
             rid = int(seg[2])
             if not conn.execute("SELECT 1 FROM production_runs WHERE id=?", (rid,)).fetchone():

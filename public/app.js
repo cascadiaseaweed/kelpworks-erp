@@ -748,6 +748,7 @@ async function pageProduction(v) {
             '🧪 QC'),
           el('button', { class: 'secondary', onclick: () => openAttachments(run) },
             '📎 Documents' + (run.attachments && run.attachments.length ? ' (' + run.attachments.length + ')' : '')),
+          el('button', { class: 'secondary', onclick: () => openLabResults(run) }, '🧫 Lab results'),
           el('button', { class: 'secondary', onclick: () => printLabels(run.fgLots.map(f => fgLabel(f, run))) }, 'Print FG labels'))),
       run.amendment ? amendBanner(run) : null,
       runSummaryGrid(run),
@@ -1136,14 +1137,17 @@ function uploadAtt(rid, file) {
     reader.onload = async () => {
       try {
         const b64 = String(reader.result).split(',')[1];
-        await api('POST', '/production/' + rid + '/attachments',
+        const resp = await api('POST', '/production/' + rid + '/attachments',
           { filename: file.name, contentType: file.type || 'application/octet-stream', dataB64: b64 });
-        resolve();
+        resolve(resp);
       } catch (e) { reject(e); }
     };
     reader.onerror = () => reject(new Error('Could not read ' + file.name));
     reader.readAsDataURL(file);
   });
+}
+function coaPdfUrl(rid, dl) {
+  return '/api/production/' + rid + '/coa.pdf?' + (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(State.token);
 }
 function summaryPdfUrl(rid, dl) {
   return '/api/production/' + rid + '/summary.pdf?' + (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(State.token);
@@ -1189,10 +1193,18 @@ async function openAttachments(run) {
       el('div', { style: 'display:flex;gap:8px' },
         el('button', { type: 'button', onclick: () => window.open(summaryPdfUrl(run.id, false), '_blank') }, 'View'),
         el('button', { type: 'button', class: 'secondary', onclick: () => { const l = el('a', { href: summaryPdfUrl(run.id, true), download: run.processingLot + '_Production-Log-Summary.pdf' }); document.body.append(l); l.click(); l.remove(); } }, '⬇ Download')))) : null;
+  const coaCard = run.status === 'completed' ? el('div', { class: 'card', style: 'margin:10px 0;padding:12px 14px' },
+    el('div', { style: 'display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap' },
+      el('div', {}, el('b', {}, '🧫 Certificate of Analysis (PDF)'),
+        el('div', { class: 'help' }, 'Results against the product specification, from the lab results entered for this run. Upload the lab reports below, then enter their values under Lab results.')),
+      el('div', { style: 'display:flex;gap:8px' },
+        el('button', { type: 'button', onclick: () => window.open(coaPdfUrl(run.id, false), '_blank') }, 'View'),
+        el('button', { type: 'button', class: 'secondary', onclick: () => { const l = el('a', { href: coaPdfUrl(run.id, true), download: run.processingLot + '_Certificate-of-Analysis.pdf' }); document.body.append(l); l.click(); l.remove(); } }, '⬇ Download'),
+        el('button', { type: 'button', class: 'secondary', onclick: () => openLabResults(run) }, 'Lab results…')))) : null;
   const body = el('div', {},
     el('div', { class: 'summary-line' }, sl('Run', run.processingLot),
       el('span', { class: 'muted' }, 'lab results, paper logs, images — PDF, images, Office docs (max 25 MB each)')),
-    summaryCard,
+    summaryCard, coaCard,
     el('label', {}, 'Attached documents'), listHost,
     el('div', { style: 'margin-top:16px' },
       el('label', {}, 'Add documents'),
@@ -3584,6 +3596,7 @@ const RELEASE_EVENTS = {
   amendment_opened: 'Amendment OPENED (log unlocked)', amendment_submitted: 'Amendment submitted for review',
   amendment_cancelled: 'Amendment cancelled', integrity_repair: 'Integrity repair applied',
   rebaseline: 'Log hash re-baselined (snapshot format change)',
+  lab_results_added: 'Lab results entered', lab_result_voided: 'Lab result VOIDED',
 };
 const shortHash = h => h ? h.slice(0, 10) + '…' : '—';
 async function pageRelease(v) {
@@ -3612,13 +3625,13 @@ async function pageRelease(v) {
     const rows = r.runs.filter(x => states.includes(x.state));
     v.append(el('h3', { style: 'margin:16px 0 6px' }, title + ' (' + rows.length + ')'));
     if (!rows.length) { v.append(el('div', { class: 'help' }, 'Nothing here.')); continue; }
-    v.append(table(['Run', 'Product', 'Finalized', 'Finished goods', 'Litres', 'Status', 'Reviewed', 'Released'],
+    v.append(table(['Run', 'Product', 'Finalized', 'Finished goods', 'Litres', 'Status', 'Lab results', 'Reviewed', 'Released'],
       rows.map(x => [mono(x.lot), skuName(x.sku), fmtWhen(x.finalizedAt) + (x.finalizedBy ? ' · ' + x.finalizedBy : ''),
         x.lots.map(l => fmt(l.qty) + ' × ' + l.packageSize).join(', ') || '—',
-        num(fmt(x.lots.reduce((a, l) => a + (l.litres || 0), 0), 0)), releaseBadge(x.state),
+        num(fmt(x.lots.reduce((a, l) => a + (l.litres || 0), 0), 0)), releaseBadge(x.state), labBadge(x.lab),
         x.reviewedBy ? x.reviewedBy + ' · ' + fmtWhen(x.reviewedAt) : '—',
         x.releasedBy ? x.releasedBy + ' · ' + fmtWhen(x.releasedAt) : '—']),
-      [false, false, false, false, true, false, false, false], i => openReleaseRun(rows[i].id)));
+      [false, false, false, false, true, false, false, false, false], i => openReleaseRun(rows[i].id)));
   }
   v.append(el('div', { class: 'help', style: 'margin-top:10px' }, 'Click a row to review the production log, sign, and see the full audit trail.'));
 }
@@ -3689,6 +3702,14 @@ async function openReleaseRun(id) {
   body.append(el('div', { class: 'summary-line' }, sl('Run', d.lot), sl('Product', skuName(d.sku)), el('span', {}, 'Status: ', releaseBadge(d.state)),
     sl('Finalized', fmtWhen(d.finalizedAt) + (d.finalizedBy ? ' by ' + d.finalizedBy : ''))));
   body.append(table(['FG lot', 'Pack', 'Units', 'Litres', 'Status'], d.lots.map(l => [mono(l.lot), l.packageSize, fmt(l.qty), num(fmt(l.litres, 0)), fgStatusBadge(l.status)]), [false, false, true, true, false]));
+  body.append(el('div', { class: 'sign-box' }, el('h4', {}, 'Laboratory results & Certificate of Analysis'),
+    el('div', { style: 'display:flex;gap:10px;align-items:center;flex-wrap:wrap' }, labBadge(d.lab), el('span', { class: 'help' }, labSummaryText(d.lab)),
+      el('button', { type: 'button', class: 'secondary', onclick: () => openLabResults(d.run) }, 'Lab results…'),
+      el('button', { type: 'button', class: 'secondary', onclick: () => window.open(coaPdfUrl(id, false), '_blank') }, 'View CoA')),
+    d.lab.missingRequired.length ? el('div', { class: 'help', style: 'color:var(--danger);font-weight:600;margin-top:6px' },
+      'Release is blocked until these results are on file: ' + d.lab.missingRequired.join(', ') + '.') : null,
+    d.lab.failed.length ? el('div', { class: 'help', style: 'color:var(--danger);font-weight:600;margin-top:6px' },
+      'Outside specification: ' + d.lab.failed.join(', ') + '. A comment is required to release this lot.') : null));
   const integrity = [];
   if (d.logMatchesReview === true) integrity.push('Production log unchanged since review (hash ' + shortHash(d.reviewedLogHash) + ').');
   if (d.logMatchesReview === false) integrity.push('WARNING: the production log no longer matches the log that was reviewed.');
@@ -3736,7 +3757,8 @@ async function openReleaseRun(id) {
   } else if (d.state === 'pending_release') {
     body.append(me.canRelease ? signBox('Quality release sign-off',
       'By signing I confirm this product conforms to specification and is released for sale — or I am rejecting it and holding the lot(s).',
-      [['release', 'Release for sale'], ['reject', 'Reject — hold']], 'release', { quality: true, button: 'Sign release' })
+      [['release', 'Release for sale'], ['reject', 'Reject — hold']], 'release', { quality: true, button: 'Sign release',
+        commentHint: d.lab.failed.length ? 'REQUIRED to release: why is this lot released with results outside specification (' + d.lab.failed.join(', ') + ')?' : undefined })
       : el('div', { class: 'help sign-box' }, 'Review is complete. Awaiting release by a Quality Manager. You do not have release permission.'));
   }
   if (['released', 'rejected', 'pending_release', 'returned'].includes(d.state) && me.canRelease) {
@@ -4911,6 +4933,13 @@ function exportYieldCsv(d) {
 // literal in the code, so it shows up in the table below automatically.
 const CALCULATIONS = [
   {
+    title: 'Certificate of Analysis: heavy-metal limit (ppm / %)',
+    formula: 'Limit (ppm) = Regulatory limit (kg metal / ha) × 1,000,000 ÷ Application rate (kg product / ha);  Limit (%) = Limit (ppm) ÷ 10,000.  A lab result is converted to ppm (ppm = 1, % = 10,000, ppb = 0.001) and passes when it is at or below the ppm limit; a “<” result is compared at its detection limit.',
+    description: 'The heavy-metal specifications are loading limits, but labs report concentrations in ppm (mg/kg) or %. The Admin limit calculator turns each loading limit into a ppm / % limit at the product application rate; results stay in the unit the lab reported and are judged against the ppm limit. The rate here is the calculator’s default; applying the calculator is what changes the limits.',
+    location: 'Admin → Certificate of Analysis specifications → Heavy-metal limit calculator; Production → 🧫 Lab results; Certificate of Analysis PDF',
+    settings: ['coa_application_rate_kg_ha'],
+  },
+  {
     title: 'Measured %Solids Loading, (w/w)',
     formula: 'Measured %Solids Loading = Wet-solids-wt (g) / (Wet-solids-wt (g) + Liquid-wt (g))',
     description: 'The solids loading (w/w) of a homogenized tank sample, from a Process Check split of a weighed sample into its solid and liquid portions.',
@@ -5461,6 +5490,75 @@ async function drawRequisitions(host) {
         async () => {}, 'Close', { noCancel: true, wide: true });
     }));
   if (!requisitions.length) host.append(el('div', { class: 'help', style: 'margin-top:8px' }, 'Requisitions appear here once created from the cart.'));
+}
+
+/* ---- Admin: Certificate of Analysis specifications ---- */
+async function drawAdminCoaSpecs(v) {
+  const { specs, applicationRate } = await api('GET', '/coa-specs');
+  v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Certificate of Analysis specifications'),
+    el('div', { class: 'actions' }, el('button', { class: 'secondary', onclick: () => openMetalLimitCalculator(specs, applicationRate) }, '🧮 Heavy-metal limit calculator'))));
+  v.append(el('div', { class: 'help', style: 'margin:-6px 0 8px' }, 'Limits each run is judged against on its Certificate of Analysis. “Required” results must be on file before Quality can release a run. '
+    + 'Heavy-metal results stay in ppm / %; the calculator converts the regulatory loading limits (kg metal per ha) to ppm / % at the product application rate. Changing a limit re-judges every certificate as it is next generated.'));
+  const names = { physical: 'Physical & chemical', metals: 'Heavy metals', microbial: 'Microbiological' };
+  const rows = [];
+  for (const g of ['physical', 'metals', 'microbial']) {
+    rows.push({ group: el('b', {}, names[g]) });
+    specs.filter(x => x.group === g).forEach(x => rows.push([x.name, x.specText, x.limitKgHa != null ? x.limitKgHa + ' kg/ha' : '—', x.required ? 'Yes' : 'No', x.method || '—', x.active ? 'Active' : 'Inactive',
+      rowActions([['Edit', () => editCoaSpec(x)]])]));
+  }
+  v.append(table(['Test', 'Specification', 'Regulatory limit', 'Required for release', 'Default method', 'Status', ''], rows));
+}
+// Heavy-metal limit calculator: the regulatory limits are loadings (kg metal per ha); results come back in ppm / %, so each limit is
+// converted at the product application rate: ppm = kg/ha x 1,000,000 / application rate (kg product per ha); % = ppm / 10,000.
+function openMetalLimitCalculator(specs, rate0) {
+  const metals = specs.filter(x => x.basis === 'metal');
+  const rate = el('input', { value: rate0 || '', placeholder: 'kg of product per ha', inputmode: 'decimal' });
+  const lim = {}; const out = {};
+  const tbody = el('tbody', {});
+  metals.forEach(m => {
+    lim[m.code] = el('input', { value: m.limitKgHa ?? '', style: 'width:90px', inputmode: 'decimal' });
+    out[m.code] = [el('td', { class: 'num' }), el('td', { class: 'num' })];
+    tbody.append(el('tr', {}, el('td', {}, m.name), el('td', {}, lim[m.code]), out[m.code][0], out[m.code][1]));
+  });
+  function calc() {
+    const r = parseFloat(rate.value);
+    metals.forEach(m => {
+      const kg = parseFloat(lim[m.code].value), ok = r > 0 && kg > 0;
+      out[m.code][0].textContent = ok ? coaFmt(kg * 1e6 / r) : '—';
+      out[m.code][1].textContent = ok ? coaFmt(kg * 1e6 / r / 10000) : '—';
+    });
+  }
+  [rate, ...Object.values(lim)].forEach(i => i.addEventListener('input', calc));
+  calc();
+  modal('Heavy-metal limit calculator', el('div', {},
+    el('div', { class: 'help' }, 'Converts each regulatory loading limit to the ppm and % limit results are judged against: ppm = limit (kg/ha) × 1,000,000 ÷ application rate (kg product/ha); % = ppm ÷ 10,000. '
+      + 'Nothing changes until you apply.'),
+    field('Product application rate (kg of product per ha)', rate),
+    el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {}, ...['Metal', 'Limit (kg/ha)', 'Limit (ppm)', 'Limit (%)'].map(h => el('th', {}, h)))), tbody))),
+    async () => {
+      const limits = {}; metals.forEach(m => { limits[m.code] = lim[m.code].value; });
+      await api('POST', '/coa-specs/metal-limits', { applicationRate: rate.value, limits });
+      toast('Metal limits applied'); render();
+    }, 'Apply limits', { wide: true });
+}
+function editCoaSpec(x) {
+  const mn = el('input', { value: x.minVal ?? '', placeholder: 'none' }), mx = el('input', { value: x.maxVal ?? '', placeholder: 'none' });
+  const excl = el('input', { type: 'checkbox' }); excl.checked = x.maxExclusive;
+  const req = el('input', { type: 'checkbox' }); req.checked = x.required;
+  const act = el('input', { type: 'checkbox' }); act.checked = x.active;
+  const meth = el('input', { value: x.method || '' });
+  modal('Specification — ' + x.name, el('div', {},
+    el('div', { class: 'help' }, 'Limits are stated in ' + (x.unit || 'the reported unit') + (x.basis === 'absent' ? ' (qualitative: the result must be Negative)' : '')
+      + (x.basis === 'metal' ? '. Normally set with the heavy-metal limit calculator; a value typed here is used as is.' : '') + '.'),
+    el('div', { class: 'form-row' }, field('Minimum', mn), field('Maximum', mx)),
+    el('label', {}, excl, ' Maximum is exclusive (“< limit”)'), el('br'),
+    el('label', {}, req, ' Required before release'), el('br'),
+    el('label', {}, act, ' Active (listed on the certificate)'),
+    field('Default method', meth)),
+    async () => {
+      await api('PUT', '/coa-specs/' + x.code, { minVal: mn.value, maxVal: mx.value, maxExclusive: excl.checked, required: req.checked, active: act.checked, method: meth.value });
+      toast('Specification saved'); render();
+    });
 }
 
 /* ---- Admin: labs, their analyses and requisition templates ---- */
@@ -6101,7 +6199,186 @@ async function pageAdmin(v) {
   v.append(el('div', { class: 'help', style: 'margin-top:10px' },
     'A QC Check in the production log links to an SOP by its reference key, not its name — renaming a document here is picked up everywhere it’s linked. Click a row to see its change history.'));
   await drawAdminLabs(v);
+  await drawAdminCoaSpecs(v);
 }
+/* ---------------- Certificate of Analysis: lab results ---------------- */
+const COA_BADGE = { pass: ['on_hand', 'PASS'], fail: ['low', 'FAIL'], review: ['pending_release', 'REVIEW'], not_evaluated: ['pending_release', 'N/E'] };
+function coaStatusBadge(row) {
+  return COA_BADGE[row.status] ? badge(...COA_BADGE[row.status]) : badge('sold', row.required ? 'PENDING' : 'Not tested');
+}
+function labBadge(l) {
+  if (!l) return '—';
+  if (l.missingRequired.length) return badge('low', 'Micro results missing');
+  if (l.failed.length) return badge('low', 'Outside spec');
+  if (l.review.length) return badge('pending_release', 'Review');
+  return badge('on_hand', 'Complete');
+}
+function labSummaryText(l) {
+  return 'Required (microbial) ' + l.requiredReceived + '/' + l.requiredTotal + ' · Heavy metals ' + l.metalsReceived + '/' + l.metalsTotal
+    + (l.additionalCount ? ' · ' + l.additionalCount + ' additional' : '') + (l.review.length ? ' · ' + l.review.length + ' to review' : '');
+}
+const coaFmt = (v, d = 4) => v == null || !isFinite(v) ? '—' : String(Number(v.toPrecision(d)));
+async function openLabResults(run) {
+  const body = el('div', {});
+  let changed = false;
+  async function draw() {
+    const d = await api('GET', '/production/' + run.id + '/lab-results');
+    const s = d.coa.summary;
+    body.innerHTML = '';
+    // the action bar is part of every redraw (a save or void redraws the window, so it must come back each time)
+    body.append(el('div', { style: 'margin-bottom:8px;display:flex;gap:8px;flex-wrap:wrap' },
+      el('button', { type: 'button', onclick: () => addLabReport(run, d, async () => { changed = true; await draw(); }) }, '+ Add lab report'),
+      el('button', { type: 'button', class: 'secondary', onclick: () => window.open(coaPdfUrl(run.id, false), '_blank') }, 'View Certificate of Analysis'),
+      el('button', { type: 'button', class: 'secondary', onclick: () => openAttachments(run) }, '📎 Documents')));
+    body.append(el('div', { class: 'summary-line' }, sl('Run', run.processingLot), sl('Required', s.requiredReceived + ' of ' + s.requiredTotal),
+      sl('Heavy metals', s.metalsReceived + ' of ' + s.metalsTotal), sl('Outside spec', s.failed.length ? s.failed.join(', ') : 'none')));
+    if (s.missingRequired.length) body.append(el('div', { class: 'help', style: 'color:var(--danger);font-weight:600' },
+      'Quality cannot release this run until these results are on file: ' + s.missingRequired.join(', ') + '.'));
+    if (d.coa.rows.some(x => x.group === 'metals' && x.status === 'not_evaluated')) body.append(el('div', { class: 'help' },
+      'Heavy-metal limits are not set yet, so the metals are listed but not judged. An administrator sets them with the limit calculator under Admin → Certificate of Analysis specifications.'));
+    const rows = [];
+    for (const [g, gname] of [['physical', 'Physical & chemical'], ['metals', 'Heavy metals'], ['microbial', 'Microbiological']]) {
+      const grp = d.coa.rows.filter(x => x.group === g);
+      if (!grp.length) continue;
+      rows.push({ group: el('b', {}, gname) });
+      grp.forEach(x => rows.push([x.name + (x.required ? ' *' : ''), x.specText, x.resultText || '—',
+        x.result ? [x.result.labName, x.result.reportNumber].filter(Boolean).join(' · ') : (x.source || '—'), coaStatusBadge(x)]));
+    }
+    if (d.coa.additional.length) {
+      rows.push({ group: el('b', {}, 'Additional analyses') });
+      d.coa.additional.forEach(x => rows.push([x.analyte, '—', x.resultText + (x.unit ? ' ' + x.unit : ''), [x.labName, x.reportNumber].filter(Boolean).join(' · '), '—']));
+    }
+    body.append(table(['Test', 'Specification', 'Result', 'Laboratory / report', 'Status'], rows));
+    body.append(el('div', { class: 'help' }, '* required before Quality can release the lot. TDS and pH come from the Packaging QC check in the production log.'));
+    const hist = d.results;
+    body.append(el('details', { class: 'accordion', style: 'margin-top:10px' }, el('summary', {}, 'Entry history (' + hist.length + ')'),
+      el('div', { class: 'accordion-body' }, hist.length ? table(['Entered', 'Test', 'Result', 'Report', 'By', ''],
+        hist.map(x => [fmtWhen(x.enteredAt), x.analyte, x.voidedAt ? el('s', {}, x.resultText) : x.resultText,
+          [x.labName, x.reportNumber, x.reportDate].filter(Boolean).join(' · '),
+          x.enteredBy || '—', x.voidedAt ? el('span', { class: 'help' }, 'Voided by ' + (x.voidedBy || '—') + ': ' + (x.voidReason || ''))
+            : rowActions([['Void', () => voidLabResult(x)]])]), [false, false, false, false, false, false])
+        : el('div', { class: 'help' }, 'Nothing entered yet.'))));
+  }
+  function voidLabResult(x) {
+    const reason = el('input', { placeholder: 'Why is this result being voided?' });
+    modal('Void ' + x.analyte + ' result', el('div', {}, el('div', { class: 'help' }, x.resultText + ' · ' + (x.reportNumber || '')), field('Reason', reason),
+      el('div', { class: 'help' }, 'A voided result stays in the history and the audit trail; enter the corrected result as a new entry.')),
+      async () => { await api('POST', '/production/' + run.id + '/lab-results/' + x.id + '/void', { reason: reason.value }); changed = true; await draw(); toast('Result voided'); }, 'Void result');
+  }
+  await draw();
+  modal('Lab results — ' + run.processingLot, body, async () => { if (changed && State.tab === 'release') render(); }, 'Done', { noCancel: true, wide: true });
+}
+async function addLabReport(run, d, done) {
+  const [{ labs }, { attachments }] = await Promise.all([api('GET', '/labs'), api('GET', '/production/' + run.id + '/attachments')]);
+  const labSel = selectFrom('', [['', '— pick the laboratory —'], ...labs.filter(l => l.active).map(l => [String(l.id), l.name]), ['other', 'Other…']]);
+  const labOther = el('input', { placeholder: 'Laboratory name', style: 'display:none;margin-top:4px' });
+  labSel.addEventListener('change', () => { labOther.style.display = labSel.value === 'other' ? '' : 'none'; });
+  const rep = el('input', { placeholder: 'e.g. 26-AU-223.18A or VR26-05008.007' });
+  const rdate = el('input', { type: 'date' });
+  const sref = el('input', { placeholder: 'Lab’s own sample ID (optional)' });
+  const attSel = selectFrom('', [['', '— none —'], ...attachments.map(a => [String(a.id), a.filename])]);
+  const scanMsg = el('div', { class: 'help' });
+  const pdfIn = el('input', { type: 'file', accept: '.pdf,application/pdf' });
+  const specs = d.specs;
+  const tbody = el('tbody', {});
+  const lines = [];
+  function addLine(code, value, extra) {
+    const testSel = selectFrom('', [['', '— test —'], ...['microbial', 'metals', 'physical'].flatMap(g => specs.filter(x => x.group === g).map(x => [x.code, x.name])), ['__other', 'Other (additional analysis)…']]);
+    const nameInp = el('input', { placeholder: 'Test name', style: 'display:none;margin-top:4px' });
+    const valInp = el('input', { placeholder: '<20, 100, Negative', style: 'width:120px' });
+    const unitSel = el('select', { style: 'display:none;width:80px' }, ...d.metalUnits.map(u => el('option', { value: u }, u)));
+    const unitTxt = el('span', { class: 'help' });
+    const unitFree = el('input', { placeholder: 'unit', style: 'display:none;width:80px' });
+    const methInp = el('input', { placeholder: 'method', style: 'width:110px' });
+    const line = { testSel, nameInp, valInp, unitSel, unitFree, methInp };
+    function sync() {
+      const sp = specs.find(x => x.code === testSel.value);
+      nameInp.style.display = testSel.value === '__other' ? '' : 'none';
+      unitSel.style.display = sp && sp.basis === 'metal' ? '' : 'none';
+      unitFree.style.display = testSel.value === '__other' ? '' : 'none';
+      unitTxt.textContent = sp && sp.basis !== 'metal' ? sp.unit : '';
+      if (sp && !methInp.value) methInp.value = sp.method || '';
+      if (sp) methInp.placeholder = sp.method || 'method';
+    }
+    testSel.addEventListener('change', () => { methInp.value = ''; sync(); });
+    if (code) testSel.value = code;
+    if (value) valInp.value = value;
+    if (extra && extra.other) { testSel.value = '__other'; nameInp.value = extra.other; unitFree.value = extra.unit || ''; }
+    sync();
+    if (extra && extra.method) methInp.value = extra.method;
+    if (extra && extra.unit && [...unitSel.options].some(o => o.value.toLowerCase() === extra.unit.toLowerCase())) {
+      unitSel.value = [...unitSel.options].find(o => o.value.toLowerCase() === extra.unit.toLowerCase()).value;
+    }
+    lines.push(line);
+    const tr = el('tr', {}, el('td', {}, testSel, nameInp), el('td', {}, valInp), el('td', {}, unitSel, unitTxt, unitFree), el('td', {}, methInp),
+      el('td', {}, el('button', { type: 'button', class: 'secondary', onclick: () => { lines.splice(lines.indexOf(line), 1); tr.remove(); } }, '×')));
+    tbody.append(tr);
+  }
+  // Read the chosen PDF and fill the form from it (header fields only where still empty; the result rows are replaced).
+  async function scanReport(attId) {
+    scanMsg.style.color = ''; scanMsg.textContent = 'Reading the report…';
+    try {
+      const r = await api('POST', '/production/' + run.id + '/lab-results/scan', { attachmentId: Number(attId) });
+      const lab = labs.find(l => r.lab && l.name.toLowerCase().replace(/\s/g, '').includes(r.lab.toLowerCase().replace(/\s/g, '')));
+      if (!labSel.value) {
+        if (lab) labSel.value = String(lab.id);
+        else if (r.lab) { labSel.value = 'other'; labOther.value = r.lab; }
+        labSel.dispatchEvent(new Event('change'));
+      }
+      if (!rep.value && r.reportNumber) rep.value = r.reportNumber;
+      if (!rdate.value && r.reportDate) rdate.value = r.reportDate;
+      if (!sref.value && r.sampleRef) sref.value = r.sampleRef;
+      lines.length = 0; tbody.innerHTML = '';
+      r.rows.forEach(x => x.specCode && specs.some(sp => sp.code === x.specCode)
+        ? addLine(x.specCode, x.value, { unit: x.unit, method: x.method })
+        : addLine(null, x.value, { other: x.analyte || x.specCode, unit: x.unit, method: x.method }));
+      scanMsg.textContent = 'Read ' + r.rows.length + ' result' + (r.rows.length === 1 ? '' : 's') + ' from the report'
+        + (r.warnings.length ? ' — ' + r.warnings.join(' ') : '') + '. Check every value against the report before saving.';
+    } catch (e) { scanMsg.style.color = 'var(--danger)'; scanMsg.textContent = e.message; }
+  }
+  attSel.addEventListener('change', () => { if (attSel.value) scanReport(attSel.value); });
+  pdfIn.addEventListener('change', async () => {
+    const f = pdfIn.files[0]; if (!f) return;
+    scanMsg.style.color = ''; scanMsg.textContent = 'Uploading ' + f.name + '…';
+    try {
+      const resp = await uploadAtt(run.id, f);
+      const a = resp.attachments.reduce((m, x) => (x.id > m.id ? x : m), resp.attachments[0]);
+      attSel.append(el('option', { value: String(a.id) }, a.filename)); attSel.value = String(a.id);
+      pdfIn.value = '';
+      await scanReport(a.id);
+    } catch (e) { scanMsg.style.color = 'var(--danger)'; scanMsg.textContent = e.message; }
+  });
+  function addPanel(codes) { codes.forEach(c => { if (specs.some(x => x.code === c) && !lines.some(l => l.testSel.value === c)) addLine(c); }); }
+  const panelBar = el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;margin:8px 0' },
+    el('button', { type: 'button', class: 'secondary', onclick: () => addPanel(['apc', 'yeast', 'mold']) }, '+ APC / Yeast / Mold'),
+    el('button', { type: 'button', class: 'secondary', onclick: () => addPanel(['fecal', 'salm']) }, '+ Fecal coliforms / Salmonella'),
+    el('button', { type: 'button', class: 'secondary', onclick: () => addPanel(specs.filter(x => x.group === 'metals').map(x => x.code)) }, '+ Heavy-metals panel'),
+    el('button', { type: 'button', class: 'secondary', onclick: () => addLine() }, '+ Other test'));
+  const body = el('div', {},
+    el('div', { class: 'sign-box' }, el('h4', {}, 'Lab report PDF'),
+      el('div', { class: 'form-row' }, field('Upload the report', pdfIn), field('…or pick one already attached', attSel)),
+      scanMsg, el('div', { class: 'help' }, 'The report is read automatically and the fields below are filled in — you review and correct them before saving.')),
+    el('div', { class: 'form-row' }, field('Laboratory', el('div', {}, labSel, labOther)), field('Report number', rep), field('Report date', rdate)),
+    el('div', { class: 'form-row' }, field('Lab sample ID', sref)),
+    panelBar,
+    el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {}, ...['Test', 'Result', 'Unit', 'Method', ''].map(h => el('th', {}, h)))), tbody)),
+    el('div', { class: 'help' }, 'Enter results exactly as the lab reports them: a number, a “<” value for below detection (e.g. <20), or Negative / Positive. Microbial results are per gram (Salmonella per 25 g). '
+      + 'Other tests on the same form are additional analyses and appear on the certificate without a specification.'));
+  modal('Add lab report — ' + run.processingLot, body, async () => {
+    const labName = labSel.value === 'other' ? labOther.value : '';
+    const results = lines.filter(l => l.testSel.value).map(l => {
+      const other = l.testSel.value === '__other';
+      return { specCode: other ? null : l.testSel.value, analyte: other ? l.nameInp.value : null, value: l.valInp.value,
+        unit: other ? l.unitFree.value : (l.unitSel.style.display === 'none' ? null : l.unitSel.value), method: l.methInp.value };
+    });
+    await api('POST', '/production/' + run.id + '/lab-results', { labId: labSel.value && labSel.value !== 'other' ? Number(labSel.value) : null, labName,
+      reportNumber: rep.value, reportDate: rdate.value, sampleRef: sref.value, attachmentId: attSel.value ? Number(attSel.value) : null, results });
+    toast('Lab results saved');
+    await done();
+  }, 'Save results', { wide: true });
+  addPanel(['apc', 'yeast', 'mold']);
+}
+
 function readFileAsBase64(file) {
   return new Promise((resolve, reject) => {
     if (file.size > 25 * 1024 * 1024) return reject(new Error(file.name + ' exceeds the 25 MB limit'));
