@@ -4933,11 +4933,11 @@ function exportYieldCsv(d) {
 // literal in the code, so it shows up in the table below automatically.
 const CALCULATIONS = [
   {
-    title: 'Certificate of Analysis: heavy-metal limit (ppm / %)',
-    formula: 'Limit (ppm) = Regulatory limit (kg metal / ha) × 1,000,000 ÷ Application rate (kg product / ha);  Limit (%) = Limit (ppm) ÷ 10,000.  A lab result is converted to ppm (ppm = 1, % = 10,000, ppb = 0.001) and passes when it is at or below the ppm limit; a “<” result is compared at its detection limit.',
-    description: 'The heavy-metal specifications are loading limits, but labs report concentrations in ppm (mg/kg) or %. The Admin limit calculator turns each loading limit into a ppm / % limit at the product application rate; results stay in the unit the lab reported and are judged against the ppm limit. The rate here is the calculator’s default; applying the calculator is what changes the limits.',
-    location: 'Admin → Certificate of Analysis specifications → Heavy-metal limit calculator; Production → 🧫 Lab results; Certificate of Analysis PDF',
-    settings: ['coa_application_rate_kg_ha'],
+    title: 'Certificate of Analysis: heavy-metal loading (kg/ha)',
+    formula: 'Loading (kg metal / ha) = Result (mg/kg) × Application rate (kg product / ha) × Application periods ÷ 1,000,000.  Result (mg/kg) = reported value × unit factor (ppm = 1, % = 10,000, ppb = 0.001).  Passes when Loading ≤ the kg/ha specification; a “<” result is compared at its detection limit.',
+    description: 'The heavy-metal specifications are loading limits in kg metal per ha. Each lab concentration is converted at the product application rate and multiplied by the number of application periods, then compared with the limit; with no application rate set, the metals are listed but not judged. Both values are admin-only constants.',
+    location: 'Production → 🧫 Lab results; Certificate of Analysis PDF',
+    settings: ['coa_application_rate_kg_ha', 'coa_application_periods'],
   },
   {
     title: 'Measured %Solids Loading, (w/w)',
@@ -5105,6 +5105,7 @@ const CALCULATIONS = [
     formula: 'Extraction efficiency (%) = (TDS after extraction − TDS before extraction) / TDS before extraction × 100',
     description: 'TDS before extraction is the Homogenization → Lot characterization TDS (%); TDS after extraction is the Extraction → Extraction Performance TDS (%). Blank when either value is missing or the before-TDS is zero.',
     location: 'Yield & Usage tab → Runs table',
+    settings: [],
   },
   {
     title: 'Usage per 1,000 L / 1,000 kg (Yield & Usage)',
@@ -5389,6 +5390,16 @@ async function drawRetentionInventory(host) {
   draw(); bulk.update();
 }
 
+// Installs the token-ready KelpWorks copy of a lab's requisition form (docs/requisition-templates) -- one click, admin only.
+async function useReadyTemplate(lab, after) {
+  if (!confirm((lab.hasTemplate ? 'Replace “' + lab.templateName + '” with the ready-made KelpWorks form for ' + lab.name + '?\n\nIts placeholders are filled in automatically. Your original file stays wherever you saved it.'
+    : 'Use the ready-made KelpWorks form for ' + lab.name + '?'))) return;
+  try {
+    const r = await api('POST', '/labs/' + lab.id + '/template/builtin', {});
+    toast('Template installed: ' + r.lab.templateName + (r.report && r.report.warnings && r.report.warnings.length ? ' — ' + r.report.warnings[0] : ''));
+    await after();
+  } catch (e) { toast(e.message, true); }
+}
 async function drawSampleCart(host) {
   const { items, labs } = await api('GET', '/cart');
   if (!items.length) { host.append(el('div', { class: 'empty card' }, 'The cart is empty. Add samples from the Catalogue or the Retention inventory, then choose a lab and analyses for each.')); return; }
@@ -5420,58 +5431,102 @@ async function drawSampleCart(host) {
   host.append(el('div', { class: 'card', style: 'margin-bottom:10px' }, el('b', {}, 'Assign several samples at once'),
     el('div', { style: 'display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:8px' }, bulkLab, bulkChecks, bulkBtn)));
   // one row per sample
+  const isAdmin = State.user.role === 'admin';
   const tb = el('tbody', {});
   const allCb = el('input', { type: 'checkbox', onchange: () => { tb.querySelectorAll('input.cartsel').forEach(c => { c.checked = allCb.checked; c.dispatchEvent(new Event('change')); }); } });
   items.forEach(it => {
     const sel = el('input', { type: 'checkbox', class: 'cartsel', onchange: () => { sel.checked ? selected.add(it.id) : selected.delete(it.id); } });
-    const labSel = el('select', {}, el('option', { value: '' }, 'Choose lab…'), ...labs.map(l => el('option', { value: l.id }, l.name)));
+    const labSel = el('select', { style: 'min-width:190px' }, el('option', { value: '' }, 'Choose lab…'), ...labs.map(l => el('option', { value: l.id }, l.name)));
     labSel.value = it.cartLabId || '';
     const chosen = new Set(it.cartAnalyses);
     const checks = el('span', { style: 'display:flex;gap:12px;flex-wrap:wrap' });
+    const statusCell = el('td', {});
+    const setStatus = () => {
+      statusCell.innerHTML = '';
+      statusCell.append(!it.cartLabId ? badge('sold', 'Needs a lab') : !it.cartAnalyses.length ? badge('pending_release', 'Needs analyses') : badge('on_hand', 'Ready'));
+    };
     const lab = labs.find(l => l.id === it.cartLabId);
-    if (lab) lab.analyses.filter(a => a.active).forEach(a => {
+    const offered = lab ? lab.analyses.filter(a => a.active) : [];
+    if (lab && offered.length) offered.forEach(a => {
       const cb = el('input', { type: 'checkbox' }); cb.checked = chosen.has(a.id);
-      cb.addEventListener('change', () => { cb.checked ? chosen.add(a.id) : chosen.delete(a.id); assign(it.id, lab.id, [...chosen]).then(updateSummary); it.cartAnalyses = [...chosen]; });
+      cb.addEventListener('change', () => {
+        cb.checked ? chosen.add(a.id) : chosen.delete(a.id);
+        it.cartAnalyses = [...chosen]; setStatus();
+        assign(it.id, lab.id, it.cartAnalyses).then(updateSummary);
+      });
       checks.append(el('label', { style: 'display:flex;gap:4px;align-items:center;font-size:13px' }, cb, a.name));
     });
+    else if (lab) checks.append(el('span', { class: 'muted' }, 'No analyses are set up for ' + lab.name + ' yet. ',
+      isAdmin ? el('a', { href: '#', onclick: e => { e.preventDefault(); manageLabAnalyses(lab.id); } }, 'Set them up') : 'Ask an administrator to add them (Admin → Labs & analyses).'));
     else checks.append(el('span', { class: 'muted' }, 'Pick a lab to see its analyses'));
     labSel.addEventListener('change', async () => { await assign(it.id, labSel.value ? +labSel.value : null, []); await redraw(); });
+    setStatus();
     tb.append(el('tr', {}, el('td', { class: 'checkcol' }, sel), el('td', { class: 'mono' }, it.code),
       el('td', {}, el('div', {}, it.description || '—'), el('div', { class: 'help' }, it.stageLabel + ' · ' + (it.container || ''))),
-      el('td', {}, labSel), el('td', { style: 'white-space:normal' }, checks),
+      el('td', {}, labSel), el('td', { style: 'white-space:normal' }, checks), statusCell,
       el('td', {}, el('button', { class: 'secondary', title: 'Take out of the cart', onclick: async () => { await api('DELETE', '/cart/' + it.id); render(); } }, '✕'))));
   });
   host.append(el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {}, el('th', { class: 'checkcol' }, allCb),
-    ...['Sample ID', 'Sample', 'Lab', 'Analyses', ''].map(h => el('th', {}, h)))), tb)));
-  // requisition summary + create
-  const summary = el('div', { style: 'margin:12px 0' }), notes = el('input', { placeholder: 'Notes for the lab (optional)', style: 'max-width:420px' }),
+    ...['Sample ID', 'Sample', 'Lab', 'Analyses', 'Status', ''].map(h => el('th', {}, h)))), tb)));
+
+  // requisitions: one per lab and production run, each filled from THAT lab's own template, ready as soon as its samples are assigned
+  const notes = el('input', { placeholder: 'Notes for the lab (optional)', style: 'max-width:420px' }),
     poInp = el('input', { placeholder: 'PO / reference # (optional)', style: 'max-width:220px' });
-  const createBtn = el('button', { onclick: async () => {
-    createBtn.disabled = true;
+  const readyHost = el('div', {});
+  async function createReqs(filter, btn) {
+    if (btn) btn.disabled = true;
     try {
-      const r = await api('POST', '/cart/requisitions', { notes: notes.value, poNumber: poInp.value });
-      const body = el('div', {}, el('div', { class: 'help', style: 'margin-bottom:8px' }, 'The filled requisitions were saved as documents on their production runs and the samples were taken out of the cart.'),
+      const r = await api('POST', '/cart/requisitions', Object.assign({ notes: notes.value, poNumber: poInp.value }, filter));
+      // one requisition: hand over the filled form straight away
+      if (r.requisitions.length === 1 && r.requisitions[0].attachmentId) {
+        const q = r.requisitions[0];
+        const l = el('a', { href: reqDocUrl(q.runId, q.attachmentId, true), download: q.filename || '' }); document.body.append(l); l.click(); l.remove();
+      }
+      const body = el('div', {}, el('div', { class: 'help', style: 'margin-bottom:8px' }, 'The requisition forms are filled in and ready to download below. They are also saved as documents on their production runs and listed under Samples → Requisitions; the samples have left the cart.'),
         table(['Requisition', 'Run', 'Lab', 'Samples', 'Documents'], r.requisitions.map(q => [mono(q.reqNumber), mono(q.processingLot), q.labName, q.samples.length,
           reqDocLinks(q)])));
       modal('Requisitions created', body, async () => {}, 'Close', { noCancel: true, wide: true });
       await redraw(); render();
-    } catch (e) { toast(e.message, true); createBtn.disabled = false; }
-  } }, 'Create requisitions');
+    } catch (e) { toast(e.message, true); if (btn) btn.disabled = false; }
+  }
   function updateSummary() {
     const groups = {};
     let notReady = 0;
     items.forEach(it => {
       if (!it.cartLabId || !it.cartAnalyses.length) { notReady++; return; }
-      const k = it.runId + '|' + it.cartLabId; (groups[k] = groups[k] || { lot: it.processingLot, lab: (labs.find(l => l.id === it.cartLabId) || {}).name, n: 0 }).n++;
+      const k = it.runId + '|' + it.cartLabId;
+      const g = groups[k] = groups[k] || { lot: it.processingLot, runId: it.runId, lab: labs.find(l => l.id === it.cartLabId), n: 0, names: new Set() };
+      g.n++;
+      it.cartAnalyses.forEach(id => { const a = g.lab.analyses.find(x => x.id === id); if (a) g.names.add(a.name); });
     });
-    summary.innerHTML = '';
-    const g = Object.values(groups);
-    summary.append(el('div', {}, el('b', {}, g.length + ' requisition(s) ready'), g.length ? ': ' + g.map(x => x.lab + ' · ' + x.lot + ' (' + x.n + ')').join(' ; ') : ''),
-      notReady ? el('div', { class: 'help' }, notReady + ' sample(s) still need a lab and at least one analysis and will stay in the cart.') : null);
-    createBtn.disabled = !g.length;
+    readyHost.innerHTML = '';
+    const list = Object.values(groups);
+    readyHost.append(el('h3', { style: 'margin:16px 0 6px' }, 'Requisitions ready (' + list.length + ')'));
+    if (!list.length) readyHost.append(el('div', { class: 'help' }, 'Once a sample has a lab and at least one analysis, its requisition appears here — one per lab and production run, filled from that lab’s own template — ready to download.'));
+    list.forEach(g => {
+      const btn = el('button', { onclick: () => createReqs({ labId: g.lab.id, runId: g.runId }, btn) }, '⬇ Create requisition & download');
+      readyHost.append(el('div', { class: 'card', style: 'margin-bottom:8px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center' },
+        el('div', {}, el('b', {}, g.lab.name + ' · ' + g.lot), el('span', { class: 'muted' }, '  ' + g.n + ' sample' + (g.n === 1 ? '' : 's')),
+          el('div', { class: 'help' }, 'Analyses: ' + [...g.names].join(', ')),
+          el('div', { class: 'help' }, g.lab.hasTemplate ? '📄 Form: ' + g.lab.templateName : 'No form uploaded for this lab — a plain built-in layout will be used.',
+            g.lab.sampleSheet ? ' · plus a sample spreadsheet' : ''),
+          // a form with no {{placeholders}} comes back exactly as it went in -- say so, and offer the fix
+          (!g.lab.hasTemplate || g.lab.templateTokens === 0) ? el('div', { class: 'help', style: 'color:var(--danger)' },
+            g.lab.hasTemplate ? '⚠ This form has no {{placeholders}}, so nothing can be filled in automatically. ' : '⚠ Uploading the lab’s own form lets it fill in automatically. ',
+            g.lab.readyTemplate ? (isAdmin ? el('a', { href: '#', onclick: e => { e.preventDefault(); useReadyTemplate(g.lab, redraw); } }, 'Use the ready-made KelpWorks ' + g.lab.name + ' form')
+              : 'Ask an administrator to install the ready-made form (Admin → Labs & analyses → Template).')
+              : (isAdmin ? 'Upload a form with placeholders under Admin → Labs & analyses → Template.' : 'Ask an administrator to upload one.')) : null),
+        btn));
+    });
+    if (list.length > 1) {
+      const all = el('button', { class: 'secondary', onclick: () => createReqs({}, all) }, 'Create all ' + list.length + ' requisitions');
+      readyHost.append(el('div', {}, all));
+    }
+    if (notReady) readyHost.append(el('div', { class: 'help', style: 'margin-top:6px' }, notReady + ' sample(s) still need a lab and at least one analysis and will stay in the cart.'));
   }
-  host.append(summary, el('div', { style: 'display:flex;gap:10px;flex-wrap:wrap;align-items:center' }, poInp, notes, createBtn),
-    el('div', { class: 'help', style: 'margin-top:8px' }, 'One requisition is created per production run and lab, filled from that lab’s template and saved as a document on the run (Production → run → Documents). Samples leave the cart — and a Retention sample leaves the retention inventory — once its requisition is created.'));
+  host.append(el('div', { style: 'display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:14px' }, poInp, notes,
+    el('span', { class: 'help' }, 'PO # and notes go on every requisition you create below.')), readyHost,
+    el('div', { class: 'help', style: 'margin-top:8px' }, 'A different lab means a different form and different analyses. Each requisition is saved as a document on its production run (Production → run → Documents). Samples leave the cart — and a Retention sample leaves the retention inventory — once its requisition is created.'));
   updateSummary();
 }
 
@@ -5494,71 +5549,72 @@ async function drawRequisitions(host) {
 
 /* ---- Admin: Certificate of Analysis specifications ---- */
 async function drawAdminCoaSpecs(v) {
-  const { specs, applicationRate } = await api('GET', '/coa-specs');
-  v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Certificate of Analysis specifications'),
-    el('div', { class: 'actions' }, el('button', { class: 'secondary', onclick: () => openMetalLimitCalculator(specs, applicationRate) }, '🧮 Heavy-metal limit calculator'))));
+  const { specs, applicationRate, applicationPeriods } = await api('GET', '/coa-specs');
+  v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Certificate of Analysis specifications')));
   v.append(el('div', { class: 'help', style: 'margin:-6px 0 8px' }, 'Limits each run is judged against on its Certificate of Analysis. “Required” results must be on file before Quality can release a run. '
-    + 'Heavy-metal results stay in ppm / %; the calculator converts the regulatory loading limits (kg metal per ha) to ppm / % at the product application rate. Changing a limit re-judges every certificate as it is next generated.'));
+    + 'Heavy-metal limits are loadings in kg metal per ha; each lab result is converted to kg/ha at the product application rate (' + (applicationRate ? applicationRate + ' kg/ha' : 'not set') + ') × application periods ('
+    + applicationPeriods + '), both set on the Calculations page. Changing a limit re-judges every certificate as it is next generated.'));
   const names = { physical: 'Physical & chemical', metals: 'Heavy metals', microbial: 'Microbiological' };
   const rows = [];
   for (const g of ['physical', 'metals', 'microbial']) {
     rows.push({ group: el('b', {}, names[g]) });
-    specs.filter(x => x.group === g).forEach(x => rows.push([x.name, x.specText, x.limitKgHa != null ? x.limitKgHa + ' kg/ha' : '—', x.required ? 'Yes' : 'No', x.method || '—', x.active ? 'Active' : 'Inactive',
+    specs.filter(x => x.group === g).forEach(x => rows.push([x.name, x.specText, x.required ? badge('on_hand', 'Required') : badge('sold', 'Optional'), x.method || '—', x.active ? badge('on_hand', 'On certificate') : badge('hold', 'Lab results only'),
       rowActions([['Edit', () => editCoaSpec(x)]])]));
   }
-  v.append(table(['Test', 'Specification', 'Regulatory limit', 'Required for release', 'Default method', 'Status', ''], rows));
-}
-// Heavy-metal limit calculator: the regulatory limits are loadings (kg metal per ha); results come back in ppm / %, so each limit is
-// converted at the product application rate: ppm = kg/ha x 1,000,000 / application rate (kg product per ha); % = ppm / 10,000.
-function openMetalLimitCalculator(specs, rate0) {
-  const metals = specs.filter(x => x.basis === 'metal');
-  const rate = el('input', { value: rate0 || '', placeholder: 'kg of product per ha', inputmode: 'decimal' });
-  const lim = {}; const out = {};
-  const tbody = el('tbody', {});
-  metals.forEach(m => {
-    lim[m.code] = el('input', { value: m.limitKgHa ?? '', style: 'width:90px', inputmode: 'decimal' });
-    out[m.code] = [el('td', { class: 'num' }), el('td', { class: 'num' })];
-    tbody.append(el('tr', {}, el('td', {}, m.name), el('td', {}, lim[m.code]), out[m.code][0], out[m.code][1]));
-  });
-  function calc() {
-    const r = parseFloat(rate.value);
-    metals.forEach(m => {
-      const kg = parseFloat(lim[m.code].value), ok = r > 0 && kg > 0;
-      out[m.code][0].textContent = ok ? coaFmt(kg * 1e6 / r) : '—';
-      out[m.code][1].textContent = ok ? coaFmt(kg * 1e6 / r / 10000) : '—';
-    });
-  }
-  [rate, ...Object.values(lim)].forEach(i => i.addEventListener('input', calc));
-  calc();
-  modal('Heavy-metal limit calculator', el('div', {},
-    el('div', { class: 'help' }, 'Converts each regulatory loading limit to the ppm and % limit results are judged against: ppm = limit (kg/ha) × 1,000,000 ÷ application rate (kg product/ha); % = ppm ÷ 10,000. '
-      + 'Nothing changes until you apply.'),
-    field('Product application rate (kg of product per ha)', rate),
-    el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {}, ...['Metal', 'Limit (kg/ha)', 'Limit (ppm)', 'Limit (%)'].map(h => el('th', {}, h)))), tbody))),
-    async () => {
-      const limits = {}; metals.forEach(m => { limits[m.code] = lim[m.code].value; });
-      await api('POST', '/coa-specs/metal-limits', { applicationRate: rate.value, limits });
-      toast('Metal limits applied'); render();
-    }, 'Apply limits', { wide: true });
+  v.append(table(['Test', 'Specification', 'Required for release', 'Default method', 'Status', ''], rows));
 }
 function editCoaSpec(x) {
-  const mn = el('input', { value: x.minVal ?? '', placeholder: 'none' }), mx = el('input', { value: x.maxVal ?? '', placeholder: 'none' });
+  const groupName = { physical: 'Physical & chemical', metals: 'Heavy metals', microbial: 'Microbiological' }[x.group] || x.group;
+  const absent = x.basis === 'absent';
+  const unit = x.unit ? ' (' + x.unit + ')' : '';
+  const mn = el('input', { value: x.minVal ?? '', placeholder: 'No minimum', inputmode: 'decimal' });
+  const mx = el('input', { value: x.maxVal ?? '', placeholder: 'No maximum', inputmode: 'decimal' });
+  const meth = el('input', { value: x.method || '', placeholder: 'e.g. MFHPB-18' });
   const excl = el('input', { type: 'checkbox' }); excl.checked = x.maxExclusive;
   const req = el('input', { type: 'checkbox' }); req.checked = x.required;
   const act = el('input', { type: 'checkbox' }); act.checked = x.active;
-  const meth = el('input', { value: x.method || '' });
-  modal('Specification — ' + x.name, el('div', {},
-    el('div', { class: 'help' }, 'Limits are stated in ' + (x.unit || 'the reported unit') + (x.basis === 'absent' ? ' (qualitative: the result must be Negative)' : '')
-      + (x.basis === 'metal' ? '. Normally set with the heavy-metal limit calculator; a value typed here is used as is.' : '') + '.'),
-    el('div', { class: 'form-row' }, field('Minimum', mn), field('Maximum', mx)),
-    el('label', {}, excl, ' Maximum is exclusive (“< limit”)'), el('br'),
-    el('label', {}, req, ' Required before release'), el('br'),
-    el('label', {}, act, ' Active (listed on the certificate)'),
-    field('Default method', meth)),
+  const option = (cb, title, hint) => {
+    const row = el('label', { class: 'perm-item' + (cb.checked ? ' on' : '') }, cb, el('span', { class: 'perm-text' }, el('b', {}, title), el('small', {}, hint)));
+    cb.addEventListener('change', () => row.classList.toggle('on', cb.checked));
+    return row;
+  };
+  const exclRow = el('div', { class: 'perm-list', style: 'margin-top:8px' },
+    option(excl, 'Strict maximum', 'The result must be below the maximum (“< limit”) rather than at or below it (“≤ limit”).'));
+  const num = i => (i.value.trim() === '' ? null : Number(i.value));
+  // the same wording the certificate prints (coa_spec_text on the server)
+  const f = v => String(Number(v.toPrecision(6)));
+  const preview = el('b', {});
+  function sync() {
+    const a = num(mn), b = num(mx), u = x.unit ? ' ' + x.unit : '';
+    let t = '—';
+    if (absent) t = x.specText;
+    else if (x.code === 'ph' && a != null && b != null) t = a.toFixed(1) + ' - ' + b.toFixed(1);
+    else if (a != null && b != null) t = f(a) + ' - ' + f(b) + u;
+    else if (a != null) t = 'min ' + f(a) + u;
+    else if (b != null) t = (excl.checked ? '< ' : '≤ ') + f(b) + u;
+    preview.textContent = t;
+    exclRow.classList.toggle('hidden', absent || b == null || a != null);
+  }
+  [mn, mx].forEach(i => i.addEventListener('input', sync)); excl.addEventListener('change', sync);
+  sync();
+  const section = (title, ...kids) => el('div', { class: 'perm-box' }, el('div', { class: 'perm-title' }, title), ...kids);
+  modal('Edit specification — ' + x.name, el('div', {},
+    el('div', { class: 'summary-line' }, sl('Test', x.name), sl('Group', groupName), sl('Stated in', x.unit || 'the reported unit')),
+    section('Limit',
+      absent ? el('div', { class: 'help' }, 'Qualitative test: the result must be Negative. There is no numeric limit to edit.')
+        : el('div', { class: 'form-row' }, field('Minimum' + unit, mn), field('Maximum' + unit, mx)),
+      exclRow,
+      el('div', { class: 'help', style: 'margin-top:8px' }, 'Printed on the certificate as: ', preview)),
+    section('Release and certificate', el('div', { class: 'perm-list' },
+      option(req, 'Required before release', 'Quality cannot release a run until a result for this test is on file.'),
+      option(act, 'Listed on the certificate', 'Untick to keep this test in Lab results but leave it off the Certificate of Analysis.'))),
+    section('Method', field('Default method', meth),
+      el('div', { class: 'help' }, 'Filled in when a result for this test is entered; a lab report’s own method replaces it.'))),
     async () => {
-      await api('PUT', '/coa-specs/' + x.code, { minVal: mn.value, maxVal: mx.value, maxExclusive: excl.checked, required: req.checked, active: act.checked, method: meth.value });
+      await api('PUT', '/coa-specs/' + x.code, { minVal: absent ? x.minVal : mn.value, maxVal: absent ? x.maxVal : mx.value,
+        maxExclusive: excl.checked, required: req.checked, active: act.checked, method: meth.value });
       toast('Specification saved'); render();
-    });
+    }, 'Save specification');
 }
 
 /* ---- Admin: labs, their analyses and requisition templates ---- */
@@ -5571,7 +5627,7 @@ async function drawAdminLabs(v) {
   else v.append(table(['Lab', 'Contact', 'Analyses', 'Requisition template', 'Status', ''],
     labs.map(l => [el('b', {}, l.name), el('span', {}, l.contact || '—', l.email ? el('div', { class: 'help' }, l.email) : null),
       el('span', {}, l.analyses.filter(a => a.active).map(a => a.name).join(', ') || el('span', { class: 'muted' }, 'none yet')),
-      el('span', {}, l.hasTemplate ? '📄 ' + l.templateName : el('span', { class: 'muted' }, 'Built-in layout'), l.sampleSheet ? el('div', { class: 'help' }, '+ sample spreadsheet') : null),
+      el('span', {}, l.hasTemplate ? el('span', {}, '📄 ' + l.templateName, l.templateTokens === 0 ? el('div', { class: 'help', style: 'color:var(--danger)' }, '⚠ no {{placeholders}} — won’t auto-fill') : null) : el('span', { class: 'muted' }, 'Built-in layout'), l.sampleSheet ? el('div', { class: 'help' }, '+ sample spreadsheet') : null),
       l.active ? badge('on_hand', 'Active') : badge('disposed', 'Inactive'),
       rowActions([['Edit', () => editLab(l)], ['Analyses', () => manageLabAnalyses(l.id)], ['Template', () => labTemplateModal(l)]])]),
     [false, false, false, false, false, false]));
@@ -5617,7 +5673,26 @@ async function manageLabAnalyses(labId) {
     try { await api('POST', '/labs/' + labId + '/analyses', { name: name.value, code: code.value, method: method.value }); name.value = ''; code.value = ''; method.value = ''; draw(); }
     catch (e) { toast(e.message, true); }
   } }, '+ Add');
-  modal('Analyses — ' + l.name, el('div', {}, host, el('div', { style: 'display:flex;gap:8px;margin-top:10px;flex-wrap:wrap' }, name, code, method, add),
+  const fromCoa = el('button', { class: 'secondary', onclick: async () => {
+    const [{ specs }, fresh] = await Promise.all([api('GET', '/coa-specs'), api('GET', '/labs')]);
+    const have = new Set(fresh.labs.find(x => x.id === labId).analyses.map(a => a.name.toLowerCase()));
+    const groupName = { physical: 'Physical & chemical', metals: 'Heavy metals', microbial: 'Microbiological' };
+    const avail = specs.filter(x => x.basis !== 'run' && !have.has(x.name.toLowerCase()));
+    if (!avail.length) return toast('Every Certificate of Analysis test is already on this lab’s list.');
+    const boxes = [];
+    const body = el('div', {}, el('div', { class: 'help' }, 'Tick the tests this lab performs. They are added with the method from the Certificate of Analysis specification; edit them afterwards if the lab uses another method.'));
+    ['microbial', 'metals', 'physical'].forEach(g => {
+      const grp = avail.filter(x => x.group === g);
+      if (!grp.length) return;
+      body.append(el('div', { class: 'perm-title', style: 'margin-top:10px' }, groupName[g]));
+      grp.forEach(x => { const cb = el('input', { type: 'checkbox' }); boxes.push([cb, x]); body.append(el('label', { style: 'display:flex;gap:8px;align-items:center;font-weight:normal;margin:4px 0' }, cb, x.name, el('span', { class: 'muted' }, x.method ? ' · ' + x.method : ''))); });
+    });
+    modal('Add Certificate of Analysis tests — ' + l.name, body, async () => {
+      for (const [cb, x] of boxes) if (cb.checked) await api('POST', '/labs/' + labId + '/analyses', { name: x.name, code: '', method: x.method || '' });
+      await draw();
+    }, 'Add selected');
+  } }, '+ From CoA tests');
+  modal('Analyses — ' + l.name, el('div', {}, host, el('div', { style: 'display:flex;gap:8px;margin-top:10px;flex-wrap:wrap' }, name, code, method, add, fromCoa),
     el('div', { class: 'help', style: 'margin-top:8px' }, 'A template checkbox column uses {{sample.check:Analysis name}} (or the code). Hiding an analysis removes it from the cart without deleting it.')),
     async () => { render(); }, 'Close', { noCancel: true, wide: true });
   draw();
@@ -5629,6 +5704,9 @@ function labTemplateModal(l) {
     el('div', { class: 'help' }, l.hasTemplate ? 'Current template: ' + l.templateName : 'No template uploaded — requisitions use the built-in layout.'),
     l.hasTemplate ? el('div', { style: 'margin:6px 0' }, el('a', { href: '/api/labs/' + l.id + '/template/download?token=' + encodeURIComponent(State.token) }, '⬇ Download current template'),
       '  ', el('button', { class: 'secondary', onclick: async () => { await api('DELETE', '/labs/' + l.id + '/template'); toast('Template removed'); document.querySelector('.modal-bg')?.remove(); render(); } }, 'Remove')) : null,
+    l.readyTemplate ? el('div', { style: 'margin:8px 0;padding:10px 12px;background:#eef8f6;border-radius:10px' }, el('b', {}, 'Ready-made form available'),
+      el('div', { class: 'help' }, l.readyTemplate + ' — the lab’s own form with the placeholders already in place.'),
+      el('button', { type: 'button', style: 'margin-top:6px', onclick: () => useReadyTemplate(l, async () => { document.querySelector('.modal-bg')?.remove(); render(); }) }, 'Use this form for ' + l.name)) : null,
     field('Upload a Word template (.docx)', file), out,
     el('details', { style: 'margin-top:10px' }, el('summary', {}, 'Placeholders you can use in the template'),
       el('div', { class: 'help', style: 'margin-top:6px' }, 'Anywhere in the document: ' + tokens + '.'),
@@ -6059,13 +6137,16 @@ function printLabels(labels) {
 
 /* ---------------- shared UI bits ---------------- */
 function table(headers, rows, numCols = [], rowClick = null) {
-  const thead = el('thead', {}, el('tr', {}, ...headers.map((h, i) => el('th', { class: numCols[i] ? 'num' : '' }, h))));
+  const colClass = i => numCols[i] === 'center' ? 'ctr' : numCols[i] ? 'num' : '';
+  const thead = el('thead', {}, el('tr', {}, ...headers.map((h, i) => el('th', { class: colClass(i) }, h))));
   const tb = el('tbody', {});
   if (!rows.length) tb.append(el('tr', {}, el('td', { colspan: headers.length, class: 'empty' }, 'Nothing here yet.')));
   rows.forEach((r, ri) => {
     // a row of the form { group: node } is a full-width group heading (not a data row; it isn't clickable)
+    // (or { groupCells: [...] }: a group heading that also carries column titles, one cell per column)
     if (r && !Array.isArray(r) && r.group != null) { tb.append(el('tr', { class: 'group-row' }, el('td', { colspan: headers.length }, r.group))); return; }
-    const cells = r.map((c, i) => el('td', { class: numCols[i] ? 'num' : '' }, c == null ? '—' : (c.nodeType ? c : String(c))));
+    if (r && !Array.isArray(r) && r.groupCells) { tb.append(el('tr', { class: 'group-row' }, ...r.groupCells.map((c, i) => el('td', { class: colClass(i) }, c || '')))); return; }
+    const cells = r.map((c, i) => el('td', { class: colClass(i) }, c == null ? '—' : (c.nodeType ? c : String(c))));
     tb.append(el('tr', rowClick ? { class: 'clickable', onclick: () => rowClick(ri) } : {}, ...cells));
   });
   return el('div', { class: 'tablewrap' }, el('table', {}, thead, tb));
@@ -6217,7 +6298,6 @@ function labSummaryText(l) {
   return 'Required (microbial) ' + l.requiredReceived + '/' + l.requiredTotal + ' · Heavy metals ' + l.metalsReceived + '/' + l.metalsTotal
     + (l.additionalCount ? ' · ' + l.additionalCount + ' additional' : '') + (l.review.length ? ' · ' + l.review.length + ' to review' : '');
 }
-const coaFmt = (v, d = 4) => v == null || !isFinite(v) ? '—' : String(Number(v.toPrecision(d)));
 async function openLabResults(run) {
   const body = el('div', {});
   let changed = false;
@@ -6235,20 +6315,23 @@ async function openLabResults(run) {
     if (s.missingRequired.length) body.append(el('div', { class: 'help', style: 'color:var(--danger);font-weight:600' },
       'Quality cannot release this run until these results are on file: ' + s.missingRequired.join(', ') + '.'));
     if (d.coa.rows.some(x => x.group === 'metals' && x.status === 'not_evaluated')) body.append(el('div', { class: 'help' },
-      'Heavy-metal limits are not set yet, so the metals are listed but not judged. An administrator sets them with the limit calculator under Admin → Certificate of Analysis specifications.'));
+      'Heavy-metal results are listed but not judged: the product application rate has not been set. An administrator sets it (with the application periods) on the Calculations page.'));
+    else if (s.applicationRate && s.metalsReceived) body.append(el('div', { class: 'help' },
+      'Metal loading (kg/ha) = result (mg/kg) × application rate (' + s.applicationRate + ' kg/ha) × application periods (' + s.applicationPeriods + ') ÷ 1,000,000.'));
     const rows = [];
     for (const [g, gname] of [['physical', 'Physical & chemical'], ['metals', 'Heavy metals'], ['microbial', 'Microbiological']]) {
       const grp = d.coa.rows.filter(x => x.group === g);
       if (!grp.length) continue;
-      rows.push({ group: el('b', {}, gname) });
-      grp.forEach(x => rows.push([x.name + (x.required ? ' *' : ''), x.specText, x.resultText || '—',
+      // the Loading (kg/ha) title sits in the Heavy metals heading row: only the metals have a loading
+      rows.push(g === 'metals' ? { groupCells: [el('b', {}, gname), '', '', el('b', {}, 'Loading (kg/ha)'), '', ''] } : { group: el('b', {}, gname) });
+      grp.forEach(x => rows.push([el('span', {}, x.name + (x.required ? ' *' : ''), x.listed ? null : el('span', { class: 'muted', style: 'font-size:11px', title: 'Shown here only; not printed on the Certificate of Analysis' }, '  · not on certificate')), x.specText, x.resultText || '—', g === 'metals' ? (x.loadingText || '—') : '',
         x.result ? [x.result.labName, x.result.reportNumber].filter(Boolean).join(' · ') : (x.source || '—'), coaStatusBadge(x)]));
     }
     if (d.coa.additional.length) {
       rows.push({ group: el('b', {}, 'Additional analyses') });
-      d.coa.additional.forEach(x => rows.push([x.analyte, '—', x.resultText + (x.unit ? ' ' + x.unit : ''), [x.labName, x.reportNumber].filter(Boolean).join(' · '), '—']));
+      d.coa.additional.forEach(x => rows.push([x.analyte, '—', x.resultText + (x.unit ? ' ' + x.unit : ''), '', [x.labName, x.reportNumber].filter(Boolean).join(' · '), '—']));
     }
-    body.append(table(['Test', 'Specification', 'Result', 'Laboratory / report', 'Status'], rows));
+    body.append(table(['Test', 'Specification', 'Result', '', 'Laboratory / report', 'Status'], rows, [false, false, false, 'center', false, false]));
     body.append(el('div', { class: 'help' }, '* required before Quality can release the lot. TDS and pH come from the Packaging QC check in the production log.'));
     const hist = d.results;
     body.append(el('details', { class: 'accordion', style: 'margin-top:10px' }, el('summary', {}, 'Entry history (' + hist.length + ')'),

@@ -126,7 +126,9 @@ SETTINGS_DEFAULTS = [
     ("yield_report_min_runs", 5, "Yield & Usage minimum runs per group",
      "A Yield & Usage group with fewer completed (non-excluded) runs than this is tagged \"Low sample\"."),
     ("coa_application_rate_kg_ha", 0, "Certificate of Analysis: product application rate (kg/ha)",
-     "Used by the Admin metal-limit calculator to turn each heavy-metal loading limit (kg metal per ha) into a ppm / % limit: ppm = limit x 1,000,000 / this application rate (kg of product per ha). Changing it here does not change the limits -- apply them from the calculator. 0 = not set."),
+     "Kilograms of product applied per hectare in one application. A heavy-metal result (mg/kg) is converted to a loading on the Certificate of Analysis: kg metal/ha = mg/kg x this rate x Application periods / 1,000,000, and judged against the kg/ha specification. 0 = not set (metals are listed but not judged)."),
+    ("coa_application_periods", 1, "Certificate of Analysis: application periods",
+     "Number of applications the metal loading accumulates over (a multiplier on the kg metal/ha: loading = mg/kg x application rate x this / 1,000,000). 1 = a single application."),
     ("separation_default_flowrate_lpm", 40, "Separation default Flow rate (L/min)",
      "Pre-filled value for a new run's Separation Flow rate (L/min) field."),
     ("separation_default_mesh_micron", 74, "Separation default Mesh size (micron)",
@@ -1813,7 +1815,7 @@ def parse_lab_report(lines):
 
 
 # basis: run = measured in-house (Packaging QC check), value = lab result compared as reported, metal = lab concentration
-# converted to ppm and compared with the ppm limit (derived from the kg/ha regulatory limit by the Admin limit calculator),
+# converted to a loading (kg metal / ha) at the application rate x application periods and compared with the kg/ha limit,
 # absent = qualitative (Negative / Positive).
 COA_GROUPS = (("physical", "Physical & chemical"), ("metals", "Heavy metals"), ("microbial", "Microbiological"))
 COA_SPEC_SEED = [
@@ -1821,17 +1823,17 @@ COA_SPEC_SEED = [
     ("tds", "TDS", "physical", "%", "run", 1, 2, 0, 0, 10, "", None),
     ("ph", "pH", "physical", "", "run", 3.0, 4.0, 0, 0, 20, "", None),
     ("potash", "Soluble potash, K2O", "physical", "%", "value", 0.5, None, 0, 0, 30, "", None),
-    ("as", "Arsenic (As)", "metals", "ppm", "metal", None, None, 0, 0, 100, "ICP-MS", 15),
-    ("cd", "Cadmium (Cd)", "metals", "ppm", "metal", None, None, 0, 0, 110, "ICP-MS", 4),
-    ("cr", "Chromium (Cr)", "metals", "ppm", "metal", None, None, 0, 0, 120, "ICP-MS", 210),
-    ("co", "Cobalt (Co)", "metals", "ppm", "metal", None, None, 0, 0, 130, "ICP-MS", 30),
-    ("cu", "Copper (Cu)", "metals", "ppm", "metal", None, None, 0, 0, 140, "ICP-MS", 150),
-    ("pb", "Lead (Pb)", "metals", "ppm", "metal", None, None, 0, 0, 150, "ICP-MS", 100),
-    ("hg", "Mercury (Hg)", "metals", "ppm", "metal", None, None, 0, 0, 160, "ICP-MS", 1),
-    ("mo", "Molybdenum (Mo)", "metals", "ppm", "metal", None, None, 0, 0, 170, "ICP-MS", 4),
-    ("ni", "Nickel (Ni)", "metals", "ppm", "metal", None, None, 0, 0, 180, "ICP-MS", 36),
-    ("se", "Selenium (Se)", "metals", "ppm", "metal", None, None, 0, 0, 190, "ICP-MS", 2.8),
-    ("zn", "Zinc (Zn)", "metals", "ppm", "metal", None, None, 0, 0, 200, "ICP-MS", 370),
+    ("as", "Arsenic (As)", "metals", "kg/ha", "metal", None, 15, 0, 0, 100, "ICP-MS", None),
+    ("cd", "Cadmium (Cd)", "metals", "kg/ha", "metal", None, 4, 0, 0, 110, "ICP-MS", None),
+    ("cr", "Chromium (Cr)", "metals", "kg/ha", "metal", None, 210, 0, 0, 120, "ICP-MS", None),
+    ("co", "Cobalt (Co)", "metals", "kg/ha", "metal", None, 30, 0, 0, 130, "ICP-MS", None),
+    ("cu", "Copper (Cu)", "metals", "kg/ha", "metal", None, 150, 0, 0, 140, "ICP-MS", None),
+    ("pb", "Lead (Pb)", "metals", "kg/ha", "metal", None, 100, 0, 0, 150, "ICP-MS", None),
+    ("hg", "Mercury (Hg)", "metals", "kg/ha", "metal", None, 1, 0, 0, 160, "ICP-MS", None),
+    ("mo", "Molybdenum (Mo)", "metals", "kg/ha", "metal", None, 4, 0, 0, 170, "ICP-MS", None),
+    ("ni", "Nickel (Ni)", "metals", "kg/ha", "metal", None, 36, 0, 0, 180, "ICP-MS", None),
+    ("se", "Selenium (Se)", "metals", "kg/ha", "metal", None, 2.8, 0, 0, 190, "ICP-MS", None),
+    ("zn", "Zinc (Zn)", "metals", "kg/ha", "metal", None, 370, 0, 0, 200, "ICP-MS", None),
     ("apc", "Aerobic plate count", "microbial", "cfu/g", "value", None, 500, 1, 1, 300, "MFHPB-18", None),
     ("yeast", "Yeast", "microbial", "cfu/g", "value", None, 20, 1, 1, 310, "MFHPB-22", None),
     ("mold", "Mold", "microbial", "cfu/g", "value", None, 20, 1, 1, 320, "MFHPB-22", None),
@@ -1847,12 +1849,10 @@ def ensure_coa_specs(conn):
     for code, name, grp, unit, basis, mn, mx, excl, req, sort, method, kg in COA_SPEC_SEED:
         conn.execute("INSERT OR IGNORE INTO coa_specs (code,name,grp,unit,basis,min_val,max_val,max_exclusive,required,sort,method,limit_kg_ha)"
                      " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (code, name, grp, unit, basis, mn, mx, excl, req, sort, method, kg))
-    # first version stored the kg/ha limit as the max: it becomes the reference limit, and the judged ppm limit waits for the calculator
-    conn.execute("UPDATE coa_specs SET limit_kg_ha=max_val, max_val=NULL, unit='ppm' WHERE basis='metal' AND unit='kg/ha'")
-    conn.execute("UPDATE settings SET label=?, description=? WHERE key='coa_application_rate_kg_ha'",
-                 ("Certificate of Analysis: product application rate (kg/ha)",
-                  "Used by the Admin metal-limit calculator to turn each heavy-metal loading limit (kg metal per ha) into a ppm / % limit: ppm = limit x 1,000,000 / this application rate (kg of product per ha). "
-                  "Changing it here does not change the limits -- apply them from the calculator. 0 = not set."))
+    # an interim version judged metals against a ppm limit derived by a calculator: the limit is the kg/ha regulatory value again
+    conn.execute("UPDATE coa_specs SET max_val=limit_kg_ha, unit='kg/ha' WHERE basis='metal' AND unit='ppm' AND limit_kg_ha IS NOT NULL")
+    for key, label, desc in ((k, l, d) for k, v, l, d in SETTINGS_DEFAULTS if k in ("coa_application_rate_kg_ha", "coa_application_periods")):
+        conn.execute("UPDATE settings SET label=?, description=? WHERE key=?", (label, desc, key))
 
 
 def coa_num(v, digits=6):
@@ -1862,6 +1862,15 @@ def coa_num(v, digits=6):
     if "e" in s:
         s = ("%." + str(digits) + "f") % v
     return s.rstrip("0").rstrip(".") if "." in s else s
+
+
+def coa_loading_text(v, qual=""):
+    """A metal loading in kg/ha for display ('<' marks an upper bound from a below-detection result)."""
+    if v is None:
+        return ""
+    if v < 0.001:
+        return "<0.001"
+    return (qual if qual == "<" else "") + (("%.2f" % v) if v >= 10 else ("%.3g" % v))
 
 
 def parse_result_value(text):
@@ -1893,16 +1902,12 @@ def coa_spec_text(s):
         return "%.1f - %.1f" % (s["min_val"], s["max_val"])
     if s["basis"] == "absent":
         return "Negative (< %s %s)" % (coa_num(s["max_val"]), s["unit"])
-    if s["basis"] == "metal":
-        if s["max_val"] is None:
-            return ("Not set (%s kg/ha)" % coa_num(s["limit_kg_ha"])) if s["limit_kg_ha"] is not None else "-"
-        return "max %s ppm (%s %%)" % (coa_num(s["max_val"], 4), coa_num(s["max_val"] / 10000.0, 4))
     if s["min_val"] is not None and s["max_val"] is not None:
         return "%s - %s%s" % (coa_num(s["min_val"]), coa_num(s["max_val"]), u)
     if s["min_val"] is not None:
         return "min %s%s" % (coa_num(s["min_val"]), u)
     if s["max_val"] is not None:
-        return ("< %s%s" if s["max_exclusive"] else "max %s%s") % (coa_num(s["max_val"]), u)
+        return ("< %s%s" if s["max_exclusive"] else "≤ %s%s") % (coa_num(s["max_val"]), u)
     return "-"
 
 
@@ -1932,6 +1937,9 @@ def _coa_judge(s, qual, num, text, rate):
 def coa_evaluate(conn, r):
     """Conformance of one run's results against the active specifications. Returns {rows, additional, summary}."""
     rate = float(get_setting_value(conn, "coa_application_rate_kg_ha", 0) or 0)
+    periods = float(get_setting_value(conn, "coa_application_periods", 1) or 1)
+    if periods <= 0:
+        periods = 1.0
     latest, additional = {}, []
     for x in conn.execute("SELECT * FROM lab_results WHERE run_id=? AND voided_at IS NULL ORDER BY id", (r["id"],)):
         if x["spec_code"]:
@@ -1939,10 +1947,10 @@ def coa_evaluate(conn, r):
         else:
             additional.append(x)
     rows = []
-    for s in conn.execute("SELECT * FROM coa_specs WHERE active=1 ORDER BY sort, code"):
-        row = {"code": s["code"], "name": s["name"], "group": s["grp"], "unit": s["unit"], "basis": s["basis"],
+    for s in conn.execute("SELECT * FROM coa_specs ORDER BY sort, code"):      # every test, listed on the certificate or not
+        row = {"listed": bool(s["active"]), "code": s["code"], "name": s["name"], "group": s["grp"], "unit": s["unit"], "basis": s["basis"],
                "required": bool(s["required"]), "specText": coa_spec_text(s), "result": None, "resultText": "", "status": None,
-               "note": ""}
+               "note": "", "loading": None, "loadingText": ""}
         if s["basis"] == "run":
             v = r["packaging_tds_pct"] if s["code"] == "tds" else r["packaging_qc_ph"] if s["code"] == "ph" else None
             if v is not None:
@@ -1959,20 +1967,22 @@ def coa_evaluate(conn, r):
                 f = COA_PPM_FACTORS.get((x["unit"] or "").strip().lower())
                 if f is None or x["value_num"] is None:
                     row["status"], row["note"] = "review", "Unit not recognised"
-                elif s["max_val"] is None:
-                    row["status"], row["note"] = "not_evaluated", "Limit not set"
+                elif rate <= 0 or s["max_val"] is None:
+                    row["status"], row["note"] = "not_evaluated", "Application rate not set" if rate <= 0 else "Limit not set"
                 else:
-                    ppm = x["value_num"] * f
+                    # loading (kg metal / ha) = mg/kg x application rate (kg product / ha) x application periods / 1e6
+                    loading = x["value_num"] * f * rate * periods / 1e6
                     mx = s["max_val"]
+                    row["loading"], row["loadingText"] = loading, coa_loading_text(loading, x["qualifier"])
                     if x["qualifier"] == ">":
-                        row["status"] = "fail" if ppm >= mx else "review"
+                        row["status"] = "fail" if loading >= mx else "review"
                     elif x["qualifier"] == "<":
                         # "below the detection limit": proves compliance only when the detection limit is itself within the limit
-                        row["status"] = "pass" if ppm <= mx else "review"
+                        row["status"] = "pass" if loading <= mx else "review"
                         if row["status"] == "review":
                             row["note"] = "Detection limit is above the specification limit"
                     else:
-                        row["status"] = "pass" if ppm <= mx else "fail"
+                        row["status"] = "pass" if loading <= mx else "fail"
             else:
                 row["status"] = _coa_judge(s, x["qualifier"] or "", x["value_num"], x["value_text"], rate)[0]
         row["tested"] = row["status"] is not None
@@ -1984,7 +1994,7 @@ def coa_evaluate(conn, r):
                "review": [x["name"] for x in rows if x["status"] in ("review", "not_evaluated")],
                "metalsReceived": sum(1 for x in rows if x["group"] == "metals" and x["result"]),
                "metalsTotal": sum(1 for x in rows if x["group"] == "metals"),
-               "applicationRate": rate or None, "additionalCount": len(additional)}
+               "applicationRate": rate or None, "applicationPeriods": periods, "additionalCount": len(additional)}
     return {"rows": rows, "additional": [lab_result_public(x) for x in additional], "summary": summary}
 
 
@@ -2027,9 +2037,9 @@ def build_coa_pdf(S, logo_path=None):
         pdf.space(130)
         pdf.heading(gname)
         metals = gcode == "metals"
-        headers = ["Test", "Specification", "Result (as reported)", "Method", "Laboratory / report", "Conformance"]
-        widths = [24, 24, 20, 14, 26, 13]
-        aligns = ["l"] * len(headers)
+        headers = ["Test", "Specification", "Result (as reported)"] + (["Loading (kg/ha)"] if metals else []) + ["Method", "Laboratory / report", "Conformance"]
+        widths = [24, 20, 20] + ([14] if metals else []) + [14, 26, 13]
+        aligns = ["l", "l", "l"] + (["c"] if metals else []) + ["l", "l", "l"]
         out = []
         for x in grp:
             res = x["result"]
@@ -2045,13 +2055,15 @@ def build_coa_pdf(S, logo_path=None):
                 st = (t, {"bold": True, "color": colors[c]})
             else:
                 st = ("Not tested" if not x["required"] else "Pending", {"color": pdf.GRAY})
-            out.append([(x["name"], {"bold": True}), x["specText"], rtxt, (res or {}).get("method") or "", src, st])
+            out.append([(x["name"], {"bold": True}), x["specText"], rtxt] + ([x["loadingText"] or "-"] if metals else [])
+                        + [(res or {}).get("method") or "", src, st])
         pdf.table(headers, out, widths, aligns, size=7.8)
         if gcode == "metals":
-            pdf.note("Heavy-metal results are shown in the unit the laboratory reported (ppm = mg/kg; 1 % = 10,000 ppm) and compared with the limit in ppm. "
-                     "A result below the detection limit is compared at the limit."
-                     + ((" Limits derived from the regulatory loading limits (kg metal/ha) at an application rate of %s kg product/ha." % coa_num(S["applicationRate"]))
-                        if S["applicationRate"] else ""))
+            if S["applicationRate"]:
+                pdf.note("Loading (kg metal per ha) = result (mg/kg; 1 %% = 10,000 mg/kg) x application rate (%s kg product per ha) x application periods (%s) / 1,000,000. "
+                         "A result below the detection limit is compared at the limit." % (coa_num(S["applicationRate"]), coa_num(S["applicationPeriods"])))
+            else:
+                pdf.note("Heavy-metal results are shown as reported by the laboratory; they are not judged because the product application rate has not been set.")
         if gcode == "microbial":
             pdf.note("Microbial results are per gram of liquid product (Salmonella per 25 g), as reported by the laboratory; '<' = below the limit of quantitation.")
     if S["additional"]:
@@ -2371,7 +2383,7 @@ def _init_pdf_widths():
 
 
 _init_pdf_widths()
-_PDF_SUBS = {"≥": ">=", "≤": "<=", "→": "->", "✓": "", "⚠": "!", "ρ": "rho", "‐": "-", "‑": "-",
+_PDF_SUBS = {"≥": "¥", "≤": "¤", "→": "->", "✓": "", "⚠": "!", "ρ": "rho", "‐": "-", "‑": "-",
              "−": "-", " ": " ", "‘": "'", "“": '"', "”": '"', "…": "..."}
 
 
@@ -2641,10 +2653,11 @@ class PdfBuilder:
         def put(i, b):
             objs[i] = b if isinstance(b, bytes) else b.encode("latin-1")
         put(1, "<< /Type /Catalog /Pages 2 0 R >>")
-        put(3, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>")
-        put(4, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>")
-        put(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique /Encoding /WinAnsiEncoding >>")
-        nxt = 6
+        put(3, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding 6 0 R >>")
+        put(4, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding 6 0 R >>")
+        put(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique /Encoding 6 0 R >>")
+        put(6, "<< /Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences [164 /lessequal 165 /greaterequal] >>")
+        nxt = 7
         xobj = ""
         if self.logo:
             w, h, rgb, alpha = self.logo
@@ -4851,14 +4864,16 @@ class Handler(BaseHTTPRequestHandler):
                 "released": released,
                 "releasedBy": rel.get("releasedBy") or ("Before release workflow" if r["release_state"] == "legacy" else ""),
                 "releasedAt": (rel.get("releasedAt") or "")[:10], "releasedComment": rel.get("releasedComment") or "",
-                "rows": ev["rows"], "additional": ev["additional"], "failed": ev["summary"]["failed"],
-                "applicationRate": ev["summary"]["applicationRate"],
+                # only the tests flagged "listed on the certificate" are printed (the Lab results window shows them all)
+                "rows": [x for x in ev["rows"] if x["listed"]], "additional": ev["additional"],
+                "failed": [x["name"] for x in ev["rows"] if x["listed"] and x["status"] == "fail"],
+                "applicationRate": ev["summary"]["applicationRate"], "applicationPeriods": ev["summary"]["applicationPeriods"],
                 "generatedAt": today_iso(), "generatedBy": user["name"] if user else None}
 
     def _lab_results_payload(self, conn, r):
         specs = [{"code": s["code"], "name": s["name"], "group": s["grp"], "unit": s["unit"], "basis": s["basis"],
                   "method": s["method"], "required": bool(s["required"]), "specText": coa_spec_text(s)}
-                 for s in conn.execute("SELECT * FROM coa_specs WHERE active=1 AND basis!='run' ORDER BY sort, code")]
+                 for s in conn.execute("SELECT * FROM coa_specs WHERE basis!='run' ORDER BY sort, code")]
         return {"results": [lab_result_public(x) for x in conn.execute("SELECT * FROM lab_results WHERE run_id=? ORDER BY id DESC", (r["id"],))],
                 "coa": coa_evaluate(conn, r), "specs": specs, "metalUnits": ["ppm", "%", "ppb", "mg/kg"]}
 
@@ -4967,34 +4982,12 @@ class Handler(BaseHTTPRequestHandler):
     def route_coa_specs(self, method, seg, conn, user):
         def pub(s):
             return {"code": s["code"], "name": s["name"], "group": s["grp"], "unit": s["unit"], "basis": s["basis"],
-                    "minVal": s["min_val"], "maxVal": s["max_val"], "limitKgHa": s["limit_kg_ha"], "maxExclusive": bool(s["max_exclusive"]),
+                    "minVal": s["min_val"], "maxVal": s["max_val"], "maxExclusive": bool(s["max_exclusive"]),
                     "required": bool(s["required"]), "active": bool(s["active"]), "method": s["method"], "specText": coa_spec_text(s)}
         if seg == ["api", "coa-specs"] and method == "GET":
             return {"specs": [pub(s) for s in conn.execute("SELECT * FROM coa_specs ORDER BY sort, code")],
-                    "applicationRate": float(get_setting_value(conn, "coa_application_rate_kg_ha", 0) or 0)}
-        if seg == ["api", "coa-specs", "metal-limits"] and method == "POST":
-            # the limit calculator: ppm limit = loading limit (kg metal / ha) x 1,000,000 / application rate (kg product / ha)
-            self._require_admin(user)
-            d = self._body_json()
-            try:
-                rate = float(d.get("applicationRate"))
-            except (TypeError, ValueError):
-                raise ApiError(400, "Enter the application rate (kg of product per ha)")
-            if rate <= 0:
-                raise ApiError(400, "The application rate must be greater than 0")
-            limits = d.get("limits") or {}
-            for s in conn.execute("SELECT * FROM coa_specs WHERE basis='metal'").fetchall():
-                raw = limits.get(s["code"], s["limit_kg_ha"])
-                try:
-                    kg = float(raw) if raw not in (None, "") else None
-                except (TypeError, ValueError):
-                    raise ApiError(400, "%s: the limit must be a number" % s["name"])
-                if kg is not None and kg <= 0:
-                    raise ApiError(400, "%s: the limit must be greater than 0" % s["name"])
-                conn.execute("UPDATE coa_specs SET limit_kg_ha=?, max_val=?, unit='ppm' WHERE code=?",
-                             (kg, (kg * 1e6 / rate) if kg is not None else None, s["code"]))
-            conn.execute("UPDATE settings SET value=?, updated_at=? WHERE key='coa_application_rate_kg_ha'", (rate, now_iso()))
-            return {"specs": [pub(s) for s in conn.execute("SELECT * FROM coa_specs ORDER BY sort, code")], "applicationRate": rate}
+                    "applicationRate": float(get_setting_value(conn, "coa_application_rate_kg_ha", 0) or 0),
+                    "applicationPeriods": float(get_setting_value(conn, "coa_application_periods", 1) or 1)}
         if len(seg) == 3 and method == "PUT":
             self._require_admin(user)
             s = conn.execute("SELECT * FROM coa_specs WHERE code=?", (seg[2],)).fetchone()
@@ -5115,8 +5108,28 @@ class Handler(BaseHTTPRequestHandler):
         raise ApiError(404, "Unknown samples endpoint")
 
     # -- labs (admin-maintained) -- #
+    @staticmethod
+    def _ready_template_path(lab_name):
+        """The token-ready KelpWorks copy of this lab's form shipped in docs/requisition-templates (matched on the lab's name), or None."""
+        key = re.sub(r"[^a-z0-9]", "", (lab_name or "").lower())
+        want = "foodassure" if "foodassure" in key else "sgs" if "sgs" in key else None
+        folder = os.path.join(BASE_DIR, "docs", "requisition-templates")
+        if want and os.path.isdir(folder):
+            for fn in sorted(os.listdir(folder)):
+                if fn.lower().endswith(".docx") and re.sub(r"[^a-z0-9]", "", fn.lower()).startswith(want):
+                    return os.path.join(folder, fn)
+        return None
+
     def _lab_public(self, conn, r):
-        return {"id": r["id"], "name": r["name"], "contact": r["contact"], "email": r["email"], "phone": r["phone"],
+        tokens = None
+        if r["template_stored"]:
+            try:
+                with open(os.path.join(LAB_DIR, r["template_stored"]), "rb") as f:
+                    tokens = len(docx_inspect(f.read())[0])
+            except Exception:
+                tokens = 0
+        ready = self._ready_template_path(r["name"])
+        return {"id": r["id"], "name": r["name"], "templateTokens": tokens, "readyTemplate": os.path.basename(ready) if ready else None, "contact": r["contact"], "email": r["email"], "phone": r["phone"],
                 "address": r["address"], "notes": r["notes"], "active": bool(r["active"]),
                 "hasTemplate": bool(r["template_stored"]), "templateName": r["template_name"],
                 "sampleSheet": bool(r["sample_sheet"]),
@@ -5229,6 +5242,25 @@ class Handler(BaseHTTPRequestHandler):
                             ids = [x for x in (json.loads(c["analyses"]) if c["analyses"] else []) if x != aid]
                             conn.execute("UPDATE sample_cart SET analyses=? WHERE id=?", (json.dumps(ids), c["id"]))
                         return self._lab_public(conn, lab)
+            if len(seg) == 5 and seg[3] == "template" and seg[4] == "builtin" and method == "POST":
+                self._require_admin(user)
+                path = self._ready_template_path(lab["name"])
+                if not path:
+                    raise ApiError(404, "There is no ready-made template for this lab. Upload its form under Template instead.")
+                with open(path, "rb") as f:
+                    raw = f.read()
+                report = self._template_report(conn, lid, raw)
+                os.makedirs(LAB_DIR, exist_ok=True)
+                stored = secrets.token_hex(8) + ".docx"
+                with open(os.path.join(LAB_DIR, stored), "wb") as f:
+                    f.write(raw)
+                if lab["template_stored"]:
+                    try:
+                        os.remove(os.path.join(LAB_DIR, lab["template_stored"]))
+                    except OSError:
+                        pass
+                conn.execute("UPDATE labs SET template_name=?, template_stored=? WHERE id=?", (os.path.basename(path), stored, lid))
+                return {"lab": self._lab_public(conn, conn.execute("SELECT * FROM labs WHERE id=?", (lid,)).fetchone()), "report": report}
             if len(seg) == 4 and seg[3] == "template":
                 self._require_admin(user)
                 if method == "POST":
@@ -5424,7 +5456,9 @@ class Handler(BaseHTTPRequestHandler):
                     with open(os.path.join(LAB_DIR, lab["template_stored"]), "rb") as f:
                         template = f.read()
                 except OSError:
-                    template = None
+                    # never quietly swap in the built-in layout for a lab that has its own form
+                    raise ApiError(409, "The requisition template for %s (%s) is missing on the server. Upload it again under "
+                                        "Admin > Labs & analyses > Template." % (lab["name"], lab["template_name"] or "template"))
             doc = docx_fill(template or build_starter_docx(), scalars, sample_rows, req_analyses)
             safe_lab = re.sub(r"[^A-Za-z0-9]+", "_", lab["name"]).strip("_")
             att_id = self._store_attachment(conn, run_id, "%s_%s_%s.docx" % (req_number, safe_lab, run["processing_lot"]),
