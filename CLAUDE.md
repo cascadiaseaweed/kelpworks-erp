@@ -242,6 +242,16 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
   rows of the "Analysis ... Result" table; names are matched to specs through `LAB_ANALYTE_ALIASES`, unknown rows become additional analyses.
   Nothing is saved by the scan; the user reviews the form. Tested on FoodAssure and SGS reports -- add aliases there for new analytes/labs. Lab results are exempt from the amend lock (`lab-results` in `_LOG_EXEMPT_SUBPATHS`) and are not part of the release hash. The CoA
   PDF is generated on demand (preliminary until the run is released) from the CURRENT specs.
+- **Quality Control charts** (the "Quality Control" tab, `pageQC` + `qc*` helpers in app.js; `GET /api/qc-charts` = `_qc_chart_data`, `PUT /api/qc-charts/limits`, tables
+  `qc_chart_limits` + append-only `qc_chart_limit_log`). One measurement at a time from a dropdown: process QC checks (`QC_FIELD_REGISTRY` columns grouped by measurement x process section via
+  `QC_MEASURE_KEYS` / `qc_section_of`, plus dilution pH / volume variance and the derived extraction efficiency), feedstock pH / ORP per tote, and numeric laboratory results (`lab_results`; metals
+  converted to ppm; `<` results are charted hollow and left out of the statistics). Completed runs only, `exclude_from_stats` runs hidden unless ticked. Everything is computed client-side from the
+  one payload: summary tiles, an individuals chart over the run sequence (x = runs oldest -> newest, colour by species / farm / SKU / stabilization / month, filters for date / SKU / species / farm /
+  stabilization), a moving-range chart, a process profile (the same measurement across sections, one line per run = within-run), and group comparisons (species / farm / SKU / stabilization / month
+  strip plots + tables) plus a within-run vs between-run SD for measurements with several results per run. Control limits are set BY HAND per measurement + section (admin or Quality Manager; logged);
+  recommended limits (mean +/- k sigma, sigma = MRbar/1.128) appear once `qc_chart_min_n_provisional` results exist (established at `qc_chart_min_n_established`) -- constants are admin-editable settings and
+  documented on the Calculations page. Signals (beyond a limit, run of N on one side, trend of N) are only raised once limits are set. Specification lines come from `coa_specs` (shown dotted, separate from
+  control limits; far-off lines are noted instead of drawn). Charts are hand-written SVG (no library).
 - **Packaging edits after finalize** re-derive everything computed from the packaging rows in the
   same transaction (`_sync_completed_packaging`): container + FG-label stock (net-change commit),
   the run's FG lots (`_adjust_fg_lot`, refuses to go below units already shipped/moved), and

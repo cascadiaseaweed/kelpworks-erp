@@ -129,6 +129,16 @@ SETTINGS_DEFAULTS = [
      "Kilograms of product applied per hectare in one application. A heavy-metal result (mg/kg) is converted to a loading on the Certificate of Analysis: kg metal/ha = mg/kg x this rate x Application periods / 1,000,000, and judged against the kg/ha specification. 0 = not set (metals are listed but not judged)."),
     ("coa_application_periods", 1, "Certificate of Analysis: application periods",
      "Number of applications the metal loading accumulates over (a multiplier on the kg metal/ha: loading = mg/kg x application rate x this / 1,000,000). 1 = a single application."),
+    ("qc_chart_sigma", 3, "Control charts: sigma multiplier",
+     "Recommended control limits = mean +/- this many standard deviations, the standard deviation estimated from the average moving range (MRbar / 1.128). 3 is the usual choice."),
+    ("qc_chart_min_n_provisional", 8, "Control charts: points needed for provisional limits",
+     "Fewest measurements before the Quality Control page offers PROVISIONAL control-limit recommendations. Below this it only shows how many more are needed."),
+    ("qc_chart_min_n_established", 20, "Control charts: points needed for established limits",
+     "Measurements after which recommended limits are no longer labelled provisional (20 to 25 is the usual guidance for an individuals chart)."),
+    ("qc_chart_run_length", 7, "Control charts: run-length signal",
+     "A signal is raised when this many consecutive points fall on the same side of the centre line."),
+    ("qc_chart_trend_length", 6, "Control charts: trend signal",
+     "A signal is raised when this many consecutive points keep rising (or keep falling)."),
     ("separation_default_flowrate_lpm", 40, "Separation default Flow rate (L/min)",
      "Pre-filled value for a new run's Separation Flow rate (L/min) field."),
     ("separation_default_mesh_micron", 74, "Separation default Mesh size (micron)",
@@ -1128,6 +1138,21 @@ CREATE INDEX IF NOT EXISTS idx_lab_analyses_lab ON lab_analyses(lab_id);
 CREATE TABLE IF NOT EXISTS requisition_contact (
     key   TEXT PRIMARY KEY,                         -- phone | email_1 .. email_5
     value TEXT NOT NULL DEFAULT ''
+);
+-- Control charts (Quality Control tab): the control limits a user set by hand for one measurement at one process section, plus an
+-- append-only log of every change (who / when / what), because limits decide what counts as "out of control".
+CREATE TABLE IF NOT EXISTS qc_chart_limits (
+    metric  TEXT NOT NULL,                          -- qc:ph | feed:orp | lab:apc ...
+    section TEXT NOT NULL,                          -- homogenization | extraction | separation_filtrate | ... | lab
+    lcl REAL, ucl REAL, center REAL, note TEXT,
+    set_by TEXT, set_at TEXT,
+    PRIMARY KEY (metric, section)
+);
+CREATE TABLE IF NOT EXISTS qc_chart_limit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    metric TEXT NOT NULL, section TEXT NOT NULL,
+    lcl REAL, ucl REAL, center REAL, note TEXT,
+    set_by TEXT, set_at TEXT NOT NULL
 );
 -- Names printed on the sample labels, per sample-point stage, where the user has changed the built-in default.
 CREATE TABLE IF NOT EXISTS sample_label_names (
@@ -2413,6 +2438,36 @@ def build_starter_docx():
                    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>')
         z.writestr("word/document.xml", doc)
     return out.getvalue()
+
+
+# ---------------------------------------------------------------------------------------
+# Quality Control charts: the measurements that can be charted, and the process sections they are taken at
+# ---------------------------------------------------------------------------------------
+# section key -> (label, order along the process); feedstock comes first, laboratory results last
+QC_SECTIONS = {
+    "feedstock": ("Feedstock (per tote)", 0), "homogenization": ("Homogenization", 10), "extraction": ("Extraction", 20),
+    "separation_filtrate": ("Separation - filtrate", 30), "separation_solids": ("Separation - solids", 31),
+    "dilution": ("Dilution & preservation", 40), "packaging": ("Final product (packaging)", 50), "lab": ("Laboratory result", 60),
+}
+# QC_FIELD_REGISTRY label -> measurement key; measurement key -> (display name, unit, can only be >= 0)
+QC_MEASURE_KEYS = {
+    "pH": "ph", "TDS (%)": "tds", "Brix (%)": "brix", "Mannitol (%)": "mannitol", "TSliquid (%)": "ts_liquid", "ρliquid (g/mL)": "rho_liquid",
+    "TSslurry (%)": "ts_slurry", "ρslurry (g/mL)": "rho_slurry", "%Moisture<sub>solids</sub>": "moisture_solids", "Solids Loading (%)": "solids_loading",
+    "%Moisture<sub>centrifuge_solids</sub>": "moisture_centrifuge", "%Moisture<sub>screw_solids</sub>": "moisture_screw",
+}
+QC_MEASURE_INFO = {
+    "ph": ("pH", "", True), "tds": ("TDS", "%", True), "brix": ("Brix", "%", True), "mannitol": ("Mannitol", "%", True),
+    "ts_liquid": ("Total solids, liquid", "%", True), "rho_liquid": ("Density, liquid", "g/mL", True), "ts_slurry": ("Total solids, slurry", "%", True),
+    "rho_slurry": ("Density, slurry", "g/mL", True), "moisture_solids": ("Moisture, solids", "%", True), "solids_loading": ("Solids loading", "%", True),
+    "moisture_centrifuge": ("Moisture, centrifuge solids", "%", True), "moisture_screw": ("Moisture, screw solids", "%", True),
+    "volume_variance": ("Dilution final volume variance", "%", False), "extraction_eff": ("Extraction efficiency (TDS gain)", "%", False),
+}
+
+
+def qc_section_of(stage, subtitle):
+    if stage == "separation":
+        return "separation_solids" if (subtitle or "").lower().startswith("solids") else "separation_filtrate"
+    return stage if stage in QC_SECTIONS else "homogenization"
 
 
 # ---- Previews: a lightweight HTML rendering of a Word / Excel document (stdlib only). Content-faithful (text, bold, tables, merged
@@ -4464,6 +4519,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.route_customers(method, seg, conn)
         if seg[:2] == ["api", "shipments"]:
             return self.route_shipments(method, seg, query, conn, user)
+        if seg[:2] == ["api", "qc-charts"]:
+            return self.route_qc_charts(method, seg, conn, user)
         if method == "GET" and seg == ["api", "yield-usage"]:
             return self.route_yield_usage(query, conn)
         if method == "GET" and seg == ["api", "reports"]:
@@ -9749,6 +9806,146 @@ class Handler(BaseHTTPRequestHandler):
         closing = round(opening + sum(t["change"] or 0 for t in txns), 2)
         return {"title": title, "unit": unit, "from": frm, "to": to,
                 "opening": opening, "closing": closing, "txns": txns}
+
+    # ---- Quality Control charts ------------------------------------------------------ #
+    def _qc_can_set_limits(self, user):
+        return bool(user and (user["role"] == "admin" or user["is_quality_manager"]))
+
+    def route_qc_charts(self, method, seg, conn, user):
+        if seg == ["api", "qc-charts"] and method == "GET":
+            return self._qc_chart_data(conn, user)
+        if seg == ["api", "qc-charts", "limits"] and method == "PUT":
+            if not self._qc_can_set_limits(user):
+                raise ApiError(403, "Only an administrator or a Quality Manager can set control limits")
+            d = self._body_json()
+            metric, section = str(d.get("metric") or ""), str(d.get("section") or "")
+            if not re.fullmatch(r"[a-z]+:[a-z_0-9]+", metric) or section not in QC_SECTIONS:
+                raise ApiError(400, "Unknown measurement or process section")
+
+            def num(k):
+                v = d.get(k)
+                if v in (None, ""):
+                    return None
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    raise ApiError(400, "Limits must be numbers")
+            lcl, ucl, center = num("lcl"), num("ucl"), num("center")
+            if lcl is not None and ucl is not None and lcl >= ucl:
+                raise ApiError(400, "The lower control limit must be below the upper control limit")
+            if center is not None and ((lcl is not None and center < lcl) or (ucl is not None and center > ucl)):
+                raise ApiError(400, "The centre line must sit between the control limits")
+            note = (str(d.get("note") or "").strip()[:200]) or None
+            who, now = (user["name"] if user else None), now_iso()
+            if lcl is None and ucl is None and center is None:
+                conn.execute("DELETE FROM qc_chart_limits WHERE metric=? AND section=?", (metric, section))
+            else:
+                conn.execute("INSERT OR REPLACE INTO qc_chart_limits (metric,section,lcl,ucl,center,note,set_by,set_at) VALUES (?,?,?,?,?,?,?,?)",
+                             (metric, section, lcl, ucl, center, note, who, now))
+            conn.execute("INSERT INTO qc_chart_limit_log (metric,section,lcl,ucl,center,note,set_by,set_at) VALUES (?,?,?,?,?,?,?,?)",
+                         (metric, section, lcl, ucl, center, note, who, now))
+            return {"ok": True}
+        raise ApiError(404, "Unknown QC chart endpoint")
+
+    def _qc_chart_data(self, conn, user):
+        """Everything the Quality Control page charts: completed runs with their grouping attributes, every measurable value (process QC checks per
+        section, feedstock per tote, laboratory results) as points keyed by run, specification reference lines, and the manually set control limits."""
+        runs = conn.execute("SELECT * FROM production_runs WHERE status='completed' ORDER BY run_date, id").fetchall()
+        sku_names = {r["code"]: r["name"] for r in conn.execute("SELECT code,name FROM fg_skus")}
+        site_names = {r["code"]: r["name"] for r in conn.execute("SELECT code,name FROM sites")}
+        sp_names = {r["code"]: (r["common"] or r["name"]) for r in conn.execute("SELECT * FROM species")}
+        totes = {}
+        for t in conn.execute("SELECT run_id, site_code, species_code, stabilization_method FROM tote_lots WHERE status='consumed' AND run_id IS NOT NULL"):
+            totes.setdefault(t["run_id"], []).append(t)
+        run_ids = {r["id"] for r in runs}
+        run_out = []
+        for r in runs:
+            rt = totes.get(r["id"], [])
+            run_out.append({
+                "id": r["id"], "lot": r["processing_lot"], "date": r["run_date"], "month": (r["run_date"] or "")[:7], "sku": r["sku_code"],
+                "skuName": sku_names.get(r["sku_code"], r["sku_code"]),
+                "species": sorted({sp_names.get(t["species_code"], t["species_code"]) for t in rt if t["species_code"]}),
+                "farms": sorted({site_names.get(t["site_code"], t["site_code"]) for t in rt if t["site_code"]}),
+                "stabilization": sorted({t["stabilization_method"] for t in rt if t["stabilization_method"]}),
+                "operators": r["operators"], "location": r["location"], "excluded": bool(r["exclude_from_stats"]), "excludeReason": r["exclude_reason"]})
+        measures = {}
+
+        def add(group, key, label, unit, nonneg, section, point):
+            m = measures.setdefault(key, {"key": key, "group": group, "label": label, "unit": unit, "nonNegative": nonneg, "sections": {}})
+            sec = m["sections"].setdefault(section, {"key": section, "label": QC_SECTIONS[section][0], "order": QC_SECTIONS[section][1], "points": []})
+            sec["points"].append(point)
+        # process QC checks (the production log's QC Check boxes) and a few process measurements
+        for r in runs:
+            for fid, stage, _sl, subtitle, lab, _unit in QC_FIELD_REGISTRY:
+                v = r[fid]
+                mk = QC_MEASURE_KEYS.get(lab)
+                if v is None or not mk:
+                    continue
+                info = QC_MEASURE_INFO[mk]
+                add("qc", "qc:" + mk, info[0], info[1], info[2], qc_section_of(stage, subtitle), {"r": r["id"], "v": float(v)})
+            if r["dilution_measured_ph"] is not None:
+                add("qc", "qc:ph", "pH", "", True, "dilution", {"r": r["id"], "v": float(r["dilution_measured_ph"])})
+            if r["dilution_final_variance_pct"] is not None:
+                info = QC_MEASURE_INFO["volume_variance"]
+                add("qc", "qc:volume_variance", info[0], info[1], info[2], "dilution", {"r": r["id"], "v": float(r["dilution_final_variance_pct"])})
+            if r["homog_tds_pct"] and r["extraction_tds_pct"] is not None:
+                info = QC_MEASURE_INFO["extraction_eff"]
+                add("qc", "qc:extraction_eff", info[0], info[1], info[2], "extraction",
+                    {"r": r["id"], "v": round((r["extraction_tds_pct"] - r["homog_tds_pct"]) / r["homog_tds_pct"] * 100.0, 2)})
+        # feedstock: one point per tote (several per run -- this is where within-run variation shows)
+        for x in conn.execute("SELECT ri.run_id, ri.ph, ri.orp, t.lot_number FROM run_inputs ri JOIN tote_lots t ON t.id=ri.tote_lot_id "
+                              "WHERE ri.decision!='rejected'"):
+            if x["run_id"] not in run_ids:
+                continue
+            if x["ph"] is not None:
+                add("feedstock", "feed:ph", "Feedstock pH (per tote)", "", True, "feedstock", {"r": x["run_id"], "v": float(x["ph"]), "n": x["lot_number"]})
+            if x["orp"] is not None:
+                add("feedstock", "feed:orp", "Feedstock ORP (per tote)", "mV", False, "feedstock", {"r": x["run_id"], "v": float(x["orp"]), "n": x["lot_number"]})
+        # laboratory results (numeric ones; metals in ppm). A "<" result is a detection limit: kept, flagged, left out of the statistics.
+        specs = {sp["code"]: sp for sp in conn.execute("SELECT * FROM coa_specs")}
+        for x in conn.execute("SELECT * FROM lab_results WHERE voided_at IS NULL AND spec_code IS NOT NULL ORDER BY id"):
+            sp = specs.get(x["spec_code"])
+            if not sp or sp["basis"] in ("run", "absent") or x["value_num"] is None or x["run_id"] not in run_ids:
+                continue
+            v, unit = float(x["value_num"]), sp["unit"] or ""
+            if sp["basis"] == "metal":
+                f = COA_PPM_FACTORS.get((x["unit"] or "").strip().lower())
+                if f is None:
+                    continue
+                v, unit = v * f, "ppm"
+            add("lab", "lab:" + sp["code"], sp["name"], unit, True, "lab",
+                {"r": x["run_id"], "v": v, "q": x["qualifier"] or "", "when": x["report_date"] or (x["entered_at"] or "")[:10], "n": x["report_number"]})
+        # specification reference lines (the Certificate of Analysis limits, in the chart's unit)
+        refs = {}
+        rate = float(get_setting_value(conn, "coa_application_rate_kg_ha", 0) or 0)
+        periods = float(get_setting_value(conn, "coa_application_periods", 1) or 1) or 1.0
+        for code in ("ph", "tds"):
+            sp = specs.get(code)
+            if sp and (sp["min_val"] is not None or sp["max_val"] is not None):
+                refs["qc:%s|packaging" % code] = {"min": sp["min_val"], "max": sp["max_val"], "label": "CoA specification"}
+        for sp in specs.values():
+            if sp["basis"] == "value":
+                refs["lab:%s|lab" % sp["code"]] = {"min": sp["min_val"], "max": sp["max_val"], "exclusive": bool(sp["max_exclusive"]), "label": "CoA specification"}
+            elif sp["basis"] == "metal" and sp["max_val"] and rate > 0:
+                refs["lab:%s|lab" % sp["code"]] = {"max": sp["max_val"] * 1e6 / (rate * periods), "label": "CoA limit (as ppm)"}
+        group_order = {"qc": 0, "feedstock": 1, "lab": 2}
+        out_measures = []
+        for m in sorted(measures.values(), key=lambda m: (group_order[m["group"]], m["label"].lower())):
+            secs = sorted(m["sections"].values(), key=lambda sct: sct["order"])
+            out_measures.append(dict(m, sections=secs))
+        limits = {"%s|%s" % (r["metric"], r["section"]): {"lcl": r["lcl"], "ucl": r["ucl"], "center": r["center"], "note": r["note"], "setBy": r["set_by"], "setAt": r["set_at"]}
+                  for r in conn.execute("SELECT * FROM qc_chart_limits")}
+        history = {}
+        for r in conn.execute("SELECT * FROM qc_chart_limit_log ORDER BY id DESC LIMIT 300"):
+            h = history.setdefault("%s|%s" % (r["metric"], r["section"]), [])
+            if len(h) < 6:
+                h.append({"lcl": r["lcl"], "ucl": r["ucl"], "center": r["center"], "note": r["note"], "setBy": r["set_by"], "setAt": r["set_at"]})
+        st = lambda k, d: float(get_setting_value(conn, k, d))
+        return {"runs": run_out, "measures": out_measures, "refs": refs, "limits": limits, "history": history,
+                "canSetLimits": self._qc_can_set_limits(user),
+                "settings": {"sigma": st("qc_chart_sigma", 3), "minProvisional": int(st("qc_chart_min_n_provisional", 8)),
+                             "minEstablished": int(st("qc_chart_min_n_established", 20)), "runLength": int(st("qc_chart_run_length", 7)),
+                             "trendLength": int(st("qc_chart_trend_length", 6))}}
 
     # ---- Yield & Usage: observed conversion rates + consumption per run ------ #
     YU_DIMS = ("sku", "species", "farm", "stabilization", "harvest_month", "processing_month")
