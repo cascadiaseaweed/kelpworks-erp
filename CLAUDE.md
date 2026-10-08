@@ -183,9 +183,15 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
   / `{{date_long}}` are scalars; a lab flagged `sample_sheet` -- e.g. Food Assure, whose form says "see attached spreadsheet" -- also gets an
   `.xlsx` sample list from `build_sample_sheet_xlsx`; ready-to-upload token copies of the Food Assure and SGS forms live in `docs/requisition-templates/` -- see its README; analyses carry an optional `method` printed by `{{sample.methods}}`; repeated rows get unique `permStart/permEnd` / sdt ids so protected forms stay valid)
   (exempt from the amend lock and the release hash), marks the samples submitted and empties them from the cart.
+  Cart UI: each sample row has a lab picker, that lab's analysis checkboxes and a Ready / Needs analyses / Needs a lab badge; below it a card per
+  lab + run ("Requisitions ready") with a one-click "Create requisition & download" (`createReqs` -> `POST /api/cart/requisitions {labId, runId}`;
+  a single requisition downloads its .docx straight away). A lab's form with no `{{placeholders}}` comes back unchanged, so `_lab_public` reports
+  `templateTokens` and the cart / Admin warn; `docs/requisition-templates/*` are installable per lab with one click (`POST /api/labs/<id>/template/builtin`,
+  matched on the lab name by `_ready_template_path`). A missing template file on disk now fails the requisition (409) instead of silently using the built-in
+  layout. Admin > Labs & analyses > Analyses has "+ From CoA tests" to add a lab's analyses from the Certificate of Analysis specifications.
 - **Production Log Summary PDF** (`GET /api/production/<id>/summary.pdf[?dl=1&token=]`, completed runs only; the "Production log summary" card at
   the top of a run's Documents window). Generated on demand from the current log by `_run_summary_data` -> `build_run_summary_pdf` -- a
-  stdlib-only PDF writer (`PdfBuilder`: standard Helvetica fonts via a built-in width table, WinAnsi/cp1252 text, tables, KPI cards, the logo
+  stdlib-only PDF writer (`PdfBuilder`: standard Helvetica fonts via a built-in width table, WinAnsi/cp1252 text -- `≤`/`≥` are real glyphs via a Differences encoding on the spare codes `¤`/`¥` (`_PDF_SUBS`) --, tables, KPI cards, the logo
   decoded from `public/logo.png` once). Key results only, grouped: headline KPIs, a stage-by-stage "Process at a glance", a Quality scorecard
   (metric x stage matrix with target / final-vs-target instead of per-stage QC dumps), a Samples & lab work matrix (process point x sample
   type from the `samples` catalogue + requisitions), materials from the ledger, FG lots and sign-off. Not stored as a run attachment (never stale).
@@ -196,10 +202,12 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
   (one row per analyte per report: value as reported -- number, `<` number, Negative/Positive -- unit, method, lab, report number/date, optional
   linked document) and are NEVER edited: a correction voids the row (reason required) and a new one is entered; add/void are logged to the
   hash-chained `release_events`. Latest non-voided result per spec wins; tests with no spec are "additional analyses". Spec basis: `run` (TDS/pH from the
-  Packaging QC check), `value` (compared as reported; unit forced to the spec's -- microbial is per g), `absent` (Salmonella), `metal` (results
-  stay in the unit the lab reported, ppm or %; converted to ppm and compared with `max_val` in ppm; `max_val` is NULL = listed, not judged,
-  until the Admin "Heavy-metal limit calculator" (`POST /api/coa-specs/metal-limits`) sets it from the regulatory loading limit kept in
-  `limit_kg_ha`: ppm = kg/ha x 1e6 / `coa_application_rate_kg_ha`; a `<` result whose detection limit exceeds the limit is REVIEW, not pass).
+  Packaging QC check), `value` (compared as reported; unit forced to the spec's -- microbial is per g), `absent` (Salmonella), `metal` (the spec
+  limit is in kg metal/ha in `max_val`; the lab result stays in the unit reported (ppm or %) and the CoA adds a Loading column = mg/kg x
+  `coa_application_rate_kg_ha` x `coa_application_periods` / 1e6, compared with the limit; both are admin-only constants on the Calculations page,
+  rate 0 = listed, not judged; a `<` result whose detection-limit loading exceeds the limit is REVIEW, not pass; `limit_kg_ha` is a legacy unused column).
+  `coa_specs.active` = "Listed on the certificate": an unlisted test is still entered, judged and shown in the Lab results window (marked
+  "not on certificate") but left off the CoA PDF; `required` is independent of it.
   `required` specs (the five microbial tests) BLOCK the Quality release (`_release_action`) until a result is on file; a FAILED result needs a
   release comment (400 without one; the comment prints on the CoA and the out-of-spec tests go in the `released` event detail).
   Microbial results are per gram of LIQUID product as reported (no TDS/solids conversion).

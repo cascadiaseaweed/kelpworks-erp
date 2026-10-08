@@ -183,6 +183,7 @@ tbody tr:hover { background: #f6faf9; }
 tbody tr.clickable { cursor: pointer; }
 tbody tr.clickable:hover { background: #e9f4f1; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.ctr, th.ctr { text-align: center; }
 .mono { font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px; }
 
 /* Sortable column headers (click to sort asc/desc) */
