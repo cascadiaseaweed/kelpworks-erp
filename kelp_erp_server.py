@@ -870,6 +870,9 @@ CREATE TABLE IF NOT EXISTS run_sample_points (
                             -- have more than one Sample Point box)
     type          TEXT,     -- Slurry | Liquid | Solid
     description   TEXT,     -- Microbial | Retention | Metals & Nutrients | Proximate Analysis | R&D | Other
+    label_type    TEXT,     -- detailed | simplified: which sample label this row prints (default detailed)
+    label_numbered INTEGER NOT NULL DEFAULT 0,   -- 1 = its labels / sample IDs carry -1, -2, -3 ... (unit number)
+    label_name    TEXT,     -- name printed on the label's second line when the user changed it (NULL = the default for the stage)
     qty           INTEGER DEFAULT 1,   -- 1-10; also the number of labels printed for this row
     container     TEXT,     -- 50 mL falcon tube | 100 g sample bag | 1 L bottle | 2 L bottle
     created_at    TEXT NOT NULL
@@ -1070,6 +1073,10 @@ CREATE INDEX IF NOT EXISTS idx_dilpasses_run ON run_dilution_passes(run_id);
 CREATE TABLE IF NOT EXISTS samples (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     sample_code     TEXT NOT NULL UNIQUE,          -- <processing lot>-<STG>-<NN>, e.g. PR-20261006-053-HOM-03
+    short_id        TEXT,                           -- (retired: an earlier numbering scheme; no longer used)
+    id_detailed     TEXT,                           -- Sample ID Detailed = first line of the Detailed label: <processing lot>[-<unit no>]
+    id_simplified   TEXT,                           -- Sample ID Simplified = first line of the Simplified label: Lot-<last 3 digits>[-<unit no>]
+    label_type      TEXT,                           -- detailed | simplified: the label this sample's point prints; picks which ID is its display ID
     run_id          INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
     sample_point_id INTEGER,                        -- run_sample_points.id this unit came from
     unit_no         INTEGER,                        -- 1..qty within that row
@@ -1117,6 +1124,16 @@ CREATE TABLE IF NOT EXISTS lab_analyses (
     active  INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_lab_analyses_lab ON lab_analyses(lab_id);
+-- The customer (our) contact details printed on lab requisition forms: {{customer_phone}} and {{customer_email_1}} .. {{customer_email_5}}.
+CREATE TABLE IF NOT EXISTS requisition_contact (
+    key   TEXT PRIMARY KEY,                         -- phone | email_1 .. email_5
+    value TEXT NOT NULL DEFAULT ''
+);
+-- Names printed on the sample labels, per sample-point stage, where the user has changed the built-in default.
+CREATE TABLE IF NOT EXISTS sample_label_names (
+    stage TEXT PRIMARY KEY,
+    name  TEXT NOT NULL
+);
 -- The cart: samples (from finalized runs) waiting for a lab + analyses and a requisition.
 CREATE TABLE IF NOT EXISTS sample_cart (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1356,6 +1373,7 @@ def init_db():
     ensure_users(conn)
     assign_item_numbers(conn)
     ensure_coa_specs(conn)
+    ensure_requisition_contact(conn)
     conn.commit()
     rebaseline_release_hashes(conn)
     conn.commit()
@@ -1844,6 +1862,32 @@ COA_SPEC_SEED = [
 COA_PPM_FACTORS = {"ppm": 1.0, "mg/kg": 1.0, "mg/l": 1.0, "%": 10000.0, "ppb": 0.001, "ug/kg": 0.001, "g/kg": 1000.0}
 
 
+REQ_CONTACT_DEFAULTS = (("phone", "204-963-5023"), ("email_1", "nwrana@cascadiaseaweed.com"), ("email_2", "dpedde@cascadiaseaweed.com"),
+                        ("email_3", ""), ("email_4", ""), ("email_5", ""))
+
+
+def ensure_requisition_contact(conn):
+    for k, v in REQ_CONTACT_DEFAULTS:
+        conn.execute("INSERT OR IGNORE INTO requisition_contact (key,value) VALUES (?,?)", (k, v))
+
+
+def requisition_contact_get(conn):
+    """{'phone': str, 'emails': [5 strings]} -- the customer contact details printed on requisitions."""
+    kv = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM requisition_contact")}
+    return {"phone": kv.get("phone", ""), "emails": [kv.get("email_%d" % i, "") for i in range(1, 6)]}
+
+
+def requisition_contact_clean(d):
+    """Validate a {phone, emails} payload (the admin defaults, or a per-requisition override from the cart)."""
+    phone = str((d or {}).get("phone") or "").strip()[:40]
+    emails = [str(x or "").strip()[:120] for x in ((d or {}).get("emails") or [])][:5]
+    emails += [""] * (5 - len(emails))
+    for e in emails:
+        if e and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", e):
+            raise ApiError(400, "“%s” is not a valid email address" % e)
+    return {"phone": phone, "emails": emails}
+
+
 def ensure_coa_specs(conn):
     """Seed the product specifications (INSERT OR IGNORE: an admin's edits are never overwritten)."""
     for code, name, grp, unit, basis, mn, mx, excl, req, sort, method, kg in COA_SPEC_SEED:
@@ -2102,6 +2146,17 @@ SAMPLE_STAGES = {
 }
 
 
+# What a sample LABEL calls a sample point (the catalogue keeps the process-stage name). Stages not listed use their stage name.
+SAMPLE_LABEL_DEFAULT_NAMES = {"packaging": "Finished Product"}
+
+
+def sample_label_name(conn, stage):
+    r = conn.execute("SELECT name FROM sample_label_names WHERE stage=?", (stage,)).fetchone()
+    if r and r["name"]:
+        return r["name"]
+    return SAMPLE_LABEL_DEFAULT_NAMES.get(stage) or sample_stage_info(stage)[1]
+
+
 def sample_stage_info(stage):
     return SAMPLE_STAGES.get(stage or "homogenization") or ((stage or "OTH")[:3].upper(), stage or "Other", None)
 
@@ -2121,6 +2176,35 @@ def add_months(iso_date, months):
 def sample_log(conn, sample_id, event_type, detail=None, user_name=None):
     conn.execute("INSERT INTO sample_events (sample_id,event_type,detail,user_name,created_at) VALUES (?,?,?,?,?)",
                  (sample_id, event_type, detail, user_name, now_iso()))
+
+
+def lot_simplified(lot):
+    """'PR-20261006-053' -> 'Lot-053': "Lot-" + the last 3 digits of the production run."""
+    digits = re.search(r"(\d{3})\D*$", lot or "")
+    return "Lot-" + (digits.group(1) if digits else (re.sub(r"\D", "", lot or "")[-3:] or (lot or "")))
+
+
+def refresh_sample_ids(conn, run_id):
+    """Set every sample's Sample ID Detailed / Simplified (and label type) from its Sample Point row: the first line of the Detailed label is the
+    processing lot, of the Simplified label "Lot-" + the last 3 digits; both take "-<unit no>" when the point's labels are numbered. A sample whose point
+    row no longer exists (history) keeps what it had. A sample that is already on a requisition is LOCKED: its IDs and label type never change again
+    (the tube and the lab's paperwork carry them), whatever is later changed on the label window. Idempotent -- runs after every sync_samples, at boot
+    and when label settings are saved."""
+    run = conn.execute("SELECT processing_lot FROM production_runs WHERE id=?", (run_id,)).fetchone()
+    if not run:
+        return
+    lot = run["processing_lot"]
+    pts = {p["id"]: p for p in conn.execute("SELECT * FROM run_sample_points WHERE run_id=?", (run_id,))}
+    for smp in conn.execute("SELECT id, sample_point_id, unit_no, id_detailed, requisition_id FROM samples WHERE run_id=?", (run_id,)).fetchall():
+        if smp["requisition_id"] and smp["id_detailed"]:
+            continue                      # locked: already on a requisition
+        p = pts.get(smp["sample_point_id"])
+        if p is None and smp["id_detailed"]:
+            continue
+        ltype = p["label_type"] if p is not None and p["label_type"] in ("detailed", "simplified") else "detailed"
+        suffix = "-%d" % (smp["unit_no"] or 1) if (p is not None and p["label_numbered"]) else ""
+        conn.execute("UPDATE samples SET id_detailed=?, id_simplified=?, label_type=? WHERE id=?",
+                     (lot + suffix, lot_simplified(lot) + suffix, ltype, smp["id"]))
 
 
 def sync_samples(conn, run_id, user_name=None):
@@ -2158,6 +2242,7 @@ def sync_samples(conn, run_id, user_name=None):
                 (code, run_id, pt["id"], u, stage, pt["type"] or "Slurry", pt["description"] or "Microbial", pt["container"], collected, now_iso()))
             sample_log(conn, cur.lastrowid, "created", "Logged in the production log (%s, %s)" % (
                 sample_stage_info(stage)[1], pt["description"] or "Microbial"), user_name)
+    refresh_sample_ids(conn, run_id)
     for key, row in existing.items():
         if key not in live and row["status"] in ("available", "in_cart"):
             conn.execute("DELETE FROM sample_cart WHERE sample_id=?", (row["id"],))
@@ -2181,10 +2266,11 @@ _W_TR = re.compile(r"<w:tr(?:\s[^>]*)?>.*?</w:tr>", re.S)
 _W_T = re.compile(r"(<w:t(?:\s[^>]*)?>)(.*?)(</w:t>)", re.S)
 _TOKEN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 REQ_SCALAR_TOKENS = ["req_number", "date", "date_long", "po_number", "po_check", "company", "lab_name", "lab_contact", "lab_email", "lab_phone", "lab_address",
+                     "customer_phone", "customer_email_1", "customer_email_2", "customer_email_3", "customer_email_4", "customer_email_5",
                      "processing_lot", "run_date", "sku", "product", "requested_by", "requested_by_email",
                      "sample_count", "analyses", "notes"]
 REQ_ANALYSIS_KEYS = ["name", "code", "method", "count", "n"]
-REQ_SAMPLE_KEYS = ["n", "id", "report_description", "stage", "type", "description", "container", "collected", "analyses", "methods", "location", "notes"]
+REQ_SAMPLE_KEYS = ["n", "id", "id_detailed", "id_simplified", "code", "container_qty", "volume_text", "report_description", "stage", "type", "description", "container", "collected", "analyses", "methods", "location", "notes"]
 
 
 def _x_unescape(t):
@@ -2329,13 +2415,205 @@ def build_starter_docx():
     return out.getvalue()
 
 
+# ---- Previews: a lightweight HTML rendering of a Word / Excel document (stdlib only). Content-faithful (text, bold, tables, merged
+# cells), not layout-faithful -- logos and exact fonts are left out. The result is shown in a sandboxed frame; every text is escaped.
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+def _wq(tag):
+    return "{%s}%s" % (_W_NS, tag)
+
+
+def _html_esc(x):
+    return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def docx_to_html(raw):
+    import xml.etree.ElementTree as ET
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            root = ET.fromstring(z.read("word/document.xml"))
+    except (KeyError, zipfile.BadZipFile, ET.ParseError):
+        return "<p><i>This document could not be previewed.</i></p>"
+    body = root.find(_wq("body"))
+
+    def flag(rpr, name):
+        e = rpr.find(_wq(name)) if rpr is not None else None
+        return e is not None and e.get(_wq("val"), "1") not in ("0", "false")
+
+    def para(p):
+        out = []
+        for r in p.iter(_wq("r")):
+            rpr = r.find(_wq("rPr"))
+            txt = ""
+            for ch in r:
+                if ch.tag == _wq("t"):
+                    txt += _html_esc(ch.text or "")
+                elif ch.tag == _wq("tab"):
+                    txt += "&emsp;"
+                elif ch.tag in (_wq("br"), _wq("cr")):
+                    txt += "<br>"
+                elif ch.tag == _wq("sym"):
+                    txt += _html_esc(chr(int(ch.get(_wq("char"), "25A1"), 16))) if ch.get(_wq("char")) else ""
+            if not txt:
+                continue
+            if flag(rpr, "b"):
+                txt = "<b>%s</b>" % txt
+            if flag(rpr, "i"):
+                txt = "<i>%s</i>" % txt
+            if flag(rpr, "u"):
+                txt = "<u>%s</u>" % txt
+            out.append(txt)
+        ppr = p.find(_wq("pPr"))
+        style, bullet = "", ""
+        if ppr is not None:
+            jc = ppr.find(_wq("jc"))
+            if jc is not None and jc.get(_wq("val")) in ("center", "right"):
+                style = ' style="text-align:%s"' % jc.get(_wq("val"))
+            if ppr.find(_wq("numPr")) is not None:
+                bullet = "&bull; "
+        inner = "".join(out)
+        return "<p%s>%s%s</p>" % (style, bullet, inner) if inner.strip() else '<p class="e">&nbsp;</p>'
+
+    def table(t):
+        rows = []
+        for tr in t.findall(_wq("tr")):
+            cells = []
+            for tc in tr.findall(_wq("tc")):
+                pr = tc.find(_wq("tcPr"))
+                span, vm = 1, None
+                if pr is not None:
+                    gs = pr.find(_wq("gridSpan"))
+                    span = int(gs.get(_wq("val"), "1")) if gs is not None else 1
+                    vm = pr.find(_wq("vMerge"))
+                if vm is not None and vm.get(_wq("val")) != "restart":
+                    continue                        # the continuation of a vertically merged cell
+                cells.append("<td%s>%s</td>" % (' colspan="%d"' % span if span > 1 else "", blocks(tc)))
+            rows.append("<tr>%s</tr>" % "".join(cells))
+        return "<table>%s</table>" % "".join(rows)
+
+    def blocks(el):
+        out = []
+        for ch in el:
+            if ch.tag == _wq("p"):
+                out.append(para(ch))
+            elif ch.tag == _wq("tbl"):
+                out.append(table(ch))
+            elif ch.tag == _wq("sdt"):
+                c = ch.find(_wq("sdtContent"))
+                if c is not None:
+                    out.append(blocks(c))
+        return "".join(out)
+    return blocks(body) if body is not None else ""
+
+
+def xlsx_to_html(raw):
+    import xml.etree.ElementTree as ET
+    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    try:
+        z = zipfile.ZipFile(io.BytesIO(raw))
+        shared = []
+        if "xl/sharedStrings.xml" in z.namelist():
+            for si in ET.fromstring(z.read("xl/sharedStrings.xml")).findall(ns + "si"):
+                shared.append("".join(t.text or "" for t in si.iter(ns + "t")))
+        wb = ET.fromstring(z.read("xl/workbook.xml"))
+        sheet_names = [sh.get("name") for sh in wb.iter(ns + "sheet")]
+        files = sorted(n for n in z.namelist() if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n))
+    except (KeyError, zipfile.BadZipFile, ET.ParseError):
+        return "<p><i>This workbook could not be previewed.</i></p>"
+
+    def col(ref):
+        n = 0
+        for ch in re.match(r"[A-Z]+", ref).group(0):
+            n = n * 26 + ord(ch) - 64
+        return n
+    out = []
+    for idx, fn in enumerate(files):
+        rows, width = {}, 0
+        for c in ET.fromstring(z.read(fn)).iter(ns + "c"):
+            ref = c.get("r") or ""
+            if not re.match(r"[A-Z]+\d+", ref):
+                continue
+            t = c.get("t")
+            if t == "inlineStr":
+                val = "".join(x.text or "" for x in c.iter(ns + "t"))
+            else:
+                v = c.find(ns + "v")
+                val = (v.text or "") if v is not None else ""
+                if t == "s" and val.isdigit() and int(val) < len(shared):
+                    val = shared[int(val)]
+            ci, ri = col(ref), int(re.search(r"\d+", ref).group(0))
+            rows.setdefault(ri, {})[ci] = val
+            width = max(width, ci)
+        if idx < len(sheet_names):
+            out.append("<h4>%s</h4>" % _html_esc(sheet_names[idx]))
+        body = []
+        for ri in range(1, (max(rows) if rows else 0) + 1):
+            cells = rows.get(ri, {})
+            body.append("<tr>%s</tr>" % "".join("<td>%s</td>" % _html_esc(cells.get(ci, "")) for ci in range(1, width + 1)))
+        out.append("<table class=\"x\">%s</table>" % "".join(body))
+    return "".join(out)
+
+
+def container_volume(litres_each, name):
+    """(amount, unit) one sample container holds: its litres_each (as mL) when set, else the amount in its name ('100 g sample bag' -> 100 g)."""
+    if litres_each:
+        return float(litres_each) * 1000.0, "mL"
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(mL|ml|L|g|kg)\b", name or "")
+    if not m:
+        return None
+    amt, unit = float(m.group(1)), m.group(2)
+    return {"ml": (amt, "mL"), "l": (amt * 1000.0, "mL"), "g": (amt, "g"), "kg": (amt * 1000.0, "g")}[unit.lower()]
+
+
+def volume_text(parts):
+    """[(amount, unit)] -> '200 mL' / '1.5 L' / '300 g' (summed per unit; mixed units are joined with ' + '); '' when unknown."""
+    tot = {}
+    for part in parts:
+        if part:
+            tot[part[1]] = tot.get(part[1], 0.0) + part[0]
+    out = []
+    for unit in ("mL", "g"):
+        if unit in tot:
+            v = tot[unit]
+            big = {"mL": ("L", 1000.0), "g": ("kg", 1000.0)}[unit]
+            out.append(("%s %s" % (coa_num(v / big[1], 4), big[0])) if v >= 1000 else ("%s %s" % (coa_num(v, 4), unit)))
+    return " + ".join(out)
+
+
+def consolidate_sample_rows(sample_rows):
+    """One line per Sample ID (+ the same description and requested tests): the lab gets a single line with the number of containers and their
+    total volume instead of the same ID repeated. Lines are in the order the IDs first appear."""
+    groups = {}
+    for sr in sample_rows:
+        key = (sr["id"], sr["report_description"], tuple(sorted(x.lower() for x in sr["analysis_names"])))
+        g = groups.setdefault(key, {"row": sr, "containers": {}, "vols": [], "qty": 0})
+        g["qty"] += 1
+        if sr["container"]:
+            g["containers"][sr["container"]] = g["containers"].get(sr["container"], 0) + 1
+        g["vols"].append(sr.get("volume"))
+    out = []
+    for g in groups.values():
+        out.append(dict(g["row"], container=", ".join(g["containers"]) if g["containers"] else "", container_qty=g["qty"], volume_total=volume_text(g["vols"])))
+    return out
+
+
+def requisition_id_conflicts(sample_rows):
+    """Sample IDs shared by DIFFERENT samples (another process point or other tests) -- these cannot be merged into one line."""
+    variants = {}
+    for sr in sample_rows:
+        variants.setdefault(sr["id"], set()).add((sr["report_description"], tuple(sorted(x.lower() for x in sr["analysis_names"]))))
+    return sorted(i for i, v in variants.items() if len(v) > 1)
+
+
 def build_sample_sheet_xlsx(scalars, sample_rows, analyses):
-    """The "attached spreadsheet" some labs (e.g. Food Assure) ask for: one row per sample with its ID, the
-    description to use on the report, and an X under each test requested for it."""
+    """The "attached spreadsheet" some labs (e.g. Food Assure) ask for: one line per Sample ID (samples sharing an ID are consolidated)
+    with the description to use on the report, the number of containers and their total volume, and an X under each test requested."""
     T = lambda v, st=0: ("t", v, st)
+    lines = consolidate_sample_rows(sample_rows)
     s = XlsxSheet("Samples")
-    s.set_widths([30, 52, 18, 10, 18] + [18] * len(analyses))
-    span = 5 + len(analyses)
+    s.set_widths([30, 52, 18, 10, 18, 14, 18] + [18] * len(analyses))
+    span = 7 + len(analyses)
     s.title("Sample list - %s" % scalars.get("req_number", ""), span)
     s.row([T("Company", 7), T(scalars.get("company", ""))])
     s.row([T("Lab", 7), T(scalars.get("lab_name", ""))])
@@ -2343,11 +2621,11 @@ def build_sample_sheet_xlsx(scalars, sample_rows, analyses):
     s.row([T("PO#", 7), T(scalars.get("po_number", ""))])
     s.row([T("Production run", 7), T(scalars.get("processing_lot", ""))])
     s.row([])
-    s.row([T(h, 3) for h in ["Sample ID", "Sample description (as it should appear on the report)", "Collected", "Type", "Container"]]
+    s.row([T(h, 3) for h in ["Sample ID", "Sample description (as it should appear on the report)", "Collected", "Type", "Container", "Container Qty", "Total sample volume"]]
           + [T(a["name"], 3) for a in analyses])
-    for sr in sample_rows:
+    for sr in lines:
         chosen = {x.lower() for x in sr["analysis_names"]}
-        s.row([T(sr["id"]), T(sr["report_description"]), T(sr["collected"]), T(sr["type"]), T(sr["container"])]
+        s.row([T(sr["id"]), T(sr["report_description"]), T(sr["collected"]), T(sr["type"]), T(sr["container"]), ("n", sr["container_qty"], 0), T(sr["volume_total"])]
               + [T("X" if a["name"].lower() in chosen else "") for a in analyses])
     return xlsx_build([s])
 
@@ -3181,6 +3459,19 @@ def migrate(conn):
     labcols = {r["name"] for r in conn.execute("PRAGMA table_info(labs)")}
     if "sample_sheet" not in labcols:
         conn.execute("ALTER TABLE labs ADD COLUMN sample_sheet INTEGER NOT NULL DEFAULT 0")
+    scols = {r["name"] for r in conn.execute("PRAGMA table_info(samples)")}
+    for col in ("short_id", "id_detailed", "id_simplified", "label_type"):
+        if col not in scols:
+            conn.execute("ALTER TABLE samples ADD COLUMN %s TEXT" % col)
+    spcols = {r["name"] for r in conn.execute("PRAGMA table_info(run_sample_points)")}
+    if "label_type" not in spcols:
+        conn.execute("ALTER TABLE run_sample_points ADD COLUMN label_type TEXT")
+    if "label_numbered" not in spcols:
+        conn.execute("ALTER TABLE run_sample_points ADD COLUMN label_numbered INTEGER NOT NULL DEFAULT 0")
+    if "label_name" not in spcols:
+        conn.execute("ALTER TABLE run_sample_points ADD COLUMN label_name TEXT")
+    for r_ in conn.execute("SELECT DISTINCT run_id FROM samples").fetchall():
+        refresh_sample_ids(conn, r_["run_id"])
     if "limit_kg_ha" not in {r["name"] for r in conn.execute("PRAGMA table_info(coa_specs)")}:
         conn.execute("ALTER TABLE coa_specs ADD COLUMN limit_kg_ha REAL")
     lacols = {r["name"] for r in conn.execute("PRAGMA table_info(lab_analyses)")}
@@ -4063,6 +4354,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", CONTENT_TYPES.get(ext, "application/octet-stream"))
         self.send_header("Content-Length", str(len(data)))
         self.send_header("X-Content-Type-Options", "nosniff")
+        # the app files change with every release and are not versioned: always re-fetch, so a browser never runs an old app.js against a newer server
+        self.send_header("Cache-Control", "no-cache, must-revalidate")
         self.end_headers()
         self.wfile.write(data)
 
@@ -4124,6 +4417,27 @@ class Handler(BaseHTTPRequestHandler):
             return self.route_labs(method, seg, conn, user)
         if seg[:2] == ["api", "coa-specs"]:
             return self.route_coa_specs(method, seg, conn, user)
+        if seg == ["api", "requisition-contact"] and method == "GET":
+            return requisition_contact_get(conn)
+        if seg == ["api", "requisition-contact"] and method == "PUT":
+            self._require_admin(user)
+            c = requisition_contact_clean(self._body_json())
+            for k, v in [("phone", c["phone"])] + [("email_%d" % (i + 1), c["emails"][i]) for i in range(5)]:
+                conn.execute("INSERT OR REPLACE INTO requisition_contact (key,value) VALUES (?,?)", (k, v))
+            return requisition_contact_get(conn)
+        if seg == ["api", "sample-label-names"] and method == "PUT":
+            # {names: {stage: name}}: a name different from the built-in default is remembered for everyone; a blank name restores the default
+            names = (self._body_json().get("names") or {})
+            for stage, name in names.items():
+                if stage not in SAMPLE_STAGES:
+                    continue
+                name = (name or "").strip()[:60]
+                builtin = SAMPLE_LABEL_DEFAULT_NAMES.get(stage) or sample_stage_info(stage)[1]
+                if not name or name == builtin:
+                    conn.execute("DELETE FROM sample_label_names WHERE stage=?", (stage,))
+                else:
+                    conn.execute("INSERT OR REPLACE INTO sample_label_names (stage,name) VALUES (?,?)", (stage, name))
+            return {"ok": True}
         if seg[:2] == ["api", "consumables"]:
             return self.route_consumables(method, seg, conn, user)
         if seg[:2] == ["api", "cip"]:
@@ -5029,7 +5343,10 @@ class Handler(BaseHTTPRequestHandler):
             analyses = json.loads(r["cart_analyses"]) if r["cart_analyses"] else []
         except ValueError:
             analyses = []
-        return {"id": r["id"], "code": r["sample_code"], "runId": r["run_id"], "processingLot": r["processing_lot"],
+        return {"id": r["id"], "code": r["sample_code"], "idDetailed": r["id_detailed"] or r["processing_lot"], "idSimplified": r["id_simplified"] or lot_simplified(r["processing_lot"]),
+                "labelType": r["label_type"] or "detailed", "idsLocked": bool(r["requisition_id"]),
+                "displayId": (r["id_simplified"] or lot_simplified(r["processing_lot"])) if r["label_type"] == "simplified" else (r["id_detailed"] or r["processing_lot"]),
+                "runId": r["run_id"], "processingLot": r["processing_lot"],
                 "runDate": r["run_date"], "sku": r["sku_code"], "stage": r["stage"],
                 "stageLabel": sample_stage_info(r["stage"])[1], "type": r["type"], "description": r["description"],
                 "container": r["container"], "collectedAt": collected, "status": r["status"], "location": r["location"],
@@ -5050,7 +5367,10 @@ class Handler(BaseHTTPRequestHandler):
             if query.get("status", [""])[0]:
                 sts = [x for x in query["status"][0].split(",") if x]
                 where.append("s.status IN (%s)" % ",".join("?" * len(sts))); params += sts
-            if query.get("retention", [""])[0]:
+            ret = query.get("retention", [""])[0]
+            if ret == "0":                      # the analysis catalogue: everything except Retention samples
+                where.append("COALESCE(s.description,'')<>'Retention'")
+            elif ret:                           # the retention inventory: only Retention samples
                 where.append("s.description='Retention'")
             sql = self.SAMPLE_SQL + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY r.run_date DESC, r.id DESC, s.sample_code"
             return {"samples": [self._sample_public(conn, r, months) for r in conn.execute(sql, params)],
@@ -5340,6 +5660,21 @@ class Handler(BaseHTTPRequestHandler):
                     conn.execute("UPDATE sample_cart SET lab_id=?, analyses=? WHERE sample_id=?", (lab_id, json.dumps(ids), sid))
                     sample_log(conn, sid, "assigned", "%s: %s" % (lab["name"], ", ".join(names[i] for i in ids) or "no analyses yet"), uname)
             return self._cart_response(conn)
+        if seg == ["api", "cart", "requisitions", "preview"] and method == "POST":
+            # what would be created: the filled form + sample list for each lab / run that is ready (nothing is written)
+            d = self._body_json()
+            notes = (d.get("notes") or "").strip() or None
+            contact = requisition_contact_clean(d["contact"]) if d.get("contact") else None
+            out = []
+            for (run_id, lab_id), items in self._cart_ready_groups(conn, d).items():
+                po_number = self._requisition_po(conn, d, run_id, lab_id)
+                b = self._requisition_build(conn, user, run_id, lab_id, items, notes, po_number, "(assigned when created)", contact)
+                out.append({"lab": b["lab"]["name"], "lot": b["run"]["processing_lot"], "nSamples": len(items),
+                            "templateName": b["lab"]["template_name"], "conflicts": requisition_id_conflicts(b["sample_rows"]),
+                            "ids": [sr["id"] for sr in b["sample_rows"]],          # kept for a browser still running the previous app.js
+                            "lines": len(consolidate_sample_rows(b["sample_rows"])), "form": docx_to_html(b["doc"]),
+                            "sheet": xlsx_to_html(b["sheet"]) if b["sheet"] else None})
+            return {"previews": out}
         if seg == ["api", "cart", "requisitions"] and method == "POST":
             return self._create_requisitions(conn, user, self._body_json())
         if len(seg) == 3 and seg[2].isdigit():
@@ -5367,9 +5702,10 @@ class Handler(BaseHTTPRequestHandler):
     # -- requisitions -- #
     def _requisition_public(self, conn, r):
         samples = []
-        for rs in conn.execute("SELECT rs.*, s.sample_code, s.stage, s.type, s.description FROM requisition_samples rs "
-                               "JOIN samples s ON s.id=rs.sample_id WHERE rs.requisition_id=? ORDER BY s.sample_code", (r["id"],)):
-            samples.append({"sampleId": rs["sample_id"], "code": rs["sample_code"], "stageLabel": sample_stage_info(rs["stage"])[1],
+        for rs in conn.execute("SELECT rs.*, s.sample_code, s.id_detailed, s.id_simplified, s.label_type, s.stage, s.type, s.description FROM requisition_samples rs "
+                               "JOIN samples s ON s.id=rs.sample_id WHERE rs.requisition_id=? ORDER BY s.id", (r["id"],)):
+            samples.append({"sampleId": rs["sample_id"], "code": rs["sample_code"], "idDetailed": rs["id_detailed"], "idSimplified": rs["id_simplified"],
+                            "displayId": (rs["id_simplified"] if rs["label_type"] == "simplified" else rs["id_detailed"]) or rs["sample_code"], "stageLabel": sample_stage_info(rs["stage"])[1],
                             "type": rs["type"], "description": rs["description"],
                             "analyses": json.loads(rs["analyses"]) if rs["analyses"] else []})
         run = conn.execute("SELECT processing_lot FROM production_runs WHERE id=?", (r["run_id"],)).fetchone()
@@ -5388,15 +5724,26 @@ class Handler(BaseHTTPRequestHandler):
                                      for r in conn.execute("SELECT * FROM lab_requisitions ORDER BY id DESC")]}
         raise ApiError(404, "Unknown requisitions endpoint")
 
-    def _create_requisitions(self, conn, user, d):
-        """Turn every ready cart sample (lab + at least one analysis) into requisitions -- one per run + lab --
-        fill the lab's .docx template, save the document on the run, and take those samples out of the cart."""
-        uname = user["name"] if user else None
+    def _requisition_po(self, conn, d, run_id, lab_id):
+        """The PO / reference number of one requisition: what the user entered for that run + lab (`poNumbers`, keyed "run:lab", an empty string
+        meaning "none"), else a single `poNumber`, else the production run's number -- the default, which the user can always change."""
+        nums = d.get("poNumbers") or {}
+        key = "%d:%d" % (run_id, lab_id)
+        if key in nums:
+            return (str(nums[key] or "").strip()[:60]) or None
+        if (d.get("poNumber") or "").strip():
+            return d["poNumber"].strip()[:60]
+        run = conn.execute("SELECT processing_lot FROM production_runs WHERE id=?", (run_id,)).fetchone()
+        return run["processing_lot"] if run else None
+
+    def _cart_ready_groups(self, conn, d):
+        """{(run_id, lab_id): [(sample_id, [analysis ids])]} for the cart samples that have a lab and at least one analysis,
+        optionally narrowed by sampleIds / labId / runId."""
         want = {int(x) for x in (d.get("sampleIds") or [])}
         lab_filter = int(d["labId"]) if d.get("labId") else None
         run_filter = int(d["runId"]) if d.get("runId") else None
         groups = {}
-        for c in conn.execute("SELECT c.*, s.run_id FROM sample_cart c JOIN samples s ON s.id=c.sample_id ORDER BY s.sample_code"):
+        for c in conn.execute("SELECT c.*, s.run_id FROM sample_cart c JOIN samples s ON s.id=c.sample_id ORDER BY s.id"):
             ids = json.loads(c["analyses"]) if c["analyses"] else []
             if not c["lab_id"] or not ids:
                 continue
@@ -5406,70 +5753,95 @@ class Handler(BaseHTTPRequestHandler):
             groups.setdefault((c["run_id"], c["lab_id"]), []).append((c["sample_id"], ids))
         if not groups:
             raise ApiError(400, "Nothing is ready: each cart sample needs a lab and at least one analysis")
+        return groups
+
+    def _requisition_build(self, conn, user, run_id, lab_id, items, notes, po_number, req_number, contact=None):
+        """Fill a lab's requisition form (and its sample spreadsheet when the lab takes one) for one run + lab. Used by the real creation
+        and by the preview (which passes a placeholder req_number); it writes nothing."""
+        uname = user["name"] if user else None
+        run = conn.execute("SELECT * FROM production_runs WHERE id=?", (run_id,)).fetchone()
+        lab = conn.execute("SELECT * FROM labs WHERE id=?", (lab_id,)).fetchone()
+        an = {a["id"]: a for a in conn.execute("SELECT * FROM lab_analyses WHERE lab_id=?", (lab_id,))}
+        vols = {r_["name"]: r_["litres_each"] for r_ in conn.execute("SELECT name, litres_each FROM consumables WHERE is_sample_container=1")}
+        sample_rows, all_names = [], []
+        for n, (sid, ids) in enumerate(items, 1):
+            s = conn.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+            names = [an[i]["name"] for i in ids if i in an]
+            codes = [an[i]["code"] for i in ids if i in an and an[i]["code"]]
+            methods = []
+            for i in ids:
+                if i in an and an[i]["method"] and an[i]["method"] not in methods:
+                    methods.append(an[i]["method"])
+            all_names += [x for x in names if x not in all_names]
+            sample_rows.append({"n": str(n), "id": (s["id_simplified"] or lot_simplified(run["processing_lot"])),
+                            "container_qty": "1", "volume": container_volume(vols.get(s["container"]), s["container"]),
+                            "volume_text": volume_text([container_volume(vols.get(s["container"]), s["container"])]),
+                            "id_detailed": s["id_detailed"] or "", "id_simplified": s["id_simplified"] or "", "code": s["sample_code"], "stage": sample_stage_info(s["stage"])[1], "type": s["type"] or "",
+                                "description": s["description"] or "", "container": s["container"] or "",
+                                "collected": (s["collected_at"] or "").replace("T", " ")[:16], "analyses": ", ".join(names), "methods": ", ".join(methods),
+                                "location": s["location"] or "", "notes": s["notes"] or "",
+                                "analysis_names": names, "analysis_codes": codes, "_sid": sid, "_names": names})
+        sku = conn.execute("SELECT name FROM fg_skus WHERE code=?", (run["sku_code"],)).fetchone()
+        product = (sku["name"] if sku else run["sku_code"]) or ""
+        for sr in sample_rows:
+            # product, lot and process point only -- the sample type / description are not part of the text a lab prints on its report
+            sr["report_description"] = " ".join(x for x in (product, run["processing_lot"], "-", sr["stage"]) if x)
+        # distinct analyses requested on this requisition (in lab order), with how many samples want each
+        req_analyses = []
+        for aid in sorted({i for _sid, ids in items for i in ids if i in an}, key=lambda i: i):   # the order the lab's analyses were added
+            req_analyses.append({"name": an[aid]["name"], "code": an[aid]["code"] or "", "method": an[aid]["method"] or "", "n": str(len(req_analyses) + 1),
+                                 "count": str(sum(1 for _sid, ids in items if aid in ids))})
+        d_today = datetime.date.fromisoformat(today_iso())
+        scalars = {"req_number": req_number, "date": today_iso(), "date_long": "%s %d, %d" % (d_today.strftime("%B"), d_today.day, d_today.year),
+                   "po_number": po_number or "", "po_check": "\u2612" if po_number else "\u2610", "company": COMPANY_NAME, "lab_name": lab["name"],
+                   "lab_contact": lab["contact"] or "", "lab_email": lab["email"] or "", "lab_phone": lab["phone"] or "",
+                   "lab_address": lab["address"] or "", "processing_lot": run["processing_lot"], "run_date": run["run_date"],
+                   "sku": run["sku_code"] or "", "product": product,
+                   "requested_by": uname or "", "requested_by_email": (user["email"] if user else "") or "",
+                   "customer_phone": (contact or requisition_contact_get(conn))["phone"],
+                   **{"customer_email_%d" % (i + 1): (contact or requisition_contact_get(conn))["emails"][i] for i in range(5)},
+                   "sample_count": str(len(sample_rows)), "analyses": ", ".join(all_names), "notes": notes or ""}
+        template = None
+        if lab["template_stored"]:
+            try:
+                with open(os.path.join(LAB_DIR, lab["template_stored"]), "rb") as f:
+                    template = f.read()
+            except OSError:
+                # never quietly swap in the built-in layout for a lab that has its own form
+                raise ApiError(409, "The requisition template for %s (%s) is missing on the server. Upload it again under "
+                                    "Admin > Labs & analyses > Template." % (lab["name"], lab["template_name"] or "template"))
+        doc = docx_fill(template or build_starter_docx(), scalars, sample_rows, req_analyses)
+        sheet = build_sample_sheet_xlsx(scalars, sample_rows, req_analyses) if lab["sample_sheet"] else None
+        return {"run": run, "lab": lab, "doc": doc, "sheet": sheet, "sample_rows": sample_rows, "scalars": scalars}
+
+    def _create_requisitions(self, conn, user, d):
+        """Turn every ready cart sample (lab + at least one analysis) into requisitions -- one per run + lab --
+        fill the lab's .docx template, save the document on the run, and take those samples out of the cart."""
+        uname = user["name"] if user else None
+        groups = self._cart_ready_groups(conn, d)
         notes = (d.get("notes") or "").strip() or None
-        po_number = (d.get("poNumber") or "").strip() or None
+        contact = requisition_contact_clean(d["contact"]) if d.get("contact") else None
         created = []
         for (run_id, lab_id), items in groups.items():
-            run = conn.execute("SELECT * FROM production_runs WHERE id=?", (run_id,)).fetchone()
             lab = conn.execute("SELECT * FROM labs WHERE id=?", (lab_id,)).fetchone()
-            an = {a["id"]: a for a in conn.execute("SELECT * FROM lab_analyses WHERE lab_id=?", (lab_id,))}
+            po_number = self._requisition_po(conn, d, run_id, lab_id)
             ts = now_iso()
             cur = conn.execute("INSERT INTO lab_requisitions (req_number,run_id,lab_id,lab_name,notes,created_by,created_at,po_number) VALUES (?,?,?,?,?,?,?,?)",
                                ("TEMP-" + secrets.token_hex(6), run_id, lab_id, lab["name"], notes, uname, ts, po_number))
             rid = cur.lastrowid
             req_number = "REQ-%s-%03d" % (today_iso().replace("-", ""), rid)
-            sample_rows, all_names = [], []
-            for n, (sid, ids) in enumerate(items, 1):
-                s = conn.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
-                names = [an[i]["name"] for i in ids if i in an]
-                codes = [an[i]["code"] for i in ids if i in an and an[i]["code"]]
-                methods = []
-                for i in ids:
-                    if i in an and an[i]["method"] and an[i]["method"] not in methods:
-                        methods.append(an[i]["method"])
-                all_names += [x for x in names if x not in all_names]
-                sample_rows.append({"n": str(n), "id": s["sample_code"], "stage": sample_stage_info(s["stage"])[1], "type": s["type"] or "",
-                                    "description": s["description"] or "", "container": s["container"] or "",
-                                    "collected": (s["collected_at"] or "").replace("T", " ")[:16], "analyses": ", ".join(names), "methods": ", ".join(methods),
-                                    "location": s["location"] or "", "notes": s["notes"] or "",
-                                    "analysis_names": names, "analysis_codes": codes, "_sid": sid, "_names": names})
-            sku = conn.execute("SELECT name FROM fg_skus WHERE code=?", (run["sku_code"],)).fetchone()
-            product = (sku["name"] if sku else run["sku_code"]) or ""
-            for sr in sample_rows:
-                sr["report_description"] = " ".join(x for x in (product, run["processing_lot"], "-", sr["stage"], sr["type"], sr["description"]) if x)
-            # distinct analyses requested on this requisition (in lab order), with how many samples want each
-            req_analyses = []
-            for aid in sorted({i for _sid, ids in items for i in ids if i in an}, key=lambda i: i):   # the order the lab's analyses were added
-                req_analyses.append({"name": an[aid]["name"], "code": an[aid]["code"] or "", "method": an[aid]["method"] or "", "n": str(len(req_analyses) + 1),
-                                     "count": str(sum(1 for _sid, ids in items if aid in ids))})
-            d_today = datetime.date.fromisoformat(today_iso())
-            scalars = {"req_number": req_number, "date": today_iso(), "date_long": "%s %d, %d" % (d_today.strftime("%B"), d_today.day, d_today.year),
-                       "po_number": po_number or "", "po_check": "\u2612" if po_number else "\u2610", "company": COMPANY_NAME, "lab_name": lab["name"],
-                       "lab_contact": lab["contact"] or "", "lab_email": lab["email"] or "", "lab_phone": lab["phone"] or "",
-                       "lab_address": lab["address"] or "", "processing_lot": run["processing_lot"], "run_date": run["run_date"],
-                       "sku": run["sku_code"] or "", "product": product,
-                       "requested_by": uname or "", "requested_by_email": (user["email"] if user else "") or "",
-                       "sample_count": str(len(sample_rows)), "analyses": ", ".join(all_names), "notes": notes or ""}
-            template = None
-            if lab["template_stored"]:
-                try:
-                    with open(os.path.join(LAB_DIR, lab["template_stored"]), "rb") as f:
-                        template = f.read()
-                except OSError:
-                    # never quietly swap in the built-in layout for a lab that has its own form
-                    raise ApiError(409, "The requisition template for %s (%s) is missing on the server. Upload it again under "
-                                        "Admin > Labs & analyses > Template." % (lab["name"], lab["template_name"] or "template"))
-            doc = docx_fill(template or build_starter_docx(), scalars, sample_rows, req_analyses)
+            b = self._requisition_build(conn, user, run_id, lab_id, items, notes, po_number, req_number, contact)
+            run, sample_rows = b["run"], b["sample_rows"]
             safe_lab = re.sub(r"[^A-Za-z0-9]+", "_", lab["name"]).strip("_")
             att_id = self._store_attachment(conn, run_id, "%s_%s_%s.docx" % (req_number, safe_lab, run["processing_lot"]),
                                             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                            base64.b64encode(doc).decode("ascii"), uname)
+                                            base64.b64encode(b["doc"]).decode("ascii"), uname)
             sheet_id = None
-            if lab["sample_sheet"]:
+            if b["sheet"]:
                 sheet_id = self._store_attachment(
                     conn, run_id, "%s_%s_%s_samples.xlsx" % (req_number, safe_lab, run["processing_lot"]),
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    base64.b64encode(build_sample_sheet_xlsx(scalars, sample_rows, req_analyses)).decode("ascii"), uname)
+                    base64.b64encode(b["sheet"]).decode("ascii"), uname)
             conn.execute("UPDATE lab_requisitions SET req_number=?, attachment_id=?, sheet_attachment_id=? WHERE id=?",
                          (req_number, att_id, sheet_id, rid))
             for sr in sample_rows:
@@ -6956,7 +7328,7 @@ class Handler(BaseHTTPRequestHandler):
         "additional_samples": "Additional samples taken (new sample entries)",
         "other": "Other",
     }
-    _LOG_EXEMPT_SUBPATHS = ("attachments", "amendments", "progress", "lab-results")
+    _LOG_EXEMPT_SUBPATHS = ("attachments", "amendments", "progress", "lab-results", "sample-label-settings")
 
     def _open_amendment(self, conn, rid):
         return conn.execute("SELECT * FROM run_amendments WHERE run_id=? AND status='open'", (rid,)).fetchone()
@@ -7515,6 +7887,43 @@ class Handler(BaseHTTPRequestHandler):
             return out
         if len(seg) == 5 and seg[2] == "drafts" and seg[3].isdigit() and seg[4] == "finalize" and method == "POST":
             return self.finalize_draft(conn, int(seg[3]), user)
+        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "sample-labels" and method == "GET":
+            # the run's logged sample points with their label settings and collection times -- works for a draft and a finalized run
+            r = conn.execute("SELECT * FROM production_runs WHERE id=?", (int(seg[2]),)).fetchone()
+            if not r:
+                raise ApiError(404, "Production run not found")
+            points = []
+            locked = {x["sample_point_id"]: x["n"] for x in conn.execute(
+                "SELECT sample_point_id, COUNT(*) n FROM samples WHERE run_id=? AND requisition_id IS NOT NULL GROUP BY sample_point_id", (r["id"],))}
+            for pt in conn.execute("SELECT * FROM run_sample_points WHERE run_id=? ORDER BY created_at, id", (r["id"],)):
+                stage = pt["stage"] or "homogenization"
+                _abbr, label, col = sample_stage_info(stage)
+                collected = (r[col] if col and col in r.keys() else None) or pt["created_at"]
+                points.append({"id": pt["id"], "stage": stage, "stageLabel": label, "type": pt["type"] or "Slurry",
+                               "description": pt["description"] or "Microbial", "qty": max(1, int(pt["qty"] or 1)), "collectedAt": collected,
+                               "labelType": pt["label_type"] if pt["label_type"] in ("detailed", "simplified") else "detailed",
+                               "numbered": bool(pt["label_numbered"]), "lockedCount": locked.get(pt["id"], 0),
+                               "labelName": pt["label_name"] or sample_label_name(conn, stage),
+                               "defaultLabelName": sample_label_name(conn, stage)})
+            return {"lot": r["processing_lot"], "lotSimplified": lot_simplified(r["processing_lot"]), "points": points}
+        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "sample-label-settings" and method == "PUT":
+            # per sample point: label type (detailed / simplified), numbering and name; the samples' IDs follow (refresh_sample_ids)
+            r = conn.execute("SELECT * FROM production_runs WHERE id=?", (int(seg[2]),)).fetchone()
+            if not r:
+                raise ApiError(404, "Production run not found")
+            for item in (self._body_json().get("points") or []):
+                pt = conn.execute("SELECT * FROM run_sample_points WHERE id=? AND run_id=?", (item.get("id"), r["id"])).fetchone()
+                if not pt:
+                    continue
+                ltype = item.get("labelType")
+                if ltype not in ("detailed", "simplified"):
+                    raise ApiError(400, "Label type must be Detailed or Simplified")
+                name = (item.get("labelName") or "").strip()[:60]
+                default = sample_label_name(conn, pt["stage"] or "homogenization")
+                conn.execute("UPDATE run_sample_points SET label_type=?, label_numbered=?, label_name=? WHERE id=?",
+                             (ltype, 1 if item.get("numbered") else 0, name if name and name != default else None, pt["id"]))
+            refresh_sample_ids(conn, r["id"])
+            return {"ok": True}
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "qc-checks" and method == "GET":
             return {"qcChecks": self._qc_checks_public(conn, int(seg[2]))}
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "edits" and method == "GET":
@@ -7533,6 +7942,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self.add_attachment(conn, rid, user)
             if len(seg) == 5 and seg[4].isdigit() and method == "DELETE":
                 return self.delete_attachment(conn, rid, int(seg[4]))
+            if len(seg) == 6 and seg[4].isdigit() and seg[5] == "preview" and method == "GET":
+                a = conn.execute("SELECT * FROM run_attachments WHERE id=? AND run_id=?", (int(seg[4]), rid)).fetchone()
+                if not a:
+                    raise ApiError(404, "Document not found")
+                name = (a["filename"] or "").lower()
+                if not (name.endswith(".docx") or name.endswith(".xlsx")):
+                    raise ApiError(400, "A preview is available for Word (.docx) and Excel (.xlsx) documents; other files open with View.")
+                try:
+                    with open(os.path.join(UPLOAD_DIR, a["stored_name"]), "rb") as f:
+                        raw = f.read()
+                except OSError:
+                    raise ApiError(404, "File missing on disk")
+                return {"filename": a["filename"], "kind": "docx" if name.endswith(".docx") else "xlsx",
+                        "html": docx_to_html(raw) if name.endswith(".docx") else xlsx_to_html(raw)}
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "feedstock-photo" and method == "POST":
             return self.feedstock_photo_draft(conn, int(seg[2]), user)
         if len(seg) == 5 and seg[2].isdigit() and seg[3] == "inputs" and seg[4].isdigit() and method == "PUT":
