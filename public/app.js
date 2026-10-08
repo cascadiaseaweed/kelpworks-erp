@@ -1261,10 +1261,465 @@ function formatQcValue(n, maxDecimals) {
   return Number.isNaN(num) ? '' : num.toLocaleString('en-US', { maximumFractionDigits: maxDecimals });
 }
 
+/* ---------------- Quality Control: control charts ---------------- */
+// One measurement at a time (process QC checks, feedstock per tote, laboratory results), shown as an individuals control chart over the run
+// sequence, with summary statistics, hand-set control limits (+ a recommendation that firms up as data arrives), the specification, and the
+// within-run (process profile) and between-run / farm / species / SKU views. Everything is computed here from GET /api/qc-charts.
+const QC_COLORS = ['#2f8f83', '#d97706', '#5b6fd6', '#c2410c', '#7c3aed', '#0e7490', '#be185d', '#65a30d', '#8b6b3e', '#6b7280'];
+const QC_NEUTRAL = '#2f8f83';
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function svgEl(tag, attrs, ...kids) {
+  const e = document.createElementNS(SVG_NS, tag);
+  Object.entries(attrs || {}).forEach(([k, v]) => { if (v != null && v !== false) e.setAttribute(k, v === true ? '' : v); });
+  kids.flat().forEach(c => { if (c != null) e.append(c.nodeType ? c : document.createTextNode(String(c))); });
+  return e;
+}
+const qcSum = a => a.reduce((s, x) => s + x, 0);
+const qcMean = a => qcSum(a) / a.length;
+const qcSd = a => { if (a.length < 2) return null; const m = qcMean(a); return Math.sqrt(qcSum(a.map(x => (x - m) ** 2)) / (a.length - 1)); };
+const qcMedian = a => { const s = [...a].sort((x, y) => x - y), h = s.length >> 1; return s.length % 2 ? s[h] : (s[h - 1] + s[h]) / 2; };
+function qcSummary(vals) {
+  if (!vals.length) return null;
+  const mean = qcMean(vals), sd = qcSd(vals);
+  return { n: vals.length, mean, sd, median: qcMedian(vals), min: Math.min(...vals), max: Math.max(...vals), cv: sd != null && mean ? Math.abs(sd / mean) * 100 : null };
+}
+// number formatting that follows the size of the numbers (no more digits than the data can support)
+function qcFmt(v, ref) {
+  if (v == null || !isFinite(v)) return '—';
+  const a = Math.abs(ref != null ? ref : v);
+  const d = a >= 1000 ? 0 : a >= 100 ? 1 : a >= 10 ? 2 : a >= 1 ? 2 : a >= 0.1 ? 3 : 4;
+  return Number(v.toFixed(d)).toLocaleString('en-US', { maximumFractionDigits: d });
+}
+function qcNiceScale(min, max, count = 5) {
+  if (!(max > min)) { const p = Math.abs(max) * 0.1 || 1; min -= p; max += p; }
+  const raw = (max - min) / (count - 1), mag = 10 ** Math.floor(Math.log10(raw)), f = raw / mag;
+  const step = (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * mag;
+  const lo = Math.floor(min / step + 1e-9) * step, hi = Math.ceil(max / step - 1e-9) * step, ticks = [];
+  for (let t = lo; t <= hi + step / 2; t += step) ticks.push(Number(t.toFixed(10)));
+  return { min: lo, max: hi, step, ticks };
+}
+// Individuals chart: sigma is estimated from the average moving range (MRbar / 1.128), so one odd run does not blow the limits up
+function qcImr(vals) {
+  if (vals.length < 2) return null;
+  const mr = vals.slice(1).map((v, i) => Math.abs(v - vals[i])), mrBar = qcMean(mr);
+  return { mr, mrBar, sigma: mrBar / 1.128, mrUcl: 3.267 * mrBar };
+}
+function qcRecommend(vals, nonNeg, S) {
+  const n = vals.length, imr = qcImr(vals);
+  if (n < S.minProvisional || !imr) return { status: 'none', n, need: Math.max(0, S.minProvisional - n) };
+  const center = qcMean(vals);
+  let lcl = center - S.sigma * imr.sigma;
+  if (nonNeg && lcl < 0) lcl = 0;
+  return { status: n >= S.minEstablished ? 'established' : 'provisional', n, need: Math.max(0, S.minEstablished - n), center, lcl, ucl: center + S.sigma * imr.sigma, sigma: imr.sigma };
+}
+// Out-of-control signals against the control limits that were set (nothing is called "out of control" until someone has set limits):
+// beyond a limit, a run of N points on one side of the centre line, a trend of N rising / falling points.
+function qcSignals(pts, lim, center, S) {
+  const sig = new Map(), add = (i, why) => { if (!sig.has(i)) sig.set(i, []); sig.get(i).push(why); };
+  if (!lim || (lim.lcl == null && lim.ucl == null && lim.center == null)) return sig;
+  const idx = pts.map((p, i) => (p.q ? -1 : i)).filter(i => i >= 0);          // detection-limit results are not judged
+  idx.forEach(i => {
+    const v = pts[i].v;
+    if (lim.ucl != null && v > lim.ucl) add(i, 'above the upper control limit (' + qcFmt(v) + ' > ' + qcFmt(lim.ucl) + ')');
+    if (lim.lcl != null && v < lim.lcl) add(i, 'below the lower control limit (' + qcFmt(v) + ' < ' + qcFmt(lim.lcl) + ')');
+  });
+  if (center != null) {
+    let run = [], side = 0;
+    idx.forEach(i => {
+      const sd = Math.sign(pts[i].v - center);
+      if (sd !== 0 && sd === side) run.push(i); else { run = sd === 0 ? [] : [i]; side = sd; }
+      if (run.length >= S.runLength) run.forEach(j => add(j, S.runLength + ' or more points in a row on the ' + (side > 0 ? 'high' : 'low') + ' side of the centre line'));
+    });
+  }
+  let up = [], down = [];
+  idx.forEach((i, k) => {
+    const prev = k ? pts[idx[k - 1]].v : null, v = pts[i].v;
+    up = prev != null && v > prev ? (up.length ? up : [idx[k - 1]]).concat(i) : []; down = prev != null && v < prev ? (down.length ? down : [idx[k - 1]]).concat(i) : [];
+    if (up.length >= S.trendLength) up.forEach(j => add(j, 'a trend of ' + S.trendLength + ' or more rising points'));
+    if (down.length >= S.trendLength) down.forEach(j => add(j, 'a trend of ' + S.trendLength + ' or more falling points'));
+  });
+  return sig;
+}
+// 'ok' | 'fail' | 'unknown' against the specification line(s), if the measurement has any
+function qcSpecState(p, ref) {
+  if (!ref || (ref.min == null && ref.max == null)) return null;
+  const v = p.v;
+  if (p.q === '<') return ref.max != null && v <= ref.max ? 'ok' : (ref.min != null && v <= ref.min ? 'fail' : 'unknown');
+  if (ref.min != null && v < ref.min) return 'fail';
+  if (ref.max != null && (ref.exclusive ? v >= ref.max : v > ref.max)) return 'fail';
+  return 'ok';
+}
+const QC_DIMS = [['species', 'Species'], ['farm', 'Farm'], ['sku', 'Product (SKU)'], ['stabilization', 'Stabilization'], ['month', 'Run month']];
+function qcDim(run, dim) {
+  const v = dim === 'species' ? run.species : dim === 'farm' ? run.farms : dim === 'stabilization' ? run.stabilization : dim === 'sku' ? [run.skuName] : [run.month];
+  return v.length > 1 ? 'Mixed' : (v[0] || 'Not recorded');
+}
+const qcShortLot = lot => String(lot || '').replace(/^PR-/, '');
+
+function qcTip(wrap) {
+  const tip = el('div', { class: 'qc-tip hidden' });
+  wrap.append(tip);
+  return {
+    show(node, lines) {
+      tip.innerHTML = ''; lines.forEach((l, i) => tip.append(el(i ? 'div' : 'b', {}, l)));
+      tip.classList.remove('hidden');
+      const w = wrap.getBoundingClientRect(), n = node.getBoundingClientRect();
+      let x = n.left - w.left + n.width / 2 + 12, y = n.top - w.top - 8;
+      tip.style.left = Math.min(x, w.width - tip.offsetWidth - 4) + 'px'; tip.style.top = Math.max(0, y - tip.offsetHeight) + 'px';
+    },
+    hide() { tip.classList.add('hidden'); },
+  };
+}
+// y domain from the data, the limits and the specification (a specification far off the data is left off the scale and noted instead)
+function qcYDomain(values, extras, nonNeg) {
+  const data = values.filter(v => v != null), lo = Math.min(...data), hi = Math.max(...data);
+  const span = Math.max(hi - lo, Math.abs(qcMean(data)) * 0.1, 1e-6), keep = [...data], off = [];
+  extras.forEach(e => { if (e.v == null) return; if (e.v > lo - 2.5 * span && e.v < hi + 2.5 * span) keep.push(e.v); else off.push(e); });
+  let min = Math.min(...keep), max = Math.max(...keep);
+  const pad = (max - min) * 0.1 || Math.abs(max) * 0.1 || 1;
+  min -= pad; max += pad;
+  if (nonNeg && min < 0) min = 0;
+  return { scale: qcNiceScale(min, max), off };
+}
+function qcRefLines(lim, rec, ref, mean) {
+  const L = [];
+  if (lim && lim.ucl != null) L.push({ v: lim.ucl, label: 'UCL', kind: 'limit' });
+  if (lim && lim.lcl != null) L.push({ v: lim.lcl, label: 'LCL', kind: 'limit' });
+  if (lim && lim.center != null) L.push({ v: lim.center, label: 'Target', kind: 'center' });
+  else if (mean != null) L.push({ v: mean, label: 'Mean', kind: 'mean' });
+  if (!lim || (lim.ucl == null && lim.lcl == null)) {
+    if (rec && rec.status !== 'none') { L.push({ v: rec.ucl, label: 'rec. UCL', kind: 'rec' }); L.push({ v: rec.lcl, label: 'rec. LCL', kind: 'rec' }); }
+  }
+  if (ref) { if (ref.max != null) L.push({ v: ref.max, label: 'Spec max', kind: 'spec' }); if (ref.min != null) L.push({ v: ref.min, label: 'Spec min', kind: 'spec' }); }
+  return L;
+}
+// y positions for the labels at the right edge of the reference lines: pushed apart so two lines at (almost) the same value stay readable
+function qcLabelYs(lines, Y) {
+  const order = lines.map((l, i) => i).sort((a, b) => Y(lines[a].v) - Y(lines[b].v)), ys = {};
+  let prev = -1e9;
+  order.forEach(i => { const y = Math.max(Y(lines[i].v), prev + 12); ys[i] = y; prev = y; });
+  return ys;
+}
+const QC_LINE_STYLE = {
+  limit: { stroke: '#c0392b', dash: null, w: 1.6 }, center: { stroke: '#1f6f66', dash: null, w: 1.4 }, mean: { stroke: '#6b7f7c', dash: '2 3', w: 1.2 },
+  rec: { stroke: '#d97706', dash: '6 4', w: 1.3 }, spec: { stroke: '#4b5563', dash: '1 4', w: 1.5 },
+};
+
+// The individuals control chart: x = run sequence (equal spacing, oldest to newest), y = the measurement
+function qcControlChart(o) {
+  const { pts, runs, unit, lim, rec, ref, colorOf, signals, nonNeg, mean } = o;
+  const W = 940, H = o.height || 350, m = { l: 62, r: 78, t: 18, b: 74 };
+  const lines = qcRefLines(lim, rec, ref, mean);
+  const dom = qcYDomain(pts.map(p => p.v), lines, nonNeg), sc = dom.scale;
+  const shown = lines.filter(l => !dom.off.includes(l));
+  const iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const step = runs.length > 1 ? Math.min(iw / (runs.length - 1), 150) : 0, x0 = m.l + (iw - step * (runs.length - 1)) / 2;
+  const X = i => x0 + i * step, Y = v => m.t + ih - (v - sc.min) / (sc.max - sc.min) * ih;
+  const wrap = el('div', { class: 'qc-chart' }), tip = qcTip(wrap);
+  const svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, class: 'qc-svg', role: 'img', 'aria-label': 'Control chart' });
+  sc.ticks.forEach(t => {
+    svg.append(svgEl('line', { x1: m.l, x2: W - m.r, y1: Y(t), y2: Y(t), stroke: '#e3ebe9', 'stroke-width': 1 }));
+    svg.append(svgEl('text', { x: m.l - 8, y: Y(t) + 4, 'text-anchor': 'end', 'font-size': 11, fill: '#6b7f7c' }, qcFmt(t, sc.step)));
+  });
+  svg.append(svgEl('line', { x1: m.l, x2: m.l, y1: m.t, y2: m.t + ih, stroke: '#9fb1ae' }), svgEl('line', { x1: m.l, x2: W - m.r, y1: m.t + ih, y2: m.t + ih, stroke: '#9fb1ae' }));
+  if (unit) svg.append(svgEl('text', { x: 14, y: m.t + ih / 2, transform: 'rotate(-90 14 ' + (m.t + ih / 2) + ')', 'text-anchor': 'middle', 'font-size': 11, fill: '#6b7f7c' }, unit));
+  // reference lines
+  const labelY = qcLabelYs(shown, Y);
+  shown.forEach((l, i) => {
+    const st = QC_LINE_STYLE[l.kind];
+    svg.append(svgEl('line', { x1: m.l, x2: W - m.r, y1: Y(l.v), y2: Y(l.v), stroke: st.stroke, 'stroke-width': st.w, 'stroke-dasharray': st.dash }));
+    svg.append(svgEl('text', { x: W - m.r + 5, y: labelY[i] + 4, 'font-size': 10.5, fill: st.stroke, 'font-weight': 600 }, l.label + ' ' + qcFmt(l.v, sc.step)));
+  });
+  // x labels (run lots), thinned when crowded
+  const every = Math.max(1, Math.ceil(runs.length / Math.floor(iw / 62)));
+  runs.forEach((r, i) => {
+    if (i % every) return;
+    svg.append(svgEl('text', { x: X(i), y: m.t + ih + 14, transform: 'rotate(40 ' + X(i) + ' ' + (m.t + ih + 14) + ')', 'text-anchor': 'start', 'font-size': 10.5, fill: '#4b5f5c' }, qcShortLot(r.lot)));
+  });
+  // points: grouped by run slot, spread sideways when a run has several (per-tote / repeated results); a thin line follows the sequence
+  const byRun = new Map(); pts.forEach((p, i) => { const k = p.run.id; if (!byRun.has(k)) byRun.set(k, []); byRun.get(k).push(i); });
+  const pos = pts.map(() => null);
+  byRun.forEach((idxs, rid) => {
+    const slot = runs.findIndex(r => r.id === rid), spread = Math.min(34, step ? step * 0.3 : 30);
+    idxs.forEach((pi, k) => { pos[pi] = X(slot) + (idxs.length > 1 ? (k - (idxs.length - 1) / 2) * (spread * 2 / Math.max(idxs.length - 1, 1)) : 0); });
+  });
+  const ordered = pts.map((p, i) => i).filter(i => !pts[i].q || true);
+  if (pts.length > 1) svg.append(svgEl('polyline', { points: ordered.map(i => pos[i] + ',' + Y(pts[i].v)).join(' '), fill: 'none', stroke: '#b9c9c6', 'stroke-width': 1.2 }));
+  pts.forEach((p, i) => {
+    const cx = pos[i], cy = Y(p.v), color = p.run.excluded ? '#9aa5a3' : colorOf(p), cens = p.q === '<';
+    const why = signals.get(i), spec = qcSpecState(p, ref);
+    const g = svgEl('g', { class: 'qc-pt' });
+    if (why) g.append(svgEl('circle', { cx, cy, r: 10, fill: 'none', stroke: '#c0392b', 'stroke-width': 2 }));
+    if (spec === 'fail') g.append(svgEl('rect', { x: cx - 7, y: cy - 7, width: 14, height: 14, fill: 'none', stroke: '#4b5563', 'stroke-width': 1.6, transform: 'rotate(45 ' + cx + ' ' + cy + ')' }));
+    g.append(svgEl('circle', { cx, cy, r: 5.5, fill: cens || p.run.excluded ? '#fff' : color, stroke: color, 'stroke-width': 2 }));
+    g.addEventListener('mouseenter', () => tip.show(g, [qcShortLot(p.run.lot) + '  ·  ' + qcFmt(p.q ? p.v : p.v) + (unit ? ' ' + unit : '') + (cens ? '  (below detection limit)' : ''),
+      p.run.date + (p.when && p.when !== p.run.date ? ' · reported ' + p.when : ''), p.run.skuName + ' · ' + qcDim(p.run, 'species') + ' · ' + qcDim(p.run, 'farm'),
+      p.n ? (p.n.toString().includes('-') ? 'Tote ' : 'Report ') + p.n : '', p.run.excluded ? 'Run excluded from statistics' + (p.run.excludeReason ? ': ' + p.run.excludeReason : '') : '',
+      ...(why || []).map(w => '⚠ ' + w), spec === 'fail' ? '✖ outside the specification' : ''].filter(Boolean)));
+    g.addEventListener('mouseleave', () => tip.hide());
+    svg.append(g);
+  });
+  wrap.prepend(svg);
+  if (dom.off.length) wrap.append(el('div', { class: 'help' }, 'Off the scale (not drawn): ' + dom.off.map(l => l.label + ' ' + qcFmt(l.v)).join(' · ')));
+  return wrap;
+}
+
+// Moving-range chart (the "MR" half of an I-MR chart): how much consecutive results jump around
+function qcMrChart(pts, runs, unit) {
+  const vals = pts.filter(p => !p.q).map(p => p.v), imr = qcImr(vals);
+  if (!imr) return null;
+  const W = 940, H = 150, m = { l: 62, r: 78, t: 12, b: 24 }, iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const sc = qcNiceScale(0, Math.max(imr.mrUcl, ...imr.mr) * 1.1, 4), Y = v => m.t + ih - (v - sc.min) / (sc.max - sc.min) * ih;
+  const step = imr.mr.length > 1 ? Math.min(iw / (imr.mr.length - 1), 150) : 0, x0 = m.l + (iw - step * (imr.mr.length - 1)) / 2;
+  const svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, class: 'qc-svg', role: 'img', 'aria-label': 'Moving range chart' });
+  sc.ticks.forEach(t => { svg.append(svgEl('line', { x1: m.l, x2: W - m.r, y1: Y(t), y2: Y(t), stroke: '#e3ebe9' }), svgEl('text', { x: m.l - 8, y: Y(t) + 4, 'text-anchor': 'end', 'font-size': 10.5, fill: '#6b7f7c' }, qcFmt(t, sc.step))); });
+  svg.append(svgEl('line', { x1: m.l, x2: m.l, y1: m.t, y2: m.t + ih, stroke: '#9fb1ae' }), svgEl('line', { x1: m.l, x2: W - m.r, y1: m.t + ih, y2: m.t + ih, stroke: '#9fb1ae' }));
+  [['MR̄ ' + qcFmt(imr.mrBar, sc.step), imr.mrBar, 'mean'], ['UCL ' + qcFmt(imr.mrUcl, sc.step), imr.mrUcl, 'rec']].forEach(([lab, v, kind]) => {
+    const st = QC_LINE_STYLE[kind]; svg.append(svgEl('line', { x1: m.l, x2: W - m.r, y1: Y(v), y2: Y(v), stroke: st.stroke, 'stroke-dasharray': st.dash, 'stroke-width': st.w }), svgEl('text', { x: W - m.r + 5, y: Y(v) + 4, 'font-size': 10.5, fill: st.stroke, 'font-weight': 600 }, lab));
+  });
+  if (imr.mr.length > 1) svg.append(svgEl('polyline', { points: imr.mr.map((v, i) => (x0 + i * step) + ',' + Y(v)).join(' '), fill: 'none', stroke: '#b9c9c6', 'stroke-width': 1.2 }));
+  imr.mr.forEach((v, i) => svg.append(svgEl('circle', { cx: x0 + i * step, cy: Y(v), r: 4, fill: v > imr.mrUcl ? '#c0392b' : '#6b7f7c' }, svgEl('title', {}, 'Moving range ' + qcFmt(v) + (unit ? ' ' + unit : '')))));
+  return el('div', { class: 'qc-chart' }, svg);
+}
+
+// Within a run: the same measurement across the process sections, one line per run
+function qcProfileChart(o) {
+  const { sections, rows, colorOf, unit, nonNeg } = o;      // rows: [{ run, byStage: {sectionKey: value}}]
+  const W = 940, H = 330, m = { l: 62, r: 30, t: 18, b: 56 };
+  const all = rows.flatMap(r => Object.values(r.byStage));
+  const dom = qcYDomain(all, [], nonNeg), sc = dom.scale, iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const X = i => m.l + (sections.length === 1 ? iw / 2 : i * iw / (sections.length - 1) * 0.92 + iw * 0.04), Y = v => m.t + ih - (v - sc.min) / (sc.max - sc.min) * ih;
+  const wrap = el('div', { class: 'qc-chart' }), tip = qcTip(wrap);
+  const svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, class: 'qc-svg', role: 'img', 'aria-label': 'Process profile' });
+  sc.ticks.forEach(t => svg.append(svgEl('line', { x1: m.l, x2: W - m.r, y1: Y(t), y2: Y(t), stroke: '#e3ebe9' }), svgEl('text', { x: m.l - 8, y: Y(t) + 4, 'text-anchor': 'end', 'font-size': 11, fill: '#6b7f7c' }, qcFmt(t, sc.step))));
+  svg.append(svgEl('line', { x1: m.l, x2: m.l, y1: m.t, y2: m.t + ih, stroke: '#9fb1ae' }), svgEl('line', { x1: m.l, x2: W - m.r, y1: m.t + ih, y2: m.t + ih, stroke: '#9fb1ae' }));
+  if (unit) svg.append(svgEl('text', { x: 14, y: m.t + ih / 2, transform: 'rotate(-90 14 ' + (m.t + ih / 2) + ')', 'text-anchor': 'middle', 'font-size': 11, fill: '#6b7f7c' }, unit));
+  sections.forEach((s, i) => {
+    svg.append(svgEl('line', { x1: X(i), x2: X(i), y1: m.t, y2: m.t + ih, stroke: '#eef3f2', 'stroke-dasharray': '2 3' }));
+    const parts = s.label.split(/ - | & /); parts.forEach((t, k) => svg.append(svgEl('text', { x: X(i), y: m.t + ih + 16 + k * 13, 'text-anchor': 'middle', 'font-size': 11, fill: '#4b5f5c' }, t)));
+  });
+  rows.forEach(r => {
+    const color = r.run.excluded ? '#9aa5a3' : colorOf({ run: r.run }), pts = sections.map((s, i) => (r.byStage[s.key] != null ? [X(i), Y(r.byStage[s.key]), s, r.byStage[s.key]] : null)).filter(Boolean);
+    if (pts.length > 1) svg.append(svgEl('polyline', { points: pts.map(p => p[0] + ',' + p[1]).join(' '), fill: 'none', stroke: color, 'stroke-width': 1.8, opacity: 0.8 }));
+    pts.forEach(p => {
+      const c = svgEl('circle', { cx: p[0], cy: p[1], r: 5, fill: color, stroke: '#fff', 'stroke-width': 1.5 });
+      c.addEventListener('mouseenter', () => tip.show(c, [qcShortLot(r.run.lot) + '  ·  ' + p[2].label, qcFmt(p[3]) + (unit ? ' ' + unit : ''), r.run.date + ' · ' + qcDim(r.run, 'species') + ' · ' + qcDim(r.run, 'farm')]));
+      c.addEventListener('mouseleave', () => tip.hide()); svg.append(c);
+    });
+  });
+  sections.forEach((s, i) => { const v = rows.map(r => r.byStage[s.key]).filter(x => x != null); if (v.length) svg.append(svgEl('path', { d: 'M' + (X(i) - 9) + ' ' + Y(qcMean(v)) + ' l9 -9 l9 9 l-9 9 z', fill: '#fff', stroke: '#1f3d39', 'stroke-width': 1.8 }, svgEl('title', {}, s.label + ' mean ' + qcFmt(qcMean(v))))); });
+  wrap.prepend(svg);
+  return wrap;
+}
+
+// Between groups (species / farm / SKU / …): every value as a dot, the group mean (◇) and ±1 SD
+function qcGroupChart(o) {
+  const { groups, unit, nonNeg, lim, ref } = o;      // groups: [{ name, pts:[{v,run,q}] }]
+  const W = 940, H = 320, m = { l: 62, r: 78, t: 18, b: 58 };
+  const lines = qcRefLines(lim, null, ref, null).filter(l => l.kind !== 'mean');
+  const dom = qcYDomain(groups.flatMap(g => g.pts.map(p => p.v)), lines, nonNeg), sc = dom.scale, iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const step = Math.min(iw / groups.length, 190), x0 = m.l + (iw - step * groups.length) / 2 + step / 2, X = i => x0 + i * step, Y = v => m.t + ih - (v - sc.min) / (sc.max - sc.min) * ih;
+  const wrap = el('div', { class: 'qc-chart' }), tip = qcTip(wrap);
+  const svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, class: 'qc-svg', role: 'img', 'aria-label': 'Comparison by group' });
+  sc.ticks.forEach(t => svg.append(svgEl('line', { x1: m.l, x2: W - m.r, y1: Y(t), y2: Y(t), stroke: '#e3ebe9' }), svgEl('text', { x: m.l - 8, y: Y(t) + 4, 'text-anchor': 'end', 'font-size': 11, fill: '#6b7f7c' }, qcFmt(t, sc.step))));
+  svg.append(svgEl('line', { x1: m.l, x2: m.l, y1: m.t, y2: m.t + ih, stroke: '#9fb1ae' }), svgEl('line', { x1: m.l, x2: W - m.r, y1: m.t + ih, y2: m.t + ih, stroke: '#9fb1ae' }));
+  if (unit) svg.append(svgEl('text', { x: 14, y: m.t + ih / 2, transform: 'rotate(-90 14 ' + (m.t + ih / 2) + ')', 'text-anchor': 'middle', 'font-size': 11, fill: '#6b7f7c' }, unit));
+  const gShown = lines.filter(l => !dom.off.includes(l)), gLabelY = qcLabelYs(gShown, Y);
+  gShown.forEach((l, i) => { const st = QC_LINE_STYLE[l.kind]; svg.append(svgEl('line', { x1: m.l, x2: W - m.r, y1: Y(l.v), y2: Y(l.v), stroke: st.stroke, 'stroke-dasharray': st.dash, 'stroke-width': st.w }), svgEl('text', { x: W - m.r + 5, y: gLabelY[i] + 4, 'font-size': 10.5, fill: st.stroke, 'font-weight': 600 }, l.label + ' ' + qcFmt(l.v, sc.step))); });
+  groups.forEach((g, i) => {
+    const color = QC_COLORS[i % QC_COLORS.length], vals = g.pts.filter(p => !p.q).map(p => p.v), s = qcSummary(vals);
+    svg.append(svgEl('text', { x: X(i), y: m.t + ih + 18, 'text-anchor': 'middle', 'font-size': 11.5, fill: '#2b3f3c', 'font-weight': 600 }, g.name.length > 24 ? g.name.slice(0, 23) + '…' : g.name), svgEl('text', { x: X(i), y: m.t + ih + 33, 'text-anchor': 'middle', 'font-size': 10.5, fill: '#6b7f7c' }, 'n = ' + g.pts.length));
+    if (s && s.sd != null) svg.append(svgEl('rect', { x: X(i) - 26, y: Y(s.mean + s.sd), width: 52, height: Math.max(2, Y(s.mean - s.sd) - Y(s.mean + s.sd)), fill: color, opacity: 0.13 }));
+    g.pts.forEach((p, k) => {
+      const jx = ((k * 37) % 41 - 20) * 0.9, cx = X(i) + jx, cy = Y(p.v), c = svgEl('circle', { cx, cy, r: 5, fill: p.q || p.run.excluded ? '#fff' : color, stroke: p.run.excluded ? '#9aa5a3' : color, 'stroke-width': 2, opacity: 0.9 });
+      c.addEventListener('mouseenter', () => tip.show(c, [qcShortLot(p.run.lot) + '  ·  ' + qcFmt(p.v) + (unit ? ' ' + unit : ''), p.run.date, p.run.skuName + ' · ' + qcDim(p.run, 'species') + ' · ' + qcDim(p.run, 'farm')]));
+      c.addEventListener('mouseleave', () => tip.hide()); svg.append(c);
+    });
+    if (s) svg.append(svgEl('path', { d: 'M' + (X(i) - 11) + ' ' + Y(s.mean) + ' l11 -10 l11 10 l-11 10 z', fill: '#fff', stroke: '#1f3d39', 'stroke-width': 2 }, svgEl('title', {}, g.name + ' mean ' + qcFmt(s.mean))));
+  });
+  wrap.prepend(svg);
+  return wrap;
+}
+
 async function pageQC(v) {
-  v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Quality Control')));
-  v.append(el('div', { class: 'empty card' },
-    'QC data now lives on each production run’s Process Log — open a run’s 🧪 QC button (Production tab) to view it.'));
+  v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Quality Control'),
+    el('div', { class: 'actions' }, el('span', { class: 'help' }, 'Control charts for process QC checks, feedstock and laboratory results'))));
+  const host = el('div', {}); v.append(host);
+  let D;
+  async function load() { D = await api('GET', '/qc-charts'); }
+  await load();
+  const S = D.settings;
+  const st = State.qc = State.qc || { metric: null, section: null, from: '', to: '', sku: '', species: '', farm: '', stab: '', excluded: false, color: 'species', showMr: true, lower: 'profile' };
+  const metricByKey = k => D.measures.find(m => m.key === k);
+  const nPts = m => m.sections.reduce((a, s) => a + s.points.length, 0);
+  if (!D.measures.length) { host.append(el('div', { class: 'empty card' }, 'No QC values or laboratory results have been recorded on completed production runs yet. Charts appear here as runs are finalized.')); return; }
+  const defaultSection = m => [...m.sections].sort((a, b) => b.points.length - a.points.length || b.order - a.order)[0].key;
+  if (!metricByKey(st.metric)) { const pref = metricByKey('qc:ph') || D.measures[0]; st.metric = pref.key; st.section = null; }
+  const runsById = Object.fromEntries(D.runs.map(r => [r.id, r]));
+  const uniq = f => [...new Set(D.runs.flatMap(f))].filter(Boolean).sort();
+  const controls = el('div', {}), body = el('div', {});
+  host.append(controls, body);
+
+  function draw() {
+    const m = metricByKey(st.metric);
+    if (!m.sections.some(s => s.key === st.section)) st.section = defaultSection(m);
+    const sec = m.sections.find(s => s.key === st.section), limKey = m.key + '|' + sec.key;
+    const manual = D.limits[limKey] || null, ref = D.refs[limKey] || null;
+    // ---- which points are shown (filters), in run order
+    const runPass = r => (!st.from || r.date >= st.from) && (!st.to || r.date <= st.to) && (!st.sku || r.sku === st.sku) && (st.excluded || !r.excluded) &&
+      (!st.species || r.species.includes(st.species)) && (!st.farm || r.farms.includes(st.farm)) && (!st.stab || r.stabilization.includes(st.stab));
+    const rank = Object.fromEntries(D.runs.map((r, i) => [r.id, i]));
+    const mk = (s, pass) => s.points.map(p => Object.assign({}, p, { run: runsById[p.r] })).filter(p => p.run && pass(p.run)).sort((a, b) => rank[a.r] - rank[b.r]);
+    const pts = mk(sec, runPass), runs = [...new Map(pts.map(p => [p.run.id, p.run])).values()];
+    const values = pts.filter(p => !p.q).map(p => p.v), sum = qcSummary(values);
+    const allVals = mk(sec, r => !r.excluded).filter(p => !p.q).map(p => p.v), rec = qcRecommend(allVals, m.nonNegative, S);
+    const center = manual && manual.center != null ? manual.center : (sum ? sum.mean : null);
+    const signals = qcSignals(pts, manual, center, S);
+    const palette = {}; const keyOf = p => (st.color === 'none' ? '' : qcDim(p.run, st.color));
+    [...new Set(D.runs.map(r => (st.color === 'none' ? '' : qcDim(r, st.color))))].sort().forEach((k, i) => { palette[k] = QC_COLORS[i % QC_COLORS.length]; });
+    const colorOf = p => palette[keyOf(p)] || QC_NEUTRAL;
+    const unit = m.unit;
+
+    // ---- summary tiles
+    const tiles = el('div', { class: 'qc-tiles' });
+    const tile_ = (label, value, sub, cls) => tiles.append(el('div', { class: 'qc-tile ' + (cls || '') }, el('div', { class: 'qc-tile-l' }, label), el('div', { class: 'qc-tile-v' }, value), sub ? el('div', { class: 'qc-tile-s' }, sub) : null));
+    const cens = pts.filter(p => p.q).length, specFail = pts.filter(p => qcSpecState(p, ref) === 'fail').length, last = pts[pts.length - 1];
+    tile_('Results', String(pts.length), runs.length + ' run' + (runs.length === 1 ? '' : 's') + (cens ? ' · ' + cens + ' below detection' : ''));
+    tile_('Mean', sum ? qcFmt(sum.mean, sum.sd || sum.mean) : '—', unit);
+    tile_('Std deviation', sum && sum.sd != null ? qcFmt(sum.sd, sum.sd) : '—', sum && sum.cv != null ? 'CV ' + qcFmt(sum.cv, 10) + ' %' : 'needs 2+ results');
+    tile_('Median', sum ? qcFmt(sum.median, sum.sd || sum.median) : '—', unit);
+    tile_('Range', sum ? qcFmt(sum.min, sum.max) + ' – ' + qcFmt(sum.max, sum.max) : '—', unit);
+    tile_('Latest', last ? qcFmt(last.v) + (last.q ? ' (<DL)' : '') : '—', last ? qcShortLot(last.run.lot) : '', last && signals.has(pts.length - 1) ? 'bad' : '');
+    tile_('Signals', manual ? String(signals.size) : '—', manual ? (signals.size ? 'out-of-control points' : 'in control') : 'set limits to enable', signals.size ? 'bad' : (manual ? 'good' : ''));
+    if (ref) tile_('Beyond spec', String(specFail), 'of ' + pts.length + ' results', specFail ? 'bad' : 'good');
+    // within-run vs between-run SD when a run has several results (per-tote feedstock, repeat lab results)
+    const perRun = [...pts.reduce((mp, p) => { if (!p.q) { if (!mp.has(p.run.id)) mp.set(p.run.id, []); mp.get(p.run.id).push(p.v); } return mp; }, new Map()).values()];
+    const multi = perRun.filter(a => a.length > 1);
+    if (multi.length) {
+      const dfw = qcSum(multi.map(a => a.length - 1)), within = Math.sqrt(qcSum(multi.map(a => qcSum(a.map(x => (x - qcMean(a)) ** 2)))) / dfw), between = qcSd(perRun.map(qcMean));
+      tile_('Within-run SD', qcFmt(within, within), 'tote-to-tote inside a run');
+      tile_('Between-run SD', between != null ? qcFmt(between, between) : '—', 'run averages');
+    }
+
+    // ---- control chart card
+    const chartCard = el('div', { class: 'card qc-card' });
+    const legend = el('div', { class: 'qc-legend' });
+    if (st.color !== 'none') [...new Set(pts.map(keyOf))].sort().forEach(k => legend.append(el('span', { class: 'qc-leg' }, el('i', { style: 'background:' + palette[k] }), k + ' (' + pts.filter(p => keyOf(p) === k).length + ')')));
+    legend.append(el('span', { class: 'qc-leg' }, el('i', { class: 'ring' }), 'hollow = below detection limit / excluded run'), el('span', { class: 'qc-leg' }, el('i', { class: 'sig' }), 'out-of-control signal'));
+    chartCard.append(el('div', { class: 'qc-card-head' }, el('h3', {}, m.label + (unit ? ' (' + unit + ')' : '') + ' — ' + sec.label), el('span', { class: 'help' }, 'Individuals chart · one point per result, oldest → newest')),
+      pts.length ? qcControlChart({ pts, runs, unit, lim: manual, rec, ref, colorOf, signals, nonNeg: m.nonNegative, mean: sum ? sum.mean : null }) : el('div', { class: 'empty' }, 'No results match the filters.'),
+      legend);
+    if (signals.size) chartCard.append(el('ul', { class: 'qc-signals' }, ...[...signals.entries()].map(([i, why]) => el('li', {}, el('b', {}, qcShortLot(pts[i].run.lot)), ' (' + qcFmt(pts[i].v) + (unit ? ' ' + unit : '') + '): ' + [...new Set(why)].join('; ')))));
+    const mrWrap = el('div', {});
+    const mrBtn = el('label', { class: 'vb-opt' + (st.showMr ? ' on' : ''), style: 'margin:0' }, el('input', { type: 'checkbox', checked: st.showMr ? 'checked' : null, onchange: e => { st.showMr = e.target.checked; draw(); } }), 'Show moving-range chart');
+    chartCard.append(el('div', { class: 'viewbar', style: 'margin:8px 0 0' }, mrBtn));
+    if (st.showMr) { const mr = qcMrChart(pts, runs, unit); mrWrap.append(mr || el('div', { class: 'help' }, 'The moving-range chart needs at least two results.')); chartCard.append(el('div', { class: 'help', style: 'margin-top:6px' }, 'Moving range = how far each result is from the one before it; a spike means the process jumped, even if the value itself is still inside the limits.'), mrWrap); }
+
+    // ---- limits + recommendation card
+    const limCard = el('div', { class: 'card qc-card' }, el('div', { class: 'qc-card-head' }, el('h3', {}, 'Control limits'), el('span', { class: 'help' }, m.label + ' · ' + sec.label)));
+    const f = x => (x == null ? '' : String(Number(x.toPrecision(6))));
+    const inLcl = el('input', { value: f(manual && manual.lcl), placeholder: 'LCL', inputmode: 'decimal' }), inCenter = el('input', { value: f(manual && manual.center), placeholder: 'Target (optional)', inputmode: 'decimal' }),
+      inUcl = el('input', { value: f(manual && manual.ucl), placeholder: 'UCL', inputmode: 'decimal' }), inNote = el('input', { value: (manual && manual.note) || '', placeholder: 'Why these limits? (optional)', maxlength: '200' });
+    const msg = el('span', { class: 'help' });
+    const can = D.canSetLimits;
+    [inLcl, inCenter, inUcl, inNote].forEach(i => { if (!can) i.disabled = true; });
+    const doSave = async clear => {
+      msg.style.color = ''; msg.textContent = '';
+      try {
+        await api('PUT', '/qc-charts/limits', { metric: m.key, section: sec.key, lcl: clear ? null : inLcl.value, ucl: clear ? null : inUcl.value, center: clear ? null : inCenter.value, note: clear ? null : inNote.value });
+        toast(clear ? 'Control limits cleared' : 'Control limits saved'); await load(); draw();
+      } catch (e) { msg.style.color = 'var(--danger)'; msg.textContent = e.message; }
+    };
+    limCard.append(el('div', { class: 'form-row-3' }, field('Lower control limit (LCL)', inLcl), field('Target / centre line', inCenter), field('Upper control limit (UCL)', inUcl)), field('Note', inNote),
+      can ? el('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px' }, el('button', { onclick: () => doSave(false) }, 'Save limits'),
+        manual ? el('button', { class: 'secondary', onclick: () => { if (confirm('Clear the control limits for ' + m.label + ' — ' + sec.label + '?')) doSave(true); } }, 'Clear') : null, msg)
+        : el('div', { class: 'help' }, 'Only an administrator or a Quality Manager can set control limits.'),
+      manual ? el('div', { class: 'help', style: 'margin-top:6px' }, 'Set by ' + (manual.setBy || '—') + ' · ' + fmtWhen(manual.setAt)) : el('div', { class: 'help', style: 'margin-top:6px' }, 'No control limits set yet — points are shown against the mean only, and no signals are raised.'));
+    // recommendation
+    const recBox = el('div', { class: 'qc-rec ' + rec.status }, el('b', {}, 'Recommended limits'));
+    if (rec.status === 'none') {
+      recBox.append(el('div', {}, 'Not enough data yet — ' + rec.n + ' of ' + S.minProvisional + ' results needed for a provisional recommendation.'),
+        el('div', { class: 'qc-meter' }, el('i', { style: 'width:' + Math.min(100, rec.n / S.minProvisional * 100) + '%' })), el('div', { class: 'help' }, 'Recommendations appear on their own as runs are finalized; until then set limits by hand from your specification or experience.'));
+    } else {
+      recBox.append(el('div', { class: 'qc-rec-badge' }, rec.status === 'established' ? 'Established (' + rec.n + ' results)' : 'Provisional (' + rec.n + ' results — ' + rec.need + ' more for established)'),
+        el('div', { class: 'qc-rec-vals' }, el('span', {}, 'LCL ', el('b', {}, qcFmt(rec.lcl, rec.sigma))), el('span', {}, 'Centre ', el('b', {}, qcFmt(rec.center, rec.sigma))), el('span', {}, 'UCL ', el('b', {}, qcFmt(rec.ucl, rec.sigma)))),
+        el('div', { class: 'help' }, 'Mean ± ' + S.sigma + ' σ, with σ estimated from the average moving range (MR̄ ÷ 1.128) of all non-excluded results (' + rec.n + ').' + (rec.status === 'provisional' ? ' Treat as a starting point and review as data grows.' : '')),
+        can ? el('button', { class: 'secondary', onclick: () => { inLcl.value = f(rec.lcl); inUcl.value = f(rec.ucl); inCenter.value = f(rec.center); inNote.value = inNote.value || 'Recommended from ' + rec.n + ' results'; msg.style.color = ''; msg.textContent = 'Recommendation copied into the fields — press Save limits to adopt it.'; } }, 'Use these limits') : null);
+    }
+    limCard.append(recBox);
+    if (ref) limCard.append(el('div', { class: 'help', style: 'margin-top:8px' }, '“' + ref.label + '”: ' + [ref.min != null ? 'min ' + qcFmt(ref.min) : null, ref.max != null ? (ref.exclusive ? '< ' : 'max ') + qcFmt(ref.max) : null].filter(Boolean).join(' · ') + (unit ? ' ' + unit : '') + ' — shown as a dotted line, separate from the control limits (control limits describe what the process normally does; the specification is what the product must meet).'));
+    const hist = D.history[limKey] || [];
+    if (hist.length > 1) limCard.append(el('details', { style: 'margin-top:8px' }, el('summary', {}, 'Limit history (' + hist.length + ')'),
+      table(['When', 'By', 'LCL', 'Target', 'UCL', 'Note'], hist.map(h => [fmtWhen(h.setAt), h.setBy || '—', h.lcl ?? '—', h.center ?? '—', h.ucl ?? '—', h.note || '—']), [false, false, true, true, true, false])));
+
+    // ---- lower comparison card: process profile (within a run) + groups (between runs / farms / species …)
+    const lowerTabs = [['profile', 'Process profile (within a run)'], ...QC_DIMS.map(([k, l]) => [k, 'By ' + l.toLowerCase()])];
+    const profileSecs = m.sections.length > 1;
+    if (!profileSecs && st.lower === 'profile') st.lower = 'species';
+    const lowerCard = el('div', { class: 'card qc-card' });
+    lowerCard.append(el('div', { class: 'qc-card-head' }, el('h3', {}, 'Where does the variation come from?'), el('span', { class: 'help' }, 'within a run · between runs, farms, species, products')),
+      el('div', { class: 'viewbar', style: 'margin-top:4px' }, el('span', { class: 'vb-label' }, 'View'), ...lowerTabs.filter(([k]) => k !== 'profile' || profileSecs).map(([k, l]) => el('label', { class: 'vb-opt' + (st.lower === k ? ' on' : ''), onclick: () => { st.lower = k; draw(); } }, l))));
+    if (st.lower === 'profile') {
+      const secsWith = m.sections.filter(s => mk(s, runPass).length);
+      const rows = runs.map(r => ({ run: r, byStage: Object.fromEntries(secsWith.map(s => { const ps = mk(s, x => x.id === r.id).filter(p => !p.q); return [s.key, ps.length ? qcMean(ps.map(p => p.v)) : null]; }).filter(([, x]) => x != null)) })).filter(r => Object.keys(r.byStage).length);
+      if (secsWith.length < 2 || !rows.length) lowerCard.append(el('div', { class: 'empty' }, 'This view needs the measurement to be recorded at two or more process sections.'));
+      else {
+        lowerCard.append(qcProfileChart({ sections: secsWith, rows, colorOf, unit, nonNeg: m.nonNegative }), el('div', { class: 'help' }, 'Each line is one production run through the process; ◇ = the average across runs at that section. Steep jumps show where the process changes the measurement; a line that wanders from the others marks an unusual run.'));
+        lowerCard.append(table(['Process section', 'Runs', 'Mean', 'Std dev', 'Min', 'Max'], secsWith.map(s => { const sm = qcSummary(mk(s, runPass).filter(p => !p.q).map(p => p.v)); return [s.label, sm ? sm.n : 0, sm ? qcFmt(sm.mean, sm.sd || sm.mean) : '—', sm && sm.sd != null ? qcFmt(sm.sd, sm.sd) : '—', sm ? qcFmt(sm.min, sm.max) : '—', sm ? qcFmt(sm.max, sm.max) : '—']; }), [false, true, true, true, true, true]));
+      }
+    } else {
+      const groupsMap = new Map(); pts.forEach(p => { const k = qcDim(p.run, st.lower); if (!groupsMap.has(k)) groupsMap.set(k, []); groupsMap.get(k).push(p); });
+      const groups = [...groupsMap.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([name, gp]) => ({ name, pts: gp }));
+      if (!groups.length) lowerCard.append(el('div', { class: 'empty' }, 'No results match the filters.'));
+      else {
+        lowerCard.append(qcGroupChart({ groups, unit, nonNeg: m.nonNegative, lim: manual, ref }), el('div', { class: 'help' }, 'Each dot is a result, ◇ the group mean and the shaded band ±1 standard deviation. Overlapping bands mean the groups are not clearly different yet.'));
+        lowerCard.append(table([QC_DIMS.find(d => d[0] === st.lower)[1], 'Runs', 'Results', 'Mean', 'Std dev', 'Min', 'Max', 'Out of control', 'Beyond spec'], groups.map(g => {
+          const vals = g.pts.filter(p => !p.q).map(p => p.v), sm = qcSummary(vals);
+          const sg = manual ? g.pts.filter(p => signals.has(pts.indexOf(p))).length : null, fail = ref ? g.pts.filter(p => qcSpecState(p, ref) === 'fail').length : null;
+          return [g.name, new Set(g.pts.map(p => p.run.id)).size, g.pts.length, sm ? qcFmt(sm.mean, sm.sd || sm.mean) : '—', sm && sm.sd != null ? qcFmt(sm.sd, sm.sd) : '—', sm ? qcFmt(sm.min, sm.max) : '—', sm ? qcFmt(sm.max, sm.max) : '—', sg == null ? '—' : sg, fail == null ? '—' : fail];
+        }), [false, true, true, true, true, true, true, true, true]));
+      }
+    }
+
+    // ---- everything at a glance (which measurements have enough data for limits)
+    const glance = el('details', { class: 'card qc-card', open: st.glance ? 'open' : null }, el('summary', { style: 'cursor:pointer;font-weight:700' }, 'All measurements at a glance'));
+    glance.addEventListener('toggle', () => { st.glance = glance.open; });
+    const grows = [];
+    D.measures.forEach(mm => mm.sections.forEach(ss => {
+      const vals = ss.points.filter(p => !p.q && !runsById[p.r].excluded).map(p => p.v), sm = qcSummary(vals), rc = qcRecommend(vals, mm.nonNegative, S), lm = D.limits[mm.key + '|' + ss.key];
+      grows.push([mm, ss, sm, rc, lm]);
+    }));
+    glance.append(el('div', { class: 'help', style: 'margin:6px 0' }, 'Click a row to open its chart. “Ready” means there is enough data to recommend control limits (' + S.minProvisional + '+ results).'),
+      table(['Measurement', 'Process section', 'Results', 'Mean', 'Std dev', 'Control limits'], grows.map(([mm, ss, sm, rc, lm]) => [
+        mm.label + (mm.unit ? ' (' + mm.unit + ')' : ''), ss.label, sm ? sm.n : 0, sm ? qcFmt(sm.mean, sm.sd || sm.mean) : '—', sm && sm.sd != null ? qcFmt(sm.sd, sm.sd) : '—',
+        lm ? badge('on_hand', 'Set') : rc.status === 'none' ? badge('sold', rc.n + ' / ' + S.minProvisional + ' results') : badge('pending_release', rc.status === 'established' ? 'Recommended' : 'Ready (provisional)')]),
+      [false, false, true, true, true, false], i => { st.metric = grows[i][0].key; st.section = grows[i][1].key; drawControls(); draw(); window.scrollTo({ top: 0, behavior: 'smooth' }); }));
+    body.innerHTML = ''; body.append(tiles, chartCard, el('div', { class: 'qc-two' }, limCard, lowerCard), glance);
+  }
+
+  function drawControls() {
+    const m = metricByKey(st.metric);
+    if (!m.sections.some(s => s.key === st.section)) st.section = defaultSection(m);
+    controls.innerHTML = '';
+    const groupNames = { qc: 'Process QC checks (production log)', feedstock: 'Feedstock (per tote)', lab: 'Laboratory results' };
+    const metricSel = el('select', { onchange: e => { st.metric = e.target.value; st.section = null; drawControls(); draw(); } },
+      ...['qc', 'feedstock', 'lab'].map(g => { const ms = D.measures.filter(x => x.group === g); return ms.length ? el('optgroup', { label: groupNames[g] }, ...ms.map(x => el('option', { value: x.key }, x.label + (x.unit ? ' (' + x.unit + ')' : '') + ' — ' + nPts(x) + ' results'))) : null; }));
+    metricSel.value = st.metric;
+    const secChips = el('div', { class: 'viewbar', style: 'margin:6px 0 0' }, el('span', { class: 'vb-label' }, 'Process section'),
+      ...m.sections.map(s => el('label', { class: 'vb-opt' + (st.section === s.key ? ' on' : ''), onclick: () => { st.section = s.key; drawControls(); draw(); } }, s.label + ' (' + s.points.length + ')')));
+    const dateIn = (k, ph) => el('input', { type: 'date', value: st[k], title: ph, onchange: e => { st[k] = e.target.value; draw(); } });
+    const sel = (k, label, opts) => { const s = el('select', { onchange: e => { st[k] = e.target.value; draw(); } }, el('option', { value: '' }, label), ...opts.map(o => el('option', { value: o[0] }, o[1]))); s.value = st[k]; return s; };
+    const colorSel = el('select', { onchange: e => { st.color = e.target.value; draw(); } }, el('option', { value: 'none' }, 'No colouring'), ...QC_DIMS.map(([k, l]) => el('option', { value: k }, 'Colour by ' + l.toLowerCase()))); colorSel.value = st.color;
+    const exclCb = el('input', { type: 'checkbox', checked: st.excluded ? 'checked' : null, onchange: e => { st.excluded = e.target.checked; draw(); } });
+    controls.append(el('div', { class: 'card qc-card' },
+      el('div', { style: 'display:flex;gap:12px;align-items:end;flex-wrap:wrap' }, el('div', { style: 'flex:1 1 320px' }, field('Measurement', metricSel)), el('div', {}, field('Colour', colorSel))), secChips,
+      el('div', { class: 'viewbar', style: 'margin:8px 0 0' }, el('span', { class: 'vb-label' }, 'Filter'), el('label', { style: 'margin:0;font-size:12px' }, 'From'), dateIn('from', 'From'), el('label', { style: 'margin:0;font-size:12px' }, 'To'), dateIn('to', 'To'),
+        sel('sku', 'All products', D.runs.map(r => [r.sku, r.skuName]).filter((x, i, a) => a.findIndex(y => y[0] === x[0]) === i)),
+        sel('species', 'All species', uniq(r => r.species).map(x => [x, x])), sel('farm', 'All farms', uniq(r => r.farms).map(x => [x, x])), sel('stab', 'All stabilization', uniq(r => r.stabilization).map(x => [x, x])),
+        el('label', { class: 'vb-opt', style: 'margin:0' }, exclCb, 'Include excluded runs'),
+        el('span', { class: 'vb-sep' }), el('button', { class: 'secondary', onclick: () => { Object.assign(st, { from: '', to: '', sku: '', species: '', farm: '', stab: '', excluded: false }); drawControls(); draw(); } }, 'Reset filters'))));
+  }
+  drawControls(); draw();
 }
 
 // Two-line stacked single-select dropdown (native <select> can't render
@@ -4939,6 +5394,20 @@ function exportYieldCsv(d) {
 // become a new settings row (backend SETTINGS_DEFAULTS) rather than a bare
 // literal in the code, so it shows up in the table below automatically.
 const CALCULATIONS = [
+  {
+    title: 'Quality Control: control limits and signals (individuals chart)',
+    formula: 'Centre = mean of the results;  σ̂ = MR̄ ÷ 1.128, where MR = |difference between consecutive results| and MR̄ is their average;  UCL = Centre + k·σ̂;  LCL = Centre − k·σ̂ (not below 0 for measurements that cannot be negative);  Moving-range UCL = 3.267 × MR̄.  Signals (only once limits are set): a result beyond a limit; N consecutive results on one side of the centre line; M consecutive rising (or falling) results. Results below the detection limit (“<”) are charted but left out of the statistics and signals.',
+    description: 'Recommended limits appear once enough results exist (provisional first, then established); a user always sets the real limits by hand. k, the point counts and the signal lengths are the constants listed here.',
+    location: 'Quality Control tab → control chart, Control limits card',
+    settings: ['qc_chart_sigma', 'qc_chart_min_n_provisional', 'qc_chart_min_n_established', 'qc_chart_run_length', 'qc_chart_trend_length'],
+  },
+  {
+    title: 'Quality Control: within-run and between-run standard deviation',
+    formula: 'Within-run SD = √( Σ over runs of Σ (result − that run’s mean)² ÷ Σ (n_run − 1) ), using runs that have more than one result (e.g. the totes of a run);  Between-run SD = standard deviation of the run means.',
+    description: 'Shows whether variation comes from inside a production run (tote to tote) or from run to run. Shown for measurements that have several results per run (feedstock pH / ORP per tote, repeat laboratory results).',
+    location: 'Quality Control tab → summary tiles',
+    settings: [],
+  },
   {
     title: 'Certificate of Analysis: heavy-metal loading (kg/ha)',
     formula: 'Loading (kg metal / ha) = Result (mg/kg) × Application rate (kg product / ha) × Application periods ÷ 1,000,000.  Result (mg/kg) = reported value × unit factor (ppm = 1, % = 10,000, ppb = 0.001).  Passes when Loading ≤ the kg/ha specification; a “<” result is compared at its detection limit.',
