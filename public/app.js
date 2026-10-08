@@ -749,7 +749,8 @@ async function pageProduction(v) {
           el('button', { class: 'secondary', onclick: () => openAttachments(run) },
             '📎 Documents' + (run.attachments && run.attachments.length ? ' (' + run.attachments.length + ')' : '')),
           el('button', { class: 'secondary', onclick: () => openLabResults(run) }, '🧫 Lab results'),
-          el('button', { class: 'secondary', onclick: () => printLabels(run.fgLots.map(f => fgLabel(f, run))) }, 'Print FG labels'))),
+          el('button', { class: 'secondary', onclick: () => printLabels(run.fgLots.map(f => fgLabel(f, run))) }, 'Print FG labels'),
+          el('button', { class: 'secondary', onclick: () => openSampleLabels(run) }, 'Print sample labels'))),
       run.amendment ? amendBanner(run) : null,
       runSummaryGrid(run),
       stageProgress(run, { onSelect: key => openProcessLog(run, key) }),
@@ -844,6 +845,19 @@ function stageProgress(run, opts) {
 async function openRunLog(id, section) {
   const run = (await api('GET', '/production')).runs.find(x => x.id === id);
   if (run) openProcessLog(run, section);
+}
+// Presses every section's own Save button inside `root`, one at a time, so anything typed but not yet saved is saved. Returns the messages of
+// the sections that could not be saved (empty = all saved). Used by Save & close and Finalize so no unsaved entry is silently dropped.
+async function pressSectionSaves(root) {
+  const failed = [];
+  for (const btn of root.querySelectorAll('button.section-save')) {
+    if (btn.disabled) continue;
+    btn.click();
+    for (let i = 0; i < 400 && btn.disabled; i++) await new Promise(r => setTimeout(r, 50));
+    const msg = btn.nextElementSibling ? btn.nextElementSibling.textContent.trim() : '';
+    if (msg && msg !== 'Saved.') failed.push(msg);
+  }
+  return failed;
 }
 function closeAllModals() { document.querySelectorAll('#modalRoot .modal-bg').forEach(m => m.remove()); }
 // Greys out every control in a production-log view. Progress chips, the amend
@@ -1033,6 +1047,7 @@ function draftCard(d) {
       el('h3', { style: 'margin:0' }, mono(d.processingLot), '  ', el('span', { class: 'badge hold' }, 'Not yet submitted')),
       el('div', { class: 'actions' },
         el('button', { onclick: () => openRun(d) }, 'Resume'),
+        el('button', { class: 'secondary', onclick: () => openSampleLabels(d) }, 'Print sample labels'),
         el('button', { class: 'danger', onclick: () => discardDraft(d) }, 'Discard'))),
     el('div', { class: 'summary-line' },
       sl('Run date', d.runDate), sl('SKU', d.sku ? skuName(d.sku) : '—'),
@@ -1170,6 +1185,7 @@ async function openAttachments(run) {
       fmtBytes(a.size), a.uploadedBy || '—', fmtWhen(a.uploadedAt),
       rowActions([
         ['View', () => window.open(attDownloadUrl(run.id, a.id, false), '_blank')],
+        /\.(docx|xlsx)$/i.test(a.filename || '') ? ['Preview', () => previewAttachment(run.id, a.id, a.filename)] : null,
         ['Download', () => { const l = el('a', { href: attDownloadUrl(run.id, a.id, true), download: a.filename }); document.body.append(l); l.click(); l.remove(); }],
         ['Delete', async () => { if (!confirm('Remove “' + a.filename + '”?')) return; await api('DELETE', '/production/' + run.id + '/attachments/' + a.id); toast('Removed'); refresh(); }, 'danger']
       ])
@@ -1933,21 +1949,11 @@ function sampleContainerOptions() {
   const names = (State.ref.containers || []).filter(c => c.isSampleContainer).map(c => c.name);
   return names.length ? names : [''];
 }
-// One printable label per physical container -- a sample row with Qty > 1
-// prints that many copies, each with its own barcode (copy N of Qty) so
-// every physical container is still uniquely identifiable.
-function samplePointLabel(processingLot, row, copyIndex, totalCopies, collectedAt) {
-  const barcode = (processingLot || 'RUN') + '-SP' + row.id + (totalCopies > 1 ? '-' + copyIndex : '');
-  return { kind: 'Sample Point', lot: barcode, barcode, meta: [
-    ['Type', row.type || '—'], ['Description', row.description || '—'], ['Container', row.container || '—'],
-    ['Qty', totalCopies > 1 ? copyIndex + ' of ' + totalCopies : String(row.qty || 1)],
-    ['Collected', collectedAt ? fmtWhen(collectedAt) : '—']] };
-}
 // The Sample Point table itself: a repeatable list of samples (Type/
 // Description/Qty/Container), each row saved immediately on add/edit/remove
-// via its own run_sample_points row (mirrors buildDilutionsSection), plus
-// one print-labels button per row that prints Qty copies using the box's
-// single shared "Collection date and time". A run can have more than one
+// via its own run_sample_points row (mirrors buildDilutionsSection). Labels are
+// not printed from here -- use the run's "Print sample labels" button on the
+// Production tab. A run can have more than one
 // Sample Point box (Homogenization, Separation Solids Out, ...); `stage`
 // tags which one this instance is, and every mutation re-filters the
 // server's full (all-stages) sample-points list back down to just this
@@ -1989,14 +1995,6 @@ function buildSamplePointsSection(initial, getRunId, processingLot, getCollected
         patch(it.id, { qty: q });
       });
       const containerSel = selectCell(sampleContainerOptions(), it.container, () => patch(it.id, { container: containerSel.value }));
-      const printBtn = el('button', {
-        type: 'button', class: 'secondary allow-locked', title: 'Print label(s) for this sample', onclick: () => {
-          const qty = Math.max(1, Math.min(10, +qtyInp.value || 1));
-          const labels = [];
-          for (let i = 1; i <= qty; i++) labels.push(samplePointLabel(processingLot, it, i, qty, getCollectedAt()));
-          printLabels(labels);
-        }
-      }, '🖨');
       const removeBtn = el('button', {
         type: 'button', class: 'icon-btn remove', title: 'Remove sample', onclick: async () => {
           if (!confirm('Remove this sample?')) return;
@@ -2007,7 +2005,7 @@ function buildSamplePointsSection(initial, getRunId, processingLot, getCollected
       }, '−');
       tbody.append(el('tr', {},
         el('td', {}, typeSel), el('td', {}, descSel), el('td', {}, qtyInp), el('td', {}, containerSel),
-        el('td', { style: 'display:flex;gap:6px;justify-content:flex-end' }, printBtn, removeBtn)));
+        el('td', { style: 'display:flex;gap:6px;justify-content:flex-end' }, removeBtn)));
     });
   }
   draw();
@@ -3384,13 +3382,7 @@ async function openRun(draftSummary, opts) {
     // save the run header + feedstock, then press every section's own Save
     // (so anything typed but not yet saved counts), and stop if one fails.
     await saveDraft(true);
-    const failed = [];
-    for (const btn of body.querySelectorAll('button.section-save')) {
-      btn.click();
-      for (let i = 0; i < 400 && btn.disabled; i++) await new Promise(r => setTimeout(r, 50));
-      const msg = btn.nextElementSibling ? btn.nextElementSibling.textContent.trim() : '';
-      if (msg && msg !== 'Saved.') failed.push(msg);
-    }
+    const failed = await pressSectionSaves(body);
     await refreshProgress();
     if (failed.length) throw new Error('A section could not be saved: ' + failed[0]);
     const r = draftId
@@ -3399,8 +3391,16 @@ async function openRun(draftSummary, opts) {
     toast(`Run ${r.processingLot}: ${fmt(r.inputKg, 0)} kg → ${fmt(r.outputLitres, 0)} L`);
     render();
   }
+  // "Save & close" = the run header + feedstock, then every section's own Save, so entries not yet saved with their section's button are kept.
+  // A section that cannot be saved keeps the window open with its message instead of silently dropping the entry.
+  async function saveAndClose() {
+    await saveDraft(true);
+    const failed = await pressSectionSaves(body);
+    if (failed.length) throw new Error('Progress was saved, but a section could not be saved: ' + failed[0]);
+    toast('Progress saved — resume it anytime from “In progress”.'); render();
+  }
   modal(draft ? 'Production run — ' + draft.processingLot : 'New production run', body, finalizeRun, 'Finalize run',
-    { extraLabel: 'Save & close', onExtra: saveDraft, wide: true, closeX: true, onClose: () => render() });
+    { extraLabel: 'Save & close', onExtra: saveAndClose, wide: true, closeX: true, onClose: () => render() });
   if (opts && opts.section) jumpToSection(body, opts.section);
 }
 
@@ -3567,8 +3567,15 @@ async function openProcessLog(run, section) {
       try { drawLogProgress((await api('GET', '/production/' + run.id + '/progress')).progress); } catch (e) { /* non-critical */ }
     }, 1200);
   }));
-  modal('Process log — ' + run.processingLot, body, async () => { render(); }, 'Done', { wide: true, closeX: true, onClose: () => render() });
-  if (!run.amendment || !canAmendLog()) lockLogBody(body);   // finalized: read-only unless an amendment is open and you may amend
+  const editable = !!run.amendment && canAmendLog();
+  modal('Process log — ' + run.processingLot, body, async () => {
+    if (editable) {          // under an amendment: save every section before closing so nothing typed is lost
+      const failed = await pressSectionSaves(body);
+      if (failed.length) throw new Error('A section could not be saved: ' + failed[0]);
+    }
+    render();
+  }, editable ? 'Save & close' : 'Done', { wide: true, closeX: true, onClose: () => render() });
+  if (!editable) lockLogBody(body);   // finalized: read-only unless an amendment is open and you may amend
   if (section) jumpToSection(body, section);
 }
 
@@ -5205,19 +5212,44 @@ async function pageCalculations(v) {
 }
 
 /* ---------------- Labels ---------------- */
-/* ---------------- Samples: catalogue, retention inventory, lab cart, requisitions ---------------- */
+/* ---------------- Samples: analysis catalogue, retention inventory, lab cart, requisitions ---------------- */
 const SAMPLE_REMOVE_REASONS = ['Consumed in analysis', 'Disposed', 'Expired', 'Lost / damaged', 'Sent to lab (outside the app)', 'Other'];
 const SAMPLE_STATUS_LABELS = { available: 'In inventory', in_cart: 'In cart', submitted: 'Sent to lab', removed: 'Removed' };
 const SAMPLE_STATUS_BADGE = { available: 'on_hand', in_cart: 'wip', submitted: 'pending_release', removed: 'consumed' };
 const sampleStatusBadge = s => badge(SAMPLE_STATUS_BADGE[s.status] || 'consumed', SAMPLE_STATUS_LABELS[s.status] || s.status);
 const reqDocUrl = (runId, attId, dl) => attDownloadUrl(runId, attId, dl);
-const reqDocLinks = q => el('span', { style: 'display:flex;gap:12px;flex-wrap:wrap' },
-  q.attachmentId ? el('a', { href: reqDocUrl(q.runId, q.attachmentId, true), onclick: e => e.stopPropagation() }, '⬇ ' + (q.filename || 'Requisition')) : null,
-  q.sheetAttachmentId ? el('a', { href: reqDocUrl(q.runId, q.sheetAttachmentId, true), onclick: e => e.stopPropagation() }, '⬇ ' + (q.sheetFilename || 'Sample spreadsheet')) : null);
+// A document link pair: download + a 👁 preview (Word / Excel are rendered as simple HTML in a window)
+const reqDocLink = (runId, attId, filename, fallback) => el('span', { style: 'display:inline-flex;gap:6px;align-items:baseline' },
+  el('a', { href: reqDocUrl(runId, attId, true), onclick: e => e.stopPropagation() }, '⬇ ' + (filename || fallback)),
+  el('a', { href: '#', title: 'Preview', onclick: e => { e.preventDefault(); e.stopPropagation(); previewAttachment(runId, attId, filename || fallback); } }, '👁 Preview'));
+const reqDocLinks = q => el('span', { style: 'display:flex;gap:14px;flex-wrap:wrap' },
+  q.attachmentId ? reqDocLink(q.runId, q.attachmentId, q.filename, 'Requisition') : null,
+  q.sheetAttachmentId ? reqDocLink(q.runId, q.sheetAttachmentId, q.sheetFilename, 'Sample spreadsheet') : null);
+const PREVIEW_SHELL = h => '<!doctype html><meta charset="utf-8"><style>body{font:13px/1.4 Arial,Helvetica,sans-serif;margin:14px;color:#111}'
+  + 'table{border-collapse:collapse;margin:6px 0;max-width:100%}td{border:1px solid #bbb;padding:3px 6px;vertical-align:top}table.x td{white-space:nowrap}'
+  + 'p{margin:3px 0}p.e{min-height:6px}h4{margin:12px 0 4px}</style>' + h;
+// parts: [{ label, html }] shown as tabs, each in a sandboxed frame (no scripts run, all text is escaped by the server)
+function previewBody(parts, note) {
+  const frame = el('iframe', { sandbox: '', style: 'width:100%;height:58vh;border:1px solid var(--line);border-radius:8px;background:#fff' });
+  const tabs = el('div', { style: 'display:flex;gap:8px;margin:8px 0' });
+  const show = i => { frame.srcdoc = PREVIEW_SHELL(parts[i].html); [...tabs.children].forEach((b, k) => { b.className = k === i ? '' : 'secondary'; }); };
+  parts.forEach((p, i) => tabs.append(el('button', { type: 'button', onclick: () => show(i) }, p.label)));
+  if (parts.length < 2) tabs.classList.add('hidden');
+  show(0);
+  return el('div', {}, tabs, frame, el('div', { class: 'help', style: 'margin-top:6px' }, note));
+}
+async function previewAttachment(runId, attId, filename) {
+  try {
+    const r = await api('GET', '/production/' + runId + '/attachments/' + attId + '/preview');
+    modal('Preview — ' + (filename || r.filename), previewBody([{ label: r.kind === 'docx' ? 'Form' : 'Spreadsheet', html: r.html }],
+      'A simplified preview of the stored document — logos and exact layout appear in the downloaded file.'),
+    async () => { const l = el('a', { href: reqDocUrl(runId, attId, true), download: filename || r.filename }); document.body.append(l); l.click(); l.remove(); }, '⬇ Download', { wide: true });
+  } catch (e) { toast(e.message, true); }
+}
 const sampleWhen = iso => iso ? String(iso).replace('T', ' ').replace('Z', '').slice(0, 16) : '—';
 
 async function pageSamples(v) {
-  const views = [['catalogue', 'Catalogue'], ['retention', 'Retention inventory'], ['cart', 'Cart'], ['requisitions', 'Requisitions']];
+  const views = [['catalogue', 'Analysis catalogue'], ['retention', 'Retention inventory'], ['cart', 'Cart'], ['requisitions', 'Requisitions']];
   if (!views.some(x => x[0] === State.samplesView)) State.samplesView = 'catalogue';
   const cartCount = (await api('GET', '/cart')).items.length;
   v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Samples'),
@@ -5243,7 +5275,7 @@ function sampleBulkBar(selected, byId) {
       const cartable = ids.filter(i => byId(i) && byId(i).status === 'available');
       const removable = ids.filter(i => byId(i) && ['available', 'in_cart'].includes(byId(i).status));
       bar.append(el('span', {}, el('b', {}, ids.length), ' selected'),
-        cartable.length ? el('button', { onclick: async () => { await api('POST', '/cart', { sampleIds: cartable }); toast(cartable.length + ' sample(s) added to the cart'); render(); } }, 'Add to cart (' + cartable.length + ')') : null,
+        cartable.length ? el('button', { onclick: async () => { await api('POST', '/cart', { sampleIds: cartable }); toast(cartable.length + ' sample(s) added to the cart'); selected.clear(); render(); } }, 'Add to cart (' + cartable.length + ')') : null,
         el('button', { class: 'secondary', onclick: () => setSampleLocationModal(ids) }, 'Set location'),
         removable.length ? el('button', { class: 'danger', onclick: () => removeSamplesModal(removable) }, 'Remove from inventory (' + removable.length + ')') : null,
         el('button', { class: 'secondary', onclick: () => { selected.clear(); render(); } }, 'Clear'));
@@ -5274,7 +5306,8 @@ async function openSampleDetails(id) {
   const s = await api('GET', '/samples/' + id);
   const loc = el('input', { value: s.location || '', placeholder: 'e.g. Freezer 2, shelf B' });
   const notes = el('textarea', { rows: '2', placeholder: 'Notes' }, s.notes || '');
-  const rows = [['Sample ID', mono(s.code)], ['Production run', mono(s.processingLot) ], ['Run date', s.runDate], ['Product', skuName(s.sku)],
+  const rows = [['Unique ID', mono(s.code)], ['Sample ID Detailed', mono(s.idDetailed)], ['Sample ID Simplified', mono(s.idSimplified)],
+    ['Label', (s.labelType === 'simplified' ? 'Simplified' : 'Detailed') + (s.idsLocked ? '  🔒 locked — on requisition ' + (s.reqNumber || '') : '')], ['Production run', mono(s.processingLot) ], ['Run date', s.runDate], ['Product', skuName(s.sku)],
     ['Process point', s.stageLabel], ['Type', s.type || '—'], ['Description', s.description || '—'], ['Container', s.container || '—'],
     ['Collected', sampleWhen(s.collectedAt)], ['Status', sampleStatusBadge(s)]];
   if (s.isRetention) rows.push(['Retention discard-by', s.discardBy ? s.discardBy + (s.expired ? '  (expired)' : '') : '—']);
@@ -5282,7 +5315,7 @@ async function openSampleDetails(id) {
     ? el('a', { href: reqDocUrl(s.runId, s.reqAttachmentId, true) }, s.reqNumber + ' · ' + (s.reqLab || '')) : s.reqNumber]);
   if (s.status === 'removed') rows.push(['Removed', sampleWhen(s.removedAt) + ' by ' + (s.removedBy || '—') + ' — ' + (s.removedReason || '')]);
   const actions = el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;margin-top:12px' },
-    s.status === 'available' ? el('button', { onclick: async () => { await api('POST', '/cart', { sampleIds: [s.id] }); toast('Added to the cart'); document.querySelector('.modal-bg')?.remove(); render(); } }, 'Add to cart') : null,
+    s.status === 'available' ? el('button', { onclick: async () => { await api('POST', '/cart', { sampleIds: [s.id] }); toast('Added to the cart'); State.sampleSel?.delete(s.id); State.retentionSel?.delete(s.id); document.querySelector('.modal-bg')?.remove(); render(); } }, 'Add to cart') : null,
     ['available', 'in_cart'].includes(s.status) ? el('button', { class: 'danger', onclick: () => { document.querySelector('.modal-bg')?.remove(); removeSamplesModal([s.id]); } }, 'Remove from inventory') : null,
     s.status === 'removed' ? el('button', { class: 'secondary', onclick: async () => { await api('POST', '/samples/' + s.id + '/restore'); toast('Sample restored'); document.querySelector('.modal-bg')?.remove(); render(); } }, 'Undo removal') : null);
   const body = el('div', {}, table(['Field', 'Value'], rows),
@@ -5313,39 +5346,94 @@ function sampleMatches(s, f) {
   const q = (f.q || '').toLowerCase();
   return (!f.run || s.processingLot === f.run) && (!f.status || s.status === f.status) && (!f.stage || s.stageLabel === f.stage) &&
     (!f.desc || s.description === f.desc) &&
-    (!q || (s.code + ' ' + s.processingLot + ' ' + (s.location || '') + ' ' + (s.description || '')).toLowerCase().includes(q));
+    (!q || (s.idDetailed + ' ' + s.idSimplified + ' ' + s.code + ' ' + s.processingLot + ' ' + (s.location || '') + ' ' + (s.description || '')).toLowerCase().includes(q));
 }
 
+// ---- shared by the Analysis catalogue and the Retention inventory: group-by boxes, sort by collected date, one grouped/sortable table ----
+const SAMPLE_DIMS = {
+  stage: ['Process point', s => s.stageLabel], type: ['Type', s => s.type || '—'], description: ['Description', s => s.description || '—'],
+  container: ['Container', s => s.container || '—'], run: ['Run', s => s.processingLot],
+};
+// each view remembers its own grouping + sort while you move around the app
+const sampleViewState = k => { State.sampleViews = State.sampleViews || {}; return State.sampleViews[k] = State.sampleViews[k] || { groupBy: [], sort: '' }; };
+// "Group by" (any combination, in the order given) and "Sort" (collected date) in one tidy bar
+function sampleViewBar(vs, dimKeys, onChange) {
+  const opts = dimKeys.map(k => {
+    const cb = el('input', { type: 'checkbox' }); cb.checked = vs.groupBy.includes(k);
+    const lab = el('label', { class: 'vb-opt' + (cb.checked ? ' on' : '') }, cb, SAMPLE_DIMS[k][0]);
+    cb.addEventListener('change', () => { lab.classList.toggle('on', cb.checked); vs.groupBy = dimKeys.filter(x => (x === k ? cb.checked : vs.groupBy.includes(x))); onChange(); });
+    return lab;
+  });
+  vs.sortSel = selectFrom('', [['', 'Default order'], ['desc', 'Collected — newest first'], ['asc', 'Collected — oldest first']], () => { vs.sort = vs.sortSel.value; onChange(); });
+  vs.sortSel.value = vs.sort;
+  return el('div', { class: 'viewbar' }, el('span', { class: 'vb-label' }, 'Group by'), ...opts,
+    el('span', { class: 'vb-sep' }), el('span', { class: 'vb-label' }, 'Sort'), vs.sortSel);
+}
+// cols: [{ label, cell: sample => <td>, dim?: a SAMPLE_DIMS key (column hidden while grouped by it), collected?: true (sortable header) }]
+function sampleTable(rows, cols, vs, selected, bulk, redraw, emptyText) {
+  const selectable = s => ['available', 'in_cart'].includes(s.status);
+  const visible = cols.filter(c => !c.dim || !vs.groupBy.includes(c.dim));
+  const cmp = (a, b) => String(a.collectedAt || '').localeCompare(String(b.collectedAt || '')) || a.code.localeCompare(b.code);
+  if (vs.sort) rows = rows.slice().sort((a, b) => (vs.sort === 'asc' ? cmp(a, b) : cmp(b, a)));
+  const all = el('input', { type: 'checkbox', onchange: () => { rows.filter(selectable).forEach(s => all.checked ? selected.add(s.id) : selected.delete(s.id)); redraw(); bulk.update(); } });
+  all.checked = rows.some(selectable) && rows.filter(selectable).every(s => selected.has(s.id));
+  const tb = el('tbody', {});
+  if (!rows.length) tb.append(el('tr', {}, el('td', { colspan: visible.length + 1, class: 'empty' }, emptyText)));
+  const sampleRow = s => {
+    const cb = selectable(s) ? el('input', { type: 'checkbox', onclick: e => e.stopPropagation(), onchange: () => { cb.checked ? selected.add(s.id) : selected.delete(s.id); bulk.update(); } }) : null;
+    if (cb) cb.checked = selected.has(s.id);
+    return el('tr', { class: 'clickable', onclick: () => openSampleDetails(s.id) }, el('td', { class: 'checkcol' }, cb), ...visible.map(c => c.cell(s)));
+  };
+  if (!vs.groupBy.length) rows.forEach(s => tb.append(sampleRow(s)));
+  else {
+    const groups = new Map();
+    rows.forEach(s => { const vals = vs.groupBy.map(k => SAMPLE_DIMS[k][1](s)); const key = vals.join('\u0000'); if (!groups.has(key)) groups.set(key, { vals, list: [] }); groups.get(key).list.push(s); });
+    [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0])).forEach(([, g]) => {
+      const sel = g.list.filter(selectable);
+      const gcb = sel.length ? el('input', { type: 'checkbox', title: 'Select every sample in this group', onchange: () => { sel.forEach(s => gcb.checked ? selected.add(s.id) : selected.delete(s.id)); redraw(); bulk.update(); } }) : null;
+      if (gcb) gcb.checked = sel.every(s => selected.has(s.id));
+      tb.append(el('tr', { class: 'group-row' }, el('td', { class: 'checkcol' }, gcb),
+        el('td', { colspan: visible.length }, el('b', {}, g.vals.join(' · ')), el('span', { class: 'muted' }, '  ·  ' + g.list.length + ' sample' + (g.list.length === 1 ? '' : 's')
+          + (sel.length !== g.list.length ? '  ·  ' + sel.length + ' in inventory' : '')))));
+      g.list.forEach(s => tb.append(sampleRow(s)));
+    });
+  }
+  const th = c => c.collected
+    ? el('th', { class: 'sortable', title: 'Click to sort by collected date', onclick: () => {
+      vs.sort = vs.sort === '' ? 'desc' : vs.sort === 'desc' ? 'asc' : ''; if (vs.sortSel) vs.sortSel.value = vs.sort; redraw();
+    } }, c.label + (vs.sort === 'desc' ? ' ▼' : vs.sort === 'asc' ? ' ▲' : ''))
+    : el('th', {}, c.label);
+  return el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {}, el('th', { class: 'checkcol' }, all), ...visible.map(th))), tb));
+}
+const sdim = k => c => el('td', {}, SAMPLE_DIMS[k][1](c));
+
+// Analysis catalogue: every sample logged in a finalized run's Sample Point boxes EXCEPT Retention samples (those live in the Retention
+// inventory). Optional grouping by process point / type / description / container; a grouped column is dropped from the rows.
 async function drawSampleCatalogue(host) {
-  const { samples } = await api('GET', '/samples');
+  const { samples } = await api('GET', '/samples?retention=0');
   const f = State.sampleFilters = State.sampleFilters || {};
   const selected = State.sampleSel = State.sampleSel || new Set();
+  const vs = sampleViewState('catalogue');
   const byId = id => samples.find(s => s.id === id);
   const bulk = sampleBulkBar(selected, byId);
   const tableHost = el('div', {}), count = el('span', { class: 'muted' });
+  const cols = [
+    { label: 'Unique ID', cell: s => el('td', { class: 'mono' }, s.code) }, { label: 'ID Detailed', cell: s => el('td', { class: 'mono' }, el('b', {}, s.idDetailed)) },
+    { label: 'ID Simplified', cell: s => el('td', { class: 'mono' }, el('b', {}, s.idSimplified)) },
+    { label: 'Run date', cell: s => el('td', {}, s.runDate) },
+    { label: 'Process point', dim: 'stage', cell: sdim('stage') }, { label: 'Type', dim: 'type', cell: sdim('type') },
+    { label: 'Description', dim: 'description', cell: sdim('description') }, { label: 'Container', dim: 'container', cell: sdim('container') },
+    { label: 'Collected', collected: true, cell: s => el('td', {}, sampleWhen(s.collectedAt)) }, { label: 'Location', cell: s => el('td', {}, s.location || '—') },
+    { label: 'Status', cell: s => el('td', {}, sampleStatusBadge(s)) }, { label: 'Requisition', cell: s => el('td', {}, s.reqNumber || '—') }];
   function draw() {
     const rows = samples.filter(s => sampleMatches(s, f));
     count.textContent = rows.length + ' of ' + samples.length + ' samples';
     tableHost.innerHTML = '';
-    const selectable = rows.filter(s => ['available', 'in_cart'].includes(s.status));
-    const all = el('input', { type: 'checkbox', onchange: () => { selectable.forEach(s => all.checked ? selected.add(s.id) : selected.delete(s.id)); draw(); bulk.update(); } });
-    all.checked = selectable.length > 0 && selectable.every(s => selected.has(s.id));
-    const tb = el('tbody', {});
-    if (!rows.length) tb.append(el('tr', {}, el('td', { colspan: 12, class: 'empty' }, 'No samples match.')));
-    rows.forEach(s => {
-      const cb = ['available', 'in_cart'].includes(s.status) ? el('input', { type: 'checkbox', onclick: e => e.stopPropagation(),
-        onchange: () => { cb.checked ? selected.add(s.id) : selected.delete(s.id); bulk.update(); } }) : null;
-      if (cb) cb.checked = selected.has(s.id);
-      tb.append(el('tr', { class: 'clickable', onclick: () => openSampleDetails(s.id) },
-        el('td', { class: 'checkcol' }, cb), el('td', { class: 'mono' }, s.code), el('td', {}, s.runDate), el('td', {}, s.stageLabel),
-        el('td', {}, s.type || '—'), el('td', {}, s.description || '—'), el('td', {}, s.container || '—'), el('td', {}, sampleWhen(s.collectedAt)),
-        el('td', {}, s.location || '—'), el('td', {}, sampleStatusBadge(s)), el('td', {}, s.reqNumber || '—')));
-    });
-    tableHost.append(el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {},
-      el('th', { class: 'checkcol' }, all), ...['Sample ID', 'Run date', 'Process point', 'Type', 'Description', 'Container', 'Collected', 'Location', 'Status', 'Requisition'].map(h => el('th', {}, h)))), tb)));
+    tableHost.append(sampleTable(rows, cols, vs, selected, bulk, draw, 'No samples match.'));
   }
-  host.append(sampleFilterBar(f, samples, draw, ['status', 'stage', 'desc']), el('div', { style: 'margin:6px 0' }, count), bulk.el, tableHost,
-    el('div', { class: 'help', style: 'margin-top:8px' }, 'Every tube / bag logged in a finalized run’s Sample Point boxes is catalogued here with its own ID. Click a row for its full history; tick samples to add them to the lab cart or set their storage location.'));
+  host.append(sampleFilterBar(f, samples, draw, ['status', 'stage', 'desc']), sampleViewBar(vs, ['stage', 'type', 'description', 'container'], draw),
+    el('div', { style: 'margin:6px 0' }, count), bulk.el, tableHost,
+    el('div', { class: 'help', style: 'margin-top:8px' }, 'Every tube / bag logged in a finalized run’s Sample Point boxes for analysis is catalogued here with its own ID — Retention samples are kept in the Retention inventory instead. Click a row for its full history; tick samples to add them to the lab cart or set their storage location. Group the rows with the “Group by” boxes, and sort by collected date from the bar or by clicking the Collected heading.'));
   draw(); bulk.update();
 }
 
@@ -5353,38 +5441,38 @@ async function drawRetentionInventory(host) {
   const { samples, retentionMonths } = await api('GET', '/samples?retention=1');
   const f = State.retentionFilters = State.retentionFilters || {};
   const selected = State.retentionSel = State.retentionSel || new Set();
+  const vs = sampleViewState('retention');
   const inInv = samples.filter(s => ['available', 'in_cart'].includes(s.status));
   const soon = inInv.filter(s => s.discardBy && !s.expired && s.discardBy <= new Date(Date.now() + 30 * 864e5).toISOString().slice(0, 10));
   const showAll = el('input', { type: 'checkbox' }); showAll.checked = !!f.showRemoved;
   showAll.addEventListener('change', () => { f.showRemoved = showAll.checked; draw(); });
   const byId = id => samples.find(s => s.id === id);
   const bulk = sampleBulkBar(selected, byId);
-  const tableHost = el('div', {});
+  const tableHost = el('div', {}), count = el('span', { class: 'muted' });
+  const cols = [
+    { label: 'Unique ID', cell: s => el('td', { class: 'mono' }, s.code) }, { label: 'ID Detailed', cell: s => el('td', { class: 'mono' }, el('b', {}, s.idDetailed)) },
+    { label: 'ID Simplified', cell: s => el('td', { class: 'mono' }, el('b', {}, s.idSimplified)) },
+    { label: 'Run', dim: 'run', cell: sdim('run') },
+    { label: 'Process point', dim: 'stage', cell: sdim('stage') }, { label: 'Type', dim: 'type', cell: sdim('type') },
+    { label: 'Collected', collected: true, cell: s => el('td', {}, sampleWhen(s.collectedAt)) },
+    { label: 'Discard by', cell: s => el('td', {}, s.expired ? el('span', { class: 'var-flag' }, (s.discardBy || '') + ' · expired') : (s.discardBy || '—')) },
+    { label: 'Container', dim: 'container', cell: sdim('container') }, { label: 'Location', cell: s => el('td', {}, s.location || '—') },
+    { label: 'Status', cell: s => el('td', {}, sampleStatusBadge(s)) },
+    { label: 'Removed / sent', cell: s => el('td', {}, s.status === 'removed' ? (s.removedReason || '') : (s.status === 'submitted' ? (s.reqNumber || '') : '')) }];
   function draw() {
     const rows = samples.filter(s => (f.showRemoved || ['available', 'in_cart'].includes(s.status)) && sampleMatches(s, f));
+    count.textContent = rows.length + ' sample' + (rows.length === 1 ? '' : 's') + ' shown';
     tableHost.innerHTML = '';
-    const tb = el('tbody', {});
-    if (!rows.length) tb.append(el('tr', {}, el('td', { colspan: 10, class: 'empty' }, 'No retention samples.')));
-    rows.forEach(s => {
-      const cb = ['available', 'in_cart'].includes(s.status) ? el('input', { type: 'checkbox', onclick: e => e.stopPropagation(),
-        onchange: () => { cb.checked ? selected.add(s.id) : selected.delete(s.id); bulk.update(); } }) : null;
-      if (cb) cb.checked = selected.has(s.id);
-      tb.append(el('tr', { class: 'clickable', onclick: () => openSampleDetails(s.id) },
-        el('td', { class: 'checkcol' }, cb), el('td', { class: 'mono' }, s.code), el('td', {}, s.processingLot), el('td', {}, s.stageLabel),
-        el('td', {}, sampleWhen(s.collectedAt)),
-        el('td', {}, s.expired ? el('span', { class: 'var-flag' }, (s.discardBy || '') + ' · expired') : (s.discardBy || '—')),
-        el('td', {}, s.container || '—'), el('td', {}, s.location || '—'), el('td', {}, sampleStatusBadge(s)),
-        el('td', {}, s.status === 'removed' ? (s.removedReason || '') : (s.status === 'submitted' ? (s.reqNumber || '') : ''))));
-    });
-    tableHost.append(el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {},
-      el('th', { class: 'checkcol' }, ''), ...['Sample ID', 'Run', 'Process point', 'Collected', 'Discard by', 'Container', 'Location', 'Status', 'Removed / sent'].map(h => el('th', {}, h)))), tb)));
+    tableHost.append(sampleTable(rows, cols, vs, selected, bulk, draw, 'No retention samples.'));
   }
   host.append(el('div', { class: 'tiles' },
     tile('In inventory', inInv.length, 'retention samples', true), tile('Expiring in 30 days', soon.length, 'samples'),
     tile('Past discard-by', inInv.filter(s => s.expired).length, 'samples'),
     tile('No longer available', samples.length - inInv.length, 'removed or sent to a lab')),
     sampleFilterBar(f, samples, draw, ['status']),
-    el('label', { style: 'display:flex;gap:6px;align-items:center;margin:6px 0;font-size:13px' }, showAll, 'Show removed / sent samples'),
+    sampleViewBar(vs, ['stage', 'type', 'container', 'run'], draw),
+    el('div', { style: 'display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin:6px 0' }, count,
+      el('label', { style: 'display:flex;gap:6px;align-items:center;margin:0;font-size:13px;font-weight:normal' }, showAll, 'Show removed / sent samples')),
     bulk.el, tableHost,
     el('div', { class: 'help', style: 'margin-top:8px' }, 'A Retention sample leaves this inventory when it is removed (with a reason), or when it is put on a lab requisition. Discard-by = collection date + ' + retentionMonths + ' months (Admin → Settings: “Retention sample shelf life”).'));
   draw(); bulk.update();
@@ -5402,7 +5490,8 @@ async function useReadyTemplate(lab, after) {
 }
 async function drawSampleCart(host) {
   const { items, labs } = await api('GET', '/cart');
-  if (!items.length) { host.append(el('div', { class: 'empty card' }, 'The cart is empty. Add samples from the Catalogue or the Retention inventory, then choose a lab and analyses for each.')); return; }
+  const contactDefaults = await api('GET', '/requisition-contact');
+  if (!items.length) { host.append(el('div', { class: 'empty card' }, 'The cart is empty. Add samples from the Analysis catalogue or the Retention inventory, then choose a lab and analyses for each.')); return; }
   if (!labs.length) host.append(el('div', { class: 'card', style: 'margin-bottom:10px' }, 'No active labs yet — an administrator adds labs and their analyses under Admin → Labs & analyses.'));
   const selected = new Set();
   const redraw = async () => { host.innerHTML = ''; await drawSampleCart(host); };
@@ -5417,10 +5506,18 @@ async function drawSampleCart(host) {
   bulkLab.addEventListener('change', () => {
     bulkSet.clear(); bulkChecks.innerHTML = '';
     const lab = labs.find(l => String(l.id) === bulkLab.value);
-    if (lab) lab.analyses.filter(a => a.active).forEach(a => {
-      const cb = el('input', { type: 'checkbox', onchange: () => { cb.checked ? bulkSet.add(a.id) : bulkSet.delete(a.id); } });
-      bulkChecks.append(el('label', { style: 'display:flex;gap:4px;align-items:center;font-size:13px' }, cb, a.name));
-    });
+    if (lab) {
+      const offered = lab.analyses.filter(a => a.active), boxes = [];
+      // "Select all" ticks every analysis this lab offers (and unticks itself if one is cleared)
+      const allBox = el('input', { type: 'checkbox' });
+      allBox.addEventListener('change', () => { const on = allBox.checked; boxes.forEach(([cb, a]) => { cb.checked = on; on ? bulkSet.add(a.id) : bulkSet.delete(a.id); }); allBox.checked = on; });
+      if (offered.length > 1) bulkChecks.append(el('label', { style: 'display:flex;gap:4px;align-items:center;font-size:13px;font-weight:700;padding-right:10px;border-right:1px solid var(--line)' }, allBox, 'Select all'));
+      offered.forEach(a => {
+        const cb = el('input', { type: 'checkbox', onchange: () => { cb.checked ? bulkSet.add(a.id) : bulkSet.delete(a.id); allBox.checked = boxes.every(([c]) => c.checked); } });
+        boxes.push([cb, a]);
+        bulkChecks.append(el('label', { style: 'display:flex;gap:4px;align-items:center;font-size:13px' }, cb, a.name));
+      });
+    }
   });
   const bulkBtn = el('button', { onclick: async () => {
     if (!selected.size) return toast('Tick the samples to assign.', true);
@@ -5461,7 +5558,7 @@ async function drawSampleCart(host) {
     else checks.append(el('span', { class: 'muted' }, 'Pick a lab to see its analyses'));
     labSel.addEventListener('change', async () => { await assign(it.id, labSel.value ? +labSel.value : null, []); await redraw(); });
     setStatus();
-    tb.append(el('tr', {}, el('td', { class: 'checkcol' }, sel), el('td', { class: 'mono' }, it.code),
+    tb.append(el('tr', {}, el('td', { class: 'checkcol' }, sel), el('td', { class: 'mono' }, it.idSimplified),
       el('td', {}, el('div', {}, it.description || '—'), el('div', { class: 'help' }, it.stageLabel + ' · ' + (it.container || ''))),
       el('td', {}, labSel), el('td', { style: 'white-space:normal' }, checks), statusCell,
       el('td', {}, el('button', { class: 'secondary', title: 'Take out of the cart', onclick: async () => { await api('DELETE', '/cart/' + it.id); render(); } }, '✕'))));
@@ -5470,13 +5567,23 @@ async function drawSampleCart(host) {
     ...['Sample ID', 'Sample', 'Lab', 'Analyses', 'Status', ''].map(h => el('th', {}, h)))), tb)));
 
   // requisitions: one per lab and production run, each filled from THAT lab's own template, ready as soon as its samples are assigned
-  const notes = el('input', { placeholder: 'Notes for the lab (optional)', style: 'max-width:420px' }),
-    poInp = el('input', { placeholder: 'PO / reference # (optional)', style: 'max-width:220px' });
+  const notes = el('input', { placeholder: 'Notes for the lab (optional)', style: 'max-width:420px' });
+  // PO / reference # per requisition (one per lab + run): starts as the production run number; edit it on the card if the lab needs another
+  const poByKey = {};
+  const poPayload = () => Object.assign({}, poByKey);
   const readyHost = el('div', {});
+  // the customer phone / emails printed on the forms: the admin defaults, editable for this requisition only
+  const cPhone = el('input', { value: contactDefaults.phone, placeholder: 'Phone' });
+  const cEmails = contactDefaults.emails.map((e, i) => el('input', { value: e, placeholder: 'Email ' + (i + 1) }));
+  const contactBox = el('details', { style: 'margin:8px 0' }, el('summary', {}, 'Our contact details on the requisition (phone and up to 5 emails)'),
+    el('div', { style: 'padding:8px 0' }, el('div', { class: 'form-row' }, field('Phone', cPhone), field('Email 1', cEmails[0])),
+      el('div', { class: 'form-row' }, field('Email 2', cEmails[1]), field('Email 3', cEmails[2])), el('div', { class: 'form-row' }, field('Email 4', cEmails[3]), field('Email 5', cEmails[4])),
+      el('div', { class: 'help' }, 'Starts from the defaults set by an administrator (Admin → Requisition contact details); changes here apply to the requisitions you create now.')));
+  const contactPayload = () => ({ phone: cPhone.value, emails: cEmails.map(i => i.value) });
   async function createReqs(filter, btn) {
     if (btn) btn.disabled = true;
     try {
-      const r = await api('POST', '/cart/requisitions', Object.assign({ notes: notes.value, poNumber: poInp.value }, filter));
+      const r = await api('POST', '/cart/requisitions', Object.assign({ notes: notes.value, poNumbers: poPayload(), contact: contactPayload() }, filter));
       // one requisition: hand over the filled form straight away
       if (r.requisitions.length === 1 && r.requisitions[0].attachmentId) {
         const q = r.requisitions[0];
@@ -5488,6 +5595,25 @@ async function drawSampleCart(host) {
       modal('Requisitions created', body, async () => {}, 'Close', { noCancel: true, wide: true });
       await redraw(); render();
     } catch (e) { toast(e.message, true); if (btn) btn.disabled = false; }
+  }
+  // the filled form + sample list exactly as they would be created, without creating anything
+  async function previewRequisition(filter) {
+    try {
+      const r = await api('POST', '/cart/requisitions/preview', Object.assign({ notes: notes.value, poNumbers: poPayload(), contact: contactPayload() }, filter));
+      const pv = r.previews[0];
+      if (!pv) return toast('Nothing is ready to preview.', true);
+      const dup = pv.conflicts || [];
+      const parts = [{ label: 'Requisition form', html: pv.form }];
+      if (pv.sheet) parts.push({ label: 'Sample list (Excel)', html: pv.sheet });
+      modal('Preview requisition — ' + pv.lab + ' · ' + pv.lot, el('div', {},
+        el('div', { class: 'summary-line' }, sl('Lab', pv.lab), sl('Run', pv.lot), sl('Samples', String(pv.nSamples)), sl('Form', pv.templateName || 'built-in layout')),
+        el('div', { class: 'help' }, 'The requisition’s Sample ID is each sample’s ID Simplified. Samples with the same ID (and the same process point and tests) are one line on the sample list, with a Container Qty and total sample volume. '
+          + pv.nSamples + ' sample' + (pv.nSamples === 1 ? '' : 's') + ' → ' + pv.lines + ' line' + (pv.lines === 1 ? '' : 's') + '.'),
+        dup.length ? el('div', { class: 'help', style: 'color:var(--danger);font-weight:600' }, '⚠ These IDs are shared by samples from different process points or with different tests (' + dup.join(', ')
+          + '). Number the labels (Print sample labels → Number) so each has its own ID.') : null,
+        previewBody(parts, 'A simplified preview — the downloaded Word form keeps the lab’s own layout and logo. The requisition number is assigned when it is created. Nothing has been created or removed from the cart yet.')),
+      () => createReqs(filter, null), '⬇ Create requisition & download', { wide: true });
+    } catch (e) { toast(e.message, true); }
   }
   function updateSummary() {
     const groups = {};
@@ -5504,10 +5630,15 @@ async function drawSampleCart(host) {
     readyHost.append(el('h3', { style: 'margin:16px 0 6px' }, 'Requisitions ready (' + list.length + ')'));
     if (!list.length) readyHost.append(el('div', { class: 'help' }, 'Once a sample has a lab and at least one analysis, its requisition appears here — one per lab and production run, filled from that lab’s own template — ready to download.'));
     list.forEach(g => {
+      const key = g.runId + ':' + g.lab.id;
+      if (!(key in poByKey)) poByKey[key] = g.lot;              // default PO = the production run number
+      const po = el('input', { value: poByKey[key], placeholder: 'PO / reference #', style: 'max-width:240px', title: 'Defaults to the production run number — change it if the lab needs another reference.' });
+      po.addEventListener('input', () => { poByKey[key] = po.value; });
       const btn = el('button', { onclick: () => createReqs({ labId: g.lab.id, runId: g.runId }, btn) }, '⬇ Create requisition & download');
       readyHost.append(el('div', { class: 'card', style: 'margin-bottom:8px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center' },
         el('div', {}, el('b', {}, g.lab.name + ' · ' + g.lot), el('span', { class: 'muted' }, '  ' + g.n + ' sample' + (g.n === 1 ? '' : 's')),
           el('div', { class: 'help' }, 'Analyses: ' + [...g.names].join(', ')),
+          el('div', { style: 'display:flex;gap:8px;align-items:center;margin:6px 0' }, el('label', { style: 'margin:0;font-size:12px' }, 'PO / reference #'), po),
           el('div', { class: 'help' }, g.lab.hasTemplate ? '📄 Form: ' + g.lab.templateName : 'No form uploaded for this lab — a plain built-in layout will be used.',
             g.lab.sampleSheet ? ' · plus a sample spreadsheet' : ''),
           // a form with no {{placeholders}} comes back exactly as it went in -- say so, and offer the fix
@@ -5516,7 +5647,7 @@ async function drawSampleCart(host) {
             g.lab.readyTemplate ? (isAdmin ? el('a', { href: '#', onclick: e => { e.preventDefault(); useReadyTemplate(g.lab, redraw); } }, 'Use the ready-made KelpWorks ' + g.lab.name + ' form')
               : 'Ask an administrator to install the ready-made form (Admin → Labs & analyses → Template).')
               : (isAdmin ? 'Upload a form with placeholders under Admin → Labs & analyses → Template.' : 'Ask an administrator to upload one.')) : null),
-        btn));
+        el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap' }, el('button', { class: 'secondary', onclick: () => previewRequisition({ labId: g.lab.id, runId: g.runId }) }, '👁 Preview'), btn)));
     });
     if (list.length > 1) {
       const all = el('button', { class: 'secondary', onclick: () => createReqs({}, all) }, 'Create all ' + list.length + ' requisitions');
@@ -5524,8 +5655,8 @@ async function drawSampleCart(host) {
     }
     if (notReady) readyHost.append(el('div', { class: 'help', style: 'margin-top:6px' }, notReady + ' sample(s) still need a lab and at least one analysis and will stay in the cart.'));
   }
-  host.append(el('div', { style: 'display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:14px' }, poInp, notes,
-    el('span', { class: 'help' }, 'PO # and notes go on every requisition you create below.')), readyHost,
+  host.append(el('div', { style: 'display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:14px' }, notes,
+    el('span', { class: 'help' }, 'Notes go on every requisition you create below. The PO / reference # is set on each requisition — it starts as the production run number.')), contactBox, readyHost,
     el('div', { class: 'help', style: 'margin-top:8px' }, 'A different lab means a different form and different analyses. Each requisition is saved as a document on its production run (Production → run → Documents). Samples leave the cart — and a Retention sample leaves the retention inventory — once its requisition is created.'));
   updateSummary();
 }
@@ -5541,10 +5672,34 @@ async function drawRequisitions(host) {
       modal('Requisition ' + q.reqNumber, el('div', {},
         el('div', { class: 'summary-line' }, sl('Lab', q.labName), sl('Run', q.processingLot), sl('PO #', q.poNumber || '—'), sl('Created', fmtWhen(q.createdAt) + ' by ' + (q.createdBy || '—'))),
         q.notes ? el('div', { class: 'help' }, 'Notes: ' + q.notes) : null,
-        table(['Sample', 'Process point', 'Description', 'Analyses'], q.samples.map(s => [mono(s.code), s.stageLabel, s.description || '—', s.analyses.join(', ')]))),
+        table(['Sample', 'Process point', 'Description', 'Analyses'], q.samples.map(s => [mono(s.idSimplified), s.stageLabel, s.description || '—', s.analyses.join(', ')]))),
         async () => {}, 'Close', { noCancel: true, wide: true });
     }));
   if (!requisitions.length) host.append(el('div', { class: 'help', style: 'margin-top:8px' }, 'Requisitions appear here once created from the cart.'));
+}
+
+/* ---- Admin: customer contact details printed on lab requisitions ---- */
+async function drawAdminRequisitionContact(v) {
+  const c = await api('GET', '/requisition-contact');
+  const phone = el('input', { value: c.phone, placeholder: 'e.g. 204-963-5023' });
+  const emails = c.emails.map((e, i) => el('input', { value: e, placeholder: 'Email ' + (i + 1) + (i ? ' (optional)' : '') }));
+  const msg = el('span', { class: 'help' });
+  const summaryNote = el('span', { class: 'muted', style: 'font-weight:normal;margin-left:8px' });
+  const refresh = () => { const n = emails.filter(i => i.value.trim()).length; summaryNote.textContent = (phone.value.trim() || 'no phone') + ' · ' + n + ' email' + (n === 1 ? '' : 's'); };
+  refresh();
+  const save = el('button', { onclick: async () => {
+    msg.style.color = ''; msg.textContent = '';
+    try { await api('PUT', '/requisition-contact', { phone: phone.value, emails: emails.map(i => i.value) }); msg.textContent = 'Saved.'; refresh(); toast('Requisition contact details saved'); }
+    catch (e) { msg.style.color = 'var(--danger)'; msg.textContent = e.message; }
+  } }, 'Save');
+  // collapsed by default and tucked under Labs & analyses: our phone + up to 5 emails printed on lab requisition forms
+  v.append(el('details', { class: 'accordion', style: 'margin-top:12px' },
+    el('summary', {}, 'Requisition contact details', summaryNote),
+    el('div', { class: 'accordion-body' },
+      el('div', { class: 'help', style: 'margin:0 0 8px' }, 'Our phone number and up to five emails, printed where a lab form has {{customer_phone}} and {{customer_email_1}} … {{customer_email_5}} (the FoodAssure form does). Blank emails are left off; a requisition can override them in the Samples cart.'),
+      el('div', { class: 'form-row-3' }, field('Phone', phone), field('Email 1', emails[0]), field('Email 2', emails[1])),
+      el('div', { class: 'form-row-3' }, field('Email 3', emails[2]), field('Email 4', emails[3]), field('Email 5', emails[4])),
+      el('div', { style: 'margin-top:8px;display:flex;gap:10px;align-items:center' }, save, msg))));
 }
 
 /* ---- Admin: Certificate of Analysis specifications ---- */
@@ -5618,6 +5773,20 @@ function editCoaSpec(x) {
 }
 
 /* ---- Admin: labs, their analyses and requisition templates ---- */
+// A lab's offered analyses as small wrapped chips under a count (instead of one long comma-separated line); long lists show the first few and "+N more".
+function analysisChips(l) {
+  const list = l.analyses.filter(a => a.active);
+  if (!list.length) return el('span', { class: 'muted' }, 'none yet');
+  const LIMIT = 6, wrap = el('div', { class: 'chips' });
+  const draw = all => {
+    wrap.innerHTML = '';
+    list.slice(0, all ? list.length : LIMIT).forEach(a => wrap.append(el('span', { class: 'chip', title: a.method ? 'Method: ' + a.method : '' }, a.name)));
+    if (list.length > LIMIT) wrap.append(el('span', { class: 'chip chip-more', role: 'button', tabindex: '0', onclick: e => { e.stopPropagation(); draw(!all); } },
+      all ? 'Show fewer' : '+' + (list.length - LIMIT) + ' more'));
+  };
+  draw(false);
+  return el('div', { class: 'chips-cell' }, el('div', { class: 'help', style: 'margin:0 0 3px' }, list.length + ' analys' + (list.length === 1 ? 'is' : 'es')), wrap);
+}
 async function drawAdminLabs(v) {
   v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Labs & analyses'),
     el('div', { class: 'actions' }, el('button', { class: 'secondary', onclick: () => { window.location = '/api/labs/starter-template/download?token=' + encodeURIComponent(State.token); } }, '⬇ Starter requisition template'),
@@ -5626,7 +5795,7 @@ async function drawAdminLabs(v) {
   if (!labs.length) { v.append(el('div', { class: 'empty card' }, 'No labs yet.')); }
   else v.append(table(['Lab', 'Contact', 'Analyses', 'Requisition template', 'Status', ''],
     labs.map(l => [el('b', {}, l.name), el('span', {}, l.contact || '—', l.email ? el('div', { class: 'help' }, l.email) : null),
-      el('span', {}, l.analyses.filter(a => a.active).map(a => a.name).join(', ') || el('span', { class: 'muted' }, 'none yet')),
+      analysisChips(l),
       el('span', {}, l.hasTemplate ? el('span', {}, '📄 ' + l.templateName, l.templateTokens === 0 ? el('div', { class: 'help', style: 'color:var(--danger)' }, '⚠ no {{placeholders}} — won’t auto-fill') : null) : el('span', { class: 'muted' }, 'Built-in layout'), l.sampleSheet ? el('div', { class: 'help' }, '+ sample spreadsheet') : null),
       l.active ? badge('on_hand', 'Active') : badge('disposed', 'Inactive'),
       rowActions([['Edit', () => editLab(l)], ['Analyses', () => manageLabAnalyses(l.id)], ['Template', () => labTemplateModal(l)]])]),
@@ -5634,21 +5803,31 @@ async function drawAdminLabs(v) {
   v.append(el('div', { class: 'help', style: 'margin-top:10px' }, 'Each lab lists the analyses it can perform; the Samples cart offers those as checkboxes. A lab’s requisition template is a Word (.docx) file with {{placeholders}} that the app fills in and saves on the production run.'));
 }
 function editLab(l) {
-  const f = k => el('input', { id: 'lb_' + k, value: (l && l[k]) || '' });
-  const active = el('input', { type: 'checkbox', id: 'lb_active' }); active.checked = l ? l.active : true;
+  const f = (k, placeholder) => el('input', { id: 'lb_' + k, value: (l && l[k]) || '', placeholder: placeholder || '' });
+  const active = el('input', { type: 'checkbox' }); active.checked = l ? l.active : true;
   const sheetCb = el('input', { type: 'checkbox' }); sheetCb.checked = l ? l.sampleSheet : false;
+  // the checklist look used elsewhere (Users, Certificate of Analysis specifications): one titled row per option, with its explanation
+  const option = (cb, title, hint) => {
+    const row = el('label', { class: 'perm-item' + (cb.checked ? ' on' : '') }, cb, el('span', { class: 'perm-text' }, el('b', {}, title), el('small', {}, hint)));
+    cb.addEventListener('change', () => row.classList.toggle('on', cb.checked));
+    return row;
+  };
+  const section = (title, ...kids) => el('div', { class: 'perm-box' }, el('div', { class: 'perm-title' }, title), ...kids);
   const body = el('div', {},
-    el('div', { class: 'form-row' }, field('Lab name', f('name')), field('Contact person', f('contact'))),
-    el('div', { class: 'form-row' }, field('Email', f('email')), field('Phone', f('phone'))),
-    field('Address', f('address')), field('Notes', f('notes')),
-    el('label', { style: 'display:flex;gap:6px;align-items:center;margin-top:8px' }, active, 'Active (offered in the cart)'),
-    el('label', { style: 'display:flex;gap:6px;align-items:center;margin-top:6px' }, sheetCb, 'Also generate a sample spreadsheet (sample ID, description, tests per sample) with each requisition'));
-  modal(l ? 'Edit lab' : 'Add lab', body, async () => {
+    section('Laboratory',
+      el('div', { class: 'form-row' }, field('Lab name', f('name')), field('Contact person', f('contact')))),
+    section('Contact details',
+      el('div', { class: 'form-row' }, field('Email', f('email')), field('Phone', f('phone'))),
+      field('Address', f('address')), field('Notes', f('notes', 'Optional'))),
+    section('Options', el('div', { class: 'perm-list' },
+      option(active, 'Active', 'Offered in the Samples cart. Untick to retire a lab without deleting it.'),
+      option(sheetCb, 'Generate a sample spreadsheet', 'Also create an Excel sample list (sample ID, description, tests per sample) with each requisition — for labs whose form says “see attached spreadsheet”.'))));
+  modal(l ? 'Edit lab — ' + l.name : 'Add lab', body, async () => {
     const p = {}; ['name', 'contact', 'email', 'phone', 'address', 'notes'].forEach(k => p[k] = body.querySelector('#lb_' + k).value);
     p.active = active.checked; p.sampleSheet = sheetCb.checked;
     if (l) await api('PUT', '/labs/' + l.id, p); else await api('POST', '/labs', p);
     toast('Lab saved'); render();
-  }, 'Save');
+  }, l ? 'Save lab' : 'Add lab');
 }
 async function manageLabAnalyses(labId) {
   const { labs } = await api('GET', '/labs'); const l = labs.find(x => x.id === labId);
@@ -5679,18 +5858,40 @@ async function manageLabAnalyses(labId) {
     const groupName = { physical: 'Physical & chemical', metals: 'Heavy metals', microbial: 'Microbiological' };
     const avail = specs.filter(x => x.basis !== 'run' && !have.has(x.name.toLowerCase()));
     if (!avail.length) return toast('Every Certificate of Analysis test is already on this lab’s list.');
+    // the checklist look used elsewhere (Users, specifications): a titled group per kind of test, one row per test with its method and limit,
+    // and a "Select all" per group
     const boxes = [];
-    const body = el('div', {}, el('div', { class: 'help' }, 'Tick the tests this lab performs. They are added with the method from the Certificate of Analysis specification; edit them afterwards if the lab uses another method.'));
+    const count = el('b', {});
+    const syncCount = () => { const n = boxes.filter(([cb]) => cb.checked).length; count.textContent = n + ' selected'; };
+    const body = el('div', {},
+      el('div', { class: 'summary-line' }, sl('Lab', l.name), sl('Available', String(avail.length)), el('span', {}, count)),
+      el('div', { class: 'help' }, 'Tick the tests this lab performs. Each is added with the method from the Certificate of Analysis specification; edit it afterwards if the lab uses another method.'));
     ['microbial', 'metals', 'physical'].forEach(g => {
       const grp = avail.filter(x => x.group === g);
       if (!grp.length) return;
-      body.append(el('div', { class: 'perm-title', style: 'margin-top:10px' }, groupName[g]));
-      grp.forEach(x => { const cb = el('input', { type: 'checkbox' }); boxes.push([cb, x]); body.append(el('label', { style: 'display:flex;gap:8px;align-items:center;font-weight:normal;margin:4px 0' }, cb, x.name, el('span', { class: 'muted' }, x.method ? ' · ' + x.method : ''))); });
+      const mine = [];
+      const all = el('input', { type: 'checkbox', title: 'Select every ' + groupName[g].toLowerCase() + ' test' });
+      all.addEventListener('change', () => { const on = all.checked; mine.forEach(cb => { cb.checked = on; cb.dispatchEvent(new Event('change')); }); all.checked = on; });
+      const list = el('div', { class: 'perm-list' });
+      grp.forEach(x => {
+        const cb = el('input', { type: 'checkbox' });
+        const row = el('label', { class: 'perm-item' }, cb, el('span', { class: 'perm-text' }, el('b', {}, x.name),
+          el('small', {}, [x.method ? 'Method: ' + x.method : '', x.specText && x.specText !== '-' ? 'Limit: ' + x.specText : ''].filter(Boolean).join('  ·  ') || 'No method set')));
+        cb.addEventListener('change', () => { row.classList.toggle('on', cb.checked); all.checked = mine.every(c => c.checked); syncCount(); });
+        mine.push(cb); boxes.push([cb, x]); list.append(row);
+      });
+      body.append(el('div', { class: 'perm-box' },
+        el('div', { class: 'perm-title', style: 'display:flex;justify-content:space-between;align-items:center' }, el('span', {}, groupName[g]),
+          el('label', { style: 'display:inline-flex;gap:6px;align-items:center;margin:0;font-size:11px;text-transform:none;letter-spacing:0;font-weight:600' }, all, 'Select all')), list));
     });
+    syncCount();
     modal('Add Certificate of Analysis tests — ' + l.name, body, async () => {
-      for (const [cb, x] of boxes) if (cb.checked) await api('POST', '/labs/' + labId + '/analyses', { name: x.name, code: '', method: x.method || '' });
+      const chosen = boxes.filter(([cb]) => cb.checked);
+      if (!chosen.length) throw new Error('Tick at least one test to add.');
+      for (const [, x] of chosen) await api('POST', '/labs/' + labId + '/analyses', { name: x.name, code: '', method: x.method || '' });
+      toast(chosen.length + ' test' + (chosen.length === 1 ? '' : 's') + ' added');
       await draw();
-    }, 'Add selected');
+    }, 'Add selected tests');
   } }, '+ From CoA tests');
   modal('Analyses — ' + l.name, el('div', {}, host, el('div', { style: 'display:flex;gap:8px;margin-top:10px;flex-wrap:wrap' }, name, code, method, add, fromCoa),
     el('div', { class: 'help', style: 'margin-top:8px' }, 'A template checkbox column uses {{sample.check:Analysis name}} (or the code). Hiding an analysis removes it from the cart without deleting it.')),
@@ -5699,7 +5900,7 @@ async function manageLabAnalyses(labId) {
 }
 function labTemplateModal(l) {
   const file = el('input', { type: 'file', accept: '.docx' }), out = el('div', { class: 'help', style: 'margin-top:8px' });
-  const tokens = '{{req_number}} {{date}} {{date_long}} {{po_number}} {{po_check}} {{company}} {{lab_name}} {{lab_contact}} {{lab_email}} {{lab_phone}} {{lab_address}} {{processing_lot}} {{run_date}} {{product}} {{requested_by}} {{requested_by_email}} {{sample_count}} {{analyses}} {{notes}}';
+  const tokens = '{{req_number}} {{date}} {{date_long}} {{po_number}} {{po_check}} {{company}} {{lab_name}} {{lab_contact}} {{lab_email}} {{lab_phone}} {{lab_address}} {{customer_phone}} {{customer_email_1}} … {{customer_email_5}} {{processing_lot}} {{run_date}} {{product}} {{requested_by}} {{requested_by_email}} {{sample_count}} {{analyses}} {{notes}}';
   const body = el('div', {},
     el('div', { class: 'help' }, l.hasTemplate ? 'Current template: ' + l.templateName : 'No template uploaded — requisitions use the built-in layout.'),
     l.hasTemplate ? el('div', { style: 'margin:6px 0' }, el('a', { href: '/api/labs/' + l.id + '/template/download?token=' + encodeURIComponent(State.token) }, '⬇ Download current template'),
@@ -6113,6 +6314,101 @@ function fgLabel(f, run) {
     ['Product', skuName(f.sku)], ['Pack', f.packageSize], ['Units', fmt(f.qty)],
     ['TDS', f.tds != null ? f.tds + '%' : '—'], ['Produced', f.producedDate || (run && run.runDate) || '—']] };
 }
+/* ---------------- Sample labels (50 mL falcon tube) ---------------- */
+// A deliberately plain label: lot number, "sample point - description", collection date. No barcode, no logo.
+// Sized 63.5 x 25.4 mm (2.5 x 1 in): it wraps about two thirds of a 50 mL conical tube; three across fit a Letter or A4 page.
+const SAMPLE_LABEL_CSS = `
+  .sample-label{box-sizing:border-box;width:63.5mm;height:25.4mm;padding:2mm 3mm;display:flex;flex-direction:column;justify-content:center;gap:1.2mm;
+    font-family:Arial,Helvetica,sans-serif;color:#000;overflow:hidden;break-inside:avoid;border:.2mm dashed #999;background:#fff}
+  .sample-label .sl-lot{font-weight:700;font-size:11.5pt;line-height:1.1;white-space:nowrap}
+  .sample-label .sl-point{font-weight:600;font-size:8.5pt;line-height:1.15;max-height:2.3em;overflow:hidden}
+  .sample-label .sl-when{font-size:8.5pt;line-height:1.1;white-space:nowrap}`;
+const escHtml = x => String(x == null ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+function sampleLabelHtml(lb) {
+  return '<div class="sample-label"><div class="sl-lot">' + escHtml(lb.lot) + '</div><div class="sl-point">' + escHtml(lb.point) + '</div><div class="sl-when">' + escHtml(lb.when) + '</div></div>';
+}
+function printSampleLabels(labels) {
+  const w = window.open('', '_blank');
+  if (!w) return toast('Allow pop-ups to print labels.', true);
+  w.document.write('<!doctype html><html><head><title>Sample labels</title><style>@page{size:auto;margin:8mm}body{margin:0}'
+    + '.sheet{display:grid;grid-template-columns:repeat(3,63.5mm);justify-content:start}' + SAMPLE_LABEL_CSS + '</style></head><body><div class="sheet">'
+    + labels.map(sampleLabelHtml).join('') + '</div><script>window.onload=()=>{window.print();}<\/script></body></html>');
+  w.document.close();
+}
+async function openSampleLabels(run) {
+  const { lot, lotSimplified, points } = await api('GET', '/production/' + run.id + '/sample-labels');
+  if (!points.length) return toast('No sample points are logged for this run yet — add them in the Process log (Sample Point boxes).', true);
+  if (!document.getElementById('sampleLabelCss')) document.head.append(el('style', { id: 'sampleLabelCss' }, SAMPLE_LABEL_CSS));
+  const when = x => (x ? String(x).replace('T', ' ').replace('Z', '').slice(0, 16) : '—');
+  // One table row per sample point. Per row: the name printed on line 2, the label type (Detailed / Simplified), whether its labels are numbered
+  // from 1, and how many labels to print (default = the point's sample count; more repeats the numbers, for spares).
+  //   Detailed   : line 1 = the production run (PR-…-053),  line 2 = name - description,  line 3 = date and time
+  //   Simplified : line 1 = "Lot-" + the run's last 3 digits (Lot-053), line 2 unchanged, line 3 = date only
+  // Printing (or Save labels) also stores these settings on the sample point, so each sample's Sample ID Detailed / Simplified follows in every
+  // table (catalogues, cart, requisitions).
+  const rows = points.map(pt => {
+    const on = el('input', { type: 'checkbox' }); on.checked = true;
+    const type = selectFrom('', [['detailed', 'Detailed'], ['simplified', 'Simplified']]); type.value = pt.labelType; type.style.width = 'auto';
+    const numbered = el('input', { type: 'checkbox', title: 'Number this point’s labels 1, 2, 3 …' }); numbered.checked = pt.numbered;
+    const copies = el('input', { type: 'number', min: '1', max: '50', value: String(pt.qty), style: 'width:70px' });
+    const name = el('input', { value: pt.labelName, maxlength: '60', placeholder: pt.defaultLabelName,
+      title: 'The name printed on the label. Clear it to use the default (' + pt.defaultLabelName + ').' });
+    return { pt, on, type, numbered, copies, name };
+  });
+  const remember = el('input', { type: 'checkbox' });
+  const nameOf = r => r.name.value.trim() || r.pt.defaultLabelName;
+  const labelsOf = r => {
+    const c = Math.max(0, parseInt(r.copies.value, 10) || 0), simple = r.type.value === 'simplified';
+    return Array.from({ length: c }, (_x, i) => ({ lot: (simple ? lotSimplified : lot) + (r.numbered.checked ? '-' + ((i % r.pt.qty) + 1) : ''),
+      point: nameOf(r) + ' - ' + r.pt.description, when: simple ? when(r.pt.collectedAt).slice(0, 10) : when(r.pt.collectedAt) }));
+  };
+  const buildLabels = () => rows.flatMap(r => (r.on.checked ? labelsOf(r) : []));
+  const preview = el('div', { style: 'display:flex;gap:10px;flex-wrap:wrap;margin-top:8px' });
+  const totalNote = el('b', {});
+  function sync() {
+    preview.innerHTML = '';
+    rows.filter(r => r.on.checked && labelsOf(r).length).forEach(r => { const d = el('div', {}); d.innerHTML = sampleLabelHtml(labelsOf(r)[0]); preview.append(d.firstChild); });
+    if (!preview.children.length) preview.append(el('div', { class: 'help' }, 'No sample points ticked.'));
+    const n = buildLabels().length;
+    totalNote.textContent = n + ' label' + (n === 1 ? '' : 's') + ' will print';
+  }
+  rows.forEach(r => ['change', 'input'].forEach(ev => [r.on, r.type, r.numbered, r.copies, r.name].forEach(c => c.addEventListener(ev, sync))));
+  const allCb = el('input', { type: 'checkbox', onchange: () => { rows.forEach(r => { r.on.checked = allCb.checked; }); sync(); } }); allCb.checked = true;
+  const tbl = el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {}, el('th', { class: 'checkcol' }, allCb),
+    ...['Sample point', 'Name on label', 'Label', 'Number', 'Description', 'Collected', 'Labels'].map(h => el('th', {}, h)))),
+    el('tbody', {}, ...rows.map(r => el('tr', {}, el('td', { class: 'checkcol' }, r.on), el('td', {}, r.pt.stageLabel, r.pt.lockedCount ? el('div', { class: 'help', title: 'These samples are already on a lab requisition, so their IDs are locked: changes here only affect the labels you print and the samples not yet sent.' },
+        '🔒 ' + r.pt.lockedCount + ' on a requisition') : null), el('td', {}, r.name), el('td', {}, r.type),
+      el('td', { class: 'checkcol' }, r.numbered), el('td', {}, r.pt.description + (r.pt.type ? ' · ' + r.pt.type : '')), el('td', {}, when(r.pt.collectedAt)), el('td', {}, r.copies))))));
+  sync();
+  const option = (cb, title, hint) => {
+    const row = el('label', { class: 'perm-item' + (cb.checked ? ' on' : '') }, cb, el('span', { class: 'perm-text' }, el('b', {}, title), el('small', {}, hint)));
+    cb.addEventListener('change', () => row.classList.toggle('on', cb.checked));
+    return row;
+  };
+  const section = (title, ...kids) => el('div', { class: 'perm-box' }, el('div', { class: 'perm-title' }, title), ...kids);
+  async function saveSettings() {
+    await api('PUT', '/production/' + run.id + '/sample-label-settings', { points: rows.map(r => ({ id: r.pt.id, labelType: r.type.value, numbered: r.numbered.checked, labelName: nameOf(r) })) });
+    if (remember.checked) {
+      const names = {};
+      rows.forEach(r => { if (!(r.pt.stage in names)) names[r.pt.stage] = r.name.value.trim(); });
+      await api('PUT', '/sample-label-names', { names });
+    }
+  }
+  const body = el('div', {}, el('div', { class: 'summary-line' }, sl('Run', lot), sl('Sample points', String(points.length))),
+    section('Sample points', tbl,
+      el('div', { class: 'help', style: 'margin-top:6px' }, el('b', {}, 'Detailed'), ' = run number, name, date and time · ', el('b', {}, 'Simplified'), ' = “' + lotSimplified + '”, name, date only. ',
+        'Tick “Number” to count a point’s labels from 1 (' + lot + '-1, ' + lotSimplified + '-1 …). Change “Labels” for spares. Saving the labels updates each sample’s Sample ID Detailed / Simplified in the catalogues — except samples already on a requisition (🔒), whose IDs are locked.')),
+    section('Options', el('div', { class: 'perm-list' },
+      option(remember, 'Save these names as the default', 'Use the names above on every run from now on (the Packaging point is “Finished Product” by default).'))),
+    section('Preview', el('div', { class: 'help' }, 'The first label of each sample point · ', totalNote, ' · 63.5 × 25.4 mm (2.5 × 1 in), sized to wrap a 50 mL falcon tube.'), preview));
+  modal('Print sample labels — ' + lot, body, async () => {
+    const out = buildLabels();
+    if (!out.length) throw new Error('Tick at least one sample point with one or more labels.');
+    await saveSettings();
+    printSampleLabels(out);
+  }, 'Print labels', { wide: true, extraLabel: 'Save labels', onExtra: async () => { await saveSettings(); toast('Sample label settings saved'); render(); } });
+}
+
 function printLabels(labels) {
   const w = window.open('', '_blank');
   if (!w) return toast('Allow pop-ups to print labels.', true);
@@ -6280,6 +6576,7 @@ async function pageAdmin(v) {
   v.append(el('div', { class: 'help', style: 'margin-top:10px' },
     'A QC Check in the production log links to an SOP by its reference key, not its name — renaming a document here is picked up everywhere it’s linked. Click a row to see its change history.'));
   await drawAdminLabs(v);
+  await drawAdminRequisitionContact(v);
   await drawAdminCoaSpecs(v);
 }
 /* ---------------- Certificate of Analysis: lab results ---------------- */

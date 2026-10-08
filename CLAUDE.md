@@ -134,7 +134,7 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
   `GET /api/production/<id>/progress`) -- the progress chips are green only when a section is
   `done`. `_finalize_run` ends with `_required_problems`; raising there rolls the whole
   finalize back. The SPA marks required labels with `rfield()/reqLabel()` (red `*`), and
-  `finalizeRun` saves the header + presses every `button.section-save` before finalizing. When
+  `finalizeRun` saves the header + presses every `button.section-save` before finalizing (`pressSectionSaves`); the draft's **Save & close** does the same (a section that can't be saved keeps the window open with its message), and so does Save & close on the Process log of a run under amendment. When
   adding a production-log field, add it to the registry (and use `rfield`) or it stays optional.
   The feedstock accept/reject decision must be an explicit choice: `run_inputs.decision` is
   NOT NULL, so `run_inputs.decision_set` records whether an operator actually chose (inputs of
@@ -168,7 +168,9 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
   output containers, and returns the emptied source IBCs to the Used IBC pool. A completed batch is read-only (no amend flow). Traceability:
   `preproc_inputs` + `GET /api/totes/:id/trace` (Feedstock Inventory "Trace" action); fine lots print a `blendLabel`. Output weight = blend
   mass (shredded kg + water) split by fill volume. `MIX` is hidden from harvest check-in; species-specific SKUs won't offer `MIX` lots in the run picker.
-- **Samples (catalogue, retention inventory, lab cart, requisitions)** (the "Samples" tab, `pageSamples`; backend `route_samples` /
+- **Samples (analysis catalogue, retention inventory, lab cart, requisitions)** (the "Samples" tab; the **Analysis catalogue** is `GET /api/samples?retention=0`
+  = every sample EXCEPT description `Retention`, with a shared "Group by" + collected-date "Sort" bar (`sampleViewBar` / `sampleTable` / `SAMPLE_DIMS`; catalogue groups by process point / type / description / container, retention by process point / type / container / run; sort also from the Collected heading; per-view state in `State.sampleViews`);
+  Retention samples appear only in the Retention inventory (`?retention=1`); `pageSamples`; backend `route_samples` /
   `route_cart` / `route_requisitions` / `route_labs`). `samples` = one row per physical unit of a FINALIZED run's Sample Point rows
   (qty 4 -> 4 samples, stable code `<processing lot>-<STG>-<NN>`), kept in step by `sync_samples` (called after every non-GET
   `/api/production/...` write and `sync_pending_samples` at boot, which also backfills older runs); a unit whose row was
@@ -188,7 +190,30 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
   a single requisition downloads its .docx straight away). A lab's form with no `{{placeholders}}` comes back unchanged, so `_lab_public` reports
   `templateTokens` and the cart / Admin warn; `docs/requisition-templates/*` are installable per lab with one click (`POST /api/labs/<id>/template/builtin`,
   matched on the lab name by `_ready_template_path`). A missing template file on disk now fails the requisition (409) instead of silently using the built-in
-  layout. Admin > Labs & analyses > Analyses has "+ From CoA tests" to add a lab's analyses from the Certificate of Analysis specifications.
+  layout. **PO / reference #** is per requisition (one per lab + run card in the cart; `poNumbers` keyed "run:lab" in the preview / create body, `_requisition_po`): it defaults to the production run
+  number and the user can change or clear it. **Customer contact on requisitions**: `{{customer_phone}}` + `{{customer_email_1..5}}` come from the `requisition_contact` table (seeded with the phone / two emails that were typed into the
+  FoodAssure form; Admin > "Requisition contact details", `GET/PUT /api/requisition-contact`), overridable per requisition from the cart (`contact` in the preview / create body). **Previews**: `docx_to_html` / `xlsx_to_html` (stdlib `zipfile` + ElementTree; content-faithful, not layout-faithful) render a Word / Excel
+  document as escaped HTML shown in a sandboxed iframe (`previewBody`). `POST /api/cart/requisitions/preview` builds the filled form + sample list for a lab+run
+  WITHOUT writing anything (same `_requisition_build` as creation, placeholder req number; the cart card's "Preview" button, which can then create it);
+  `GET /api/production/<id>/attachments/<aid>/preview` previews any stored .docx/.xlsx (links in the creation window, Samples > Requisitions, run Documents).
+  Admin > Labs & analyses > Analyses has "+ From CoA tests" to add a lab's analyses from the Certificate of Analysis specifications.
+- **Sample IDs and labels.** Every sample has a UNIQUE ID (`samples.sample_code`, e.g. `PR-20261006-053-HOM-01`, never changes) plus two label IDs:
+  **Sample ID Detailed** (`id_detailed`) = the first line of the Detailed label = the processing lot, and **Sample ID Simplified** (`id_simplified`) = the first line of
+  the Simplified label = `Lot-` + the run's last 3 digits (`lot_simplified`), both with `-<unit no>` when the point's labels are numbered. They are derived, never typed:
+  `refresh_sample_ids` sets them from the sample's `run_sample_points` row (`label_type` detailed|simplified, `label_numbered`, `label_name`) after every `sync_samples`, at boot
+  and when label settings are saved -- so the defaults at finalize are the un-numbered lot / `Lot-053`, and a user's label changes flow into every table (Analysis catalogue,
+  Retention inventory, cart, requisition detail, requisition docx/xlsx). The lab REQUISITION always uses **ID Simplified** as its Sample ID (`{{sample.id}}` / the "Sample ID" column, cart and requisition detail; `{{sample.id_detailed}}`, `{{sample.id_simplified}}`,
+  `{{sample.code}}`, `{{sample.container_qty}}`, `{{sample.volume_text}}` are also available per sample). The sample-list spreadsheet (`build_sample_sheet_xlsx`) CONSOLIDATES samples sharing a Sample ID
+  (same description + tests; `consolidate_sample_rows`) into one line with **Container Qty** and **Total sample volume** (`container_volume`: the sample container's `litres_each` as mL, else the amount in its
+  name such as "100 g"; summed per unit); the same ID on a different process point / tests stays separate lines and the preview warns (`requisition_id_conflicts`). The Word form rows stay one per sample.
+  **Locked once on a requisition:** `refresh_sample_ids` skips any sample with a `requisition_id` (its IDs and label type never change again); the label window still saves/prints from the production log -- that only affects labels printed and samples not yet sent (a 🔒 count shows on the point's row, `idsLocked` in the sample API). (`short_id` is a retired column.)
+- **Sample labels** ("Print sample labels" next to "Print FG labels" on a finalized run card, and on in-progress cards; `openSampleLabels` / `printSampleLabels`, data from
+  `GET /api/production/<id>/sample-labels` = the run's sample POINTS with their label settings; settings saved by `PUT /api/production/<id>/sample-label-settings`, exempt
+  from the amend lock). ONE TABLE ROW PER SAMPLE POINT: tick, process point, editable "Name on label", Label type (Detailed / Simplified), "Number" (count the point's labels
+  from 1), description, collected, "Labels" count (default = the point's sample count; more repeats the numbers). 63.5 x 25.4 mm, 3 lines, no barcode/logo: Detailed = run lot /
+  `<name> - <description>` / date AND time; Simplified = `Lot-053` / same line 2 / date only. "Print labels" (or "Save labels") stores the settings on the points, "Save these names
+  as the default" stores stage-level names (`sample_label_names`, `PUT /api/sample-label-names`; built-in `SAMPLE_LABEL_DEFAULT_NAMES`: Packaging = "Finished Product"). The
+  Sample Point rows in the production log have no print button.
 - **Production Log Summary PDF** (`GET /api/production/<id>/summary.pdf[?dl=1&token=]`, completed runs only; the "Production log summary" card at
   the top of a run's Documents window). Generated on demand from the current log by `_run_summary_data` -> `build_run_summary_pdf` -- a
   stdlib-only PDF writer (`PdfBuilder`: standard Helvetica fonts via a built-in width table, WinAnsi/cp1252 text -- `≤`/`≥` are real glyphs via a Differences encoding on the spare codes `¤`/`¥` (`_PDF_SUBS`) --, tables, KPI cards, the logo

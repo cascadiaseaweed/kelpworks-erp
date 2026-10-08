@@ -525,3 +525,21 @@ th.actions-head { cursor: default; }
 /* Grouped table (e.g. FG labels under a heading per SKU) */
 tr.group-row td { background: #e3efec; color: var(--teal-dark); padding: 9px 12px; font-size: 13.5px; border-top: 1px solid var(--line); }
 tr.group-row:hover { background: transparent; }
+
+/* Samples: group-by / sort bar and sortable column heading */
+.viewbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 12px; margin: 8px 0; background: #f6faf9; border: 1px solid var(--line); border-radius: 10px; }
+.viewbar .vb-label { font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
+.viewbar .vb-opt { display: inline-flex; align-items: center; gap: 6px; margin: 0; padding: 3px 11px 3px 8px; font-size: 13px; font-weight: normal; color: var(--ink); cursor: pointer; white-space: nowrap; background: #fff; border: 1px solid var(--line); border-radius: 999px; }
+.viewbar .vb-opt input { width: auto; margin: 0; }
+.viewbar .vb-opt.on { background: #e3efec; border-color: var(--teal); color: var(--teal-dark); }
+.viewbar .vb-sep { flex: 1; }
+.viewbar select { width: auto; padding: 5px 8px; font-size: 13px; }
+th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+th.sortable:hover { color: var(--teal-dark); }
+
+/* Admin > Labs: a lab's analyses as wrapped chips */
+.chips-cell { max-width: 460px; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px 5px; }
+.chip { display: inline-block; padding: 2px 9px; font-size: 11.5px; line-height: 1.5; color: var(--teal-dark); background: #eef3f2; border: 1px solid var(--line); border-radius: 999px; white-space: nowrap; }
+.chip-more { cursor: pointer; background: #fff; border-style: dashed; user-select: none; }
+.chip-more:hover { background: #e3efec; }
