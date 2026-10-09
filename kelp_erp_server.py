@@ -52,6 +52,8 @@ import struct
 import zlib
 import secrets
 import tempfile
+import logging
+import sys
 import shutil
 import threading
 import datetime
@@ -74,6 +76,13 @@ UPLOAD_DIR = os.environ.get("KELP_ERP_UPLOADS", os.path.join(BASE_DIR, "uploads"
 SOP_DIR = os.path.join(os.path.dirname(UPLOAD_DIR), "sop_documents")
 LAB_DIR = os.path.join(os.path.dirname(UPLOAD_DIR), "lab_templates")   # lab requisition .docx templates
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB per file
+MAX_REQUEST_BYTES = 40 * 1024 * 1024  # largest JSON request body (a 25 MB file is ~34 MB as base64)
+MAX_LOGIN_BODY_BYTES = 8 * 1024       # the only request accepted without a token
+SOCKET_TIMEOUT = float(os.environ.get("KELP_ERP_SOCKET_TIMEOUT", "30"))     # seconds a client may stay silent mid-request
+MAX_ZIP_MEMBER_BYTES = 10 * 1024 * 1024   # largest part of a .docx / .xlsx we will unpack
+MAX_PDF_STREAM_BYTES = 20 * 1024 * 1024   # largest inflated PDF stream, and the budget for a whole PDF is three times that
+MAX_PREVIEW_ROWS, MAX_PREVIEW_COLS = 1000, 60
+MAX_PREVIEW_HTML_BYTES = 5 * 1024 * 1024
 PORT = int(os.environ.get("PORT", "8002"))
 HOST = os.environ.get("HOST", "0.0.0.0")
 DEV_SECRET = "dev-secret-change-me"          # the old public default: never accepted as a signing secret any more
@@ -1428,6 +1437,27 @@ def db():
     return conn
 
 
+logger = logging.getLogger("kelpworks")
+_TOKEN_IN_URL = re.compile(r"(token=)[^&\s]+")
+
+
+def redact(text):
+    """Never write a login token (they travel in ?token= for downloads) to the log."""
+    return _TOKEN_IN_URL.sub(r"\1REDACTED", str(text))
+
+
+def configure_logging():
+    try:
+        sys.stderr.reconfigure(errors="backslashreplace")       # the Windows console is cp1252: never crash on a character
+    except (AttributeError, OSError):
+        pass
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.handlers[:] = [handler]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+
 def hash_password(password, salt=None, iterations=200_000):
     if salt is None:
         salt = secrets.token_hex(16)
@@ -1522,8 +1552,19 @@ _PDF_OBJ_RE = re.compile(rb"(\d+)\s+(\d+)\s+obj\b(.*?)\bendobj", re.S)
 _PDF_REF_RE = re.compile(rb"(\d+)\s+\d+\s+R\b")
 
 
+def _inflate(raw, limit):
+    """Inflate a Flate stream, giving up (b"") on anything that would expand beyond `limit` or is corrupt."""
+    d = zlib.decompressobj()
+    try:
+        out = d.decompress(raw, limit + 1)
+    except zlib.error:
+        return b""
+    return out if len(out) <= limit else b""
+
+
 def _pdf_objects(data):
     objs = {}
+    budget = 3 * MAX_PDF_STREAM_BYTES
     for m in _PDF_OBJ_RE.finditer(data):
         body = m.group(3)
         stream = None
@@ -1535,13 +1576,8 @@ def _pdf_objects(data):
             raw = raw[2:] if raw.startswith(b"\r\n") else raw[1:] if raw[:1] in (b"\n", b"\r") else raw
             stream = raw
             if b"FlateDecode" in head:
-                try:
-                    stream = zlib.decompress(raw)
-                except zlib.error:
-                    try:
-                        stream = zlib.decompressobj().decompress(raw)
-                    except zlib.error:
-                        stream = b""
+                stream = _inflate(raw, min(MAX_PDF_STREAM_BYTES, budget))
+                budget -= len(stream)
         objs[int(m.group(1))] = (head, stream)
     return objs
 
@@ -2616,7 +2652,7 @@ def docx_fill(template, scalars, samples, analyses=None):
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
         for item in zin.infolist():
-            data = zin.read(item.filename)
+            data = zip_read(zin, item.filename, 4 * MAX_ZIP_MEMBER_BYTES)
             if item.filename == "word/document.xml" or re.match(r"word/(header|footer)\d*\.xml$", item.filename):
                 xml = data.decode("utf-8")
                 if item.filename == "word/document.xml":
@@ -2646,13 +2682,13 @@ def docx_inspect(raw):
     """Validate an uploaded template and report what it contains."""
     try:
         z = zipfile.ZipFile(io.BytesIO(raw))
-        xml = z.read("word/document.xml").decode("utf-8")
+        xml = zip_read(z, "word/document.xml").decode("utf-8")
     except Exception:
         raise ApiError(400, "That file is not a Word (.docx) document")
     texts = [_xml_text(m.group(0)) for m in _W_P.finditer(xml)]
     for name in z.namelist():
         if re.match(r"word/(header|footer)\d*\.xml$", name):
-            texts += [_xml_text(m.group(0)) for m in _W_P.finditer(z.read(name).decode("utf-8"))]
+            texts += [_xml_text(m.group(0)) for m in _W_P.finditer(zip_read(z, name).decode("utf-8"))]
     tokens = sorted({t.strip() for tx in texts for t in _TOKEN.findall(tx)})
     has_row = any("{{sample." in _xml_text(m.group(0)).replace(" ", "") for m in _W_TR.finditer(xml))
     return tokens, has_row
@@ -2748,7 +2784,9 @@ def docx_to_html(raw):
     import xml.etree.ElementTree as ET
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as z:
-            root = ET.fromstring(z.read("word/document.xml"))
+            root = ET.fromstring(zip_read(z, "word/document.xml"))
+    except ValueError:
+        return "<p><i>This document is too large to preview.</i></p>"
     except (KeyError, zipfile.BadZipFile, ET.ParseError):
         return "<p><i>This document could not be previewed.</i></p>"
     body = root.find(_wq("body"))
@@ -2820,7 +2858,27 @@ def docx_to_html(raw):
                 if c is not None:
                     out.append(blocks(c))
         return "".join(out)
-    return blocks(body) if body is not None else ""
+    return cap_html(blocks(body) if body is not None else "")
+
+
+def cap_html(html):
+    """A preview is shown in the browser: never send an unbounded page."""
+    if len(html) <= MAX_PREVIEW_HTML_BYTES:
+        return html
+    return "<p><i>This preview was cut short because the document is very large. Download it to read it all.</i></p>"
+
+
+def zip_read(z, name, limit=None):
+    """Read one member of an untrusted zip without ever holding more than `limit` bytes (a tiny file can inflate to hundreds of MB)."""
+    limit = limit or MAX_ZIP_MEMBER_BYTES
+    info = z.getinfo(name)
+    if info.file_size > limit:
+        raise ValueError("%s is larger than %d MB when unpacked" % (name, limit // (1024 * 1024)))
+    with z.open(info) as f:
+        data = f.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("%s is larger than %d MB when unpacked" % (name, limit // (1024 * 1024)))
+    return data
 
 
 def xlsx_to_html(raw):
@@ -2830,11 +2888,13 @@ def xlsx_to_html(raw):
         z = zipfile.ZipFile(io.BytesIO(raw))
         shared = []
         if "xl/sharedStrings.xml" in z.namelist():
-            for si in ET.fromstring(z.read("xl/sharedStrings.xml")).findall(ns + "si"):
+            for si in ET.fromstring(zip_read(z, "xl/sharedStrings.xml")).findall(ns + "si"):
                 shared.append("".join(t.text or "" for t in si.iter(ns + "t")))
-        wb = ET.fromstring(z.read("xl/workbook.xml"))
+        wb = ET.fromstring(zip_read(z, "xl/workbook.xml"))
         sheet_names = [sh.get("name") for sh in wb.iter(ns + "sheet")]
-        files = sorted(n for n in z.namelist() if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n))
+        files = sorted(n for n in z.namelist() if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n))[:20]
+    except ValueError:
+        return "<p><i>This workbook is too large to preview.</i></p>"
     except (KeyError, zipfile.BadZipFile, ET.ParseError):
         return "<p><i>This workbook could not be previewed.</i></p>"
 
@@ -2843,12 +2903,17 @@ def xlsx_to_html(raw):
         for ch in re.match(r"[A-Z]+", ref).group(0):
             n = n * 26 + ord(ch) - 64
         return n
-    out = []
+    out, cut = [], False
     for idx, fn in enumerate(files):
         rows, width = {}, 0
-        for c in ET.fromstring(z.read(fn)).iter(ns + "c"):
+        try:
+            sheet_xml = ET.fromstring(zip_read(z, fn))
+        except (ValueError, ET.ParseError):
+            out.append("<p><i>A sheet could not be previewed.</i></p>")
+            continue
+        for c in sheet_xml.iter(ns + "c"):
             ref = c.get("r") or ""
-            if not re.match(r"[A-Z]+\d+", ref):
+            if not re.match(r"[A-Z]{1,3}\d+$", ref):
                 continue
             t = c.get("t")
             if t == "inlineStr":
@@ -2859,6 +2924,9 @@ def xlsx_to_html(raw):
                 if t == "s" and val.isdigit() and int(val) < len(shared):
                     val = shared[int(val)]
             ci, ri = col(ref), int(re.search(r"\d+", ref).group(0))
+            if ri > MAX_PREVIEW_ROWS or ci > MAX_PREVIEW_COLS:      # a lone cell far away must not make a huge empty grid
+                cut = True
+                continue
             rows.setdefault(ri, {})[ci] = val
             width = max(width, ci)
         if idx < len(sheet_names):
@@ -2868,7 +2936,9 @@ def xlsx_to_html(raw):
             cells = rows.get(ri, {})
             body.append("<tr>%s</tr>" % "".join("<td>%s</td>" % _html_esc(cells.get(ci, "")) for ci in range(1, width + 1)))
         out.append("<table class=\"x\">%s</table>" % "".join(body))
-    return "".join(out)
+    if cut:
+        out.append("<p><i>Only the first %d rows and %d columns are shown in this preview.</i></p>" % (MAX_PREVIEW_ROWS, MAX_PREVIEW_COLS))
+    return cap_html("".join(out))
 
 
 def container_volume(litres_each, name):
@@ -4444,6 +4514,18 @@ def scrub_for_staging(conn):
     conn.execute("INSERT OR REPLACE INTO app_flags (key,value) VALUES ('staging_restored_at', ?)", (now_iso(),))
 
 
+def _copy_exact(src, dst, expected):
+    """Copy a zip member, refusing one that inflates past the size the zip declared for it (a lying header is how a zip bomb hides)."""
+    left = expected + 1
+    while left > 0:
+        chunk = src.read(min(1 << 20, left))
+        if not chunk:
+            return
+        dst.write(chunk)
+        left -= len(chunk)
+    raise ApiError(400, "The backup is damaged (a file is larger than its header says); nothing was restored.")
+
+
 def restore_backup(zip_path):
     """Replace this (staging) server's data with a full backup .zip, migrate it to this version of the code, and reset every password.
     Everything is validated before anything is changed."""
@@ -4477,7 +4559,7 @@ def restore_backup(zip_path):
         try:
             tmp_db = os.path.join(tmpdir, "incoming.db")
             with zf.open("kelp_erp.db") as src, open(tmp_db, "wb") as out:
-                shutil.copyfileobj(src, out)
+                _copy_exact(src, out, zf.getinfo("kelp_erp.db").file_size)
             check = sqlite3.connect(tmp_db)
             try:
                 ok = check.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -4512,7 +4594,7 @@ def restore_backup(zip_path):
                         raise ApiError(400, "Unsafe path in the backup: %s" % info.filename[:80])
                     os.makedirs(os.path.dirname(target), exist_ok=True)
                     with zf.open(info) as src_f, open(target, "wb") as dst_f:
-                        shutil.copyfileobj(src_f, dst_f)
+                        _copy_exact(src_f, dst_f, info.file_size)
                     counts[arc] += 1
                 init_db()                                             # bring the restored data up to this version's schema
                 conn = db()
@@ -4530,8 +4612,24 @@ def restore_backup(zip_path):
 class Handler(BaseHTTPRequestHandler):
     server_version = "KelpWorksERP/1.0"
 
+    timeout = SOCKET_TIMEOUT                       # a client that goes silent mid-request is dropped (slowloris)
+
     def log_message(self, fmt, *args):
-        pass
+        pass                                       # the access line is written by log_request (which can leave tokens out)
+
+    def log_request(self, code="-", size="-"):
+        path = urlparse(self.path).path
+        if path.startswith("/api/") or (str(code).isdigit() and int(code) >= 400):          # not every css / js / image
+            logger.info("%s %s -> %s", self.command, redact(self.path), code)
+
+    def _server_error(self, exc):
+        """An unexpected failure: the traceback goes to the log under a short reference; the user gets the reference, never the raw error."""
+        if isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower():
+            logger.warning("Database busy: %s %s", self.command, redact(self.path))
+            return self._send_json({"error": "The server is busy right now. Please try again in a moment."}, 503)
+        ref = secrets.token_hex(4)
+        logger.error("Unhandled error [%s] %s %s", ref, self.command, redact(self.path), exc_info=exc)
+        self._send_json({"error": "Something went wrong on the server (reference %s). Please try again; if it keeps happening, tell an administrator this reference." % ref}, 500)
 
     # ---- helpers ---------------------------------------------------------- #
     def _send_json(self, obj, status=200):
@@ -4542,8 +4640,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _body_json(self):
-        length = int(self.headers.get("Content-Length", 0) or 0)
+    def _body_json(self, limit=None):
+        limit = limit or MAX_REQUEST_BYTES
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            raise ApiError(400, "Invalid Content-Length")
+        if length < 0:
+            raise ApiError(400, "Invalid Content-Length")
+        if length > limit:
+            self.close_connection = True               # the body is not read; the connection is closed instead
+            raise ApiError(413, "That request is too large (the limit is %d MB)." % max(1, limit // (1024 * 1024)) if limit >= 1024 * 1024
+                           else "That request is too large.")
         if not length:
             return {}
         raw = self.rfile.read(length)
@@ -4662,7 +4770,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(content)
         except Exception as e:  # pragma: no cover
-            self._send_json({"error": "Server error: %s" % e}, 500)
+            self._server_error(e)
         finally:
             conn.close()
 
@@ -4687,7 +4795,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(content)
         except Exception as e:  # pragma: no cover
-            self._send_json({"error": "Server error: %s" % e}, 500)
+            self._server_error(e)
         finally:
             conn.close()
 
@@ -4750,7 +4858,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(content)
         except Exception as e:  # pragma: no cover
-            self._send_json({"error": "Server error: %s" % e}, 500)
+            self._server_error(e)
         finally:
             conn.close()
 
@@ -4787,7 +4895,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         except Exception as e:  # pragma: no cover
-            self._send_json({"error": "Server error: %s" % e}, 500)
+            self._server_error(e)
         finally:
             conn.close()
 
@@ -4821,7 +4929,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         except Exception as e:  # pragma: no cover
-            self._send_json({"error": "Server error: %s" % e}, 500)
+            self._server_error(e)
         finally:
             conn.close()
 
@@ -4852,7 +4960,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         except Exception as e:  # pragma: no cover
-            self._send_json({"error": "Server error: %s" % e}, 500)
+            self._server_error(e)
         finally:
             conn.close()
 
@@ -4885,7 +4993,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         except Exception as e:  # pragma: no cover
-            self._send_json({"error": "Server error: %s" % e}, 500)
+            self._server_error(e)
         finally:
             conn.close()
 
@@ -4931,7 +5039,7 @@ class Handler(BaseHTTPRequestHandler):
             except ApiError as e:
                 return self._send_json({"error": e.message}, e.status)
         except Exception as e:  # pragma: no cover
-            self._send_json({"error": "Server error: %s" % e}, 500)
+            self._server_error(e)
         finally:
             try:
                 conn.close()
@@ -4985,10 +5093,15 @@ class Handler(BaseHTTPRequestHandler):
             conn.rollback()
             self._remove_files(self._created_files)      # files this request wrote for rows that were rolled back
             self._send_json({"error": e.message, **({"code": e.code} if e.code else {})}, status=e.status)
+        except (TimeoutError, ConnectionError):
+            conn.rollback()                              # the client went silent or hung up mid-request: nothing to answer
+            self._remove_files(self._created_files)
+            self.close_connection = True
+            logger.info("Client gave up: %s %s", self.command, redact(self.path))
         except Exception as e:  # pragma: no cover
             conn.rollback()
             self._remove_files(self._created_files)
-            self._send_json({"error": "Server error: %s" % e}, status=500)
+            self._server_error(e)
         finally:
             conn.close()
 
@@ -5106,7 +5219,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.client_address[0]
 
     def login(self, conn):
-        data = self._body_json()
+        data = self._body_json(limit=MAX_LOGIN_BODY_BYTES)
         email = (data.get("email") or "").strip().lower()
         password = data.get("password") or ""
         ip = self._client_ip()
@@ -11622,8 +11735,25 @@ def report_workbook(data, spname, skname):
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
+def boot_summary():
+    """One line for the log: which database, how big, and how much is in it (ASCII only)."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        counts = {t: conn.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0] for t in ("users", "production_runs", "tote_lots", "fg_lots")}
+        conn.close()
+        return "Database: %s (%.1f MB): %s" % (DB_PATH, os.path.getsize(DB_PATH) / 1048576.0, ", ".join("%d %s" % (v, k.replace("_", " ")) for k, v in counts.items()))
+    except Exception as e:  # pragma: no cover
+        return "Database: %s (could not be summarised: %s)" % (DB_PATH, e)
+
+
 def main():
-    init_db()
+    configure_logging()
+    try:
+        init_db()
+    except Exception:
+        logger.critical("The server could not start: the database failed to initialise.", exc_info=True)
+        raise SystemExit(1)
+    logger.info(boot_summary())
     print("KelpWorks ERP running at http://%s:%s  (DB: %s)  [%s%s]" % (HOST, PORT, DB_PATH, ENV_NAME.upper(), ", restore enabled" if ALLOW_RESTORE else ""))
     if DEV_MODE and ADMIN_PASSWORD == "kelp1234":
         print("Development login (new database): %s / kelp1234" % ADMIN_EMAIL)
