@@ -40,6 +40,17 @@ python kelp_erp_server.py       # or: run.bat
 → http://localhost:8002 · seed admin **admin@kelp.local / kelp1234**.
 No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.json`.
 
+## Tests
+
+```bash
+python -m pip install -r requirements-dev.txt    # pytest -- dev/CI only; the shipped app stays standard-library only
+python -m pytest
+```
+`tests/harness.py` (stdlib only) boots the REAL server as a subprocess on a free port with its own temporary SQLite database + uploads, seeded like a
+first deploy (`Server`; `restart()` re-boots on the same data; `Server(db_path=...)` boots on a COPY of an existing database), plus a thin urllib
+`ApiClient` (bearer-token `login()`, `admin_client()`, `make_user()`). `tests/conftest.py` turns those into pytest fixtures (`server`, `fresh_server`,
+`anon`, `admin`, `make_user`). Never point a test at `kelp_erp.db`. CI (`.github/workflows/tests.yml`) runs the suite on every pull request.
+
 ## Layout
 
 - `kelp_erp_server.py` — the entire backend: DB schema, migrations, auth, and

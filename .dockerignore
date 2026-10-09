@@ -7,3 +7,10 @@ uploads/
 __pycache__/
 *.pyc
 .git
+
+# Dev-only files: the shipped image stays small and dependency-free.
+tests/
+requirements-dev.txt
+pytest.ini
+.pytest_cache/
+.github/

@@ -125,12 +125,20 @@ class Server:
         if self.db_source:
             shutil.copyfile(self.db_source, self.db_path)           # boot on a COPY, never on the original
         self.log_path = os.path.join(self.tmp, "server.log")
+        return self._launch()
+
+    def restart(self):
+        """Stop the server process and boot it again on the SAME database and uploads (what a redeploy does)."""
+        self._stop_process()
+        return self._launch()
+
+    def _launch(self):
         self.port = free_port()
         env = dict(os.environ, PORT=str(self.port), HOST="127.0.0.1", PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8",
                    KELP_ERP_DB=self.db_path, KELP_ERP_UPLOADS=os.path.join(self.tmp, "uploads"), KELP_ERP_SECRET=SIGNING_SECRET,
                    KELP_ERP_ADMIN_EMAIL=ADMIN_EMAIL, KELP_ERP_ADMIN_PASSWORD=ADMIN_PASSWORD, KELP_ERP_INITIAL_PASSWORD="initial-pass-123")
         env.update(self.extra_env)
-        self._log = open(self.log_path, "wb")
+        self._log = open(self.log_path, "ab")
         self.proc = subprocess.Popen([sys.executable, SERVER_PY], cwd=ROOT, env=env, stdout=self._log, stderr=subprocess.STDOUT)
         deadline = time.time() + self.startup_timeout
         while time.time() < deadline:
@@ -147,7 +155,7 @@ class Server:
         self.stop()
         raise RuntimeError("The server did not answer within %ss:\n%s" % (self.startup_timeout, log))
 
-    def stop(self):
+    def _stop_process(self):
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
             try:
@@ -156,6 +164,9 @@ class Server:
                 self.proc.kill()
         if getattr(self, "_log", None):
             self._log.close()
+
+    def stop(self):
+        self._stop_process()
         if self.tmp:
             shutil.rmtree(self.tmp, ignore_errors=True)
             self.tmp = None

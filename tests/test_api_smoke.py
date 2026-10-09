@@ -1,63 +1,47 @@
-"""Smoke tests that use the harness: a real server on a throwaway database.
-
-    python -m unittest discover -s tests
-"""
+"""Smoke tests: a real server on a throwaway database, driven over HTTP (fixtures: tests/conftest.py, machinery: tests/harness.py)."""
 import os
-import sys
-import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import ADMIN_EMAIL, ADMIN_PASSWORD, Server  # noqa: E402
+from harness import ADMIN_EMAIL, ADMIN_PASSWORD, ROOT
 
 
-class ApiSmoke(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.srv = Server().start()          # one server for the whole class: boots in about a second
-        cls.admin = cls.srv.admin_client()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.srv.stop()
-
-    def test_serves_the_app(self):
-        r = self.srv.client().get("/")
-        self.assertEqual(r.status, 200)
-        self.assertIn("KelpWorks", r.text)
-
-    def test_uses_a_throwaway_database(self):
-        self.assertNotEqual(os.path.abspath(self.srv.db_path), os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "kelp_erp.db"))
-        self.assertTrue(os.path.exists(self.srv.db_path))
-
-    def test_api_requires_a_token(self):
-        self.assertEqual(self.srv.client().get("/api/refdata").status, 401)
-        self.assertEqual(self.srv.client().get("/api/refdata", token="not-a-real-token").status, 401)
-
-    def test_login(self):
-        bad = self.srv.client().login(ADMIN_EMAIL, "wrong-password")
-        self.assertEqual(bad.status, 401)
-        good = self.srv.client().login(ADMIN_EMAIL, ADMIN_PASSWORD)
-        self.assertEqual(good.status, 200)
-        self.assertEqual(good.json["user"]["role"], "admin")
-
-    def test_me(self):
-        r = self.admin.get("/api/me")
-        self.assertEqual(r.status, 200)
-        self.assertEqual(r.json["email"], ADMIN_EMAIL)
-
-    def test_seed_data_is_loaded(self):
-        ref = self.admin.get("/api/refdata").raise_for_status().json
-        self.assertTrue(ref["species"], "species should be seeded")
-        self.assertIn("SL", [s["code"] for s in ref["species"]])
-        self.assertIn("KELPIVEX", [k["code"] for k in ref["skus"]])
-
-    def test_admin_only_routes(self):
-        user, _ = self.srv.make_user(role="user")
-        self.assertEqual(user.get("/api/users").status, 403)
-        r = self.admin.get("/api/users")
-        self.assertEqual(r.status, 200)
-        self.assertIn(ADMIN_EMAIL, [u["email"] for u in r.json["users"]])
+def test_serves_the_app(anon):
+    r = anon.get("/")
+    assert r.status == 200
+    assert "KelpWorks" in r.text
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_uses_a_throwaway_database(server):
+    assert os.path.abspath(server.db_path) != os.path.join(ROOT, "kelp_erp.db")
+    assert os.path.exists(server.db_path)
+
+
+def test_api_requires_a_token(anon):
+    assert anon.get("/api/refdata").status == 401
+    assert anon.get("/api/refdata", token="not-a-real-token").status == 401
+
+
+def test_login(server):
+    assert server.client().login(ADMIN_EMAIL, "wrong-password").status == 401
+    good = server.client().login(ADMIN_EMAIL, ADMIN_PASSWORD)
+    assert good.status == 200
+    assert good.json["user"]["role"] == "admin"
+
+
+def test_me(admin):
+    r = admin.get("/api/me")
+    assert r.status == 200
+    assert r.json["email"] == ADMIN_EMAIL
+
+
+def test_seed_data_is_loaded(admin):
+    ref = admin.get("/api/refdata").raise_for_status().json
+    assert "SL" in [s["code"] for s in ref["species"]]
+    assert "KELPIVEX" in [k["code"] for k in ref["skus"]]
+
+
+def test_admin_only_routes(admin, make_user):
+    user, _ = make_user(role="user")
+    assert user.get("/api/users").status == 403
+    r = admin.get("/api/users")
+    assert r.status == 200
+    assert ADMIN_EMAIL in [u["email"] for u in r.json["users"]]

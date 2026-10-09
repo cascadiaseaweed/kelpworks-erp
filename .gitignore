@@ -6,3 +6,4 @@ preview_*.db
 uploads/
 sop_documents/
 lab_templates/
+.pytest_cache/
