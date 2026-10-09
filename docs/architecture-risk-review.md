@@ -20,6 +20,8 @@ Date: 2026-10-09. Code reviewed: `main` at `c1e5343` (after PRs #4 to #7). Scope
 | R-04 secrets and defaults | **Fixed** (batch 2): no public secret (generated key file), no default passwords outside development, must-change enforced by the server, no prefilled login. Still to do in Render: confirm `KELP_ERP_SECRET` / `KELP_ERP_ADMIN_PASSWORD` are set on live and staging |
 | R-12 token revocation | **Mostly fixed** (batch 2): token versions end sessions on password change / reset / deactivation; downloads use the same authentication as the API. Still open: `?token=` is a full-scope bearer token (short-lived download tokens) |
 | R-13 login | **Fixed** (batch 2): throttling and no timing difference for unknown emails |
+| R-05 stored XSS | **Fixed** (batch 3): files are served by their name's type only (non-PDF/image = download), script-capable types refused, print windows escape their data, a Content-Security-Policy on the app page |
+| R-25 uploads | **Mostly fixed** (batch 3): header injection and non-ASCII filenames, total size limit and disk-free check, files removed when a draft is discarded or a request fails. Still open: per-user quota |
 | R-06 shipments | **Fixed** (batch 1): duplicate lines, un-cancel, disposed-lot return, conditional deduction, write lock |
 | R-14 edit under amendment | **Fixed** (batch 1) |
 | R-15 concurrency | **Partly fixed** (batch 1): writes take the lock up front and wait up to 30 s. Still open: unique-number collisions return 500 instead of 409 |

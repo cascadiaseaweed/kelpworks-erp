@@ -158,6 +158,15 @@ for `main` so a red run blocks the merge.
   `password_change_required` from everything except `/api/me` and `/api/me/password` (the SPA asks for the new password before loading). Sign-in is throttled in memory
   (`login_wait_seconds`: 8 failures per account+address, 40 per address, per 5 minutes -> 429) and an unknown email still pays for a password check (`dummy_verify`).
   The address is the LAST `X-Forwarded-For` entry on Render only. `?token=` is still a full-scope bearer token (short-lived download tokens are a later item).
+- **Uploads, downloads and browser headers** (risk review batch 3; tests in `tests/test_uploads_xss.py`). What a stored file is served as comes from its FILE NAME only
+  (`served_type`): PDFs and images may open inline, everything else is a download with a server-chosen type (`SAFE_INLINE_TYPES` / `DOWNLOAD_TYPES`); the type a client
+  sends is ignored, including for rows stored before this rule. Script-capable extensions (`BLOCKED_UPLOAD_EXTENSIONS`: html, svg, js, xml, exe ...) are refused at upload
+  (`check_upload_filename`). `content_disposition()` builds every Content-Disposition (ASCII fallback + RFC 5987 `filename*`, no header injection). Uploads go through
+  `_check_storage_room` (all documents together <= `KELP_ERP_MAX_UPLOADS_MB`, default 600, and the disk keeps 100 MB free -> 507) and `_write_upload`, which remembers the file so
+  it is deleted if the request fails; files of rows removed by a draft discard / tote delete are deleted after the commit (`_files_to_remove`). Every response gets nosniff,
+  X-Frame-Options DENY, Referrer-Policy and (over https) HSTS from `end_headers`; CORS headers are gone (the app is same-origin); the app page carries `APP_CSP`
+  (`script-src 'self'`: NO inline script, so print windows are printed by the opener via `printWhenReady`, and every value written into a print window goes through
+  `escHtml`). Don't add an inline `<script>`, an inline event attribute or an un-escaped template string.
 - **Production-log required fields** are defined once, server-side, in `PROGRESS_SECTIONS` /
   `REQUIRED_FEEDSTOCK` (`kelp_erp_server.py`; exposed to the SPA as `refdata.requiredFields`).
   Everything is required except: every Notes field, the Homogenization / Separation /

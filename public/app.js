@@ -4149,7 +4149,7 @@ function releaseAuditCsv(d) {
 function printReleaseRecord(d) {
   const w = window.open('', '_blank');
   if (!w) return toast('Allow pop-ups to print.', true);
-  const esc = x => String(x == null ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const esc = escHtml;
   w.document.write('<html><head><title>Release record ' + esc(d.lot) + '</title><style>body{font-family:Segoe UI,Arial,sans-serif;margin:24px;font-size:12px}'
     + 'table{border-collapse:collapse;width:100%}td,th{border:1px solid #888;padding:4px 6px;text-align:left;vertical-align:top}.h{font-family:monospace;font-size:10px;word-break:break-all}</style></head><body>'
     + '<h2>Product release record — ' + esc(d.lot) + '</h2><p>Product: ' + esc(skuName(d.sku)) + ' · Status: <b>' + esc(d.label) + '</b> · Finalized: '
@@ -4471,9 +4471,9 @@ function printPackingSlip(s) {
   const w = window.open('', '_blank');
   if (!w) return toast('Allow pop-ups to print the packing slip.', true);
   const cust = State.ref.customers.find(c => c.id === s.customerId) || {};
-  const rows = s.lines.map(ln => `<tr><td class="mono">${ln.lot}</td><td>${skuName(ln.sku)}</td><td>${ln.packageSize}</td>
-    <td style="text-align:right">${fmt(ln.qty)}</td><td style="text-align:right">${fmt(ln.litres, 0)} L</td>
-    <td class="mono" style="font-size:10px">${(ln.processingLot || '—')}</td></tr>`).join('');
+  const rows = s.lines.map(ln => `<tr><td class="mono">${escHtml(ln.lot)}</td><td>${escHtml(skuName(ln.sku))}</td><td>${escHtml(ln.packageSize)}</td>
+    <td style="text-align:right">${escHtml(fmt(ln.qty))}</td><td style="text-align:right">${escHtml(fmt(ln.litres, 0))} L</td>
+    <td class="mono" style="font-size:10px">${escHtml(ln.processingLot || '—')}</td></tr>`).join('');
   const css = `body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:28px;color:#0c2b27;}
     .hd{display:flex;justify-content:space-between;border-bottom:3px solid #15564F;padding-bottom:10px;}
     .co{font-size:20px;font-weight:700;color:#15564F;} .sub{font-size:11px;color:#666;}
@@ -4485,24 +4485,25 @@ function printPackingSlip(s) {
     .tot{margin-top:10px;text-align:right;font-size:13px;font-weight:700;}
     .sign{margin-top:48px;display:flex;gap:40px;} .sign div{flex:1;border-top:1px solid #999;padding-top:5px;font-size:11px;color:#666;}
     .foot{margin-top:8px;font-size:10px;color:#999;}`;
-  const addr = (s.shipTo || cust.address || '').replace(/\n/g, '<br>');
+  const addr = escHtml(s.shipTo || cust.address || '').replace(/\n/g, '<br>');
   const logo = location.origin + '/logo.png';
-  w.document.write(`<!doctype html><html><head><title>Packing Slip ${s.shipmentNo}</title><style>${css}
+  w.document.write(`<!doctype html><html><head><title>Packing Slip ${escHtml(s.shipmentNo)}</title><style>${css}
     .hd .co{display:flex;align-items:center;gap:10px;} .hd img{height:46px;width:auto;}</style></head><body>
     <div class="hd"><div><div class="co"><img src="${logo}" alt="">CASCADIA SEAWEED</div><div class="sub">Kelp Processing &middot; Liquid Kelp Extract</div></div>
-      <div style="text-align:right"><h1 style="margin:0">PACKING SLIP</h1><div class="mono">${s.shipmentNo}</div></div></div>
+      <div style="text-align:right"><h1 style="margin:0">PACKING SLIP</h1><div class="mono">${escHtml(s.shipmentNo)}</div></div></div>
     <div class="meta">
-      <div><b>Ship to</b>${cust.name || '—'}${addr ? '<br>' + addr : ''}${cust.contact ? '<br>Attn: ' + cust.contact : ''}</div>
-      <div><b>Ship date</b>${s.shipDate}<br><b style="margin-top:8px">Status</b>${s.status}</div>
-      <div><b>Carrier</b>${s.carrier || '—'}<br><b style="margin-top:8px">Tracking</b>${s.trackingNo || '—'}<br><b style="margin-top:8px">Customer PO</b>${s.reference || '—'}</div>
+      <div><b>Ship to</b>${escHtml(cust.name || '—')}${addr ? '<br>' + addr : ''}${cust.contact ? '<br>Attn: ' + escHtml(cust.contact) : ''}</div>
+      <div><b>Ship date</b>${escHtml(s.shipDate)}<br><b style="margin-top:8px">Status</b>${escHtml(s.status)}</div>
+      <div><b>Carrier</b>${escHtml(s.carrier || '—')}<br><b style="margin-top:8px">Tracking</b>${escHtml(s.trackingNo || '—')}<br><b style="margin-top:8px">Customer PO</b>${escHtml(s.reference || '—')}</div>
     </div>
     <table><thead><tr><th>FG lot</th><th>Product</th><th>Pack</th><th style="text-align:right">Qty</th><th style="text-align:right">Volume</th><th>Processing lot</th></tr></thead><tbody>${rows}</tbody></table>
-    <div class="tot">Total: ${fmt(s.units)} units &middot; ${fmt(s.litres, 0)} L</div>
-    ${s.notes ? '<div style="margin-top:10px;font-size:12px"><b>Notes:</b> ' + s.notes + '</div>' : ''}
+    <div class="tot">Total: ${escHtml(fmt(s.units))} units &middot; ${escHtml(fmt(s.litres, 0))} L</div>
+    ${s.notes ? '<div style="margin-top:10px;font-size:12px"><b>Notes:</b> ' + escHtml(s.notes) + '</div>' : ''}
     <div class="sign"><div>Picked / packed by</div><div>Received by (signature &amp; date)</div></div>
     <div class="foot">Lot numbers above provide full traceability to production run and source harvest totes. Generated by KelpWorks ERP.</div>
-    <script>window.onload=()=>window.print()<\/script></body></html>`);
+    </body></html>`);
   w.document.close();
+  printWhenReady(w);
 }
 
 async function manageCustomers() {
@@ -5136,7 +5137,7 @@ function printReport(d) {
   if (!d) return toast('Nothing to print yet.', true);
   const w = window.open('', '_blank');
   if (!w) return toast('Allow pop-ups to print the report.', true);
-  const sec = (title, headers, rows, nums) => `<h2>${title}</h2><table><thead><tr>${headers.map((h, i) => `<th${nums && nums[i] ? ' class=n' : ''}>${h}</th>`).join('')}</tr></thead><tbody>${rows.map(r => `<tr>${r.map((c, i) => `<td${nums && nums[i] ? ' class=n' : ''}>${c}</td>`).join('')}</tr>`).join('') || '<tr><td>—</td></tr>'}</tbody></table>`;
+  const sec = (title, headers, rows, nums) => `<h2>${escHtml(title)}</h2><table><thead><tr>${headers.map((h, i) => `<th${nums && nums[i] ? ' class=n' : ''}>${escHtml(h)}</th>`).join('')}</tr></thead><tbody>${rows.map(r => `<tr>${r.map((c, i) => `<td${nums && nums[i] ? ' class=n' : ''}>${escHtml(c)}</td>`).join('')}</tr>`).join('') || '<tr><td>—</td></tr>'}</tbody></table>`;
   const spRows = s => s.bySpecies.map(r => [speciesName(r.species), fmt(r.totes), fmt(r.kg, 0)]);
   const css = `body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:28px;color:#0c2b27;font-size:12px;}
     .hd{display:flex;justify-content:space-between;border-bottom:3px solid #15564F;padding-bottom:8px;margin-bottom:6px;}
@@ -5144,8 +5145,8 @@ function printReport(d) {
     table{width:100%;border-collapse:collapse;margin-bottom:6px;} th{background:#eef3f2;text-align:left;padding:5px 8px;color:#15564F;} td{padding:5px 8px;border-bottom:1px solid #eee;} .n{text-align:right;}
     .tiles{display:flex;gap:18px;margin:10px 0;flex-wrap:wrap;} .ti{font-size:11px;color:#666;} .ti b{display:block;font-size:18px;color:#15564F;}
     .co{display:flex;align-items:center;gap:10px;} .hd img{height:46px;width:auto;}`;
-  w.document.write(`<!doctype html><html><head><title>Manufacturing Report ${d.month}</title><style>${css}</style></head><body>
-    <div class="hd"><div class="co"><img src="${location.origin}/logo.png" alt="">CASCADIA SEAWEED</div><div style="text-align:right"><h1 style="margin:0">MANUFACTURING REPORT</h1>${d.period} · on hand as of ${d.asOf}</div></div>
+  w.document.write(`<!doctype html><html><head><title>Manufacturing Report ${escHtml(d.month)}</title><style>${css}</style></head><body>
+    <div class="hd"><div class="co"><img src="${location.origin}/logo.png" alt="">CASCADIA SEAWEED</div><div style="text-align:right"><h1 style="margin:0">MANUFACTURING REPORT</h1>${escHtml(d.period)} · on hand as of ${escHtml(d.asOf)}</div></div>
     <div class="tiles">
       <div class="ti">Stabilized created<b>${fmt(d.stabilized.created.kg, 0)} kg</b></div>
       <div class="ti">Stabilized consumed<b>${fmt(d.stabilized.consumed.kg, 0)} kg</b></div>
@@ -5166,9 +5167,10 @@ function printReport(d) {
     ${sec('Finished goods by location (current)', ['Location', 'Units', 'Litres'], (d.byLocation && d.byLocation.finishedGoods || []).map(r => [r.location, fmt(r.units), fmt(r.litres, 0)]), [0, 1, 1])}
     ${sec('Reagents / packaging by location (current)', ['Location', 'Item', 'On hand'], (d.byLocation && d.byLocation.consumables || []).map(r => [r.location, r.name, fmt(r.onHand, 1) + ' ' + r.unit]), [0, 0, 0])}
     ${sec('Disposed / written off', ['Date', 'Type', 'Item', 'Qty', 'Reason', 'By'], (d.disposed && d.disposed.lines || []).map(l => [l.date, disposalTypeLabel(l.type), l.ref, fmt(l.qty, 1) + ' ' + (l.unit || ''), l.reason, l.by || '']), [0, 0, 0, 1, 0, 0])}
-    <p style="margin-top:14px;font-size:10px;color:#999">Generated by KelpWorks ERP · ${d.month}</p>
-    <script>window.onload=()=>window.print()<\/script></body></html>`);
+    <p style="margin-top:14px;font-size:10px;color:#999">Generated by KelpWorks ERP · ${escHtml(d.month)}</p>
+    </body></html>`);
   w.document.close();
+  printWhenReady(w);
 }
 function downloadReportXlsx() {
   const r = State.reportRange;
@@ -6874,6 +6876,11 @@ const SAMPLE_LABEL_CSS = `
   .sample-label .sl-point{font-weight:600;font-size:8.5pt;line-height:1.15;max-height:2.3em;overflow:hidden}
   .sample-label .sl-when{font-size:8.5pt;line-height:1.1;white-space:nowrap}`;
 const escHtml = x => String(x == null ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+// Print a window we just wrote with document.write: the app's Content-Security-Policy forbids inline script, so the opener asks for the print.
+function printWhenReady(w) {
+  const go = () => { try { w.focus(); w.print(); } catch (e) { /* the window was closed */ } };
+  if (w.document.readyState === 'complete') setTimeout(go, 200); else w.addEventListener('load', () => setTimeout(go, 200));
+}
 function sampleLabelHtml(lb) {
   return '<div class="sample-label"><div class="sl-lot">' + escHtml(lb.lot) + '</div><div class="sl-point">' + escHtml(lb.point) + '</div><div class="sl-when">' + escHtml(lb.when) + '</div></div>';
 }
@@ -6882,8 +6889,9 @@ function printSampleLabels(labels) {
   if (!w) return toast('Allow pop-ups to print labels.', true);
   w.document.write('<!doctype html><html><head><title>Sample labels</title><style>@page{size:auto;margin:8mm}body{margin:0}'
     + '.sheet{display:grid;grid-template-columns:repeat(3,63.5mm);justify-content:start}' + SAMPLE_LABEL_CSS + '</style></head><body><div class="sheet">'
-    + labels.map(sampleLabelHtml).join('') + '</div><script>window.onload=()=>{window.print();}<\/script></body></html>');
+    + labels.map(sampleLabelHtml).join('') + '</div></body></html>');
   w.document.close();
+  printWhenReady(w);
 }
 async function openSampleLabels(run) {
   const { lot, lotSimplified, points } = await api('GET', '/production/' + run.id + '/sample-labels');
@@ -6973,12 +6981,13 @@ function printLabels(labels) {
   .kelp-label svg{width:100%;height:46px;} .ll-human{text-align:center;font-family:ui-monospace,monospace;font-size:11px;letter-spacing:1px;}`;
   const logo = location.origin + '/logo.png';
   const html = labels.map(lb => `<div class="kelp-label">
-    <div class="ll-top"><span class="ll-co"><img src="${logo}" alt="" style="height:16px;width:auto;margin-right:5px;vertical-align:middle">CASCADIA SEAWEED</span><span class="ll-kind">${lb.kind}</span></div>
-    <div class="ll-lot">${lb.lot}</div>
-    <div class="ll-meta">${lb.meta.map(([k, v]) => `<span><b>${k}:</b> ${v}</span>`).join('')}</div>
-    ${code128SVG(lb.barcode)}<div class="ll-human">${lb.barcode}</div></div>`).join('');
-  w.document.write(`<!doctype html><html><head><title>KelpWorks labels</title><style>${css}</style></head><body><div class="labels-sheet">${html}</div><script>window.onload=()=>{window.print();}<\/script></body></html>`);
+    <div class="ll-top"><span class="ll-co"><img src="${logo}" alt="" style="height:16px;width:auto;margin-right:5px;vertical-align:middle">CASCADIA SEAWEED</span><span class="ll-kind">${escHtml(lb.kind)}</span></div>
+    <div class="ll-lot">${escHtml(lb.lot)}</div>
+    <div class="ll-meta">${lb.meta.map(([k, v]) => `<span><b>${escHtml(k)}:</b> ${escHtml(v)}</span>`).join('')}</div>
+    ${code128SVG(lb.barcode)}<div class="ll-human">${escHtml(lb.barcode)}</div></div>`).join('');
+  w.document.write(`<!doctype html><html><head><title>KelpWorks labels</title><style>${css}</style></head><body><div class="labels-sheet">${html}</div></body></html>`);
   w.document.close();
+  printWhenReady(w);
 }
 
 /* ---------------- shared UI bits ---------------- */
