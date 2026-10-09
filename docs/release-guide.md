@@ -103,9 +103,21 @@ Merge only changes you are ready to have live. A red `test` run on `main` means 
 
 Use this for migrations, anything that depends on real data, or when you want to see it work before it is live. Full details: [staging.md](staging.md).
 
-1. **Refresh the data (when it is stale):** on live, Admin > **Download full backup**; on staging, sign in as the staging admin, Admin > **Restore from a full backup...**, choose the zip, type `RESTORE`. Then sign in with your **live email** and the **staging password**. Delete the zip afterwards.
-2. **Deploy the branch to staging:** Render > `kelpworks-erp-staging` > Manual Deploy > the branch or commit under test.
-3. **Test it** on the staging URL (amber STAGING banner). Nothing there reaches live.
+Do this **before** merging the PR (merging deploys to live). The PR is only merged once it looks right on staging.
+
+1. **Wait for the green `test` check** on the PR. There is no point deploying a branch that fails the tests.
+2. **Make sure staging has realistic data.** If it is stale, refresh it first (see [Refreshing staging from live](staging.md#refreshing-staging-from-live-each-time)). Staging keeps its data between deploys, so this is only needed when you want fresher data.
+3. **Point staging at the branch.** Render dashboard > `kelpworks-erp-staging` > Settings > Build & Deploy > **Branch**: change `main` to the PR's branch (for example `hardening/phase1_release_integrity`) and save. Nothing deploys yet, because auto-deploy is off.
+4. **Deploy it.** On the service, open the **Manual Deploy** menu and choose **Deploy latest commit**. Watch the deploy log until the service is live. The migrations run at startup on the copy of live data, so this also tests that the upgrade works on real data.
+5. **Test it on the staging address** (amber STAGING banner). Sign in with your **live email** and the **staging password**, and try what the PR changes. The PR description lists what to check.
+6. **Decide.**
+   - Looks good: **merge the PR on GitHub.** That deploys to live; nothing else is needed for live.
+   - Problem found: do **not** merge. Tell Claude what you saw; it fixes the branch and pushes, and the PR updates itself. Repeat step 4 (**Deploy latest commit**) to test the new commit.
+7. **Set staging's Branch back to `main`** (Settings > Build & Deploy > Branch), so a later manual deploy does not redeploy the old branch. Use Manual Deploy afterwards if you want staging to match live again.
+
+Menu names are as of writing and may be worded slightly differently in the Render dashboard.
+
+In Claude Code, the matching prompts are: "push and open a pull request" (before step 1), "is the test check passing on the PR?" (step 1), and "the check failed, please fix it" or "staging showed this problem: ..." (step 6).
 
 Staging never auto-deploys, and its Restore function exists only there: the live site cannot overwrite itself.
 
