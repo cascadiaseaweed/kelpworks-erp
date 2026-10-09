@@ -15,7 +15,7 @@ python kelp_erp_server.py
 ```
 (or double-click `run.bat`) then open <http://localhost:8002>.
 
-Seed login: **admin@kelp.local / kelp1234**
+On a NEW database in local development (`run.bat` sets `KELP_ERP_ENV=development`) the seed login is **admin@kelp.local / kelp1234**. Anywhere else the first-run admin password is generated and printed once in the server log (or set `KELP_ERP_ADMIN_PASSWORD`).
 
 ## What it models
 
@@ -58,8 +58,9 @@ created and seeded automatically.
 | `PORT` | `8002` | HTTP port (hosts inject this) |
 | `KELP_ERP_DB` | `./kelp_erp.db` | sqlite database file |
 | `KELP_ERP_UPLOADS` | `./uploads` | folder for attached documents |
-| `KELP_ERP_SECRET` | dev value | token signing secret — **set before hosting** |
-| `KELP_ERP_ADMIN_EMAIL` / `KELP_ERP_ADMIN_PASSWORD` | `admin@kelp.local` / `kelp1234` | first-run admin account |
+| `KELP_ERP_SECRET` | generated key in `kelp_secret.key` next to the database | token signing secret — **set it when hosting** (a value that is the old public default is ignored) |
+| `KELP_ERP_ENV` | (production) | `development` enables the convenience login defaults; `staging` is the staging site (see docs/staging.md) |
+| `KELP_ERP_ADMIN_EMAIL` / `KELP_ERP_ADMIN_PASSWORD` | `admin@kelp.local` / generated and printed once (`kelp1234` only in development) | first-run admin account |
 
 ## Deploying to Render
 

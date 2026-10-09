@@ -151,6 +151,8 @@ class Server:
                    KELP_ERP_DB=self.db_path, KELP_ERP_UPLOADS=os.path.join(self.tmp, "uploads"), KELP_ERP_SECRET=SIGNING_SECRET,
                    KELP_ERP_ADMIN_EMAIL=ADMIN_EMAIL, KELP_ERP_ADMIN_PASSWORD=ADMIN_PASSWORD, KELP_ERP_INITIAL_PASSWORD="initial-pass-123")
         env.update(self.extra_env)
+        for k in [k for k, v in env.items() if v is None]:      # env={"NAME": None} removes the variable (it is not set at all)
+            del env[k]
         self._log = open(self.log_path, "ab")
         self.proc = subprocess.Popen([sys.executable, SERVER_PY], cwd=ROOT, env=env, stdout=self._log, stderr=subprocess.STDOUT)
         deadline = time.time() + self.startup_timeout

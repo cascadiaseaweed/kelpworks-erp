@@ -37,7 +37,8 @@ labels, and an admin panel.
 ```bash
 python kelp_erp_server.py       # or: run.bat
 ```
-→ http://localhost:8002 · seed admin **admin@kelp.local / kelp1234**.
+→ http://localhost:8002. `run.bat` sets `KELP_ERP_ENV=development`, which gives a NEW database the seed admin **admin@kelp.local / kelp1234** and pre-fills the login form; in any other
+environment the first-run admin password is generated and printed once, and the staff roster accounts get an unusable password until an admin resets it (Admin > Users).
 No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.json`.
 
 ## Tests
@@ -151,6 +152,12 @@ for `main` so a red run blocks the merge.
   (`qty=qty-? WHERE qty>=?`), a reinstated shipment needs the stock, units returned to a disposed lot go on hold. *Run edits under an amendment* need
   `can_amend_log`. *Writes*: every non-GET request (except login) starts `BEGIN IMMEDIATE` and `db()` waits up to 30 s for the write lock, so read-check-write
   sequences cannot interleave. Don't add a mutating endpoint that skips these rules; add a test to that file.
+- **Secrets and sessions** (risk review batch 2; tests in `tests/test_secrets_sessions.py`). Every authenticated route, including the `?token=` downloads, goes through
+  `_user_from_token`: valid signature, the user exists and is active, and the token's `tv` equals `users.token_version` (bumped by a password change, an admin reset and a
+  deactivation, so those end the user's other sessions; `POST /api/me/password` returns a fresh token for the current one). A user with `must_change_password` gets 403
+  `password_change_required` from everything except `/api/me` and `/api/me/password` (the SPA asks for the new password before loading). Sign-in is throttled in memory
+  (`login_wait_seconds`: 8 failures per account+address, 40 per address, per 5 minutes -> 429) and an unknown email still pays for a password check (`dummy_verify`).
+  The address is the LAST `X-Forwarded-For` entry on Render only. `?token=` is still a full-scope bearer token (short-lived download tokens are a later item).
 - **Production-log required fields** are defined once, server-side, in `PROGRESS_SECTIONS` /
   `REQUIRED_FEEDSTOCK` (`kelp_erp_server.py`; exposed to the SPA as `refdata.requiredFields`).
   Everything is required except: every Notes field, the Homogenization / Separation /
@@ -335,7 +342,8 @@ for `main` so a red run blocks the merge.
   recommit_stock, fix_lot_status) need the actor's password and are logged to `release_events`.
   Legacy runs without packaging entries can't be cross-checked and are reported as info only.
 - **Env vars:** `PORT` (8002), `KELP_ERP_DB`, `KELP_ERP_UPLOADS`,
-  `KELP_ERP_SECRET`, `KELP_ERP_ADMIN_EMAIL/PASSWORD`, `KELP_ERP_INITIAL_PASSWORD`; staging only: `KELP_ERP_ENV=staging`, `KELP_ERP_ALLOW_RESTORE=1`,
+  `KELP_ERP_SECRET` (when unset or equal to the old public default, a random key is generated once into `kelp_secret.key` next to the database), `KELP_ERP_ADMIN_EMAIL/PASSWORD`,
+  `KELP_ERP_INITIAL_PASSWORD`, `KELP_ERP_ENV=development` (convenience defaults), `KELP_ERP_TRUST_PROXY=1` (trust the last `X-Forwarded-For` entry; always on Render); staging only: `KELP_ERP_ENV=staging`, `KELP_ERP_ALLOW_RESTORE=1`,
   `KELP_ERP_STAGING_PASSWORD`, `KELP_ERP_MAX_RESTORE_MB`. **Never set the staging ones on the live service.**
 - **Staging** (full guide: `docs/staging.md`, blueprint: `render.staging.yaml`): a second Render service with its own disk that holds a copy of live data.
   `GET /api/admin/backup?full=1` (admin; `build_full_backup`) = one .zip with a consistent DB snapshot + `uploads/`, `lab_templates/`, `sop_documents/` + `manifest.json`
