@@ -11,3 +11,4 @@ e56f9bf  2026-09-20  process-log makeover
 64a35b4  2026-10-08  QC control charts (the release before the SGS update)
 f130934  2026-10-08  SGS mineral scans, contacts, merged Sample IDs (live 2026-10-08)
 d0a85f8  2026-10-09  staging support, tests and CI (live now; later commits are documentation only)
+65147e1  2026-10-09  release integrity (batch 1) merged to main and live (docs-only commits after it)
