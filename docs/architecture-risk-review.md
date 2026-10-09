@@ -17,6 +17,9 @@ Date: 2026-10-09. Code reviewed: `main` at `c1e5343` (after PRs #4 to #7). Scope
 | R-01 finished-goods edits | **Fixed** (batch 1): permissions, status whitelist, reason, audit event |
 | R-02 lab results | **Partly fixed** (batch 1): Quality Manager only; released product is held when a required result is voided or a new failure appears. Still open: required attachment / second-person check, wider gate scope (R-11) |
 | R-03 tote reuse | **Fixed** (batch 1): ownership check at draft save and finalize; tote status/weight edits restricted |
+| R-04 secrets and defaults | **Fixed** (batch 2): no public secret (generated key file), no default passwords outside development, must-change enforced by the server, no prefilled login. Still to do in Render: confirm `KELP_ERP_SECRET` / `KELP_ERP_ADMIN_PASSWORD` are set on live and staging |
+| R-12 token revocation | **Mostly fixed** (batch 2): token versions end sessions on password change / reset / deactivation; downloads use the same authentication as the API. Still open: `?token=` is a full-scope bearer token (short-lived download tokens) |
+| R-13 login | **Fixed** (batch 2): throttling and no timing difference for unknown emails |
 | R-06 shipments | **Fixed** (batch 1): duplicate lines, un-cancel, disposed-lot return, conditional deduction, write lock |
 | R-14 edit under amendment | **Fixed** (batch 1) |
 | R-15 concurrency | **Partly fixed** (batch 1): writes take the lock up front and wait up to 30 s. Still open: unique-number collisions return 500 instead of 409 |

@@ -14,3 +14,4 @@ requirements-dev.txt
 pytest.ini
 .pytest_cache/
 .github/
+kelp_secret.key

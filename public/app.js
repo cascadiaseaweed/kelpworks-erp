@@ -85,12 +85,17 @@ function selectTab(tab) {
 async function boot() {
   try {
     State.user = (await api('GET', '/me'));
+    if (State.user.mustChange) {
+      $('#whoName').textContent = State.user.name;
+      show('app');
+      changePasswordModal(true);                       // its Save signs in again with the new password and calls boot()
+      return;
+    }
     State.ref = await api('GET', '/refdata');
     $('#whoName').textContent = State.user.name;
     $('#tabs [data-tab=admin]').closest('.tab-group').classList.toggle('hidden', State.user.role !== 'admin');
     if (State.tab === 'admin' && State.user.role !== 'admin') State.tab = 'dashboard';
     show('app'); selectTab(State.tab);
-    if (State.user.mustChange) changePasswordModal(true);
   } catch (err) { logout(); }
 }
 
@@ -7063,9 +7068,12 @@ function changePasswordModal(forced) {
     const cur = body.querySelector('#pw_cur').value, nw = body.querySelector('#pw_new').value, cf = body.querySelector('#pw_conf').value;
     if (nw.length < 8) throw new Error('New password must be at least 8 characters.');
     if (nw !== cf) throw new Error('New passwords do not match.');
-    await api('POST', '/me/password', { currentPassword: cur, newPassword: nw });
+    const r = await api('POST', '/me/password', { currentPassword: cur, newPassword: nw });
+    // changing the password ends every other session of this user; the reply carries this session's new token
+    if (r.token) { State.token = r.token; localStorage.setItem(TOKEN_KEY, r.token); }
     State.user.mustChange = false;
     toast('Password updated');
+    if (forced) await boot();
   }, forced ? 'Set password' : 'Update', forced ? { noCancel: true, noBackdropClose: true } : {});
 }
 
@@ -7492,6 +7500,7 @@ async function setUserActive(u, active) {
 (async function start() {
   try {
     State.env = await (await fetch('/api/env')).json();
+    if (State.env.env === 'development') { $('#email').value = 'admin@kelp.local'; $('#password').value = 'kelp1234'; }
     if (State.env.env === 'staging') {
       $('#envBanner').textContent = 'STAGING — a test copy of live data. Nothing here affects the live site.';
       $('#envBanner').classList.remove('hidden');

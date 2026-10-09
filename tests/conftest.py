@@ -10,6 +10,10 @@ Fixtures
 import os
 import sys
 
+# The tests import kelp_erp_server in-process only to read its registries. Give that import a secret so it does not write a kelp_secret.key
+# next to the repository's own database (the servers the tests START get their own explicit secrets from harness.py).
+os.environ.setdefault("KELP_ERP_SECRET", "in-process-import-secret-for-tests-only-0123456789")
+
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

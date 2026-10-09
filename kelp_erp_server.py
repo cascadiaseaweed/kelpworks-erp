@@ -76,12 +76,46 @@ LAB_DIR = os.path.join(os.path.dirname(UPLOAD_DIR), "lab_templates")   # lab req
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB per file
 PORT = int(os.environ.get("PORT", "8002"))
 HOST = os.environ.get("HOST", "0.0.0.0")
-DEV_SECRET = "dev-secret-change-me"
-SECRET = os.environ.get("KELP_ERP_SECRET", DEV_SECRET).encode("utf-8")
+DEV_SECRET = "dev-secret-change-me"          # the old public default: never accepted as a signing secret any more
+
+
+def load_secret():
+    """(secret bytes, where it came from). KELP_ERP_SECRET when set; otherwise a random key generated once and kept in `kelp_secret.key` next to the
+    database, so tokens survive restarts but nobody can forge one from the source code."""
+    env = os.environ.get("KELP_ERP_SECRET", "").strip()
+    if env and env != DEV_SECRET:
+        return env.encode("utf-8"), "environment"
+    path = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "kelp_secret.key")
+    try:
+        with open(path, "r", encoding="ascii") as f:
+            key = f.read().strip()
+        if len(key) >= 32:
+            return key.encode("ascii"), path
+    except OSError:
+        pass
+    key = secrets.token_hex(32)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="ascii") as f:
+            f.write(key)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return key.encode("ascii"), path
+    except OSError:
+        return key.encode("ascii"), "generated for this process only (could not write %s)" % path
+
+
+SECRET, SECRET_SOURCE = load_secret()
 TOKEN_TTL = 60 * 60 * 12  # 12 hours
 
 ADMIN_EMAIL = os.environ.get("KELP_ERP_ADMIN_EMAIL", "admin@kelp.local")
-ADMIN_PASSWORD = os.environ.get("KELP_ERP_ADMIN_PASSWORD", "kelp1234")
+# Convenience defaults (admin kelp1234, staff Cascadia123!) exist ONLY for local development: start with KELP_ERP_ENV=development.
+# Anywhere else a missing password is generated: the admin's once, printed once at first start; staff accounts get an unusable one until an
+# administrator resets it (Admin > Users).
+DEV_MODE = os.environ.get("KELP_ERP_ENV", "").strip().lower() == "development"
+ADMIN_PASSWORD = os.environ.get("KELP_ERP_ADMIN_PASSWORD") or ("kelp1234" if DEV_MODE else "")
 
 # Initial staff roster — created (if missing) on startup with a temporary
 # password and forced to reset it on first login.
@@ -90,12 +124,12 @@ INITIAL_USERS = [
     "dboire@cascadiaseaweed.com",
     "nwrana@cascadiaseaweed.com",
 ]
-INITIAL_USER_PASSWORD = os.environ.get("KELP_ERP_INITIAL_PASSWORD", "Cascadia123!")
+INITIAL_USER_PASSWORD = os.environ.get("KELP_ERP_INITIAL_PASSWORD") or ("Cascadia123!" if DEV_MODE else "")
 MIN_PASSWORD_LEN = 8
 
 # Environment. Anything other than "staging" is production. A STAGING server may restore a copy of the live data (full backup .zip) from the
 # Admin page; that is only possible when KELP_ERP_ENV=staging AND KELP_ERP_ALLOW_RESTORE=1, so the live site can never be overwritten by it.
-ENV_NAME = "staging" if os.environ.get("KELP_ERP_ENV", "").strip().lower() == "staging" else "production"
+ENV_NAME = "staging" if os.environ.get("KELP_ERP_ENV", "").strip().lower() == "staging" else ("development" if DEV_MODE else "production")
 ALLOW_RESTORE = ENV_NAME == "staging" and os.environ.get("KELP_ERP_ALLOW_RESTORE", "").strip() == "1"
 STAGING_PASSWORD = os.environ.get("KELP_ERP_STAGING_PASSWORD", "")        # every login password after a restore (live passwords never carry over)
 MAX_RESTORE_BYTES = int(os.environ.get("KELP_ERP_MAX_RESTORE_MB", "900")) * 1024 * 1024
@@ -365,7 +399,8 @@ CREATE TABLE IF NOT EXISTS users (
     role                 TEXT NOT NULL DEFAULT 'user',   -- 'admin' | 'user'
     must_change_password INTEGER NOT NULL DEFAULT 0,
     active               INTEGER NOT NULL DEFAULT 1,
-    created_at           TEXT NOT NULL
+    created_at           TEXT NOT NULL,
+    token_version        INTEGER NOT NULL DEFAULT 0       -- bumped to end a user's existing sessions (password change / reset / deactivation)
 );
 
 CREATE TABLE IF NOT EXISTS species (
@@ -1407,6 +1442,50 @@ def verify_password(password, stored):
         return hmac.compare_digest(stored, hash_password(password, salt, int(iterations)))
     except Exception:
         return False
+
+
+# ---- login throttling (single instance: in memory is enough) ----
+LOGIN_WINDOW_SECONDS = 300
+LOGIN_MAX_FAILS_PER_ACCOUNT = 8          # failed attempts for one email from one address within the window
+LOGIN_MAX_FAILS_PER_ADDRESS = 40         # failed attempts from one address (any email) within the window
+LOGIN_FAILS = {}
+LOGIN_LOCK = threading.Lock()
+_DUMMY_HASH = []
+
+
+def login_wait_seconds(ip, email):
+    """Seconds this address must wait before another sign-in attempt (0 = allowed)."""
+    now = time.time()
+    with LOGIN_LOCK:
+        wait = 0
+        for key, limit in (((ip, email), LOGIN_MAX_FAILS_PER_ACCOUNT), ((ip, None), LOGIN_MAX_FAILS_PER_ADDRESS)):
+            fails = [t for t in LOGIN_FAILS.get(key, []) if now - t < LOGIN_WINDOW_SECONDS]
+            LOGIN_FAILS[key] = fails
+            if len(fails) >= limit:
+                wait = max(wait, int(LOGIN_WINDOW_SECONDS - (now - fails[0])) + 1)
+        return wait
+
+
+def login_failed(ip, email):
+    now = time.time()
+    with LOGIN_LOCK:
+        for key in ((ip, email), (ip, None)):
+            LOGIN_FAILS.setdefault(key, []).append(now)
+        if len(LOGIN_FAILS) > 5000:                    # keep the table small
+            for key in [k for k, v in LOGIN_FAILS.items() if not v or now - v[-1] > LOGIN_WINDOW_SECONDS]:
+                LOGIN_FAILS.pop(key, None)
+
+
+def login_succeeded(ip, email):
+    with LOGIN_LOCK:
+        LOGIN_FAILS.pop((ip, email), None)
+
+
+def dummy_verify(password):
+    """Spend the same time as a real password check, so an unknown email cannot be told from a wrong password by timing."""
+    if not _DUMMY_HASH:
+        _DUMMY_HASH.append(hash_password("not-a-real-password"))
+    verify_password(password, _DUMMY_HASH[0])
 
 
 def init_db():
@@ -3563,6 +3642,8 @@ def migrate(conn):
     if "active" not in ucols:
         conn.execute("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
     # Product-release sign-off permissions (independent of the admin/user role).
+    if "token_version" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0")
     if "is_production_manager" not in ucols:
         conn.execute("ALTER TABLE users ADD COLUMN is_production_manager INTEGER NOT NULL DEFAULT 0")
     if "is_quality_manager" not in ucols:
@@ -3974,7 +4055,9 @@ def ensure_users(conn):
         conn.execute(
             "INSERT INTO users (name,email,password_hash,role,must_change_password,active,created_at)"
             " VALUES (?,?,?,?,1,1,?)",
-            (email.split("@")[0], email, hash_password(INITIAL_USER_PASSWORD), "user", ts))
+            (email.split("@")[0], email, hash_password(INITIAL_USER_PASSWORD or secrets.token_urlsafe(24)), "user", ts))
+        if not INITIAL_USER_PASSWORD:
+            print("Created account %s with no usable password: set one under Admin > Users > Reset password." % email)
 
 
 def seed(conn):
@@ -3982,8 +4065,15 @@ def seed(conn):
     extracted from the 202605 inventory workbook (seed.json)."""
     ts = now_iso()
     cur = conn.cursor()
+    admin_pw = ADMIN_PASSWORD
+    if not admin_pw:
+        admin_pw = secrets.token_urlsafe(12)
+        print("=" * 72)
+        print("FIRST START: administrator account %s  password: %s" % (ADMIN_EMAIL, admin_pw))
+        print("This is shown once. Sign in and change it, or set KELP_ERP_ADMIN_PASSWORD.")
+        print("=" * 72)
     cur.execute("INSERT INTO users (name,email,password_hash,role,created_at) VALUES (?,?,?,'admin',?)",
-                ("Plant Admin", ADMIN_EMAIL.strip().lower(), hash_password(ADMIN_PASSWORD), ts))
+                ("Plant Admin", ADMIN_EMAIL.strip().lower(), hash_password(admin_pw), ts))
     try:
         with open(SEED_FILE, encoding="utf-8") as f:
             data = json.load(f)
@@ -4030,8 +4120,8 @@ def _unb64(s):
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
-def make_token(user_id):
-    payload = {"uid": user_id, "exp": int(time.time()) + TOKEN_TTL}
+def make_token(user_id, token_version=0):
+    payload = {"uid": user_id, "exp": int(time.time()) + TOKEN_TTL, "tv": int(token_version or 0)}
     body = _b64(json.dumps(payload).encode("utf-8"))
     sig = _b64(hmac.new(SECRET, body.encode("ascii"), hashlib.sha256).digest())
     return f"{body}.{sig}"
@@ -4429,19 +4519,37 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             raise ApiError(400, "Invalid JSON body")
 
-    def _auth(self, conn):
-        header = self.headers.get("Authorization", "")
-        if not header.startswith("Bearer "):
-            raise ApiError(401, "Missing token")
-        payload = read_token(header[7:])
+    def _user_from_token(self, conn, token):
+        """The user a token belongs to, or an ApiError. Rejects an expired / forged token, a token from before the user's last password change
+        or deactivation (token_version), and a deactivated user."""
+        payload = read_token(token or "")
         if not payload:
             raise ApiError(401, "Invalid or expired token")
         row = conn.execute("SELECT * FROM users WHERE id=?", (payload["uid"],)).fetchone()
         if not row:
             raise ApiError(401, "User not found")
+        if int(payload.get("tv", 0) or 0) != int(row["token_version"] or 0):
+            raise ApiError(401, "Your session has ended. Please sign in again.")
         if not row["active"]:
             raise ApiError(403, "This account has been deactivated")
         return row
+
+    def _auth(self, conn):
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            raise ApiError(401, "Missing token")
+        return self._user_from_token(conn, header[7:])
+
+    def _token_user(self, conn):
+        """Authenticate a download: the token comes from the Authorization header, or from ?token= (so a file can open in a browser tab)."""
+        header = self.headers.get("Authorization", "")
+        tok = header[7:] if header.startswith("Bearer ") else (parse_qs(urlparse(self.path).query).get("token", [""])[0])
+        if not tok:
+            raise ApiError(401, "Missing token")
+        user = self._user_from_token(conn, tok)
+        if user["must_change_password"]:
+            raise ApiError(403, "You must change your password before continuing.", "password_change_required")
+        return user
 
     def _require_admin(self, user):
         if user["role"] != "admin":
@@ -4496,10 +4604,10 @@ class Handler(BaseHTTPRequestHandler):
         conn = db()
         try:
             qs = parse_qs(urlparse(self.path).query)
-            header = self.headers.get("Authorization", "")
-            tok = header[7:] if header.startswith("Bearer ") else qs.get("token", [None])[0]
-            if not read_token(tok or ""):
-                return self._send_json({"error": "Invalid or missing token"}, 401)
+            try:
+                self._token_user(conn)
+            except ApiError as e:
+                return self._send_json({"error": e.message}, e.status)
             try:
                 data = self.route_reports(qs, conn)
             except ApiError as e:
@@ -4526,10 +4634,10 @@ class Handler(BaseHTTPRequestHandler):
         conn = db()
         try:
             qs = parse_qs(urlparse(self.path).query)
-            header = self.headers.get("Authorization", "")
-            tok = header[7:] if header.startswith("Bearer ") else qs.get("token", [None])[0]
-            if not read_token(tok or ""):
-                return self._send_json({"error": "Invalid or missing token"}, 401)
+            try:
+                self._token_user(conn)
+            except ApiError as e:
+                return self._send_json({"error": e.message}, e.status)
             try:
                 data = self.route_yield_usage(qs, conn)
             except ApiError as e:
@@ -4557,14 +4665,10 @@ class Handler(BaseHTTPRequestHandler):
         conn = db()
         try:
             qs = parse_qs(urlparse(self.path).query)
-            header = self.headers.get("Authorization", "")
-            tok = header[7:] if header.startswith("Bearer ") else qs.get("token", [None])[0]
-            payload = read_token(tok or "")
-            if not payload:
-                return self._send_json({"error": "Invalid or missing token"}, 401)
-            user = conn.execute("SELECT * FROM users WHERE id=?", (payload["uid"],)).fetchone()
-            if not user or not user["active"]:
-                return self._send_json({"error": "Invalid or missing token"}, 401)
+            try:
+                user = self._token_user(conn)
+            except ApiError as e:
+                return self._send_json({"error": e.message}, e.status)
             if user["role"] != "admin":
                 return self._send_json({"error": "Administrator access required"}, 403)
             if qs.get("full", ["0"])[0] == "1":
@@ -4623,10 +4727,10 @@ class Handler(BaseHTTPRequestHandler):
         conn = db()
         try:
             qs = parse_qs(urlparse(self.path).query)
-            header = self.headers.get("Authorization", "")
-            tok = header[7:] if header.startswith("Bearer ") else qs.get("token", [None])[0]
-            if not read_token(tok or ""):
-                return self._send_json({"error": "Invalid or missing token"}, 401)
+            try:
+                self._token_user(conn)
+            except ApiError as e:
+                return self._send_json({"error": e.message}, e.status)
             seg = [s for s in path.split("/") if s]   # api production|totes :id attachments :aid download
             kind, rid, aid = seg[1], int(seg[2]), int(seg[4])
             if kind == "totes":
@@ -4664,10 +4768,10 @@ class Handler(BaseHTTPRequestHandler):
         conn = db()
         try:
             qs = parse_qs(urlparse(self.path).query)
-            header = self.headers.get("Authorization", "")
-            tok = header[7:] if header.startswith("Bearer ") else qs.get("token", [None])[0]
-            if not read_token(tok or ""):
-                return self._send_json({"error": "Invalid or missing token"}, 401)
+            try:
+                self._token_user(conn)
+            except ApiError as e:
+                return self._send_json({"error": e.message}, e.status)
             seg = [s for s in path.split("/") if s]   # api sop-documents :id download
             sid = int(seg[2])
             r = conn.execute("SELECT * FROM sop_documents WHERE id=?", (sid,)).fetchone()
@@ -4699,12 +4803,10 @@ class Handler(BaseHTTPRequestHandler):
         conn = db()
         try:
             qs = parse_qs(urlparse(self.path).query)
-            header = self.headers.get("Authorization", "")
-            tok = header[7:] if header.startswith("Bearer ") else qs.get("token", [None])[0]
-            payload = read_token(tok or "")
-            if not payload:
-                return self._send_json({"error": "Invalid or missing token"}, 401)
-            user = conn.execute("SELECT * FROM users WHERE id=?", (payload["uid"],)).fetchone()
+            try:
+                user = self._token_user(conn)
+            except ApiError as e:
+                return self._send_json({"error": e.message}, e.status)
             seg = [x for x in path.split("/") if x]
             if len(seg) != 4 or not seg[2].isdigit():
                 return self._send_json({"error": "Unknown endpoint"}, 404)
@@ -4732,10 +4834,10 @@ class Handler(BaseHTTPRequestHandler):
         conn = db()
         try:
             qs = parse_qs(urlparse(self.path).query)
-            header = self.headers.get("Authorization", "")
-            tok = header[7:] if header.startswith("Bearer ") else qs.get("token", [None])[0]
-            if not read_token(tok or ""):
-                return self._send_json({"error": "Invalid or missing token"}, 401)
+            try:
+                self._token_user(conn)
+            except ApiError as e:
+                return self._send_json({"error": e.message}, e.status)
             seg = [x for x in path.split("/") if x]
             if seg[2] == "starter-template":
                 data, fname = build_starter_docx(), "requisition-starter-template.docx"
@@ -4866,6 +4968,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.login(conn)
 
         user = self._auth(conn)  # everything below requires auth
+        if user["must_change_password"] and seg not in (["api", "me"], ["api", "me", "password"]):
+            raise ApiError(403, "You must change your password before continuing.", "password_change_required")
 
         if method == "GET" and seg == ["api", "me"]:
             return self._me(user)
@@ -4962,16 +5066,34 @@ class Handler(BaseHTTPRequestHandler):
         raise ApiError(404, "Unknown endpoint")
 
     # ---- auth ------------------------------------------------------------- #
+    def _client_ip(self):
+        """The caller's address. Behind Render's proxy the real address is the LAST X-Forwarded-For entry (the proxy appends it); the header is
+        only trusted on Render (RENDER is set there) or when KELP_ERP_TRUST_PROXY=1, because anywhere else a caller could forge it."""
+        xff = self.headers.get("X-Forwarded-For", "")
+        if xff and (os.environ.get("RENDER") or os.environ.get("KELP_ERP_TRUST_PROXY") == "1"):
+            return xff.split(",")[-1].strip() or self.client_address[0]
+        return self.client_address[0]
+
     def login(self, conn):
         data = self._body_json()
         email = (data.get("email") or "").strip().lower()
         password = data.get("password") or ""
+        ip = self._client_ip()
+        wait = login_wait_seconds(ip, email)
+        if wait:
+            raise ApiError(429, "Too many failed sign-in attempts. Try again in %d seconds." % wait)
         row = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-        if not row or not verify_password(password, row["password_hash"]):
+        if not row:
+            dummy_verify(password)
+            login_failed(ip, email)
+            raise ApiError(401, "Invalid email or password")
+        if not verify_password(password, row["password_hash"]):
+            login_failed(ip, email)
             raise ApiError(401, "Invalid email or password")
         if not row["active"]:
             raise ApiError(403, "This account has been deactivated")
-        return {"token": make_token(row["id"]), "user": self._me(row)}
+        login_succeeded(ip, email)
+        return {"token": make_token(row["id"], row["token_version"]), "user": self._me(row)}
 
     def _me(self, row):
         return {"id": row["id"], "name": row["name"], "email": row["email"],
@@ -5011,9 +5133,10 @@ class Handler(BaseHTTPRequestHandler):
         newpw = d.get("newPassword") or ""
         if len(newpw) < MIN_PASSWORD_LEN:
             raise ApiError(400, "New password must be at least %d characters" % MIN_PASSWORD_LEN)
-        conn.execute("UPDATE users SET password_hash=?, must_change_password=0 WHERE id=?",
+        conn.execute("UPDATE users SET password_hash=?, must_change_password=0, token_version=token_version+1 WHERE id=?",
                      (hash_password(newpw), user["id"]))
-        return {"ok": True}
+        fresh = conn.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        return {"ok": True, "token": make_token(fresh["id"], fresh["token_version"])}      # every OTHER session of this user has ended
 
     def route_users(self, method, seg, conn, user):
         self._require_admin(user)
@@ -5057,7 +5180,7 @@ class Handler(BaseHTTPRequestHandler):
                 if len(pw) < MIN_PASSWORD_LEN:
                     raise ApiError(400, "Password must be at least %d characters" % MIN_PASSWORD_LEN)
                 must_change = 0 if d.get("mustChange") is False else 1
-                conn.execute("UPDATE users SET password_hash=?, must_change_password=? WHERE id=?",
+                conn.execute("UPDATE users SET password_hash=?, must_change_password=?, token_version=token_version+1 WHERE id=?",
                              (hash_password(pw), must_change, uid))
                 return {"ok": True}
 
@@ -5070,9 +5193,9 @@ class Handler(BaseHTTPRequestHandler):
                 demoting = target["role"] == "admin" and (new_role != "admin" or not new_active)
                 if demoting and self._active_admin_count(conn, exclude_id=uid) == 0:
                     raise ApiError(400, "There must be at least one active administrator")
-                conn.execute("UPDATE users SET name=?, role=?, active=? WHERE id=?",
+                conn.execute("UPDATE users SET name=?, role=?, active=?, token_version=token_version+? WHERE id=?",
                              ((d["name"].strip() if d.get("name") else target["name"]),
-                              new_role, new_active, uid))
+                              new_role, new_active, 1 if (target["active"] and not new_active) else 0, uid))
                 for key, col, perm in (("isProductionManager", "is_production_manager", "Production Manager"),
                                        ("isQualityManager", "is_quality_manager", "Quality Manager"),
                                        ("canAmendLog", "can_amend_log", "Production Log Amender")):
@@ -11444,12 +11567,10 @@ def report_workbook(data, spname, skname):
 def main():
     init_db()
     print("KelpWorks ERP running at http://%s:%s  (DB: %s)  [%s%s]" % (HOST, PORT, DB_PATH, ENV_NAME.upper(), ", restore enabled" if ALLOW_RESTORE else ""))
-    if ADMIN_PASSWORD == "kelp1234":
-        print("Seed login: %s / kelp1234  (set KELP_ERP_ADMIN_PASSWORD before hosting)" % ADMIN_EMAIL)
-    else:
-        print("Admin login: %s  (password set via KELP_ERP_ADMIN_PASSWORD)" % ADMIN_EMAIL)
-    if SECRET == DEV_SECRET.encode("utf-8"):
-        print("WARNING: using the default dev signing secret. Set KELP_ERP_SECRET in production.")
+    if DEV_MODE and ADMIN_PASSWORD == "kelp1234":
+        print("Development login (new database): %s / kelp1234" % ADMIN_EMAIL)
+    if SECRET_SOURCE != "environment":
+        print("NOTE: KELP_ERP_SECRET is not set; using a generated signing key (%s). Set KELP_ERP_SECRET in production." % SECRET_SOURCE)
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     try:
         server.serve_forever()
