@@ -58,7 +58,7 @@ import datetime
 import statistics
 from xml.sax.saxutils import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -4334,6 +4334,43 @@ class ApiError(Exception):
         self.code = code
 
 
+# Served inline (the browser shows them): only types that cannot run script. Everything else is a download with a server-chosen type.
+SAFE_INLINE_TYPES = {".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
+DOWNLOAD_TYPES = {".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                  ".doc": "application/msword", ".xls": "application/vnd.ms-excel", ".csv": "text/csv", ".txt": "text/plain", ".zip": "application/zip"}
+# File types that can carry script or markup for the browser: refused at upload.
+BLOCKED_UPLOAD_EXTENSIONS = {".html", ".htm", ".xhtml", ".shtml", ".svg", ".svgz", ".xml", ".xsl", ".xslt", ".js", ".mjs", ".jsx", ".swf", ".hta",
+                             ".php", ".jsp", ".asp", ".aspx", ".exe", ".dll", ".bat", ".cmd", ".com", ".scr", ".msi", ".vbs", ".ps1", ".sh", ".jar"}
+MAX_UPLOAD_TOTAL_BYTES = int(os.environ.get("KELP_ERP_MAX_UPLOADS_MB", "600")) * 1024 * 1024     # all uploaded documents together (the disk is 1 GB)
+MIN_FREE_DISK_BYTES = 100 * 1024 * 1024
+APP_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; "
+           "connect-src 'self'; frame-src 'self' about: blob:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+
+
+def served_type(filename):
+    """(Content-Type, may be shown inline) for a stored file, from its extension only."""
+    ext = os.path.splitext(filename or "")[1].lower()
+    if ext in SAFE_INLINE_TYPES:
+        return SAFE_INLINE_TYPES[ext], True
+    return DOWNLOAD_TYPES.get(ext, "application/octet-stream"), False
+
+
+def content_disposition(filename, inline):
+    """A Content-Disposition header value that is safe for any filename: no control characters or quotes, an ASCII fallback, and the real
+    name percent-encoded (RFC 5987) so names with accents, dashes or other scripts download correctly."""
+    name = "".join(ch for ch in (filename or "") if ch >= " " and ch != "\x7f").strip() or "download"
+    ascii_name = re.sub(r"[^A-Za-z0-9._ -]", "_", name)[:120] or "download"
+    return "%s; filename=\"%s\"; filename*=UTF-8''%s" % ("inline" if inline else "attachment", ascii_name, quote(name, safe=""))
+
+
+def check_upload_filename(filename):
+    ext = os.path.splitext(filename or "")[1].lower()
+    if ext in BLOCKED_UPLOAD_EXTENSIONS:
+        raise ApiError(400, "Files of type %s cannot be uploaded (documents, spreadsheets, PDFs and images are fine)." % ext)
+
+
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".js": "application/javascript; charset=utf-8",
@@ -4502,10 +4539,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
@@ -4569,11 +4602,17 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(403, "Only a Quality Manager can %s" % what)
 
     # ---- dispatch --------------------------------------------------------- #
+    def end_headers(self):
+        """Headers every response carries: no MIME sniffing, no framing, no referrer to other sites, and HTTPS only once the caller came in over HTTPS."""
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "same-origin")
+        if self.headers.get("X-Forwarded-Proto", "") == "https":
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
+        super().end_headers()
+
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.end_headers()
 
     def do_GET(self):
@@ -4619,10 +4658,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type",
                              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             self.send_header("Content-Length", str(len(content)))
-            self.send_header("Content-Disposition",
-                             'attachment; filename="kelpworks-report-%s_%s.xlsx"'
-                             % (data["from"], data["to"]))
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Disposition", content_disposition("kelpworks-report-%s_%s.xlsx" % (data["from"], data["to"]), False))
             self.end_headers()
             self.wfile.write(content)
         except Exception as e:  # pragma: no cover
@@ -4648,7 +4684,6 @@ class Handler(BaseHTTPRequestHandler):
                              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             self.send_header("Content-Length", str(len(content)))
             self.send_header("Content-Disposition", 'attachment; filename="kelpworks-yield-usage.xlsx"')
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(content)
         except Exception as e:  # pragma: no cover
@@ -4682,7 +4717,6 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header("Content-Type", "application/zip")
                     self.send_header("Content-Length", str(os.path.getsize(zip_path)))
                     self.send_header("Content-Disposition", 'attachment; filename="kelpworks-full-backup-%s.zip"' % ts)
-                    self.send_header("Access-Control-Allow-Origin", "*")
                     self.end_headers()
                     with open(zip_path, "rb") as f:
                         shutil.copyfileobj(f, self.wfile, 1 << 20)
@@ -4713,7 +4747,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(content)))
             self.send_header("Content-Disposition",
                              'attachment; filename="kelpworks-backup-%s.db"' % ts)
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(content)
         except Exception as e:  # pragma: no cover
@@ -4746,14 +4779,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": "File missing on disk"}, 404)
             with open(full, "rb") as f:
                 data = f.read()
-            disp = "attachment" if qs.get("dl", [""])[0] else "inline"
-            safe = r["filename"].replace('"', '').replace("\r", "").replace("\n", "")
+            ctype, inline_ok = served_type(r["filename"])             # from the file name, never from the stored (client-sent) type
             self.send_response(200)
-            self.send_header("Content-Type", r["content_type"] or "application/octet-stream")
+            self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Content-Disposition", '%s; filename="%s"' % (disp, safe))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Disposition", content_disposition(r["filename"], inline_ok and not qs.get("dl", [""])[0]))
             self.end_headers()
             self.wfile.write(data)
         except Exception as e:  # pragma: no cover
@@ -4782,14 +4812,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": "File missing on disk"}, 404)
             with open(full, "rb") as f:
                 data = f.read()
-            disp = "attachment" if qs.get("dl", [""])[0] else "inline"
-            safe = (r["filename"] or r["name"]).replace('"', '').replace("\r", "").replace("\n", "")
+            sop_name = r["filename"] or r["name"]
+            ctype, inline_ok = served_type(sop_name)
             self.send_response(200)
-            self.send_header("Content-Type", r["content_type"] or "application/octet-stream")
+            self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Content-Disposition", '%s; filename="%s"' % (disp, safe))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Disposition", content_disposition(sop_name, inline_ok and not qs.get("dl", [""])[0]))
             self.end_headers()
             self.wfile.write(data)
         except Exception as e:  # pragma: no cover
@@ -4819,9 +4847,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/pdf")
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Content-Disposition", '%s; filename="%s_%s.pdf"' % (
-                disp, S["lot"], "Certificate-of-Analysis" if kind == "coa" else "Production-Log-Summary"))
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Disposition", content_disposition("%s_%s.pdf" % (
+                S["lot"], "Certificate-of-Analysis" if kind == "coa" else "Production-Log-Summary"), disp == "inline"))
             self.end_headers()
             self.wfile.write(data)
         except Exception as e:  # pragma: no cover
@@ -4854,8 +4881,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Content-Disposition", 'attachment; filename="%s"' % fname)
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Disposition", content_disposition(fname, False))
             self.end_headers()
             self.wfile.write(data)
         except Exception as e:  # pragma: no cover
@@ -4935,9 +4961,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", CONTENT_TYPES.get(ext, "application/octet-stream"))
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("X-Content-Type-Options", "nosniff")
         # the app files change with every release and are not versioned: always re-fetch, so a browser never runs an old app.js against a newer server
         self.send_header("Cache-Control", "no-cache, must-revalidate")
+        if ext == ".html":
+            self.send_header("Content-Security-Policy", APP_CSP)      # the app page runs only its own script (no injected inline script)
         self.end_headers()
         self.wfile.write(data)
 
@@ -4946,17 +4973,21 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         conn = db()
+        self._created_files, self._files_to_remove = [], []
         try:
             if method != "GET" and parsed.path != "/api/auth/login":
                 conn.execute("BEGIN IMMEDIATE")          # take the write lock BEFORE any read the handler bases a write on
             result = self._route(method, parsed.path, query, conn)
             conn.commit()
+            self._remove_files(self._files_to_remove)    # files of rows this request deleted (only once the delete is committed)
             self._send_json(result if result is not None else {"ok": True})
         except ApiError as e:
             conn.rollback()
+            self._remove_files(self._created_files)      # files this request wrote for rows that were rolled back
             self._send_json({"error": e.message, **({"code": e.code} if e.code else {})}, status=e.status)
         except Exception as e:  # pragma: no cover
             conn.rollback()
+            self._remove_files(self._created_files)
             self._send_json({"error": "Server error: %s" % e}, status=500)
         finally:
             conn.close()
@@ -5325,11 +5356,8 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "The file is empty")
         if len(raw) > MAX_UPLOAD_BYTES:
             raise ApiError(400, "File exceeds the %d MB limit" % (MAX_UPLOAD_BYTES // (1024 * 1024)))
-        os.makedirs(SOP_DIR, exist_ok=True)
-        ext = os.path.splitext(filename)[1][:12]
-        stored = secrets.token_hex(8) + ext
-        with open(os.path.join(SOP_DIR, stored), "wb") as f:
-            f.write(raw)
+        check_upload_filename(filename)
+        stored = self._write_upload(SOP_DIR, raw, os.path.splitext(filename)[1][:12])
         return filename, stored, len(raw)
 
     def _create_sop(self, conn, user):
@@ -5346,7 +5374,7 @@ class Handler(BaseHTTPRequestHandler):
         filename = stored = size = content_type = None
         if d.get("dataB64"):
             filename, stored, size = self._store_sop_file(d.get("filename"), d.get("contentType"), d["dataB64"])
-            content_type = d.get("contentType")
+            content_type = served_type(filename)[0]
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO sop_documents (name,key,filename,content_type,size,stored_name,uploaded_by,uploaded_at,"
@@ -5376,7 +5404,7 @@ class Handler(BaseHTTPRequestHandler):
         if d.get("dataB64"):
             filename, stored, size = self._store_sop_file(d.get("filename"), d.get("contentType"), d["dataB64"])
             old_stored = row["stored_name"]
-            updates.update(filename=filename, content_type=d.get("contentType"), size=size,
+            updates.update(filename=filename, content_type=served_type(filename)[0], size=size,
                            stored_name=stored, uploaded_by=user["name"] if user else None,
                            uploaded_at=now_iso())
             self._log_sop_edit(conn, sid, user, "File", row["filename"] or "—", filename)
@@ -5624,6 +5652,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(400, "Cannot delete a tote already consumed by a run")
                 if it["status"] == "wip":
                     raise ApiError(400, "Cannot delete a tote that's locked into an in-progress run")
+                self._files_to_remove += [os.path.join(UPLOAD_DIR, a["stored_name"]) for a in conn.execute(
+                    "SELECT stored_name FROM tote_attachments WHERE tote_lot_id=?", (tid,))]
                 conn.execute("DELETE FROM tote_lots WHERE id=?", (tid,))
                 return {"ok": True}
         raise ApiError(404, "Unknown totes endpoint")
@@ -8729,6 +8759,36 @@ class Handler(BaseHTTPRequestHandler):
                     "SELECT * FROM run_attachments WHERE run_id=? ORDER BY uploaded_at DESC, id DESC",
                     (run_id,))]
 
+    def _check_storage_room(self, conn, nbytes):
+        """Refuse an upload that would fill the document store or the disk (every user can upload, and the disk is shared with the database)."""
+        used = sum(conn.execute("SELECT COALESCE(SUM(size),0) FROM %s" % t).fetchone()[0] for t in ("run_attachments", "tote_attachments", "sop_documents"))
+        if used + nbytes > MAX_UPLOAD_TOTAL_BYTES:
+            raise ApiError(507, "The document store is full (%d MB used of %d MB). Ask an administrator to remove old documents."
+                           % (used // (1024 * 1024), MAX_UPLOAD_TOTAL_BYTES // (1024 * 1024)))
+        try:
+            free = shutil.disk_usage(UPLOAD_DIR if os.path.isdir(UPLOAD_DIR) else os.path.dirname(UPLOAD_DIR)).free
+        except OSError:
+            return
+        if free - nbytes < MIN_FREE_DISK_BYTES:
+            raise ApiError(507, "The server is almost out of disk space; the upload was refused.")
+
+    def _write_upload(self, directory, raw, ext):
+        """Write an uploaded file under an opaque name. The path is remembered so it is deleted again if the request fails before its commit."""
+        os.makedirs(directory, exist_ok=True)
+        stored = secrets.token_hex(8) + ext
+        path = os.path.join(directory, stored)
+        with open(path, "wb") as f:
+            f.write(raw)
+        self._created_files = getattr(self, "_created_files", []) + [path]
+        return stored
+
+    def _remove_files(self, paths):
+        for path in paths:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
     def _store_attachment(self, conn, run_id, filename, content_type, data_b64, uploaded_by):
         """Decode+store one base64 file and insert its run_attachments row.
         Shared by generic document uploads and every stage/tote photo slot."""
@@ -8744,16 +8804,14 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "The file is empty")
         if len(raw) > MAX_UPLOAD_BYTES:
             raise ApiError(400, "File exceeds the %d MB limit" % (MAX_UPLOAD_BYTES // (1024 * 1024)))
-        os.makedirs(UPLOAD_DIR, exist_ok=True)
-        ext = os.path.splitext(filename)[1][:12]
-        stored = secrets.token_hex(8) + ext
-        with open(os.path.join(UPLOAD_DIR, stored), "wb") as f:
-            f.write(raw)
+        check_upload_filename(filename)
+        self._check_storage_room(conn, len(raw))
+        stored = self._write_upload(UPLOAD_DIR, raw, os.path.splitext(filename)[1][:12])
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO run_attachments (run_id,filename,content_type,size,stored_name,"
             "uploaded_by,uploaded_at) VALUES (?,?,?,?,?,?,?)",
-            (run_id, filename, content_type or "application/octet-stream", len(raw),
+            (run_id, filename, served_type(filename)[0], len(raw),
              stored, uploaded_by, now_iso()))
         return cur.lastrowid
 
@@ -9075,16 +9133,14 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "The file is empty")
         if len(raw) > MAX_UPLOAD_BYTES:
             raise ApiError(400, "File exceeds the %d MB limit" % (MAX_UPLOAD_BYTES // (1024 * 1024)))
-        os.makedirs(UPLOAD_DIR, exist_ok=True)
-        ext = os.path.splitext(filename)[1][:12]
-        stored = secrets.token_hex(8) + ext
-        with open(os.path.join(UPLOAD_DIR, stored), "wb") as f:
-            f.write(raw)
+        check_upload_filename(filename)
+        self._check_storage_room(conn, len(raw))
+        stored = self._write_upload(UPLOAD_DIR, raw, os.path.splitext(filename)[1][:12])
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO tote_attachments (tote_lot_id,filename,content_type,size,stored_name,"
             "uploaded_by,uploaded_at) VALUES (?,?,?,?,?,?,?)",
-            (tote_id, filename, content_type or "application/octet-stream", len(raw), stored,
+            (tote_id, filename, served_type(filename)[0], len(raw), stored,
              uploaded_by, now_iso()))
         return cur.lastrowid
 
@@ -10050,6 +10106,8 @@ class Handler(BaseHTTPRequestHandler):
                    if rc["consumable_id"] else self._consumable_by_name(conn, rc["reagent"]))
             if row and rc["committed_kg"]:
                 self._consume(conn, row["id"], rc["committed_kg"], note, r["processing_lot"], uname)
+        self._files_to_remove += [os.path.join(UPLOAD_DIR, a["stored_name"]) for a in conn.execute(
+            "SELECT stored_name FROM run_attachments WHERE run_id=?", (rid,))]
         conn.execute("DELETE FROM production_runs WHERE id=?", (rid,))
         return {"ok": True}
 
