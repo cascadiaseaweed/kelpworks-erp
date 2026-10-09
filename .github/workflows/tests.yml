@@ -1,0 +1,23 @@
+name: tests
+
+# Runs on every pull request and on every push to main. The app is standard-library only, so there is nothing to install.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"        # the version the Docker image / runtime.txt use
+      - name: Compile (catches syntax errors)
+        run: python -m py_compile kelp_erp_server.py
+      - name: Tests (a brand-new database must start)
+        run: python -m unittest discover -s tests -v
