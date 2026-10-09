@@ -1406,6 +1406,8 @@ def init_db():
     conn.commit()
     if conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"] == 0:
         seed(conn)
+        migrate(conn)          # migrate() is idempotent: the steps that need the seeded reference data (SKU -> species links) now apply
+        conn.commit()
     ensure_users(conn)
     assign_item_numbers(conn)
     ensure_coa_specs(conn)
@@ -3807,8 +3809,9 @@ def migrate(conn):
             " nabenzoate_target=excluded.nabenzoate_target, active=1",
             (code, name, tds, ph, ksorb, nabenz))
         for sp in species_codes:
+            # a brand-new database has no species yet (seed() adds them after migrate()); init_db() runs this again once they exist
             conn.execute("INSERT OR IGNORE INTO fg_sku_species (sku_code,species_code)"
-                         " VALUES (?,?)", (code, sp))
+                         " SELECT ?, code FROM species WHERE code=?", (code, sp))
     conn.execute("INSERT OR IGNORE INTO locations (name) VALUES ('QAQC Hold')")
     # Backfill: totes already sitting at QAQC Hold from before the 'hold'
     # status existed should carry that status now.
