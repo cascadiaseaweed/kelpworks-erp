@@ -1,0 +1,11 @@
+# Past versions of the app whose databases the CURRENT code must be able to upgrade (tests/test_migrations.py).
+# Each one is built by checking out that commit and booting it on an empty database, then the current server is booted on a COPY.
+# Format: <commit>  <comment>.  The commits must exist in the repository history (CI fetches full history).
+#
+# After each release, add the commit that is now live (a deployed database is what has to keep working).
+5a6ca97  2026-06-18  initial commit
+6f4a3a9  2026-07-28  draft production runs
+e56f9bf  2026-09-20  process-log makeover
+177ddf4  2026-10-03  inventory cleanup, reagent deduction
+89d2f4b  2026-10-07  certificate of analysis, release gate
+64a35b4  2026-10-08  QC control charts (the release before the SGS update)
