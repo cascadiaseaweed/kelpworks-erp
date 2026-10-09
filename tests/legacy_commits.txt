@@ -9,3 +9,5 @@ e56f9bf  2026-09-20  process-log makeover
 177ddf4  2026-10-03  inventory cleanup, reagent deduction
 89d2f4b  2026-10-07  certificate of analysis, release gate
 64a35b4  2026-10-08  QC control charts (the release before the SGS update)
+f130934  2026-10-08  SGS mineral scans, contacts, merged Sample IDs (live 2026-10-08)
+d0a85f8  2026-10-09  staging support, tests and CI (live now; later commits are documentation only)
