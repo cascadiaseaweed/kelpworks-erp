@@ -5957,6 +5957,59 @@ async function useReadyTemplate(lab, after) {
     await after();
   } catch (e) { toast(e.message, true); }
 }
+// The analyses a lab offers, as checkboxes grouped by category (a group's header ticks or unticks the whole group, e.g. "CFIA Heavy Metals").
+// Minerals count toward the lab's mineral scan, which the requisition adds on its own (Up to 12 / Up to 20), so scans are never listed here.
+// `chosen` is a Set of analysis ids that the picker edits; onChange(chosen) fires after every change.
+function analysisPicker(lab, chosen, onChange, opts = {}) {
+  const offered = lab.analyses.filter(a => a.active && a.kind !== 'scan').sort((a, b) => a.id - b.id);
+  const groups = [];
+  offered.forEach(a => { const k = a.category || ''; let g = groups.find(x => x.name === k); if (!g) { g = { name: k, items: [] }; groups.push(g); } g.items.push(a); });
+  groups.sort((a, b) => (a.name === '') - (b.name === ''));
+  const showHeads = groups.some(g => g.name);
+  const root = el('div', { class: 'ap' }), hint = el('div', { class: 'help ap-hint' });
+  const boxes = new Map();
+  const refresh = () => {
+    groups.forEach(g => { if (!g.head) return; const on = g.items.filter(a => chosen.has(a.id)).length; g.head.checked = on === g.items.length; g.head.indeterminate = on > 0 && on < g.items.length; });
+    if (allBox) { const on = offered.filter(a => chosen.has(a.id)).length; allBox.checked = on === offered.length && on > 0; allBox.indeterminate = on > 0 && on < offered.length; }
+    offered.forEach(a => { const cb = boxes.get(a.id); if (cb) cb.checked = chosen.has(a.id); });
+    const mins = offered.filter(a => a.kind === 'mineral' && chosen.has(a.id)).length;
+    hint.innerHTML = ''; hint.style.color = '';
+    if (mins) {
+      const scans = lab.analyses.filter(a => a.active && a.kind === 'scan' && a.capacity).sort((a, b) => a.capacity - b.capacity), scan = scans.find(x => x.capacity >= mins);
+      if (scan) hint.append('→ ', el('b', {}, scan.name), ' (' + mins + ' mineral' + (mins === 1 ? '' : 's') + ') is added to the requisition; the individual minerals are listed in its Notes.');
+      else { hint.style.color = 'var(--danger)'; hint.textContent = '⚠ ' + mins + ' minerals are more than the largest mineral scan this lab offers' + (scans.length ? ' (' + scans[scans.length - 1].capacity + ')' : '') + '.'; }
+    }
+  };
+  const fire = () => { refresh(); onChange(chosen); };
+  const setMany = (list, on) => { list.forEach(a => on ? chosen.add(a.id) : chosen.delete(a.id)); fire(); };
+  let allBox = null;
+  if (opts.all && offered.length > 1) {
+    allBox = el('input', { type: 'checkbox', onchange: () => setMany(offered, allBox.checked) });
+    root.append(el('label', { class: 'ap-head' }, allBox, el('b', {}, 'Select all'), el('span', { class: 'muted' }, ' (' + offered.length + ')')));
+  }
+  groups.forEach(g => {
+    const wrap = el('div', { class: 'ap-group' });
+    if (showHeads) {
+      g.head = el('input', { type: 'checkbox', title: 'Select every analysis in this group', onchange: () => setMany(g.items, g.head.checked) });
+      wrap.append(el('label', { class: 'ap-head' }, g.head, el('b', {}, g.name || 'Other analyses'), el('span', { class: 'muted' }, ' (' + g.items.length + ')')));
+    }
+    const items = el('div', { class: 'ap-items' });
+    g.items.forEach(a => {
+      const cb = el('input', { type: 'checkbox', onchange: () => { cb.checked ? chosen.add(a.id) : chosen.delete(a.id); fire(); } });
+      boxes.set(a.id, cb); cb.checked = chosen.has(a.id);
+      items.append(el('label', { class: 'ap-item', title: a.method ? 'Method: ' + a.method : '' }, cb, a.name));
+    });
+    wrap.append(items); root.append(wrap);
+  });
+  root.append(hint); refresh();
+  return root;
+}
+// What a requisition will ask the lab for: the mineral scan sized by the minerals ticked, plus every other analysis (minerals themselves go in the Notes)
+function analysisDisplayNames(lab, ids) {
+  const picked = lab.analyses.filter(a => ids.includes(a.id) && a.active), mins = picked.filter(a => a.kind === 'mineral').length;
+  const scan = mins ? lab.analyses.filter(a => a.active && a.kind === 'scan' && a.capacity).sort((a, b) => a.capacity - b.capacity).find(x => x.capacity >= mins) : null;
+  return [...(scan ? [scan.name] : []), ...picked.filter(a => a.kind !== 'mineral' && a.kind !== 'scan').map(a => a.name)];
+}
 async function drawSampleCart(host) {
   const { items, labs } = await api('GET', '/cart');
   const contactDefaults = await api('GET', '/requisition-contact');
@@ -5964,29 +6017,22 @@ async function drawSampleCart(host) {
   if (!labs.length) host.append(el('div', { class: 'card', style: 'margin-bottom:10px' }, 'No active labs yet — an administrator adds labs and their analyses under Admin → Labs & analyses.'));
   const selected = new Set();
   const redraw = async () => { host.innerHTML = ''; await drawSampleCart(host); };
-  async function assign(sampleId, labId, analysisIds) {
-    try { await api('PUT', '/cart/' + sampleId, { labId: labId || null, analysisIds }); }
-    catch (e) { toast(e.message, true); }
+  // Saves are queued per sample, so quick consecutive ticks can never land out of order (the last tick always wins on the server).
+  const assignQueue = new Map();
+  function assign(sampleId, labId, analysisIds) {
+    const ids = [...analysisIds], prev = assignQueue.get(sampleId) || Promise.resolve();
+    const next = prev.then(() => api('PUT', '/cart/' + sampleId, { labId: labId || null, analysisIds: ids })).catch(e => { toast(e.message, true); });
+    assignQueue.set(sampleId, next);
+    return next;
   }
   // bulk assign
   const bulkLab = el('select', {}, el('option', { value: '' }, 'Choose lab…'), ...labs.map(l => el('option', { value: l.id }, l.name)));
-  const bulkChecks = el('span', { style: 'display:flex;gap:10px;flex-wrap:wrap' });
+  const bulkChecks = el('div', { style: 'flex:1 1 420px;min-width:260px' });
   const bulkSet = new Set();
   bulkLab.addEventListener('change', () => {
     bulkSet.clear(); bulkChecks.innerHTML = '';
     const lab = labs.find(l => String(l.id) === bulkLab.value);
-    if (lab) {
-      const offered = lab.analyses.filter(a => a.active), boxes = [];
-      // "Select all" ticks every analysis this lab offers (and unticks itself if one is cleared)
-      const allBox = el('input', { type: 'checkbox' });
-      allBox.addEventListener('change', () => { const on = allBox.checked; boxes.forEach(([cb, a]) => { cb.checked = on; on ? bulkSet.add(a.id) : bulkSet.delete(a.id); }); allBox.checked = on; });
-      if (offered.length > 1) bulkChecks.append(el('label', { style: 'display:flex;gap:4px;align-items:center;font-size:13px;font-weight:700;padding-right:10px;border-right:1px solid var(--line)' }, allBox, 'Select all'));
-      offered.forEach(a => {
-        const cb = el('input', { type: 'checkbox', onchange: () => { cb.checked ? bulkSet.add(a.id) : bulkSet.delete(a.id); allBox.checked = boxes.every(([c]) => c.checked); } });
-        boxes.push([cb, a]);
-        bulkChecks.append(el('label', { style: 'display:flex;gap:4px;align-items:center;font-size:13px' }, cb, a.name));
-      });
-    }
+    if (lab) bulkChecks.append(analysisPicker(lab, bulkSet, () => {}, { all: true }));
   });
   const bulkBtn = el('button', { onclick: async () => {
     if (!selected.size) return toast('Tick the samples to assign.', true);
@@ -6005,23 +6051,18 @@ async function drawSampleCart(host) {
     const labSel = el('select', { style: 'min-width:190px' }, el('option', { value: '' }, 'Choose lab…'), ...labs.map(l => el('option', { value: l.id }, l.name)));
     labSel.value = it.cartLabId || '';
     const chosen = new Set(it.cartAnalyses);
-    const checks = el('span', { style: 'display:flex;gap:12px;flex-wrap:wrap' });
+    const checks = el('div', {});
     const statusCell = el('td', {});
     const setStatus = () => {
       statusCell.innerHTML = '';
       statusCell.append(!it.cartLabId ? badge('sold', 'Needs a lab') : !it.cartAnalyses.length ? badge('pending_release', 'Needs analyses') : badge('on_hand', 'Ready'));
     };
     const lab = labs.find(l => l.id === it.cartLabId);
-    const offered = lab ? lab.analyses.filter(a => a.active) : [];
-    if (lab && offered.length) offered.forEach(a => {
-      const cb = el('input', { type: 'checkbox' }); cb.checked = chosen.has(a.id);
-      cb.addEventListener('change', () => {
-        cb.checked ? chosen.add(a.id) : chosen.delete(a.id);
-        it.cartAnalyses = [...chosen]; setStatus();
-        assign(it.id, lab.id, it.cartAnalyses).then(updateSummary);
-      });
-      checks.append(el('label', { style: 'display:flex;gap:4px;align-items:center;font-size:13px' }, cb, a.name));
-    });
+    const offered = lab ? lab.analyses.filter(a => a.active && a.kind !== 'scan') : [];
+    if (lab && offered.length) checks.append(analysisPicker(lab, chosen, () => {
+      it.cartAnalyses = [...chosen]; setStatus();
+      assign(it.id, lab.id, it.cartAnalyses).then(updateSummary);
+    }));
     else if (lab) checks.append(el('span', { class: 'muted' }, 'No analyses are set up for ' + lab.name + ' yet. ',
       isAdmin ? el('a', { href: '#', onclick: e => { e.preventDefault(); manageLabAnalyses(lab.id); } }, 'Set them up') : 'Ask an administrator to add them (Admin → Labs & analyses).'));
     else checks.append(el('span', { class: 'muted' }, 'Pick a lab to see its analyses'));
@@ -6041,14 +6082,12 @@ async function drawSampleCart(host) {
   const poByKey = {};
   const poPayload = () => Object.assign({}, poByKey);
   const readyHost = el('div', {});
-  // the customer phone / emails printed on the forms: the admin defaults, editable for this requisition only
-  const cPhone = el('input', { value: contactDefaults.phone, placeholder: 'Phone' });
-  const cEmails = contactDefaults.emails.map((e, i) => el('input', { value: e, placeholder: 'Email ' + (i + 1) }));
-  const contactBox = el('details', { style: 'margin:8px 0' }, el('summary', {}, 'Our contact details on the requisition (phone and up to 5 emails)'),
-    el('div', { style: 'padding:8px 0' }, el('div', { class: 'form-row' }, field('Phone', cPhone), field('Email 1', cEmails[0])),
-      el('div', { class: 'form-row' }, field('Email 2', cEmails[1]), field('Email 3', cEmails[2])), el('div', { class: 'form-row' }, field('Email 4', cEmails[3]), field('Email 5', cEmails[4])),
+  // the contact details printed on the forms: the admin defaults, editable for this requisition only
+  const cf = contactFields(contactDefaults);
+  const contactBox = el('details', { style: 'margin:8px 0' }, el('summary', {}, 'Contact details on the requisition (submitted by, results emails)'),
+    el('div', { style: 'padding:8px 0' }, cf.node,
       el('div', { class: 'help' }, 'Starts from the defaults set by an administrator (Admin → Requisition contact details); changes here apply to the requisitions you create now.')));
-  const contactPayload = () => ({ phone: cPhone.value, emails: cEmails.map(i => i.value) });
+  const contactPayload = cf.payload;
   async function createReqs(filter, btn) {
     if (btn) btn.disabled = true;
     try {
@@ -6092,7 +6131,8 @@ async function drawSampleCart(host) {
       const k = it.runId + '|' + it.cartLabId;
       const g = groups[k] = groups[k] || { lot: it.processingLot, runId: it.runId, lab: labs.find(l => l.id === it.cartLabId), n: 0, names: new Set() };
       g.n++;
-      it.cartAnalyses.forEach(id => { const a = g.lab.analyses.find(x => x.id === id); if (a) g.names.add(a.name); });
+      analysisDisplayNames(g.lab, it.cartAnalyses).forEach(n => g.names.add(n));
+      if (g.lab.analyses.some(a => a.kind === 'mineral' && it.cartAnalyses.includes(a.id))) g.hasMinerals = true;
     });
     readyHost.innerHTML = '';
     const list = Object.values(groups);
@@ -6106,7 +6146,7 @@ async function drawSampleCart(host) {
       const btn = el('button', { onclick: () => createReqs({ labId: g.lab.id, runId: g.runId }, btn) }, '⬇ Create requisition & download');
       readyHost.append(el('div', { class: 'card', style: 'margin-bottom:8px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center' },
         el('div', {}, el('b', {}, g.lab.name + ' · ' + g.lot), el('span', { class: 'muted' }, '  ' + g.n + ' sample' + (g.n === 1 ? '' : 's')),
-          el('div', { class: 'help' }, 'Analyses: ' + [...g.names].join(', ')),
+          el('div', { class: 'help' }, 'Analyses: ' + [...g.names].join(', ') + (g.hasMinerals ? '  ·  the minerals requested are listed in the requisition Notes automatically' : '')),
           el('div', { style: 'display:flex;gap:8px;align-items:center;margin:6px 0' }, el('label', { style: 'margin:0;font-size:12px' }, 'PO / reference #'), po),
           el('div', { class: 'help' }, g.lab.hasTemplate ? '📄 Form: ' + g.lab.templateName : 'No form uploaded for this lab — a plain built-in layout will be used.',
             g.lab.sampleSheet ? ' · plus a sample spreadsheet' : ''),
@@ -6147,27 +6187,37 @@ async function drawRequisitions(host) {
   if (!requisitions.length) host.append(el('div', { class: 'help', style: 'margin-top:8px' }, 'Requisitions appear here once created from the cart.'));
 }
 
-/* ---- Admin: customer contact details printed on lab requisitions ---- */
+// The contact fields shared by the Samples cart (this requisition only) and Admin (the defaults). Returns the form `node`, a `payload()` and the `inputs`.
+function contactFields(c) {
+  const inp = (value, placeholder) => el('input', { value: value || '', placeholder: placeholder || '' });
+  const sName = inp(c.submitter.name, 'Name'), sPhone = inp(c.submitter.phone, 'Phone'), sEmail = inp(c.submitter.email, 'Email');
+  const emails = c.emails.map((e, i) => inp(e, 'Email ' + (i + 1) + (i ? ' (optional)' : '')));
+  const group = (title, hint, ...rows) => el('div', { class: 'perm-box' }, el('div', { class: 'perm-title' }, title), hint ? el('div', { class: 'help', style: 'margin:0 0 8px' }, hint) : null, ...rows);
+  const node = el('div', {},
+    group('Samples submitted by', 'The name and phone are also the contact for the results and the Client’s Authorized Signature (SGS: {{submitter_name}}, {{submitter_phone}}, {{submitter_email}}; FoodAssure: {{customer_phone}}).',
+      el('div', { class: 'form-row-3' }, field('Name', sName), field('Phone', sPhone), field('Email', sEmail))),
+    group('Send analysis results to (up to 5 emails)', 'Printed under “Send Analysis Results To” on the SGS form ({{results_emails}}, one per line) and as the customer emails on the FoodAssure form ({{customer_email_1}} … {{customer_email_5}}). Blank emails are left off.',
+      el('div', { class: 'form-row-3' }, field('Email 1', emails[0]), field('Email 2', emails[1]), field('Email 3', emails[2])),
+      el('div', { class: 'form-row' }, field('Email 4', emails[3]), field('Email 5', emails[4]))));
+  return { node, inputs: [sName, sPhone, sEmail, ...emails],
+    payload: () => ({ submitter: { name: sName.value, phone: sPhone.value, email: sEmail.value }, emails: emails.map(i => i.value) }) };
+}
+
+/* ---- Admin: contact details printed on lab requisitions ---- */
 async function drawAdminRequisitionContact(v) {
-  const c = await api('GET', '/requisition-contact');
-  const phone = el('input', { value: c.phone, placeholder: 'e.g. 204-963-5023' });
-  const emails = c.emails.map((e, i) => el('input', { value: e, placeholder: 'Email ' + (i + 1) + (i ? ' (optional)' : '') }));
+  const cf = contactFields(await api('GET', '/requisition-contact'));
   const msg = el('span', { class: 'help' });
-  const summaryNote = el('span', { class: 'muted', style: 'font-weight:normal;margin-left:8px' });
-  const refresh = () => { const n = emails.filter(i => i.value.trim()).length; summaryNote.textContent = (phone.value.trim() || 'no phone') + ' · ' + n + ' email' + (n === 1 ? '' : 's'); };
-  refresh();
   const save = el('button', { onclick: async () => {
     msg.style.color = ''; msg.textContent = '';
-    try { await api('PUT', '/requisition-contact', { phone: phone.value, emails: emails.map(i => i.value) }); msg.textContent = 'Saved.'; refresh(); toast('Requisition contact details saved'); }
+    try { await api('PUT', '/requisition-contact', cf.payload()); msg.textContent = 'Saved.'; toast('Requisition contact details saved'); }
     catch (e) { msg.style.color = 'var(--danger)'; msg.textContent = e.message; }
   } }, 'Save');
-  // collapsed by default and tucked under Labs & analyses: our phone + up to 5 emails printed on lab requisition forms
+  // collapsed by default and tucked under Labs & analyses: the name, phone and emails printed on lab requisition forms
   v.append(el('details', { class: 'accordion', style: 'margin-top:12px' },
-    el('summary', {}, 'Requisition contact details', summaryNote),
+    el('summary', {}, 'Requisition contact details'),
     el('div', { class: 'accordion-body' },
-      el('div', { class: 'help', style: 'margin:0 0 8px' }, 'Our phone number and up to five emails, printed where a lab form has {{customer_phone}} and {{customer_email_1}} … {{customer_email_5}} (the FoodAssure form does). Blank emails are left off; a requisition can override them in the Samples cart.'),
-      el('div', { class: 'form-row-3' }, field('Phone', phone), field('Email 1', emails[0]), field('Email 2', emails[1])),
-      el('div', { class: 'form-row-3' }, field('Email 3', emails[2]), field('Email 4', emails[3]), field('Email 5', emails[4])),
+      el('div', { class: 'help', style: 'margin:0 0 8px' }, 'The defaults printed on lab requisition forms. A requisition can override any of them in the Samples cart.'),
+      cf.node,
       el('div', { style: 'margin-top:8px;display:flex;gap:10px;align-items:center' }, save, msg))));
 }
 
@@ -6275,6 +6325,7 @@ function editLab(l) {
   const f = (k, placeholder) => el('input', { id: 'lb_' + k, value: (l && l[k]) || '', placeholder: placeholder || '' });
   const active = el('input', { type: 'checkbox' }); active.checked = l ? l.active : true;
   const sheetCb = el('input', { type: 'checkbox' }); sheetCb.checked = l ? l.sampleSheet : false;
+  const mergeCb = el('input', { type: 'checkbox' }); mergeCb.checked = l ? l.mergeIds : false;
   // the checklist look used elsewhere (Users, Certificate of Analysis specifications): one titled row per option, with its explanation
   const option = (cb, title, hint) => {
     const row = el('label', { class: 'perm-item' + (cb.checked ? ' on' : '') }, cb, el('span', { class: 'perm-text' }, el('b', {}, title), el('small', {}, hint)));
@@ -6290,10 +6341,11 @@ function editLab(l) {
       field('Address', f('address')), field('Notes', f('notes', 'Optional'))),
     section('Options', el('div', { class: 'perm-list' },
       option(active, 'Active', 'Offered in the Samples cart. Untick to retire a lab without deleting it.'),
-      option(sheetCb, 'Generate a sample spreadsheet', 'Also create an Excel sample list (sample ID, description, tests per sample) with each requisition — for labs whose form says “see attached spreadsheet”.'))));
+      option(sheetCb, 'Generate a sample spreadsheet', 'Also create an Excel sample list (sample ID, description, tests per sample) with each requisition — for labs whose form says “see attached spreadsheet”.'),
+      option(mergeCb, 'List each Sample ID once', 'Samples that share the same ID Simplified are ONE line on the form and the spreadsheet (container quantity and total volume add up; the tests requested are combined).'))));
   modal(l ? 'Edit lab — ' + l.name : 'Add lab', body, async () => {
     const p = {}; ['name', 'contact', 'email', 'phone', 'address', 'notes'].forEach(k => p[k] = body.querySelector('#lb_' + k).value);
-    p.active = active.checked; p.sampleSheet = sheetCb.checked;
+    p.active = active.checked; p.sampleSheet = sheetCb.checked; p.mergeIds = mergeCb.checked;
     if (l) await api('PUT', '/labs/' + l.id, p); else await api('POST', '/labs', p);
     toast('Lab saved'); render();
   }, l ? 'Save lab' : 'Add lab');
@@ -6302,23 +6354,37 @@ async function manageLabAnalyses(labId) {
   const { labs } = await api('GET', '/labs'); const l = labs.find(x => x.id === labId);
   const host = el('div', {});
   const name = el('input', { placeholder: 'Analysis name, e.g. Total Plate Count' }), code = el('input', { placeholder: 'Code (optional)', style: 'max-width:110px' }),
-    method = el('input', { placeholder: 'Method / spec (optional)', style: 'max-width:170px' });
+    method = el('input', { placeholder: 'Method / spec (optional)', style: 'max-width:170px' }), category = el('input', { placeholder: 'Group (optional)', style: 'max-width:150px', list: 'an_cats' });
+  const cats = el('datalist', { id: 'an_cats' }, ...[...new Set(l.analyses.map(a => a.category).filter(Boolean))].map(c => el('option', { value: c })));
+  const KIND = { analysis: 'Analysis', mineral: 'Mineral', scan: 'Mineral scan (automatic)' };
+  function editAnalysis(a) {
+    const n = el('input', { value: a.name }), c = el('input', { value: a.code || '' }), m = el('input', { value: a.method || '' }), g = el('input', { value: a.category || '', list: 'an_cats', placeholder: 'e.g. CFIA Heavy Metals' });
+    const kindSel = selectFrom('', Object.entries(KIND)); kindSel.value = a.kind || 'analysis';
+    const sym = el('input', { value: a.symbol || '', placeholder: 'e.g. Pb', style: 'max-width:90px' }), cap = el('input', { type: 'number', min: '1', value: a.capacity || '', style: 'max-width:110px' });
+    const capField = field('Minerals covered', cap), symField = field('Element symbol', sym);
+    const noteIn = el('input', { value: a.reqNote || '', placeholder: 'e.g. Total Nitrogen expressed in percent', maxlength: '300' });
+    const sync = () => { capField.classList.toggle('hidden', kindSel.value !== 'scan'); symField.classList.toggle('hidden', kindSel.value !== 'mineral'); };
+    kindSel.addEventListener('change', sync); sync();
+    modal('Edit analysis', el('div', {}, field('Name', n), el('div', { class: 'form-row' }, field('Code', c), field('Method / specification', m)),
+      el('div', { class: 'form-row' }, field('Group', g), field('Type', kindSel)), symField, capField,
+      field('Line added to the requisition Notes when requested (optional)', noteIn),
+      el('div', { class: 'help' }, 'A group shows in the cart with a select-all. “Mineral” analyses are counted to choose a mineral scan; a “Mineral scan” is never ticked by hand — it is added to the requisition from the number of minerals ticked (smallest scan that covers them).')), async () => {
+      await api('PUT', '/labs/' + labId + '/analyses/' + a.id, { name: n.value, code: c.value, method: m.value, category: g.value, kind: kindSel.value, symbol: sym.value, capacity: cap.value, reqNote: noteIn.value }); draw();
+    }, 'Save');
+  }
   async function draw() {
     const fresh = (await api('GET', '/labs')).labs.find(x => x.id === labId);
     host.innerHTML = '';
-    host.append(table(['Analysis', 'Code', 'Method / spec', 'Status', ''], fresh.analyses.map(a => [a.name, a.code || '—', a.method || '—', a.active ? badge('on_hand', 'Offered') : badge('disposed', 'Hidden'),
+    const ord = [...fresh.analyses].sort((a, b) => ((a.category || '~') > (b.category || '~')) - ((a.category || '~') < (b.category || '~')) || a.id - b.id);
+    host.append(table(['Analysis', 'Group', 'Type', 'Code', 'Method / spec', 'Status', ''], ord.map(a => [a.reqNote ? el('span', {}, a.name, el('div', { class: 'help' }, 'Notes: ' + a.reqNote)) : a.name, a.category || '—',
+      a.kind === 'scan' ? 'Scan · up to ' + a.capacity : a.kind === 'mineral' ? 'Mineral' : 'Analysis', a.code || '—', a.method || '—', a.active ? badge('on_hand', 'Offered') : badge('disposed', 'Hidden'),
       rowActions([[a.active ? 'Hide' : 'Show', async () => { await api('PUT', '/labs/' + labId + '/analyses/' + a.id, { active: !a.active }); draw(); }],
-        ['Edit', () => {
-          const n = el('input', { value: a.name }), c = el('input', { value: a.code || '' }), m = el('input', { value: a.method || '' });
-          modal('Edit analysis', el('div', {}, field('Name', n), el('div', { class: 'form-row' }, field('Code', c), field('Method / specification', m))), async () => {
-            await api('PUT', '/labs/' + labId + '/analyses/' + a.id, { name: n.value, code: c.value, method: m.value }); draw();
-          }, 'Save');
-        }],
+        ['Edit', () => editAnalysis(a)],
         ['Delete', async () => { if (confirm('Delete “' + a.name + '”? Past requisitions keep their record of it.')) { await api('DELETE', '/labs/' + labId + '/analyses/' + a.id); draw(); } }, 'danger']])])));
   }
   const add = el('button', { onclick: async () => {
     if (!name.value.trim()) return;
-    try { await api('POST', '/labs/' + labId + '/analyses', { name: name.value, code: code.value, method: method.value }); name.value = ''; code.value = ''; method.value = ''; draw(); }
+    try { await api('POST', '/labs/' + labId + '/analyses', { name: name.value, code: code.value, method: method.value, category: category.value }); name.value = ''; code.value = ''; method.value = ''; category.value = ''; draw(); }
     catch (e) { toast(e.message, true); }
   } }, '+ Add');
   const fromCoa = el('button', { class: 'secondary', onclick: async () => {
@@ -6362,14 +6428,14 @@ async function manageLabAnalyses(labId) {
       await draw();
     }, 'Add selected tests');
   } }, '+ From CoA tests');
-  modal('Analyses — ' + l.name, el('div', {}, host, el('div', { style: 'display:flex;gap:8px;margin-top:10px;flex-wrap:wrap' }, name, code, method, add, fromCoa),
+  modal('Analyses — ' + l.name, el('div', {}, host, el('div', { style: 'display:flex;gap:8px;margin-top:10px;flex-wrap:wrap' }, name, code, method, category, add, fromCoa, cats),
     el('div', { class: 'help', style: 'margin-top:8px' }, 'A template checkbox column uses {{sample.check:Analysis name}} (or the code). Hiding an analysis removes it from the cart without deleting it.')),
     async () => { render(); }, 'Close', { noCancel: true, wide: true });
   draw();
 }
 function labTemplateModal(l) {
   const file = el('input', { type: 'file', accept: '.docx' }), out = el('div', { class: 'help', style: 'margin-top:8px' });
-  const tokens = '{{req_number}} {{date}} {{date_long}} {{po_number}} {{po_check}} {{company}} {{lab_name}} {{lab_contact}} {{lab_email}} {{lab_phone}} {{lab_address}} {{customer_phone}} {{customer_email_1}} … {{customer_email_5}} {{processing_lot}} {{run_date}} {{product}} {{requested_by}} {{requested_by_email}} {{sample_count}} {{analyses}} {{notes}}';
+  const tokens = '{{req_number}} {{date}} {{date_long}} {{po_number}} {{po_check}} {{company}} {{lab_name}} {{lab_contact}} {{lab_email}} {{lab_phone}} {{lab_address}} {{customer_phone}} {{customer_email_1}} … {{customer_email_5}} {{submitter_name}} {{submitter_phone}} {{submitter_email}} {{results_name}} {{results_phone}} {{results_emails}} {{results_email_1}} … {{results_email_5}} {{br}} {{processing_lot}} {{run_date}} {{product}} {{requested_by}} {{requested_by_email}} {{sample_count}} {{analyses}} {{notes}}';
   const body = el('div', {},
     el('div', { class: 'help' }, l.hasTemplate ? 'Current template: ' + l.templateName : 'No template uploaded — requisitions use the built-in layout.'),
     l.hasTemplate ? el('div', { style: 'margin:6px 0' }, el('a', { href: '/api/labs/' + l.id + '/template/download?token=' + encodeURIComponent(State.token) }, '⬇ Download current template'),
@@ -6380,7 +6446,7 @@ function labTemplateModal(l) {
     field('Upload a Word template (.docx)', file), out,
     el('details', { style: 'margin-top:10px' }, el('summary', {}, 'Placeholders you can use in the template'),
       el('div', { class: 'help', style: 'margin-top:6px' }, 'Anywhere in the document: ' + tokens + '.'),
-      el('div', { class: 'help', style: 'margin-top:6px' }, 'Put these in ONE table row — that row is repeated for every sample: {{sample.n}} {{sample.id}} {{sample.stage}} {{sample.type}} {{sample.description}} {{sample.container}} {{sample.collected}} {{sample.analyses}} {{sample.location}}. {{sample.report_description}} and {{sample.methods}} (the methods of that sample’s analyses) are also available. For a column of analysis checkboxes use {{sample.check:Analysis name}} (☒ / ☐).'),
+      el('div', { class: 'help', style: 'margin-top:6px' }, 'Put these in ONE table row — that row is repeated for every sample: {{sample.n}} {{sample.id}} {{sample.stage}} {{sample.type}} {{sample.description}} {{sample.container}} {{sample.collected}} {{sample.analyses}} {{sample.location}}. {{sample.analyses_lines}} (the same tests, one per line with a blank line between) and {{sample.methods_lines}} (each test’s method on the matching line). {{sample.report_description}} and {{sample.methods}} (the methods of that sample’s analyses) are also available. For a column of analysis checkboxes use {{sample.check:Analysis name}} (☒ / ☐).'),
       el('div', { class: 'help', style: 'margin-top:6px' }, 'A paragraph containing {{analysis.name}} (also {{analysis.code}}, {{analysis.count}}) is repeated once for each test requested on the requisition — use it for a “Tests requested” list. A value with several lines can be placed with {{analyses}} (comma separated).')));
   modal('Requisition template — ' + l.name, body, async () => {
     if (!file.files[0]) throw new Error('Choose a .docx file to upload.');

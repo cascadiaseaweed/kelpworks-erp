@@ -578,3 +578,13 @@ th.sortable:hover { color: var(--teal-dark); }
 .viewbar input[type=date] { width: auto; padding: 5px 8px; font-size: 13px; }
 .viewbar select { max-width: 200px; }
 .qc-card .viewbar { background: #f6faf9; }
+
+/* Cart / bulk assign: analyses grouped by category */
+.ap { display: flex; flex-direction: column; gap: 6px; }
+.ap-group { padding: 4px 0 2px; }
+.ap-group + .ap-group { border-top: 1px dashed var(--line); padding-top: 8px; }
+.ap-head { display: flex; align-items: center; gap: 6px; margin: 0 0 3px; font-size: 12.5px; font-weight: normal; color: var(--teal-dark); }
+.ap-head input, .ap-item input { width: auto; margin: 0; }
+.ap-items { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.ap-item { display: inline-flex; align-items: center; gap: 4px; margin: 0; font-size: 13px; font-weight: normal; color: var(--ink); white-space: nowrap; }
+.ap-hint { margin: 2px 0 0; }

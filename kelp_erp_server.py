@@ -1123,6 +1123,7 @@ CREATE TABLE IF NOT EXISTS labs (
     template_name   TEXT,                           -- original filename of the uploaded requisition template
     template_stored TEXT,                           -- opaque name on disk under LAB_DIR
     sample_sheet    INTEGER NOT NULL DEFAULT 0,     -- 1 = also generate the "attached spreadsheet" (sample ID / description / tests per sample)
+    merge_ids       INTEGER NOT NULL DEFAULT 0,     -- 1 = samples sharing a Sample ID are ONE line on the form and the sheet (container qty / total volume add up)
     created_at      TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS lab_analyses (
@@ -1131,12 +1132,22 @@ CREATE TABLE IF NOT EXISTS lab_analyses (
     name    TEXT NOT NULL,
     code    TEXT, notes TEXT,
     method  TEXT,                                   -- e.g. "ICP-MS": printed in a form's Specifications / Methods column
-    active  INTEGER NOT NULL DEFAULT 1
+    active  INTEGER NOT NULL DEFAULT 1,
+    category TEXT,                                  -- a group shown in the cart with a select-all, e.g. "CFIA Heavy Metals"
+    kind    TEXT NOT NULL DEFAULT 'analysis',       -- analysis | mineral (counts toward a mineral scan) | scan (added automatically from the mineral count)
+    symbol  TEXT,                                   -- element symbol of a mineral (As, Ca ...)
+    capacity INTEGER,                               -- scan only: the most minerals this scan covers (12, 20)
+    req_note TEXT                                   -- text added to the requisition Notes whenever this analysis is requested
+);
+-- One-time seeding markers (so an analysis an admin deletes is not recreated at the next start).
+CREATE TABLE IF NOT EXISTS app_flags (
+    key   TEXT PRIMARY KEY,
+    value TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_lab_analyses_lab ON lab_analyses(lab_id);
 -- The customer (our) contact details printed on lab requisition forms: {{customer_phone}} and {{customer_email_1}} .. {{customer_email_5}}.
 CREATE TABLE IF NOT EXISTS requisition_contact (
-    key   TEXT PRIMARY KEY,                         -- phone | email_1 .. email_5
+    key   TEXT PRIMARY KEY,                         -- phone | email_1 .. email_5 | submit_name/phone/email | results_name/phone/email_1 .. email_5
     value TEXT NOT NULL DEFAULT ''
 );
 -- Control charts (Quality Control tab): the control limits a user set by hand for one measurement at one process section, plus an
@@ -1399,6 +1410,7 @@ def init_db():
     assign_item_numbers(conn)
     ensure_coa_specs(conn)
     ensure_requisition_contact(conn)
+    ensure_sgs_analyses(conn)
     conn.commit()
     rebaseline_release_hashes(conn)
     conn.commit()
@@ -1887,7 +1899,112 @@ COA_SPEC_SEED = [
 COA_PPM_FACTORS = {"ppm": 1.0, "mg/kg": 1.0, "mg/l": 1.0, "%": 10000.0, "ppb": 0.001, "ug/kg": 0.001, "g/kg": 1000.0}
 
 
-REQ_CONTACT_DEFAULTS = (("phone", "204-963-5023"), ("email_1", "nwrana@cascadiaseaweed.com"), ("email_2", "dpedde@cascadiaseaweed.com"),
+# SGS: the analyses we can request. Minerals are picked individually (the 11 on the Certificate of Analysis are the "CFIA Heavy Metals" group); the
+# requisition shows a single "Mineral Scan Up to 12 / 20" chosen from how many minerals were ticked, and lists the minerals themselves in the Notes.
+MINERAL_ORDER = ["As", "Cd", "Cr", "Co", "Cu", "Pb", "Hg", "Mo", "Ni", "Se", "Zn", "Ca", "K", "Na", "P", "Mg", "Fe", "S"]
+SGS_CFIA = "CFIA Heavy Metals"
+SGS_MINERALS = [("Arsenic (As)", "As", SGS_CFIA), ("Cadmium (Cd)", "Cd", SGS_CFIA), ("Chromium (Cr)", "Cr", SGS_CFIA), ("Cobalt (Co)", "Co", SGS_CFIA),
+                ("Copper (Cu)", "Cu", SGS_CFIA), ("Lead (Pb)", "Pb", SGS_CFIA), ("Mercury (Hg)", "Hg", SGS_CFIA), ("Molybdenum (Mo)", "Mo", SGS_CFIA),
+                ("Nickel (Ni)", "Ni", SGS_CFIA), ("Selenium (Se)", "Se", SGS_CFIA), ("Zinc (Zn)", "Zn", SGS_CFIA),
+                ("Calcium (Ca)", "Ca", "Other minerals"), ("Potassium (K)", "K", "Other minerals"), ("Sodium (Na)", "Na", "Other minerals"),
+                ("Phosphorus (P)", "P", "Other minerals"), ("Magnesium (Mg)", "Mg", "Other minerals"), ("Iron (Fe)", "Fe", "Other minerals"),
+                ("Sulfur (S)", "S", "Other minerals")]
+SGS_DIRECT = ["Total Nitrogen", "Moisture - Vacuum Oven", "Proximate Analysis"]
+SGS_SCANS = [("Mineral Scan Up to 12", 12), ("Mineral Scan Up to 20", 20)]
+# analyses whose request always adds a line to the requisition Notes (an admin can edit these per analysis)
+SGS_REQ_NOTES = {"Total Nitrogen": "Total Nitrogen expressed in percent",
+                 "Proximate Analysis": "Ash, Crude_protein, Crude_fat (Crude_lipid), Crude_Fiber"}
+
+
+def ensure_sgs_analyses(conn):
+    """Once per SGS lab: make sure the requestable analyses exist and the 11 CoA minerals sit in the "CFIA Heavy Metals" group. Existing rows are
+    kept (their ids may be in cart assignments); only rows still at their defaults are re-categorised."""
+    for lab in conn.execute("SELECT id FROM labs WHERE LOWER(name) LIKE '%sgs%'").fetchall():
+        flag = "sgs_analyses_%d" % lab["id"]
+        if conn.execute("SELECT 1 FROM app_flags WHERE key=?", (flag,)).fetchone():
+            continue
+        have = {r["name"].lower(): r for r in conn.execute("SELECT * FROM lab_analyses WHERE lab_id=?", (lab["id"],))}
+
+        def put(name, kind, category=None, symbol=None, capacity=None, method=None):
+            r = have.get(name.lower())
+            if r is None:
+                conn.execute("INSERT INTO lab_analyses (lab_id,name,method,category,kind,symbol,capacity) VALUES (?,?,?,?,?,?,?)",
+                             (lab["id"], name, method, category, kind, symbol, capacity))
+            elif (r["kind"] or "analysis") == "analysis" and not r["category"] and kind != "analysis":
+                conn.execute("UPDATE lab_analyses SET kind=?, category=?, symbol=?, capacity=?, method=COALESCE(method,?) WHERE id=?",
+                             (kind, category, symbol, capacity, method, r["id"]))
+        for name, symbol, category in SGS_MINERALS:
+            put(name, "mineral", category, symbol, None, "ICP-MS")
+        for name in SGS_DIRECT:
+            put(name, "analysis")
+        for name, cap in SGS_SCANS:
+            put(name, "scan", None, None, cap, "ICP-MS")
+        conn.execute("INSERT OR REPLACE INTO app_flags (key,value) VALUES (?,?)", (flag, now_iso()))
+    # the SGS form lists a Sample ID once however many samples share it (once per lab, so an admin can switch it off)
+    for lab in conn.execute("SELECT id FROM labs WHERE LOWER(name) LIKE '%sgs%'").fetchall():
+        flag = "sgs_merge_ids_%d" % lab["id"]
+        if not conn.execute("SELECT 1 FROM app_flags WHERE key=?", (flag,)).fetchone():
+            conn.execute("UPDATE labs SET merge_ids=1 WHERE id=?", (lab["id"],))
+            conn.execute("INSERT OR REPLACE INTO app_flags (key,value) VALUES (?,?)", (flag, now_iso()))
+    # the standing notes: once per lab, and only onto an analysis that has none (an admin's wording is never overwritten)
+    for lab in conn.execute("SELECT id FROM labs WHERE LOWER(name) LIKE '%sgs%'").fetchall():
+        flag = "sgs_req_notes_%d" % lab["id"]
+        if conn.execute("SELECT 1 FROM app_flags WHERE key=?", (flag,)).fetchone():
+            continue
+        for name, note in SGS_REQ_NOTES.items():
+            conn.execute("UPDATE lab_analyses SET req_note=? WHERE lab_id=? AND LOWER(name)=? AND req_note IS NULL", (note, lab["id"], name.lower()))
+        conn.execute("INSERT OR REPLACE INTO app_flags (key,value) VALUES (?,?)", (flag, now_iso()))
+
+
+def mineral_scan_for(analyses, n):
+    """The smallest active mineral scan of a lab that covers n minerals, or None."""
+    scans = sorted([a for a in analyses if a["kind"] == "scan" and a["active"] and a["capacity"]], key=lambda a: a["capacity"])
+    return next((a for a in scans if a["capacity"] >= n), None), (scans[-1]["capacity"] if scans else 0)
+
+
+def mineral_notes(sample_rows):
+    """Notes lines that spell out every mineral requested: one per distinct (scan, minerals) set, each once -- no Sample IDs. The scan name is
+    derived from the count, but the individual minerals are always listed. `**x**` marks the part printed in bold (the analysis the line is about)."""
+    out = []
+    for sr in sample_rows:
+        if sr.get("_minerals"):
+            line = "**%s** requested (%d mineral%s): %s." % (sr["scan"], len(sr["_minerals"]), "" if len(sr["_minerals"]) == 1 else "s", ", ".join(sr["_minerals"]))
+            if line not in out:
+                out.append(line)
+    return out
+
+
+def analysis_notes(sample_rows, an):
+    """One Notes line per requested analysis that carries a standing note (`lab_analyses.req_note`), in the lab's analysis order, each once however
+    many samples request it. The analysis name is bold: a note that already starts with the name has that part bolded, else the name is put in front."""
+    want = set()
+    for sr in sample_rows:
+        want.update(sr.get("_direct_ids", []))
+    out = []
+    for aid in sorted(want):
+        note = ((an[aid]["req_note"] or "").strip() if aid in an else "").replace("**", "")
+        if note:
+            name = an[aid]["name"]
+            line = ("**%s**%s" % (note[:len(name)], note[len(name):])) if note.lower().startswith(name.lower()) else "**%s:** %s" % (name, note)
+            if line not in out:
+                out.append(line)
+    return out
+
+
+def requisition_notes(sample_rows, an, user_notes):
+    """The requisition Notes: every request is its own entry with a blank line between entries, each said once -- the minerals, then each analysis's standing note, then anything typed
+    in the cart. `**x**` marks bold text (the analysis a line applies to); the rest of the notes is regular."""
+    lines = mineral_notes(sample_rows) + analysis_notes(sample_rows, an)
+    seen = {ln.replace("**", "") for ln in lines}
+    for ln in (user_notes or "").replace("**", "").splitlines():
+        if ln.strip() and ln.strip() not in seen:
+            seen.add(ln.strip())
+            lines.append(ln.strip())
+    return "\n\n".join(lines)
+
+
+REQ_CONTACT_DEFAULTS = (("submit_name", "Nathan Wrana"), ("submit_phone", "204-963-5023"), ("submit_email", "nwrana@cascadiaseaweed.com"),
+                        ("email_1", "nwrana@cascadiaseaweed.com"), ("email_2", "dpedde@cascadiaseaweed.com"),
                         ("email_3", ""), ("email_4", ""), ("email_5", ""))
 
 
@@ -1897,20 +2014,39 @@ def ensure_requisition_contact(conn):
 
 
 def requisition_contact_get(conn):
-    """{'phone': str, 'emails': [5 strings]} -- the customer contact details printed on requisitions."""
+    """The contact details printed on requisitions: 'submitter' {name, phone, email} ("Samples submitted by"; the name and phone are also the contact
+    for results and the signature) and 'emails' [5] (where results are sent: "Send analysis results to" and the customer emails on the FoodAssure form)."""
     kv = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM requisition_contact")}
-    return {"phone": kv.get("phone", ""), "emails": [kv.get("email_%d" % i, "") for i in range(1, 6)]}
+    g = lambda k: kv.get(k, "")
+    return {"submitter": {"name": g("submit_name"), "phone": g("submit_phone"), "email": g("submit_email")},
+            "emails": [g("email_%d" % i) for i in range(1, 6)]}
 
 
-def requisition_contact_clean(d):
-    """Validate a {phone, emails} payload (the admin defaults, or a per-requisition override from the cart)."""
-    phone = str((d or {}).get("phone") or "").strip()[:40]
-    emails = [str(x or "").strip()[:120] for x in ((d or {}).get("emails") or [])][:5]
-    emails += [""] * (5 - len(emails))
-    for e in emails:
-        if e and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", e):
-            raise ApiError(400, "“%s” is not a valid email address" % e)
-    return {"phone": phone, "emails": emails}
+def _contact_email(e):
+    e = str(e or "").strip()[:120]
+    if e and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", e):
+        raise ApiError(400, "\u201c%s\u201d is not a valid email address" % e)
+    return e
+
+
+def requisition_contact_clean(d, base=None):
+    """Validate a contact payload (the admin defaults, or a per-requisition override from the cart). A part the payload leaves out
+    keeps its value from `base`."""
+    d = d or {}
+    base = base or {"submitter": {"name": "", "phone": "", "email": ""}, "emails": [""] * 5}
+    sub = d.get("submitter") or {}
+    emails = base["emails"] if d.get("emails") is None else [_contact_email(x) for x in d["emails"]][:5]
+    emails = list(emails) + [""] * (5 - len(emails))
+    pick = lambda k: str(sub[k] if k in sub else base["submitter"][k] or "").strip()
+    return {"submitter": {"name": pick("name")[:80], "phone": pick("phone")[:40],
+                          "email": _contact_email(sub["email"]) if "email" in sub else base["submitter"]["email"]},
+            "emails": emails}
+
+
+def requisition_contact_pairs(c):
+    """The requisition_contact (key, value) rows of a cleaned contact."""
+    return ([("submit_name", c["submitter"]["name"]), ("submit_phone", c["submitter"]["phone"]), ("submit_email", c["submitter"]["email"])]
+            + [("email_%d" % (i + 1), c["emails"][i]) for i in range(5)])
 
 
 def ensure_coa_specs(conn):
@@ -2292,10 +2428,12 @@ _W_T = re.compile(r"(<w:t(?:\s[^>]*)?>)(.*?)(</w:t>)", re.S)
 _TOKEN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 REQ_SCALAR_TOKENS = ["req_number", "date", "date_long", "po_number", "po_check", "company", "lab_name", "lab_contact", "lab_email", "lab_phone", "lab_address",
                      "customer_phone", "customer_email_1", "customer_email_2", "customer_email_3", "customer_email_4", "customer_email_5",
+                     "submitter_name", "submitter_phone", "submitter_email", "results_name", "results_phone", "results_emails", "br",
+                     "results_email_1", "results_email_2", "results_email_3", "results_email_4", "results_email_5",
                      "processing_lot", "run_date", "sku", "product", "requested_by", "requested_by_email",
                      "sample_count", "analyses", "notes"]
 REQ_ANALYSIS_KEYS = ["name", "code", "method", "count", "n"]
-REQ_SAMPLE_KEYS = ["n", "id", "id_detailed", "id_simplified", "code", "container_qty", "volume_text", "report_description", "stage", "type", "description", "container", "collected", "analyses", "methods", "location", "notes"]
+REQ_SAMPLE_KEYS = ["n", "id", "id_detailed", "id_simplified", "code", "container_qty", "volume_text", "minerals", "scan", "report_description", "stage", "type", "description", "container", "collected", "analyses", "analyses_lines", "methods", "methods_lines", "location", "notes"]
 
 
 def _x_unescape(t):
@@ -2308,6 +2446,34 @@ def _x_escape(t):
 
 def _xml_text(xml):
     return "".join(_x_unescape(m.group(2)) for m in _W_T.finditer(xml))
+
+
+def _run_props(rpr, bold):
+    """A run-properties block with bold switched on or off (the rest of the formatting is kept)."""
+    base = re.sub(r"<w:b(?:Cs)?(?:\s[^>]*)?/>", "", rpr or "")
+    if not bold:
+        return base
+    if not base:
+        return "<w:rPr><w:b/><w:bCs/></w:rPr>"
+    fonts = re.search(r"<w:rFonts[^>]*/>", base)
+    return base[:fonts.end()] + "<w:b/><w:bCs/>" + base[fonts.end():] if fonts else base.replace("<w:rPr>", "<w:rPr><w:b/><w:bCs/>", 1)
+
+
+def _bold_runs(text, pxml, t0):
+    """The replacement for a paragraph's first text element when the filled text uses `**bold**` markup: the original run is left empty
+    and the text follows as separate runs, bold inside the markers and regular outside (formatting otherwise copied from the original run).
+    The original run's closing tag is left to close the last new run."""
+    starts = [m.start() for m in re.finditer(r"<w:r(?=[\s>])", pxml[:t0.start()])]
+    rpr_m = re.search(r"<w:rPr>.*?</w:rPr>", pxml[starts[-1]:t0.start()], re.S) if starts else None
+    rpr = rpr_m.group(0) if rpr_m else ""
+    runs = []
+    for n, seg in enumerate(text.split("**")):
+        if seg:
+            runs.append("<w:r>%s<w:t xml:space=\"preserve\">%s</w:t></w:r>" % (
+                _run_props(rpr, n % 2 == 1), '</w:t><w:br/><w:t xml:space="preserve">'.join(_x_escape(x) for x in seg.split("\n"))))
+    if not runs:
+        return '<w:t xml:space="preserve"></w:t>'
+    return '<w:t xml:space="preserve"></w:t></w:r>' + "".join(runs)[:-len("</w:r>")]
 
 
 def _fill_paragraphs(xml, resolver):
@@ -2325,8 +2491,11 @@ def _fill_paragraphs(xml, resolver):
         out, pos = [], 0
         for i, t in enumerate(ts):
             out.append(pxml[pos:t.start()])
-            out.append('<w:t xml:space="preserve">%s</w:t>' % '</w:t><w:br/><w:t xml:space="preserve">'.join(
-                _x_escape(part) for part in new.split("\n")) if i == 0 else t.group(1) + "</w:t>")
+            if i == 0 and "**" in new:
+                out.append(_bold_runs(new, pxml, t))
+            else:
+                out.append('<w:t xml:space="preserve">%s</w:t>' % '</w:t><w:br/><w:t xml:space="preserve">'.join(
+                    _x_escape(part) for part in new.split("\n")) if i == 0 else t.group(1) + "</w:t>")
             pos = t.end()
         out.append(pxml[pos:])
         return "".join(out)
@@ -2636,20 +2805,26 @@ def volume_text(parts):
     return " + ".join(out)
 
 
-def consolidate_sample_rows(sample_rows):
+def consolidate_sample_rows(sample_rows, merge=None):
     """One line per Sample ID (+ the same description and requested tests): the lab gets a single line with the number of containers and their
-    total volume instead of the same ID repeated. Lines are in the order the IDs first appear."""
+    total volume instead of the same ID repeated. Lines are in the order the IDs first appear.
+    merge: a function (analysis ids) -> the analysis fields of a row. When given (labs that list a Sample ID once), samples sharing an ID are merged
+    whatever they request: the line asks for the union of their tests (so a mineral scan is sized for the union) and is numbered 1, 2, ..."""
     groups = {}
     for sr in sample_rows:
-        key = (sr["id"], sr["report_description"], tuple(sorted(x.lower() for x in sr["analysis_names"])))
-        g = groups.setdefault(key, {"row": sr, "containers": {}, "vols": [], "qty": 0})
+        key = sr["id"] if merge else (sr["id"], sr["report_description"], tuple(sorted(x.lower() for x in sr["analysis_names"])), tuple(sr.get("_minerals", [])))
+        g = groups.setdefault(key, {"row": sr, "containers": {}, "vols": [], "qty": 0, "ids": []})
         g["qty"] += 1
         if sr["container"]:
             g["containers"][sr["container"]] = g["containers"].get(sr["container"], 0) + 1
         g["vols"].append(sr.get("volume"))
+        g["ids"] += [i for i in sr.get("_ids", []) if i not in g["ids"]]
     out = []
-    for g in groups.values():
-        out.append(dict(g["row"], container=", ".join(g["containers"]) if g["containers"] else "", container_qty=g["qty"], volume_total=volume_text(g["vols"])))
+    for n, g in enumerate(groups.values(), 1):
+        row = dict(g["row"], container=", ".join(g["containers"]) if g["containers"] else "", container_qty=g["qty"], volume_total=volume_text(g["vols"]))
+        if merge:
+            row.update(merge(sorted(g["ids"])), n=str(n), volume_text=row["volume_total"], container_qty=str(g["qty"]))
+        out.append(row)
     return out
 
 
@@ -2661,14 +2836,15 @@ def requisition_id_conflicts(sample_rows):
     return sorted(i for i, v in variants.items() if len(v) > 1)
 
 
-def build_sample_sheet_xlsx(scalars, sample_rows, analyses):
+def build_sample_sheet_xlsx(scalars, sample_rows, analyses, lines=None):
     """The "attached spreadsheet" some labs (e.g. Food Assure) ask for: one line per Sample ID (samples sharing an ID are consolidated)
     with the description to use on the report, the number of containers and their total volume, and an X under each test requested."""
     T = lambda v, st=0: ("t", v, st)
-    lines = consolidate_sample_rows(sample_rows)
+    lines = lines if lines is not None else consolidate_sample_rows(sample_rows)
     s = XlsxSheet("Samples")
-    s.set_widths([30, 52, 18, 10, 18, 14, 18] + [18] * len(analyses))
-    span = 7 + len(analyses)
+    with_min = any(sr.get("_minerals") for sr in lines)
+    s.set_widths([30, 52, 18, 10, 18, 14, 18] + ([46] if with_min else []) + [18] * len(analyses))
+    span = 7 + (1 if with_min else 0) + len(analyses)
     s.title("Sample list - %s" % scalars.get("req_number", ""), span)
     s.row([T("Company", 7), T(scalars.get("company", ""))])
     s.row([T("Lab", 7), T(scalars.get("lab_name", ""))])
@@ -2676,11 +2852,15 @@ def build_sample_sheet_xlsx(scalars, sample_rows, analyses):
     s.row([T("PO#", 7), T(scalars.get("po_number", ""))])
     s.row([T("Production run", 7), T(scalars.get("processing_lot", ""))])
     s.row([])
-    s.row([T(h, 3) for h in ["Sample ID", "Sample description (as it should appear on the report)", "Collected", "Type", "Container", "Container Qty", "Total sample volume"]]
+    s.row([T(h, 3) for h in ["Sample ID", "Sample description (as it should appear on the report)", "Collected", "Type", "Container", "Container Qty", "Total sample volume"]
+                          + (["Minerals requested"] if with_min else [])]
           + [T(a["name"], 3) for a in analyses])
     for sr in lines:
         chosen = {x.lower() for x in sr["analysis_names"]}
-        s.row([T(sr["id"]), T(sr["report_description"]), T(sr["collected"]), T(sr["type"]), T(sr["container"]), ("n", sr["container_qty"], 0), T(sr["volume_total"])]
+        # the sheet describes a sample by lot + process point (no product), the collected DATE only, and a whole number of containers
+        s.row([T(sr["id"]), T(sr["sheet_description"]), T((sr["collected"] or "")[:10]), T(sr["type"]), T(sr["container"]),
+               ("n", int(round(float(sr["container_qty"] or 0))), 0), T(sr["volume_total"])]
+              + ([T(sr.get("minerals", ""))] if with_min else [])
               + [T("X" if a["name"].lower() in chosen else "") for a in analyses])
     return xlsx_build([s])
 
@@ -3514,6 +3694,8 @@ def migrate(conn):
     labcols = {r["name"] for r in conn.execute("PRAGMA table_info(labs)")}
     if "sample_sheet" not in labcols:
         conn.execute("ALTER TABLE labs ADD COLUMN sample_sheet INTEGER NOT NULL DEFAULT 0")
+    if "merge_ids" not in labcols:
+        conn.execute("ALTER TABLE labs ADD COLUMN merge_ids INTEGER NOT NULL DEFAULT 0")
     scols = {r["name"] for r in conn.execute("PRAGMA table_info(samples)")}
     for col in ("short_id", "id_detailed", "id_simplified", "label_type"):
         if col not in scols:
@@ -3532,6 +3714,9 @@ def migrate(conn):
     lacols = {r["name"] for r in conn.execute("PRAGMA table_info(lab_analyses)")}
     if "method" not in lacols:
         conn.execute("ALTER TABLE lab_analyses ADD COLUMN method TEXT")
+    for col, ddl in (("category", "TEXT"), ("kind", "TEXT NOT NULL DEFAULT 'analysis'"), ("symbol", "TEXT"), ("capacity", "INTEGER"), ("req_note", "TEXT")):
+        if col not in lacols:
+            conn.execute("ALTER TABLE lab_analyses ADD COLUMN %s %s" % (col, ddl))
     reqcols = {r["name"] for r in conn.execute("PRAGMA table_info(lab_requisitions)")}
     for col in ("po_number", "sheet_attachment_id"):
         if col not in reqcols:
@@ -4476,8 +4661,8 @@ class Handler(BaseHTTPRequestHandler):
             return requisition_contact_get(conn)
         if seg == ["api", "requisition-contact"] and method == "PUT":
             self._require_admin(user)
-            c = requisition_contact_clean(self._body_json())
-            for k, v in [("phone", c["phone"])] + [("email_%d" % (i + 1), c["emails"][i]) for i in range(5)]:
+            c = requisition_contact_clean(self._body_json(), requisition_contact_get(conn))
+            for k, v in requisition_contact_pairs(c):
                 conn.execute("INSERT OR REPLACE INTO requisition_contact (key,value) VALUES (?,?)", (k, v))
             return requisition_contact_get(conn)
         if seg == ["api", "sample-label-names"] and method == "PUT":
@@ -5509,10 +5694,27 @@ class Handler(BaseHTTPRequestHandler):
         return {"id": r["id"], "name": r["name"], "templateTokens": tokens, "readyTemplate": os.path.basename(ready) if ready else None, "contact": r["contact"], "email": r["email"], "phone": r["phone"],
                 "address": r["address"], "notes": r["notes"], "active": bool(r["active"]),
                 "hasTemplate": bool(r["template_stored"]), "templateName": r["template_name"],
-                "sampleSheet": bool(r["sample_sheet"]),
+                "sampleSheet": bool(r["sample_sheet"]), "mergeIds": bool(r["merge_ids"]),
                 "analyses": [{"id": a["id"], "name": a["name"], "code": a["code"], "notes": a["notes"], "method": a["method"],
-                              "active": bool(a["active"])}
+                              "active": bool(a["active"]), "category": a["category"], "kind": a["kind"] or "analysis",
+                              "symbol": a["symbol"], "capacity": a["capacity"], "reqNote": a["req_note"]}
                              for a in conn.execute("SELECT * FROM lab_analyses WHERE lab_id=? ORDER BY name", (r["id"],))]}
+
+    @staticmethod
+    def _analysis_kind(d, cur=None):
+        """(kind, capacity) from a request body: analysis | mineral | scan (a scan needs the number of minerals it covers)."""
+        kind = d.get("kind", cur["kind"] if cur else "analysis") or "analysis"
+        if kind not in ("analysis", "mineral", "scan"):
+            raise ApiError(400, "Type must be Analysis, Mineral or Mineral scan")
+        cap = None
+        if kind == "scan":
+            try:
+                cap = int(d["capacity"]) if d.get("capacity") not in (None, "") else (cur["capacity"] if cur else None)
+            except (TypeError, ValueError):
+                cap = None
+            if not cap or cap < 1:
+                raise ApiError(400, "Enter how many minerals this scan covers")
+        return kind, cap
 
     def _labs_all(self, conn):
         return [self._lab_public(conn, r) for r in conn.execute("SELECT * FROM labs ORDER BY name")]
@@ -5552,9 +5754,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(400, "Lab name is required")
                 if conn.execute("SELECT 1 FROM labs WHERE name=?", (name,)).fetchone():
                     raise ApiError(409, "A lab with that name already exists")
-                cur = conn.execute("INSERT INTO labs (name,contact,email,phone,address,notes,sample_sheet,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                cur = conn.execute("INSERT INTO labs (name,contact,email,phone,address,notes,sample_sheet,merge_ids,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
                                    (name, d.get("contact"), d.get("email"), d.get("phone"), d.get("address"), d.get("notes"),
-                                    1 if d.get("sampleSheet") else 0, now_iso()))
+                                    1 if d.get("sampleSheet") else 0, 1 if d.get("mergeIds") else 0, now_iso()))
                 return self._lab_public(conn, conn.execute("SELECT * FROM labs WHERE id=?", (cur.lastrowid,)).fetchone())
         if len(seg) >= 3 and seg[2].isdigit():
             lid = int(seg[2])
@@ -5568,11 +5770,12 @@ class Handler(BaseHTTPRequestHandler):
                     name = (d.get("name") or lab["name"]).strip()
                     if name != lab["name"] and conn.execute("SELECT 1 FROM labs WHERE name=? AND id<>?", (name, lid)).fetchone():
                         raise ApiError(409, "A lab with that name already exists")
-                    conn.execute("UPDATE labs SET name=?, contact=?, email=?, phone=?, address=?, notes=?, active=?, sample_sheet=? WHERE id=?",
+                    conn.execute("UPDATE labs SET name=?, contact=?, email=?, phone=?, address=?, notes=?, active=?, sample_sheet=?, merge_ids=? WHERE id=?",
                                  (name, d.get("contact", lab["contact"]), d.get("email", lab["email"]), d.get("phone", lab["phone"]),
                                   d.get("address", lab["address"]), d.get("notes", lab["notes"]),
                                   (1 if d["active"] else 0) if "active" in d else lab["active"],
-                                  (1 if d["sampleSheet"] else 0) if "sampleSheet" in d else lab["sample_sheet"], lid))
+                                  (1 if d["sampleSheet"] else 0) if "sampleSheet" in d else lab["sample_sheet"],
+                                  (1 if d["mergeIds"] else 0) if "mergeIds" in d else lab["merge_ids"], lid))
                     return self._lab_public(conn, conn.execute("SELECT * FROM labs WHERE id=?", (lid,)).fetchone())
                 if method == "DELETE":
                     if conn.execute("SELECT 1 FROM lab_requisitions WHERE lab_id=?", (lid,)).fetchone() or \
@@ -5594,9 +5797,11 @@ class Handler(BaseHTTPRequestHandler):
                         raise ApiError(400, "Analysis name is required")
                     if conn.execute("SELECT 1 FROM lab_analyses WHERE lab_id=? AND name=?", (lid, name)).fetchone():
                         raise ApiError(409, "That analysis already exists for this lab")
-                    conn.execute("INSERT INTO lab_analyses (lab_id,name,code,notes,method) VALUES (?,?,?,?,?)",
+                    kind, cap = self._analysis_kind(d)
+                    conn.execute("INSERT INTO lab_analyses (lab_id,name,code,notes,method,category,kind,symbol,capacity,req_note) VALUES (?,?,?,?,?,?,?,?,?,?)",
                                  (lid, name, (d.get("code") or "").strip() or None, (d.get("notes") or "").strip() or None,
-                                  (d.get("method") or "").strip() or None))
+                                  (d.get("method") or "").strip() or None, (d.get("category") or "").strip() or None, kind,
+                                  (d.get("symbol") or "").strip() or None, cap, (d.get("reqNote") or "").strip()[:300] or None))
                     return self._lab_public(conn, lab)
                 if len(seg) == 5 and seg[4].isdigit():
                     aid = int(seg[4])
@@ -5608,9 +5813,13 @@ class Handler(BaseHTTPRequestHandler):
                         name = (d.get("name") or a["name"]).strip()
                         if name != a["name"] and conn.execute("SELECT 1 FROM lab_analyses WHERE lab_id=? AND name=? AND id<>?", (lid, name, aid)).fetchone():
                             raise ApiError(409, "That analysis already exists for this lab")
-                        conn.execute("UPDATE lab_analyses SET name=?, code=?, notes=?, method=?, active=? WHERE id=?",
+                        kind, cap = self._analysis_kind(d, a)
+                        conn.execute("UPDATE lab_analyses SET name=?, code=?, notes=?, method=?, active=?, category=?, kind=?, symbol=?, capacity=?, req_note=? WHERE id=?",
                                      (name, d.get("code", a["code"]), d.get("notes", a["notes"]), d.get("method", a["method"]),
-                                      (1 if d["active"] else 0) if "active" in d else a["active"], aid))
+                                      (1 if d["active"] else 0) if "active" in d else a["active"],
+                                      ((d.get("category") or "").strip() or None) if "category" in d else a["category"], kind,
+                                      ((d.get("symbol") or "").strip() or None) if "symbol" in d else a["symbol"], cap,
+                                      ((d.get("reqNote") or "").strip()[:300] or None) if "reqNote" in d else a["req_note"], aid))
                         return self._lab_public(conn, lab)
                     if method == "DELETE":
                         conn.execute("DELETE FROM lab_analyses WHERE id=?", (aid,))
@@ -5685,7 +5894,7 @@ class Handler(BaseHTTPRequestHandler):
         lab = conn.execute("SELECT * FROM labs WHERE id=? AND active=1", (lab_id,)).fetchone()
         if not lab:
             raise ApiError(400, "Choose an active lab")
-        ok = {a["id"] for a in conn.execute("SELECT id FROM lab_analyses WHERE lab_id=? AND active=1", (lab_id,))}
+        ok = {a["id"] for a in conn.execute("SELECT id FROM lab_analyses WHERE lab_id=? AND active=1 AND kind!='scan'", (lab_id,))}   # scans are added automatically
         ids = [int(x) for x in (analysis_ids or [])]
         bad = [x for x in ids if x not in ok]
         if bad:
@@ -5721,15 +5930,15 @@ class Handler(BaseHTTPRequestHandler):
             # what would be created: the filled form + sample list for each lab / run that is ready (nothing is written)
             d = self._body_json()
             notes = (d.get("notes") or "").strip() or None
-            contact = requisition_contact_clean(d["contact"]) if d.get("contact") else None
+            contact = requisition_contact_clean(d["contact"], requisition_contact_get(conn)) if d.get("contact") else None
             out = []
             for (run_id, lab_id), items in self._cart_ready_groups(conn, d).items():
                 po_number = self._requisition_po(conn, d, run_id, lab_id)
                 b = self._requisition_build(conn, user, run_id, lab_id, items, notes, po_number, "(assigned when created)", contact)
                 out.append({"lab": b["lab"]["name"], "lot": b["run"]["processing_lot"], "nSamples": len(items),
-                            "templateName": b["lab"]["template_name"], "conflicts": requisition_id_conflicts(b["sample_rows"]),
+                            "templateName": b["lab"]["template_name"], "conflicts": b["conflicts"],
                             "ids": [sr["id"] for sr in b["sample_rows"]],          # kept for a browser still running the previous app.js
-                            "lines": len(consolidate_sample_rows(b["sample_rows"])), "form": docx_to_html(b["doc"]),
+                            "lines": len(b["lines"]), "form": docx_to_html(b["doc"]),
                             "sheet": xlsx_to_html(b["sheet"]) if b["sheet"] else None})
             return {"previews": out}
         if seg == ["api", "cart", "requisitions"] and method == "POST":
@@ -5820,44 +6029,83 @@ class Handler(BaseHTTPRequestHandler):
         lab = conn.execute("SELECT * FROM labs WHERE id=?", (lab_id,)).fetchone()
         an = {a["id"]: a for a in conn.execute("SELECT * FROM lab_analyses WHERE lab_id=?", (lab_id,))}
         vols = {r_["name"]: r_["litres_each"] for r_ in conn.execute("SELECT name, litres_each FROM consumables WHERE is_sample_container=1")}
-        sample_rows, all_names = [], []
+        sample_rows = []
+        scan_pool = list(an.values())
+
+        def analysis_fields(ids):
+            """The analysis part of a requisition row for these analysis ids. Minerals are ticked one by one; the form asks for ONE mineral scan
+            sized by how many were ticked (and the notes list them)."""
+            mins = sorted([an[i] for i in ids if i in an and an[i]["kind"] == "mineral"],
+                          key=lambda a: (MINERAL_ORDER.index(a["symbol"]) if a["symbol"] in MINERAL_ORDER else 99, a["name"]))
+            direct = [an[i] for i in ids if i in an and an[i]["kind"] not in ("mineral", "scan")]
+            scan = None
+            if mins:
+                scan, biggest = mineral_scan_for(scan_pool, len(mins))
+                if scan is None:
+                    raise ApiError(400, "%d minerals are more than the largest mineral scan %s offers (%d). Remove some minerals." % (len(mins), lab["name"], biggest))
+            shown = ([scan] if scan else []) + direct
+            names = [a["name"] for a in shown]
+            methods = []
+            for a in shown + (mins if not (scan and scan["method"]) else []):
+                if a["method"] and a["method"] not in methods:
+                    methods.append(a["method"])
+            # the method of each requested analysis starts on the same line as its name (blank when it has none; a scan without its own method shows
+            # its minerals' method). Every analysis is one line plus a blank spacer line in BOTH columns, so the two columns stay in step as long as no
+            # name wraps -- the template's Analysis Requested column is wide enough for that (see CLAUDE.md).
+            lines_m = [(a["method"] or (next((m["method"] for m in mins if m["method"]), "") if a is scan else "")) for a in shown]
+            return {"analyses": ", ".join(names), "analyses_lines": "\n\n".join(names), "methods": ", ".join(methods),
+                    "methods_lines": "\n\n".join(lines_m).rstrip("\n"),
+                    "analysis_names": names, "analysis_codes": [a["code"] for a in shown if a["code"]], "_names": names,
+                    "scan": scan["name"] if scan else "", "_minerals": [a["name"] for a in mins], "minerals": ", ".join(a["name"] for a in mins),
+                    "_direct_ids": [a["id"] for a in direct], "_shown_ids": [a["id"] for a in shown]}
         for n, (sid, ids) in enumerate(items, 1):
             s = conn.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
-            names = [an[i]["name"] for i in ids if i in an]
-            codes = [an[i]["code"] for i in ids if i in an and an[i]["code"]]
-            methods = []
-            for i in ids:
-                if i in an and an[i]["method"] and an[i]["method"] not in methods:
-                    methods.append(an[i]["method"])
-            all_names += [x for x in names if x not in all_names]
-            sample_rows.append({"n": str(n), "id": (s["id_simplified"] or lot_simplified(run["processing_lot"])),
+            sample_rows.append(dict({"n": str(n), "id": (s["id_simplified"] or lot_simplified(run["processing_lot"])),
                             "container_qty": "1", "volume": container_volume(vols.get(s["container"]), s["container"]),
                             "volume_text": volume_text([container_volume(vols.get(s["container"]), s["container"])]),
                             "id_detailed": s["id_detailed"] or "", "id_simplified": s["id_simplified"] or "", "code": s["sample_code"], "stage": sample_stage_info(s["stage"])[1], "type": s["type"] or "",
                                 "description": s["description"] or "", "container": s["container"] or "",
-                                "collected": (s["collected_at"] or "").replace("T", " ")[:16], "analyses": ", ".join(names), "methods": ", ".join(methods),
-                                "location": s["location"] or "", "notes": s["notes"] or "",
-                                "analysis_names": names, "analysis_codes": codes, "_sid": sid, "_names": names})
+                                "collected": (s["collected_at"] or "").replace("T", " ")[:16],
+                                "location": s["location"] or "", "notes": s["notes"] or "", "_sid": sid, "_ids": list(ids)}, **analysis_fields(ids)))
         sku = conn.execute("SELECT name FROM fg_skus WHERE code=?", (run["sku_code"],)).fetchone()
         product = (sku["name"] if sku else run["sku_code"]) or ""
         for sr in sample_rows:
             # product, lot and process point only -- the sample type / description are not part of the text a lab prints on its report
             sr["report_description"] = " ".join(x for x in (product, run["processing_lot"], "-", sr["stage"]) if x)
-        # distinct analyses requested on this requisition (in lab order), with how many samples want each
+            sr["sheet_description"] = " ".join(x for x in (run["processing_lot"], "-", sr["stage"]) if x)
+        # labs that list a Sample ID once (SGS): the form, the sheet and the notes all work from the merged lines; the other labs get one form row per sample
+        merge = bool(lab["merge_ids"])
+        lines = consolidate_sample_rows(sample_rows, analysis_fields if merge else None)
+        doc_rows = lines if merge else sample_rows
+        # distinct analyses requested on this requisition (in lab order), with how many lines want each
+        disp_ids, all_names = {}, []
+        for r_ in doc_rows:
+            for aid in r_["_shown_ids"]:
+                disp_ids[aid] = disp_ids.get(aid, 0) + 1
+            all_names += [x for x in r_["analysis_names"] if x not in all_names]
         req_analyses = []
-        for aid in sorted({i for _sid, ids in items for i in ids if i in an}, key=lambda i: i):   # the order the lab's analyses were added
+        for aid in sorted(disp_ids):                              # the order the lab's analyses were added; a mineral scan counts once per line that needs it
             req_analyses.append({"name": an[aid]["name"], "code": an[aid]["code"] or "", "method": an[aid]["method"] or "", "n": str(len(req_analyses) + 1),
-                                 "count": str(sum(1 for _sid, ids in items if aid in ids))})
+                                 "count": str(disp_ids[aid])})
         d_today = datetime.date.fromisoformat(today_iso())
+        cont = contact or requisition_contact_get(conn)
         scalars = {"req_number": req_number, "date": today_iso(), "date_long": "%s %d, %d" % (d_today.strftime("%B"), d_today.day, d_today.year),
                    "po_number": po_number or "", "po_check": "\u2612" if po_number else "\u2610", "company": COMPANY_NAME, "lab_name": lab["name"],
                    "lab_contact": lab["contact"] or "", "lab_email": lab["email"] or "", "lab_phone": lab["phone"] or "",
                    "lab_address": lab["address"] or "", "processing_lot": run["processing_lot"], "run_date": run["run_date"],
                    "sku": run["sku_code"] or "", "product": product,
                    "requested_by": uname or "", "requested_by_email": (user["email"] if user else "") or "",
-                   "customer_phone": (contact or requisition_contact_get(conn))["phone"],
-                   **{"customer_email_%d" % (i + 1): (contact or requisition_contact_get(conn))["emails"][i] for i in range(5)},
-                   "sample_count": str(len(sample_rows)), "analyses": ", ".join(all_names), "notes": notes or ""}
+                   # one contact: the submitter's name / phone are also the results contact and the customer phone; the five emails are
+                   # where results are sent (SGS "Send analysis results to", FoodAssure customer emails). The signature is the submitter's name.
+                   "customer_phone": cont["submitter"]["phone"], **{"customer_email_%d" % (i + 1): cont["emails"][i] for i in range(5)},
+                   "submitter_name": cont["submitter"]["name"], "submitter_phone": cont["submitter"]["phone"], "submitter_email": cont["submitter"]["email"],
+                   "results_name": cont["submitter"]["name"], "results_phone": cont["submitter"]["phone"],
+                   **{"results_email_%d" % (i + 1): cont["emails"][i] for i in range(5)},
+                   "results_emails": "\n".join(e for e in cont["emails"] if e),
+                   "br": "\n",
+                   "sample_count": str(len(sample_rows)), "analyses": ", ".join(all_names),
+                   # the minerals requested + each analysis's standing note, one per line, ahead of anything the user typed in the cart
+                   "notes": requisition_notes(doc_rows, an, notes)}
         template = None
         if lab["template_stored"]:
             try:
@@ -5867,9 +6115,10 @@ class Handler(BaseHTTPRequestHandler):
                 # never quietly swap in the built-in layout for a lab that has its own form
                 raise ApiError(409, "The requisition template for %s (%s) is missing on the server. Upload it again under "
                                     "Admin > Labs & analyses > Template." % (lab["name"], lab["template_name"] or "template"))
-        doc = docx_fill(template or build_starter_docx(), scalars, sample_rows, req_analyses)
-        sheet = build_sample_sheet_xlsx(scalars, sample_rows, req_analyses) if lab["sample_sheet"] else None
-        return {"run": run, "lab": lab, "doc": doc, "sheet": sheet, "sample_rows": sample_rows, "scalars": scalars}
+        doc = docx_fill(template or build_starter_docx(), scalars, doc_rows, req_analyses)
+        sheet = build_sample_sheet_xlsx(scalars, sample_rows, req_analyses, lines) if lab["sample_sheet"] else None
+        return {"run": run, "lab": lab, "doc": doc, "sheet": sheet, "sample_rows": sample_rows, "scalars": scalars, "lines": lines,
+                "conflicts": [] if merge else requisition_id_conflicts(sample_rows)}
 
     def _create_requisitions(self, conn, user, d):
         """Turn every ready cart sample (lab + at least one analysis) into requisitions -- one per run + lab --
@@ -5877,7 +6126,7 @@ class Handler(BaseHTTPRequestHandler):
         uname = user["name"] if user else None
         groups = self._cart_ready_groups(conn, d)
         notes = (d.get("notes") or "").strip() or None
-        contact = requisition_contact_clean(d["contact"]) if d.get("contact") else None
+        contact = requisition_contact_clean(d["contact"], requisition_contact_get(conn)) if d.get("contact") else None
         created = []
         for (run_id, lab_id), items in groups.items():
             lab = conn.execute("SELECT * FROM labs WHERE id=?", (lab_id,)).fetchone()
