@@ -46,6 +46,24 @@ told it is a staging server, so the live site cannot overwrite itself.
 4. **Sign in** with your **live email** and the **staging password**. Everything is there as on live: runs, lots, samples, labs, documents.
 5. Test the change. When finished, delete the backup file from your computer.
 
+## Testing a pull request on staging (before merging it)
+
+Merging a PR into `main` deploys it to the live site, so use staging first for anything risky: migrations, changes to who may do what, anything that depends on real data. Staging never deploys on its own, so you choose when it changes.
+
+1. **Wait for the green `test` check** on the PR. There is no point deploying a branch that fails the tests.
+2. **Make sure staging has realistic data.** If it is stale, refresh it first (see [Refreshing staging from live](#refreshing-staging-from-live-each-time)). Staging keeps its data between deploys, so this is only needed when you want fresher data.
+3. **Point staging at the branch.** Render dashboard > `kelpworks-erp-staging` > Settings > Build & Deploy > **Branch**: change `main` to the PR's branch (for example `hardening/phase1_release_integrity`) and save. Nothing deploys yet, because auto-deploy is off.
+4. **Deploy it.** On the service, open the **Manual Deploy** menu and choose **Deploy latest commit**. Watch the deploy log until the service is live. The migrations run at startup on the copy of live data, so this also tests that the upgrade works on real data.
+5. **Test it on the staging address** (amber STAGING banner). Sign in with your **live email** and the **staging password**, and try what the PR changes. The PR description lists what to check.
+6. **Decide.**
+   - Looks good: **merge the PR on GitHub.** That deploys to live; nothing else is needed for live.
+   - Problem found: do **not** merge. Tell Claude what you saw; it fixes the branch and pushes, and the PR updates itself. Repeat step 4 (**Deploy latest commit**) to test the new commit.
+7. **Set staging's Branch back to `main`** (Settings > Build & Deploy > Branch), so a later manual deploy does not redeploy the old branch. Use Manual Deploy afterwards if you want staging to match live again.
+
+Menu names are as of writing and may be worded slightly differently in the Render dashboard.
+
+What staging cannot tell you: how real users will behave with a change, or anything that depends on the live service's own settings (environment variables). After a live deploy, do the spot-check in [release-guide.md](release-guide.md).
+
 ## What a restore does and does not do
 
 - Replaces the staging database and every document, lab template and SOP with the backup's.
