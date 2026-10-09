@@ -52,6 +52,8 @@ import struct
 import zlib
 import secrets
 import tempfile
+import shutil
+import threading
 import datetime
 import statistics
 from xml.sax.saxutils import escape
@@ -90,6 +92,14 @@ INITIAL_USERS = [
 ]
 INITIAL_USER_PASSWORD = os.environ.get("KELP_ERP_INITIAL_PASSWORD", "Cascadia123!")
 MIN_PASSWORD_LEN = 8
+
+# Environment. Anything other than "staging" is production. A STAGING server may restore a copy of the live data (full backup .zip) from the
+# Admin page; that is only possible when KELP_ERP_ENV=staging AND KELP_ERP_ALLOW_RESTORE=1, so the live site can never be overwritten by it.
+ENV_NAME = "staging" if os.environ.get("KELP_ERP_ENV", "").strip().lower() == "staging" else "production"
+ALLOW_RESTORE = ENV_NAME == "staging" and os.environ.get("KELP_ERP_ALLOW_RESTORE", "").strip() == "1"
+STAGING_PASSWORD = os.environ.get("KELP_ERP_STAGING_PASSWORD", "")        # every login password after a restore (live passwords never carry over)
+MAX_RESTORE_BYTES = int(os.environ.get("KELP_ERP_MAX_RESTORE_MB", "900")) * 1024 * 1024
+BACKUP_FORMAT = "kelpworks-backup"
 
 # (key, default value, label, description) -- seeded into the `settings`
 # table on every boot (INSERT OR IGNORE, so an admin's edited value is never
@@ -4245,6 +4255,150 @@ CONTENT_TYPES = {
 }
 
 
+# ---------------------------------------------------------------------------------------
+# Full backup (database + documents) and the staging-only restore
+# ---------------------------------------------------------------------------------------
+RESTORE_LOCK = threading.Lock()
+
+
+def backup_dirs():
+    """(name inside the backup, folder on disk) for every folder of files that belongs to the data."""
+    return [("uploads", UPLOAD_DIR), ("lab_templates", LAB_DIR), ("sop_documents", SOP_DIR)]
+
+
+def build_full_backup(conn, out_path):
+    """Write a .zip with a consistent snapshot of the database (sqlite3's backup API, safe while writers are active), every uploaded document,
+    lab template and SOP, and a manifest. The file holds password hashes and all business records: treat it as sensitive."""
+    fd, snap = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        dst = sqlite3.connect(snap)
+        try:
+            conn.backup(dst)
+        finally:
+            dst.close()
+        counts = {}
+        with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+            zf.write(snap, "kelp_erp.db")
+            for arc, folder in backup_dirs():
+                counts[arc] = 0
+                for root, _dirs, files in os.walk(folder):
+                    for fn in files:
+                        full = os.path.join(root, fn)
+                        zf.write(full, arc + "/" + os.path.relpath(full, folder).replace(os.sep, "/"))
+                        counts[arc] += 1
+            zf.writestr("manifest.json", json.dumps({"format": BACKUP_FORMAT, "version": 1, "createdAt": now_iso(), "env": ENV_NAME,
+                                                     "files": counts}, indent=2))
+    finally:
+        try:
+            os.remove(snap)
+        except OSError:
+            pass
+
+
+def _safe_member(name):
+    """The (folder, relative path) a backup member belongs to, or None when the name is not one we write (absolute paths, `..`, odd folders)."""
+    n = name.replace("\\", "/")
+    parts = n.split("/")
+    if n.startswith("/") or ".." in parts or (parts and ":" in parts[0]):
+        return None
+    if n in ("kelp_erp.db", "manifest.json"):
+        return (n, "")
+    for arc, _folder in backup_dirs():
+        if parts[0] == arc and len(parts) > 1 and parts[-1]:
+            return (arc, "/".join(parts[1:]))
+    return None
+
+
+def scrub_for_staging(conn):
+    """Make a restored copy of live data safe to test on: no live password works, and the copy knows it is a restore."""
+    conn.execute("UPDATE users SET password_hash=?, must_change_password=0", (hash_password(STAGING_PASSWORD),))
+    conn.execute("INSERT OR REPLACE INTO app_flags (key,value) VALUES ('staging_restored_at', ?)", (now_iso(),))
+
+
+def restore_backup(zip_path):
+    """Replace this (staging) server's data with a full backup .zip, migrate it to this version of the code, and reset every password.
+    Everything is validated before anything is changed."""
+    if not ALLOW_RESTORE:
+        raise ApiError(403, "Restore is disabled on this server (it is only available on a staging server).")
+    if len(STAGING_PASSWORD) < MIN_PASSWORD_LEN:
+        raise ApiError(400, "Set KELP_ERP_STAGING_PASSWORD (at least %d characters) on this server before restoring." % MIN_PASSWORD_LEN)
+    try:
+        zf = zipfile.ZipFile(zip_path)
+    except (zipfile.BadZipFile, OSError):
+        raise ApiError(400, "That file is not a KelpWorks full backup (.zip).")
+    with zf:
+        try:
+            manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+        except (KeyError, ValueError):
+            raise ApiError(400, "That zip has no manifest: use \u201cDownload full backup\u201d on the live site.")
+        if manifest.get("format") != BACKUP_FORMAT or manifest.get("version") != 1:
+            raise ApiError(400, "That backup has a format this version cannot read.")
+        members, total = [], 0
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            where = _safe_member(info.filename)
+            if where is None:
+                raise ApiError(400, "The backup contains an unexpected file (%s); nothing was restored." % info.filename[:80])
+            total += info.file_size
+            members.append((info, where))
+        if total > MAX_RESTORE_BYTES * 3 or "kelp_erp.db" not in [w[0] for _i, w in members]:
+            raise ApiError(400, "The backup is too large or has no database; nothing was restored.")
+        tmpdir = tempfile.mkdtemp(prefix="kelp_restore_")
+        try:
+            tmp_db = os.path.join(tmpdir, "incoming.db")
+            with zf.open("kelp_erp.db") as src, open(tmp_db, "wb") as out:
+                shutil.copyfileobj(src, out)
+            check = sqlite3.connect(tmp_db)
+            try:
+                ok = check.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+                has_users = bool(check.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'").fetchone())
+            except sqlite3.DatabaseError:
+                ok = has_users = False
+            finally:
+                check.close()
+            if not ok or not has_users:
+                raise ApiError(400, "The database inside the backup is damaged or is not a KelpWorks database; nothing was restored.")
+            with RESTORE_LOCK:
+                src = sqlite3.connect(tmp_db)
+                dst = sqlite3.connect(DB_PATH, timeout=60)
+                try:
+                    src.backup(dst)                                   # replaces the whole content of the live file
+                finally:
+                    dst.close()
+                    src.close()
+                counts = {}
+                for arc, folder in backup_dirs():
+                    os.makedirs(folder, exist_ok=True)
+                    for entry in os.listdir(folder):                  # empty the folder but keep it (it may be a mount point)
+                        full = os.path.join(folder, entry)
+                        shutil.rmtree(full) if os.path.isdir(full) else os.remove(full)
+                    counts[arc] = 0
+                for info, (arc, rel) in members:
+                    if arc in ("kelp_erp.db", "manifest.json"):
+                        continue
+                    folder = dict(backup_dirs())[arc]
+                    target = os.path.normpath(os.path.join(folder, *rel.split("/")))
+                    if not target.startswith(os.path.normpath(folder) + os.sep):
+                        raise ApiError(400, "Unsafe path in the backup: %s" % info.filename[:80])
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with zf.open(info) as src_f, open(target, "wb") as dst_f:
+                        shutil.copyfileobj(src_f, dst_f)
+                    counts[arc] += 1
+                init_db()                                             # bring the restored data up to this version's schema
+                conn = db()
+                try:
+                    scrub_for_staging(conn)
+                    conn.commit()
+                    users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+                finally:
+                    conn.close()
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    return {"ok": True, "backupCreatedAt": manifest.get("createdAt"), "backupEnv": manifest.get("env"), "users": users, "files": counts}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "KelpWorksERP/1.0"
 
@@ -4318,6 +4472,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._yield_usage_xlsx()
         if path == "/api/admin/backup":
             return self._admin_backup()
+        if path == "/api/env":                       # public: the login page shows a STAGING banner from this
+            return self._send_json({"env": ENV_NAME, "restoreEnabled": ALLOW_RESTORE})
         if path.startswith("/api/"):
             return self._handle_api("GET")
         return self._serve_static(path)
@@ -4397,6 +4553,27 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": "Invalid or missing token"}, 401)
             if user["role"] != "admin":
                 return self._send_json({"error": "Administrator access required"}, 403)
+            if qs.get("full", ["0"])[0] == "1":
+                # database + uploaded documents + lab templates + SOPs, as one .zip (what a staging server restores)
+                fd, zip_path = tempfile.mkstemp(suffix=".zip")
+                os.close(fd)
+                try:
+                    build_full_backup(conn, zip_path)
+                    ts = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/zip")
+                    self.send_header("Content-Length", str(os.path.getsize(zip_path)))
+                    self.send_header("Content-Disposition", 'attachment; filename="kelpworks-full-backup-%s.zip"' % ts)
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    with open(zip_path, "rb") as f:
+                        shutil.copyfileobj(f, self.wfile, 1 << 20)
+                finally:
+                    try:
+                        os.remove(zip_path)
+                    except OSError:
+                        pass
+                return
             fd, tmp_path = tempfile.mkstemp(suffix=".db")
             os.close(fd)
             try:
@@ -4571,7 +4748,53 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
 
     def do_POST(self):
+        if urlparse(self.path).path == "/api/admin/restore":
+            return self._admin_restore()
         return self._handle_api("POST")
+
+    def _admin_restore(self):
+        """Staging only: the request body is a full backup .zip (Content-Type application/zip). Admin-only; see restore_backup()."""
+        conn = db()
+        try:
+            try:
+                user = self._auth(conn)
+                self._require_admin(user)
+                if not ALLOW_RESTORE:
+                    raise ApiError(403, "Restore is disabled on this server (it is only available on a staging server).")
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                if not length:
+                    raise ApiError(400, "No file was sent.")
+                if length > MAX_RESTORE_BYTES:
+                    raise ApiError(413, "That backup is larger than this server accepts (%d MB)." % (MAX_RESTORE_BYTES // (1024 * 1024)))
+                fd, tmp = tempfile.mkstemp(suffix=".zip")
+                try:
+                    with os.fdopen(fd, "wb") as out:
+                        left = length
+                        while left > 0:
+                            chunk = self.rfile.read(min(1 << 20, left))
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                            left -= len(chunk)
+                    if left:
+                        raise ApiError(400, "The upload was cut short; nothing was restored.")
+                    conn.close()                           # release this request's connection before the file is replaced
+                    result = restore_backup(tmp)
+                finally:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                return self._send_json(result)
+            except ApiError as e:
+                return self._send_json({"error": e.message}, e.status)
+        except Exception as e:  # pragma: no cover
+            self._send_json({"error": "Server error: %s" % e}, 500)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def do_PUT(self):
         return self._handle_api("PUT")
@@ -11094,7 +11317,7 @@ def report_workbook(data, spname, skname):
 # --------------------------------------------------------------------------- #
 def main():
     init_db()
-    print("KelpWorks ERP running at http://%s:%s  (DB: %s)" % (HOST, PORT, DB_PATH))
+    print("KelpWorks ERP running at http://%s:%s  (DB: %s)  [%s%s]" % (HOST, PORT, DB_PATH, ENV_NAME.upper(), ", restore enabled" if ALLOW_RESTORE else ""))
     if ADMIN_PASSWORD == "kelp1234":
         print("Seed login: %s / kelp1234  (set KELP_ERP_ADMIN_PASSWORD before hosting)" % ADMIN_EMAIL)
     else:

@@ -588,3 +588,9 @@ th.sortable:hover { color: var(--teal-dark); }
 .ap-items { display: flex; flex-wrap: wrap; gap: 4px 14px; }
 .ap-item { display: inline-flex; align-items: center; gap: 4px; margin: 0; font-size: 13px; font-weight: normal; color: var(--ink); white-space: nowrap; }
 .ap-hint { margin: 2px 0 0; }
+
+/* STAGING banner: a test copy of live data, never to be mistaken for the live site */
+.env-banner { position: fixed; top: 0; left: 0; right: 0; z-index: 1000; background: #f2b134; color: #3b2a00; text-align: center; font-size: 12.5px; font-weight: 700; letter-spacing: .04em; padding: 4px 12px; border-bottom: 2px solid #b97d00; }
+body.is-staging { padding-top: 26px; }
+.restore-box { border: 1px solid #e0b25c; background: #fff8e8; border-radius: 10px; padding: 12px 14px; margin: 0 0 14px; }
+.restore-box h3 { margin: 0 0 4px; }

@@ -2,7 +2,7 @@
 'use strict';
 
 const TOKEN_KEY = 'kelp_erp_token';
-const State = { token: localStorage.getItem(TOKEN_KEY) || null, user: null, ref: null, tab: 'dashboard' };
+const State = { token: localStorage.getItem(TOKEN_KEY) || null, user: null, ref: null, tab: 'dashboard', env: { env: 'production', restoreEnabled: false } };
 
 /* ---------------- API ---------------- */
 async function api(method, path, body) {
@@ -7065,7 +7065,9 @@ async function pageAdmin(v) {
     el('div', { class: 'actions' },
       el('button', { class: 'secondary', onclick: openIntegrityCheck }, 'Data integrity check'),
       el('button', { class: 'secondary', onclick: downloadDbBackup }, '⬇ Download database backup'),
+      el('button', { class: 'secondary', onclick: downloadFullBackup, title: 'The database plus every uploaded document, lab template and SOP: what a staging server restores' }, '⬇ Download full backup'),
       el('button', { onclick: addUser }, '+ Add user'))));
+  if (State.env.restoreEnabled) v.append(restoreBox());
   const r = await api('GET', '/users');
   v.append(table(
     ['Name', 'Email', 'Role', 'Permissions', 'Status', 'Actions'],
@@ -7379,6 +7381,37 @@ function downloadDbBackup() {
   document.body.append(a); a.click(); a.remove();
   toast('Backup downloading…');
 }
+// The database AND every uploaded document / lab template / SOP as one .zip. This is the file a STAGING server restores; it holds password
+// hashes and all business records, so keep it somewhere private and delete it when finished.
+function downloadFullBackup() {
+  const ts = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+  const a = el('a', { href: '/api/admin/backup?full=1&token=' + encodeURIComponent(State.token), download: 'kelpworks-full-backup-' + ts + '.zip' });
+  document.body.append(a); a.click(); a.remove();
+  toast('Full backup downloading…');
+}
+// STAGING only: replace this server's data with a full backup taken on the live site.
+function restoreBox() {
+  return el('div', { class: 'restore-box' },
+    el('h3', {}, 'Restore a copy of live data (staging)'),
+    el('div', { class: 'help' }, 'Replaces EVERYTHING on this staging site (database and documents) with a full backup from the live site. Every password is reset to the staging password, so sign in with your live email and that password afterwards. The live site is not touched.'),
+    el('div', { style: 'margin-top:8px' }, el('button', { onclick: openRestore }, 'Restore from a full backup…')));
+}
+function openRestore() {
+  const file = el('input', { type: 'file', accept: '.zip,application/zip', id: 'restore_file' });
+  const confirmIn = el('input', { id: 'restore_confirm', placeholder: 'Type RESTORE to confirm', autocomplete: 'off' });
+  const body = el('div', {}, el('div', { class: 'help', style: 'margin-bottom:8px' }, 'Choose the “Download full backup” file from the live site. This deletes the current staging data first.'),
+    field('Full backup (.zip)', file), field('Confirm', confirmIn));
+  modal('Restore live data into staging', body, async () => {
+    const f = file.files[0];
+    if (!f) throw new Error('Choose the backup file first.');
+    if (confirmIn.value.trim() !== 'RESTORE') throw new Error('Type RESTORE to confirm.');
+    const res = await fetch('/api/admin/restore', { method: 'POST', headers: { 'Authorization': 'Bearer ' + State.token, 'Content-Type': 'application/zip' }, body: f });
+    const r = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(r.error || 'Restore failed (' + res.status + ')');
+    toast('Restored ' + r.users + ' users and ' + Object.values(r.files).reduce((a, b) => a + b, 0) + ' documents. Sign in again with the staging password.');
+    logout();
+  }, 'Restore');
+}
 // Permissions checklist for Add / Edit user: one tidy row per permission (checkbox, name,
 // plain-language description). Admin role alone grants none of these.
 const USER_PERMISSIONS = [
@@ -7444,4 +7477,16 @@ async function setUserActive(u, active) {
 }
 
 /* ---------------- start ---------------- */
-if (State.token) boot(); else show('login');
+// Which server is this? (public endpoint) A staging server gets an unmissable banner and a tab title prefix.
+(async function start() {
+  try {
+    State.env = await (await fetch('/api/env')).json();
+    if (State.env.env === 'staging') {
+      $('#envBanner').textContent = 'STAGING — a test copy of live data. Nothing here affects the live site.';
+      $('#envBanner').classList.remove('hidden');
+      document.body.classList.add('is-staging');
+      document.title = '[STAGING] ' + document.title;
+    }
+  } catch (e) { /* an older server without /api/env: behave as live */ }
+  if (State.token) boot(); else show('login');
+})();
