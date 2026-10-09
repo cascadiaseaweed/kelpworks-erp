@@ -167,6 +167,14 @@ for `main` so a red run blocks the merge.
   X-Frame-Options DENY, Referrer-Policy and (over https) HSTS from `end_headers`; CORS headers are gone (the app is same-origin); the app page carries `APP_CSP`
   (`script-src 'self'`: NO inline script, so print windows are printed by the opener via `printWhenReady`, and every value written into a print window goes through
   `escHtml`). Don't add an inline `<script>`, an inline event attribute or an un-escaped template string.
+- **Request limits, bounded parsing and logging** (risk review batch 4; tests in `tests/test_limits_logging.py`). `_body_json(limit)` refuses a body over
+  `MAX_REQUEST_BYTES` (40 MB; the login, the only open route, 8 KB) with 413 BEFORE reading it, and `Handler.timeout` (`KELP_ERP_SOCKET_TIMEOUT`, 30 s) drops a client that goes silent.
+  Untrusted .docx / .xlsx / .pdf are unpacked only through `zip_read` (parts over `MAX_ZIP_MEMBER_BYTES`, 10 MB, are refused) and `_inflate` (PDF streams capped); spreadsheet previews
+  show at most `MAX_PREVIEW_ROWS` x `MAX_PREVIEW_COLS` and every preview page is capped (`cap_html`); a restore's zip members may not inflate past their declared size (`_copy_exact`).
+  Logging goes to stderr through the `kelpworks` logger (`configure_logging`): one line per API request (`log_request`; **tokens in `?token=` are always redacted** -- use `redact()` for
+  anything you log from a URL), a boot line with the database size and row counts, and every unexpected error through `_server_error`: the traceback is logged under a short
+  reference and the user sees only the reference ("Something went wrong ... reference ab12cd34"); a locked database is a 503 "busy". A failed start logs why. Never put
+  `"Server error: %s" % e` in a response; call `self._server_error(e)`.
 - **Production-log required fields** are defined once, server-side, in `PROGRESS_SECTIONS` /
   `REQUIRED_FEEDSTOCK` (`kelp_erp_server.py`; exposed to the SPA as `refdata.requiredFields`).
   Everything is required except: every Notes field, the Homogenization / Separation /

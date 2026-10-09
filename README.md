@@ -60,6 +60,7 @@ created and seeded automatically.
 | `KELP_ERP_UPLOADS` | `./uploads` | folder for attached documents |
 | `KELP_ERP_SECRET` | generated key in `kelp_secret.key` next to the database | token signing secret — **set it when hosting** (a value that is the old public default is ignored) |
 | `KELP_ERP_MAX_UPLOADS_MB` | `600` | total size of all uploaded documents; further uploads are refused (the Render disk is 1 GB) |
+| `KELP_ERP_SOCKET_TIMEOUT` | `30` | seconds a client may stay silent in the middle of a request before it is dropped |
 | `KELP_ERP_ENV` | (production) | `development` enables the convenience login defaults; `staging` is the staging site (see docs/staging.md) |
 | `KELP_ERP_ADMIN_EMAIL` / `KELP_ERP_ADMIN_PASSWORD` | `admin@kelp.local` / generated and printed once (`kelp1234` only in development) | first-run admin account |
 

@@ -22,6 +22,9 @@ Date: 2026-10-09. Code reviewed: `main` at `c1e5343` (after PRs #4 to #7). Scope
 | R-13 login | **Fixed** (batch 2): throttling and no timing difference for unknown emails |
 | R-05 stored XSS | **Fixed** (batch 3): files are served by their name's type only (non-PDF/image = download), script-capable types refused, print windows escape their data, a Content-Security-Policy on the app page |
 | R-25 uploads | **Mostly fixed** (batch 3): header injection and non-ASCII filenames, total size limit and disk-free check, files removed when a draft is discarded or a request fails. Still open: per-user quota |
+| R-08 logging | **Fixed** (batch 4): tracebacks and one line per API request go to the Render log (tokens redacted), a boot line with database size and counts, users see a short reference instead of raw errors |
+| R-09 request limits | **Fixed** (batch 4): 40 MB body cap (8 KB for login) refused before reading, 30 s socket timeout |
+| R-10 parsing bombs | **Fixed** (batch 4): bounded unpacking of docx / xlsx / pdf, capped previews |
 | R-06 shipments | **Fixed** (batch 1): duplicate lines, un-cancel, disposed-lot return, conditional deduction, write lock |
 | R-14 edit under amendment | **Fixed** (batch 1) |
 | R-15 concurrency | **Partly fixed** (batch 1): writes take the lock up front and wait up to 30 s. Still open: unique-number collisions return 500 instead of 409 |
