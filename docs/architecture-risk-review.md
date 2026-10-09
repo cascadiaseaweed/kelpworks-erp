@@ -10,6 +10,18 @@ Date: 2026-10-09. Code reviewed: `main` at `c1e5343` (after PRs #4 to #7). Scope
 - **Effort.** S = under a day, M = a few days, L = a week or more.
 - **Not examined.** The live database and anything only visible in the Render dashboard (snapshot settings, proxy timeouts, SIGTERM grace period, which environment variables are actually set). Items that depend on those are flagged **confirm in Render**.
 
+## Remediation status
+
+| Finding | Status |
+|---|---|
+| R-01 finished-goods edits | **Fixed** (batch 1): permissions, status whitelist, reason, audit event |
+| R-02 lab results | **Partly fixed** (batch 1): Quality Manager only; released product is held when a required result is voided or a new failure appears. Still open: required attachment / second-person check, wider gate scope (R-11) |
+| R-03 tote reuse | **Fixed** (batch 1): ownership check at draft save and finalize; tote status/weight edits restricted |
+| R-06 shipments | **Fixed** (batch 1): duplicate lines, un-cancel, disposed-lot return, conditional deduction, write lock |
+| R-14 edit under amendment | **Fixed** (batch 1) |
+| R-15 concurrency | **Partly fixed** (batch 1): writes take the lock up front and wait up to 30 s. Still open: unique-number collisions return 500 instead of 409 |
+| all others | Open |
+
 ## Executive summary
 
 The application's core design is sound where it was designed carefully: each request runs in one transaction with rollback on error, the release workflow re-checks the signer's password and enforces states server-side, last-admin protection works, all SQL is parameterized (no injection found), the staging restore cannot run on live, and every old database in `tests/legacy_commits.txt` upgrades cleanly.
