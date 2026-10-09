@@ -25,6 +25,10 @@ Date: 2026-10-09. Code reviewed: `main` at `c1e5343` (after PRs #4 to #7). Scope
 | R-08 logging | **Fixed** (batch 4): tracebacks and one line per API request go to the Render log (tokens redacted), a boot line with database size and counts, users see a short reference instead of raw errors |
 | R-09 request limits | **Fixed** (batch 4): 40 MB body cap (8 KB for login) refused before reading, 30 s socket timeout |
 | R-10 parsing bombs | **Fixed** (batch 4): bounded unpacking of docx / xlsx / pdf, capped previews |
+| R-07 migrations | **Fixed** (batch 5): one transaction for the whole upgrade (a failed or killed start rolls back), a compressed snapshot before new code migrates an existing database, repairs as soft steps |
+| R-16 / R-17 | **Fixed** (batch 5): one-time changes run once (`run_once`); a new database gets its reagent types |
+| R-24 shutdown | **Fixed** (batch 5): SIGTERM finishes requests in progress and exits cleanly (verified on the Linux CI) |
+| R-29 migration tests | **Fixed** (batch 5): an old release is run with real data and upgraded; failed-start, snapshot, and soft-step behaviour are tested |
 | R-06 shipments | **Fixed** (batch 1): duplicate lines, un-cancel, disposed-lot return, conditional deduction, write lock |
 | R-14 edit under amendment | **Fixed** (batch 1) |
 | R-15 concurrency | **Partly fixed** (batch 1): writes take the lock up front and wait up to 30 s. Still open: unique-number collisions return 500 instead of 409 |

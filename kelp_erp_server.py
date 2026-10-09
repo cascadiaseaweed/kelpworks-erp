@@ -54,6 +54,8 @@ import secrets
 import tempfile
 import logging
 import sys
+import gzip
+import signal
 import shutil
 import threading
 import datetime
@@ -1437,6 +1439,9 @@ def db():
     return conn
 
 
+INFLIGHT = [0]                                    # requests being handled right now (for a clean stop)
+INFLIGHT_LOCK = threading.Lock()
+SHUTDOWN_WAIT_SECONDS = 15
 logger = logging.getLogger("kelpworks")
 _TOKEN_IN_URL = re.compile(r"(token=)[^&\s]+")
 
@@ -1518,30 +1523,122 @@ def dummy_verify(password):
     verify_password(password, _DUMMY_HASH[0])
 
 
+def run_once(conn, key, fn):
+    """Run a one-time data change exactly once (recorded in app_flags, in the same transaction as the change). Anything that would otherwise
+    run at EVERY start and overwrite what an administrator has since set belongs here."""
+    flag = "migrated_" + key
+    if conn.execute("SELECT 1 FROM app_flags WHERE key=?", (flag,)).fetchone():
+        return False
+    fn()
+    conn.execute("INSERT OR REPLACE INTO app_flags (key,value) VALUES (?,?)", (flag, now_iso()))
+    return True
+
+
+def soft_step(conn, label, fn):
+    """A repair or backfill that must not stop the server from starting: if it fails its own changes are rolled back (SAVEPOINT), the failure
+    is logged with its traceback, and the rest of the start carries on. It is tried again at the next start."""
+    conn.execute("SAVEPOINT soft_step")
+    try:
+        fn()
+        conn.execute("RELEASE soft_step")
+    except Exception:
+        conn.execute("ROLLBACK TO soft_step")
+        conn.execute("RELEASE soft_step")
+        logger.error("Start-up step '%s' failed and was skipped (it will be tried again at the next start).", label, exc_info=True)
+
+
+def code_fingerprint():
+    """A short fingerprint of the server code: it changes whenever a deploy changes kelp_erp_server.py (and so possibly the migrations)."""
+    with open(os.path.abspath(__file__), "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()[:16]
+
+
+def backups_dir():
+    return os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "backups")
+
+
+MIGRATION_SNAPSHOTS_KEPT = 3
+
+
+def snapshot_before_migrating(conn, stamp=None):
+    """Copy the database (compressed, with sqlite's backup API) into backups/ next to it BEFORE a new version of the code migrates it, so a bad
+    migration can be undone by restoring the file. Skipped when the disk is too full to do it safely. Returns the file path or None."""
+    try:
+        size = os.path.getsize(DB_PATH)
+        folder = backups_dir()
+        os.makedirs(folder, exist_ok=True)
+        if shutil.disk_usage(folder).free < 3 * size + 50 * 1024 * 1024:
+            logger.warning("Not enough free disk for a pre-migration snapshot of the database (%.1f MB); continuing without one.", size / 1048576.0)
+            return None
+        stamp = stamp or datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        raw_copy = os.path.join(folder, "snapshot-%s.tmp" % stamp)
+        target = os.path.join(folder, "pre-migrate-%s.db.gz" % stamp)
+        dst = sqlite3.connect(raw_copy)
+        try:
+            conn.backup(dst)
+        finally:
+            dst.close()
+        with open(raw_copy, "rb") as src, gzip.open(target, "wb", compresslevel=6) as out:
+            shutil.copyfileobj(src, out, 1 << 20)
+        os.remove(raw_copy)
+        for old in sorted(f for f in os.listdir(folder) if f.startswith("pre-migrate-") and f.endswith(".db.gz"))[:-MIGRATION_SNAPSHOTS_KEPT]:
+            os.remove(os.path.join(folder, old))
+        logger.info("Database snapshot before migrating: %s", target)
+        return target
+    except Exception:
+        logger.error("Could not take the pre-migration snapshot; continuing without one.", exc_info=True)
+        return None
+
+
+def ensure_reagent_types(conn):
+    """The three standard reagents carry their reagent type. migrate() sets it when the column is added, which on a NEW database is before
+    the reagents exist (seed() inserts them afterwards), so this runs again after seeding. Only fills a blank type."""
+    for t in ("Citric Acid", "Potassium Sorbate", "Sodium Benzoate"):
+        conn.execute("UPDATE consumables SET reagent_type=? WHERE name=? AND reagent_type IS NULL AND COALESCE(is_container,0)=0 "
+                     "AND label_sku_code IS NULL AND COALESCE(is_cip_agent,0)=0", (t, t))
+
+
 def init_db():
+    """Create / upgrade the database. The schema statements are idempotent; everything after them (migrations, seed, the ensure_* steps) runs in ONE
+    transaction: a failure rolls the whole upgrade back (SQLite DDL is transactional), so a start that dies or is killed half-way leaves the database exactly
+    as it was and the next start redoes the work. Repairs that must not block a start run as soft steps. Before new code migrates an existing
+    database, the database is copied to backups/ (see snapshot_before_migrating)."""
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     conn = db()
-    conn.executescript(SCHEMA)
-    migrate(conn)
-    conn.commit()
-    if conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"] == 0:
-        seed(conn)
-        migrate(conn)          # migrate() is idempotent: the steps that need the seeded reference data (SKU -> species links) now apply
-        conn.commit()
-    ensure_users(conn)
-    assign_item_numbers(conn)
-    ensure_coa_specs(conn)
-    ensure_requisition_contact(conn)
-    ensure_sgs_analyses(conn)
-    conn.commit()
-    rebaseline_release_hashes(conn)
-    conn.commit()
-    sync_pending_samples(conn)
-    # a Sample Point row never edited keeps blank type/description in the log while the dropdowns show Slurry / Microbial
-    conn.execute("UPDATE samples SET description='Microbial' WHERE description IS NULL OR description=''")
-    conn.execute("UPDATE samples SET type='Slurry' WHERE type IS NULL OR type=''")
-    conn.commit()
-    conn.close()
+    try:
+        conn.executescript(SCHEMA)
+        fingerprint = code_fingerprint()
+        known = conn.execute("SELECT value FROM app_flags WHERE key='code_fingerprint'").fetchone()
+        has_data = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"] > 0
+        if has_data and (not known or known["value"] != fingerprint):
+            snapshot_before_migrating(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            migrate(conn)
+            if conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"] == 0:
+                seed(conn)
+                migrate(conn)          # migrate() is idempotent: the steps that need the seeded reference data (SKU -> species links) now apply
+            ensure_users(conn)
+            assign_item_numbers(conn)
+            ensure_coa_specs(conn)
+            ensure_requisition_contact(conn)
+            ensure_sgs_analyses(conn)
+            ensure_reagent_types(conn)
+            soft_step(conn, "re-hash signed production logs", lambda: rebaseline_release_hashes(conn))
+            soft_step(conn, "sample catalogue for finalized runs", lambda: sync_pending_samples(conn))
+
+            def sample_defaults():
+                # a Sample Point row never edited keeps blank type/description in the log while the dropdowns show Slurry / Microbial
+                conn.execute("UPDATE samples SET description='Microbial' WHERE description IS NULL OR description=''")
+                conn.execute("UPDATE samples SET type='Slurry' WHERE type IS NULL OR type=''")
+            soft_step(conn, "sample defaults", sample_defaults)
+            conn.execute("INSERT OR REPLACE INTO app_flags (key,value) VALUES ('code_fingerprint', ?)", (fingerprint,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------------------
@@ -2182,8 +2279,10 @@ def ensure_coa_specs(conn):
     for code, name, grp, unit, basis, mn, mx, excl, req, sort, method, kg in COA_SPEC_SEED:
         conn.execute("INSERT OR IGNORE INTO coa_specs (code,name,grp,unit,basis,min_val,max_val,max_exclusive,required,sort,method,limit_kg_ha)"
                      " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (code, name, grp, unit, basis, mn, mx, excl, req, sort, method, kg))
-    # an interim version judged metals against a ppm limit derived by a calculator: the limit is the kg/ha regulatory value again
-    conn.execute("UPDATE coa_specs SET max_val=limit_kg_ha, unit='kg/ha' WHERE basis='metal' AND unit='ppm' AND limit_kg_ha IS NOT NULL")
+    # an interim version judged metals against a ppm limit derived by a calculator: the limit is the kg/ha regulatory value again (once: it must
+    # not overwrite a unit or limit an administrator sets afterwards)
+    run_once(conn, "coa_metal_limits_kg_ha", lambda: conn.execute(
+        "UPDATE coa_specs SET max_val=limit_kg_ha, unit='kg/ha' WHERE basis='metal' AND unit='ppm' AND limit_kg_ha IS NOT NULL"))
     for key, label, desc in ((k, l, d) for k, v, l, d in SETTINGS_DEFAULTS if k in ("coa_application_rate_kg_ha", "coa_application_periods")):
         conn.execute("UPDATE settings SET label=?, description=? WHERE key=?", (label, desc, key))
 
@@ -3850,8 +3949,10 @@ def migrate(conn):
         conn.execute("ALTER TABLE preproc_inputs ADD COLUMN volume_l REAL")
     # the default target blend solids moved from 10 % to 50 %: update the stored setting if nobody had changed it,
     # and draft batches still sitting on the old default
-    conn.execute("UPDATE settings SET value=50 WHERE key='preproc_target_solids_pct' AND value=10")
-    conn.execute("UPDATE preproc_batches SET target_solids_pct=50 WHERE status='draft' AND target_solids_pct=10")
+    def retarget_blend_solids():
+        conn.execute("UPDATE settings SET value=50 WHERE key='preproc_target_solids_pct' AND value=10")
+        conn.execute("UPDATE preproc_batches SET target_solids_pct=50 WHERE status='draft' AND target_solids_pct=10")
+    run_once(conn, "preproc_target_solids_50", retarget_blend_solids)          # once: an administrator may deliberately choose 10 later
     pbcols = {r["name"] for r in conn.execute("PRAGMA table_info(preproc_batches)")}
     if "citric_item_id" not in pbcols:
         conn.execute("ALTER TABLE preproc_batches ADD COLUMN citric_item_id INTEGER")
@@ -3871,8 +3972,10 @@ def migrate(conn):
         conn.execute("ALTER TABLE run_sample_points ADD COLUMN label_numbered INTEGER NOT NULL DEFAULT 0")
     if "label_name" not in spcols:
         conn.execute("ALTER TABLE run_sample_points ADD COLUMN label_name TEXT")
-    for r_ in conn.execute("SELECT DISTINCT run_id FROM samples").fetchall():
-        refresh_sample_ids(conn, r_["run_id"])
+    def refresh_all_sample_ids():
+        for r_ in conn.execute("SELECT DISTINCT run_id FROM samples").fetchall():
+            refresh_sample_ids(conn, r_["run_id"])
+    soft_step(conn, "refresh sample ids", refresh_all_sample_ids)
     if "limit_kg_ha" not in {r["name"] for r in conn.execute("PRAGMA table_info(coa_specs)")}:
         conn.execute("ALTER TABLE coa_specs ADD COLUMN limit_kg_ha REAL")
     lacols = {r["name"] for r in conn.execute("PRAGMA table_info(lab_analyses)")}
@@ -3992,15 +4095,17 @@ def migrate(conn):
     # production_runs has that applies regardless of draft/completed status.
     # INSERT OR IGNORE + the UNIQUE(run_id, field_id) constraint make this a
     # no-op after the first boot that runs it.
-    qc_cols = ", ".join(f[0] for f in QC_FIELD_REGISTRY)
-    for r in conn.execute("SELECT id, created_at, %s FROM production_runs" % qc_cols):
-        for field_id, _stage, _stage_label, _subtitle, _label, _unit in QC_FIELD_REGISTRY:
-            val = r[field_id]
-            if val is None:
-                continue
-            conn.execute(
-                "INSERT OR IGNORE INTO qc_field_log (run_id, field_id, value, recorded_by, recorded_at)"
-                " VALUES (?,?,?,?,?)", (r["id"], field_id, val, None, r["created_at"]))
+    def backfill_qc_field_log():
+        qc_cols = ", ".join(f[0] for f in QC_FIELD_REGISTRY)
+        for r in conn.execute("SELECT id, created_at, %s FROM production_runs" % qc_cols):
+            for field_id, _stage, _stage_label, _subtitle, _label, _unit in QC_FIELD_REGISTRY:
+                val = r[field_id]
+                if val is None:
+                    continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO qc_field_log (run_id, field_id, value, recorded_by, recorded_at)"
+                    " VALUES (?,?,?,?,?)", (r["id"], field_id, val, None, r["created_at"]))
+    soft_step(conn, "backfill qc_field_log", backfill_qc_field_log)
     sopcols = {r["name"] for r in conn.execute("PRAGMA table_info(sop_documents)")}
     if "key" not in sopcols:
         conn.execute("ALTER TABLE sop_documents ADD COLUMN key TEXT")
@@ -4047,11 +4152,13 @@ def migrate(conn):
     # Carry over any OTHER container units an admin already added/edited in
     # the now-retired Container Units table before this round's rework (the
     # is_ibc-flagged one, whatever it's named, was just handled above).
-    for r in conn.execute("SELECT code, litres_each FROM container_units WHERE is_ibc=0"):
-        if not conn.execute("SELECT 1 FROM consumables WHERE name=?", (r["code"],)).fetchone():
-            conn.execute(
-                "INSERT INTO consumables (name,unit,on_hand,reorder_level,is_container,litres_each)"
-                " VALUES (?,'unit',0,0,1,?)", (r["code"], r["litres_each"]))
+    def carry_over_container_units():
+        for r in conn.execute("SELECT code, litres_each FROM container_units WHERE is_ibc=0"):
+            if not conn.execute("SELECT 1 FROM consumables WHERE name=?", (r["code"],)).fetchone():
+                conn.execute(
+                    "INSERT INTO consumables (name,unit,on_hand,reorder_level,is_container,litres_each)"
+                    " VALUES (?,'unit',0,0,1,?)", (r["code"], r["litres_each"]))
+    run_once(conn, "container_units_carry_over", carry_over_container_units)    # once: re-running it re-created the retired rows at every start
     # Seed the Sample Point boxes' container options -- INSERT OR IGNORE so an
     # admin's already-edited counts are never overwritten. On-hand starts at 0
     # since these are being tracked for the first time; the plant enters its
@@ -4065,8 +4172,7 @@ def migrate(conn):
     # from the old Container Units table) turned out to be the exact same
     # physical item as "1 L bottle"/"2 L bottle" (Sample Point vessels) --
     # merge each pair into one container valid for both purposes.
-    _merge_consumable(conn, "1 L Bottle", "1 L bottle")
-    _merge_consumable(conn, "2 L Bottle", "2 L bottle")
+    run_once(conn, "merge_bottle_containers", lambda: (_merge_consumable(conn, "1 L Bottle", "1 L bottle"), _merge_consumable(conn, "2 L Bottle", "2 L bottle")))
     # Sodium Benzoate (a reagent, like Citric Acid / Potassium Sorbate) and the
     # 55 gallon drum FG package (55 US gal = 208.2 L; unit must not be 'tote',
     # which the harvest check-in source list filters on). Insert-only so an
@@ -4104,13 +4210,15 @@ def migrate(conn):
     # grandfathered as released (one SYSTEM audit event each, no review hash),
     # so lots already in stock stay sellable. Runs finalized from now on get a
     # release_state at finalize, so this only ever touches the pre-process runs.
-    for r in conn.execute("SELECT id, processing_lot FROM production_runs"
-                          " WHERE status='completed' AND release_state IS NULL ORDER BY id").fetchall():
-        conn.execute("UPDATE production_runs SET release_state='legacy' WHERE id=?", (r["id"],))
-        release_log(conn, r["id"], "legacy_release", None, capacity="System",
-                    meaning="Finalized before the product release process existed; grandfathered as released "
-                            "without a production-log review or Quality sign-off.",
-                    detail={"to": "legacy", "lot": r["processing_lot"]})
+    def grandfather_legacy_runs():
+        for r in conn.execute("SELECT id, processing_lot FROM production_runs"
+                              " WHERE status='completed' AND release_state IS NULL ORDER BY id").fetchall():
+            conn.execute("UPDATE production_runs SET release_state='legacy' WHERE id=?", (r["id"],))
+            release_log(conn, r["id"], "legacy_release", None, capacity="System",
+                        meaning="Finalized before the product release process existed; grandfathered as released "
+                                "without a production-log review or Quality sign-off.",
+                        detail={"to": "legacy", "lot": r["processing_lot"]})
+    soft_step(conn, "grandfather legacy runs", grandfather_legacy_runs)
 
 
 def ensure_users(conn):
@@ -4176,7 +4284,6 @@ def seed(conn):
              t.get("harvest_year"), t.get("checkin_date"), t.get("tote_number"),
              t.get("volume_l") or 1000, t.get("ph"), t.get("avg_weight_kg"),
              t.get("location"), t.get("description"), ts))
-    conn.commit()
 
 
 # --------------------------------------------------------------------------- #
@@ -4613,6 +4720,15 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "KelpWorksERP/1.0"
 
     timeout = SOCKET_TIMEOUT                       # a client that goes silent mid-request is dropped (slowloris)
+
+    def handle_one_request(self):
+        with INFLIGHT_LOCK:
+            INFLIGHT[0] += 1
+        try:
+            return super().handle_one_request()
+        finally:
+            with INFLIGHT_LOCK:
+                INFLIGHT[0] -= 1
 
     def log_message(self, fmt, *args):
         pass                                       # the access line is written by log_request (which can leave tokens out)
@@ -11760,11 +11876,22 @@ def main():
     if SECRET_SOURCE != "environment":
         print("NOTE: KELP_ERP_SECRET is not set; using a generated signing key (%s). Set KELP_ERP_SECRET in production." % SECRET_SOURCE)
     server = ThreadingHTTPServer((HOST, PORT), Handler)
+
+    def stop(signum, _frame):
+        logger.info("Stop requested (signal %s): finishing the requests in progress.", signum)
+        threading.Thread(target=server.shutdown, daemon=True).start()      # shutdown() must not run in the thread that serves
+    for name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            signal.signal(sig, stop)
     try:
         server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down.")
-        server.shutdown()
+    finally:
+        deadline = time.time() + SHUTDOWN_WAIT_SECONDS
+        while INFLIGHT[0] > 0 and time.time() < deadline:
+            time.sleep(0.1)
+        server.server_close()
+        logger.info("Server stopped.")
 
 
 if __name__ == "__main__":

@@ -8,3 +8,4 @@ sop_documents/
 lab_templates/
 .pytest_cache/
 kelp_secret.key
+backups/

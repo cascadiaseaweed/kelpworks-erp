@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -126,8 +127,10 @@ def free_port():
 class Server:
     """A throwaway KelpWorks server in a subprocess. Use as a context manager, or call start() / stop()."""
 
-    def __init__(self, db_path=None, env=None, startup_timeout=40):
+    def __init__(self, db_path=None, env=None, startup_timeout=40, root=None):
+        """`root`: run the server code found in this folder (for example an OLD version checked out from git) instead of the repository's."""
         self.db_source, self.extra_env, self.startup_timeout = db_path, env or {}, startup_timeout
+        self.root = root or ROOT
         self.tmp = self.proc = self.port = None
         self.users = 0
 
@@ -154,7 +157,7 @@ class Server:
         for k in [k for k, v in env.items() if v is None]:      # env={"NAME": None} removes the variable (it is not set at all)
             del env[k]
         self._log = open(self.log_path, "ab")
-        self.proc = subprocess.Popen([sys.executable, SERVER_PY], cwd=ROOT, env=env, stdout=self._log, stderr=subprocess.STDOUT)
+        self.proc = subprocess.Popen([sys.executable, os.path.join(self.root, "kelp_erp_server.py")], cwd=self.root, env=env, stdout=self._log, stderr=subprocess.STDOUT)
         deadline = time.time() + self.startup_timeout
         while time.time() < deadline:
             if self.proc.poll() is not None:
@@ -185,6 +188,23 @@ class Server:
         if self.tmp:
             shutil.rmtree(self.tmp, ignore_errors=True)
             self.tmp = None
+
+    def export(self, dest_dir):
+        """Stop the server and copy its database (and uploads) into dest_dir, so another server (for instance the CURRENT code) can be started on what
+        this one wrote. Returns the copied database path."""
+        self._stop_process()
+        os.makedirs(dest_dir, exist_ok=True)
+        out = os.path.join(dest_dir, "kelp.db")
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
+        shutil.copyfile(self.db_path, out)
+        uploads = os.path.join(self.tmp, "uploads")
+        if os.path.isdir(uploads):
+            shutil.copytree(uploads, os.path.join(dest_dir, "uploads"), dirs_exist_ok=True)
+        return out
 
     def __enter__(self):
         return self.start()

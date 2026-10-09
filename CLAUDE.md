@@ -175,6 +175,15 @@ for `main` so a red run blocks the merge.
   anything you log from a URL), a boot line with the database size and row counts, and every unexpected error through `_server_error`: the traceback is logged under a short
   reference and the user sees only the reference ("Something went wrong ... reference ab12cd34"); a locked database is a 503 "busy". A failed start logs why. Never put
   `"Server error: %s" % e` in a response; call `self._server_error(e)`.
+- **Migration safety** (risk review batch 5; tests in `tests/test_migration_safety.py`). `init_db()` runs the idempotent `SCHEMA`, then ONE transaction
+  (`BEGIN IMMEDIATE` ... commit) holding `migrate()`, `seed()` (no longer commits), the `ensure_*` steps and a second `migrate()` after seeding: a start that fails or is killed
+  half-way rolls EVERYTHING back (SQLite DDL is transactional), so the database is exactly as it was and the next start redoes the work. Before new code migrates an EXISTING
+  database (the `code_fingerprint` in `app_flags` differs from the sha256 of `kelp_erp_server.py`) `snapshot_before_migrating` writes `backups/pre-migrate-<utc>.db.gz` next to the
+  database (last 3 kept; skipped when the disk is too full). **Rules for a migration step:** a data change that must happen once goes through `run_once(conn, "name", fn)` (never an
+  unconditional UPDATE: it would overwrite what an admin sets later); a repair or backfill that must not block a start goes through `soft_step(conn, "label", fn)` (SAVEPOINT;
+  logged and skipped on failure, retried next start); anything a NEW database needs that `seed()` creates afterwards (reagent types) belongs in an `ensure_*` that runs after `seed()`.
+  Never call `conn.commit()` inside `migrate()` / `seed()` / `ensure_*`. `SIGTERM` / `SIGINT` finish the requests in progress (up to 15 s) and exit 0 (`main`, `INFLIGHT`).
+  Add the live commit to `tests/legacy_commits.txt` after each release; `test_data_written_by_an_older_release_upgrades_intact` runs an OLD release with real data and upgrades it.
 - **Production-log required fields** are defined once, server-side, in `PROGRESS_SECTIONS` /
   `REQUIRED_FEEDSTOCK` (`kelp_erp_server.py`; exposed to the SPA as `refdata.requiredFields`).
   Everything is required except: every Notes field, the Homogenization / Separation /
