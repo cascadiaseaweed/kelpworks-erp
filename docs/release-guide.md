@@ -124,6 +124,10 @@ Staging never auto-deploys, and its Restore function exists only there: the live
 ## If something goes wrong
 
 - **Undo a deploy:** open the merged PR on GitHub and click **Revert**. That creates a new PR; check it is green and merge it. Data is not affected.
+- **A migration went wrong at startup:** the failed start rolled back by itself, so the data is as it was before the deploy; fix forward (a new PR) or revert the PR. Every
+  upgrade of an existing database is preceded by a compressed copy at `/var/data/backups/pre-migrate-<date>.db.gz` (the last three are kept). To go back to one: stop the service
+  (or suspend it in Render), open the Render shell, run `gunzip -c /var/data/backups/pre-migrate-<date>.db.gz > /var/data/kelp_erp.db`, delete `/var/data/kelp_erp.db-wal` and
+  `/var/data/kelp_erp.db-shm`, then deploy the previous version. Anything entered since that snapshot is lost, so use this only when the data itself was damaged.
 - **Protect live data:** never edit the live database directly; never copy a local or staging database over it. The Render disk holds the only copy: take regular disk snapshots or download full backups (Admin > Download full backup).
 - **Never set** `KELP_ERP_ENV`, `KELP_ERP_ALLOW_RESTORE` or `KELP_ERP_STAGING_PASSWORD` on the live service.
 
