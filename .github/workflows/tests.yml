@@ -1,6 +1,8 @@
 name: tests
 
-# Runs on every pull request and on every push to main. The app is standard-library only, so there is nothing to install.
+# Runs on every pull request and on every push to main. The job is named `test`: make it a REQUIRED check in the repository's branch
+# protection rule for main so that a red run blocks the merge.
+# The shipped app is standard-library only; pytest is a dev-only dependency (requirements-dev.txt).
 on:
   pull_request:
   push:
@@ -12,12 +14,23 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0                # the migration check builds databases from older commits (tests/legacy_commits.txt)
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"        # the version the Docker image / runtime.txt use
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install test tools (dev only)
+        run: python -m pip install -r requirements-dev.txt
       - name: Compile (catches syntax errors)
         run: python -m py_compile kelp_erp_server.py
-      - name: Tests (a brand-new database must start)
-        run: python -m unittest discover -s tests -v
+      - name: Fresh database boots (and restarts)
+        run: python -m pytest tests/test_fresh_db.py
+      - name: Migrations upgrade older databases without losing data
+        run: python -m pytest tests/test_migrations.py
+      - name: Rest of the suite (real server on a throwaway database)
+        run: python -m pytest --ignore=tests/test_fresh_db.py --ignore=tests/test_migrations.py

@@ -40,6 +40,22 @@ python kelp_erp_server.py       # or: run.bat
 → http://localhost:8002 · seed admin **admin@kelp.local / kelp1234**.
 No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.json`.
 
+## Tests
+
+```bash
+python -m pip install -r requirements-dev.txt    # pytest -- dev/CI only; the shipped app stays standard-library only
+python -m pytest
+```
+`tests/harness.py` (stdlib only) boots the REAL server as a subprocess on a free port with its own temporary SQLite database + uploads, seeded like a
+first deploy (`Server`; `restart()` re-boots on the same data; `Server(db_path=...)` boots on a COPY of an existing database), plus a thin urllib
+`ApiClient` (bearer-token `login()`, `admin_client()`, `make_user()`). `tests/conftest.py` turns those into pytest fixtures (`server`, `fresh_server`,
+`anon`, `admin`, `make_user`). Never point a test at `kelp_erp.db`. CI (`.github/workflows/tests.yml`, one job named `test`) runs the suite on every pull request in three named steps:
+a fresh database boots and restarts (`tests/test_fresh_db.py`), **migrations upgrade older databases** (`tests/test_migrations.py`: for each commit listed in
+`tests/legacy_commits.txt` it checks that old version out, boots it on an empty database, then boots the CURRENT server on a copy and checks it starts, restarts,
+keeps every row and key, and adds no foreign-key damage -- after each release add the commit that is now live to that file), and everything else. CI fetches full
+git history for that; locally a commit missing from the clone is skipped, in CI it fails. Make `test` a required status check in the branch protection rule
+for `main` so a red run blocks the merge.
+
 ## Layout
 
 - `kelp_erp_server.py` — the entire backend: DB schema, migrations, auth, and

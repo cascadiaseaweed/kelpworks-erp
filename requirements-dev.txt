@@ -1,0 +1,5 @@
+# Development and CI only. The shipped app (kelp_erp_server.py) stays standard-library only; the Docker image never installs this file.
+#
+#   python -m pip install -r requirements-dev.txt
+#   python -m pytest
+pytest>=8.4,<9
