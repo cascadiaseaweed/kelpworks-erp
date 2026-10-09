@@ -141,6 +141,16 @@ for `main` so a red run blocks the merge.
   shipped units recorded in the event). Runs finalized before this existed are `legacy`
   (grandfathered as released, one SYSTEM event each, via `migrate()`). Don't add a way to
   edit/delete `release_events` rows.
+- **Release-integrity rules** (risk review batch 1; tests in `tests/test_release_integrity.py`). *Lab results*: only a Quality Manager can add / void / scan them
+  (everyone can read); after release, a voided required result or a new failure that the release did not accept puts the run's `on_hand` lots on HOLD and logs
+  `lab_result_hold` (`_lab_regate`). *Finished-goods lots* (`PUT /api/fg/:id`, `_edit_fg_lot`): status is limited to on_hand / hold / sold and a lot that is
+  pending_release or disposed cannot be changed by hand; hold / un-hold needs a Quality Manager, units / TDS / on_hand<->sold a Production or Quality Manager;
+  each change needs a reason and is written to the hash chain (`fg_lot_edited`); location is open to all and goes in the move log. *Totes*: a tote joins a run
+  only if `in_stock`, already locked to THAT run, or rejected from it (`_tote_available_for_run`); `PUT /api/totes/:id` only moves in_stock <-> hold and never
+  changes the weight of a wip/consumed tote. *Shipments*: lines for the same lot are summed before checking stock, deduction is relative and conditional
+  (`qty=qty-? WHERE qty>=?`), a reinstated shipment needs the stock, units returned to a disposed lot go on hold. *Run edits under an amendment* need
+  `can_amend_log`. *Writes*: every non-GET request (except login) starts `BEGIN IMMEDIATE` and `db()` waits up to 30 s for the write lock, so read-check-write
+  sequences cannot interleave. Don't add a mutating endpoint that skips these rules; add a test to that file.
 - **Production-log required fields** are defined once, server-side, in `PROGRESS_SECTIONS` /
   `REQUIRED_FEEDSTOCK` (`kelp_erp_server.py`; exposed to the SPA as `refdata.requiredFields`).
   Everything is required except: every Notes field, the Homogenization / Separation /

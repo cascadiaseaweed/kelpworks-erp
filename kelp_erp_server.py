@@ -1045,7 +1045,8 @@ CREATE TABLE IF NOT EXISTS release_events (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id       INTEGER NOT NULL,
     event_type   TEXT NOT NULL,     -- submitted | review_approved | review_returned | resubmitted |
-                                    -- released | release_rejected | reopened | voided | legacy_release
+                                    -- released | release_rejected | reopened | voided | legacy_release |
+                                    -- fg_lot_edited | lab_result_hold
     user_id      INTEGER,
     user_name    TEXT,
     user_email   TEXT,
@@ -1385,7 +1386,7 @@ def status_for_location(location, current_status):
 
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)          # wait for a competing writer instead of failing after 5 s
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
@@ -4446,6 +4447,19 @@ class Handler(BaseHTTPRequestHandler):
         if user["role"] != "admin":
             raise ApiError(403, "Administrator access required")
 
+    @staticmethod
+    def _is_quality_manager(user):
+        return bool(user and user["is_quality_manager"])
+
+    @staticmethod
+    def _is_manager(user):
+        """Production Manager or Quality Manager (the admin role alone grants neither)."""
+        return bool(user and (user["is_quality_manager"] or user["is_production_manager"]))
+
+    def _require_quality_manager(self, user, what):
+        if not self._is_quality_manager(user):
+            raise ApiError(403, "Only a Quality Manager can %s" % what)
+
     # ---- dispatch --------------------------------------------------------- #
     def do_OPTIONS(self):
         self.send_response(204)
@@ -4831,6 +4845,8 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         conn = db()
         try:
+            if method != "GET" and parsed.path != "/api/auth/login":
+                conn.execute("BEGIN IMMEDIATE")          # take the write lock BEFORE any read the handler bases a write on
             result = self._route(method, parsed.path, query, conn)
             conn.commit()
             self._send_json(result if result is not None else {"ok": True})
@@ -4925,7 +4941,7 @@ class Handler(BaseHTTPRequestHandler):
         if seg[:2] == ["api", "release"]:
             return self.route_release(method, seg, query, conn, user)
         if seg[:2] == ["api", "fg"]:
-            return self.route_fg(method, seg, query, conn)
+            return self.route_fg(method, seg, query, conn, user)
         if seg[:2] == ["api", "customers"]:
             return self.route_customers(method, seg, conn)
         if seg[:2] == ["api", "shipments"]:
@@ -5453,6 +5469,12 @@ class Handler(BaseHTTPRequestHandler):
                 # An explicit status wins; otherwise a location change may
                 # auto-flip status to/from 'hold' (see status_for_location).
                 new_status = d["status"] if "status" in d else status_for_location(new_location, it["status"])
+                # A tote's status is moved by the processes that use it (run draft -> wip, finalize -> consumed, disposal). By hand it can only
+                # go between in stock and hold, and a tote in a run or already consumed keeps its weight.
+                if "status" in d and d["status"] != it["status"] and (it["status"] not in ("in_stock", "hold") or d["status"] not in ("in_stock", "hold")):
+                    raise ApiError(400, "A tote that is %s cannot be set to %s by hand" % (it["status"], d["status"]))
+                if it["status"] in ("wip", "consumed", "disposed") and new_weight != it["avg_weight_kg"]:
+                    raise ApiError(400, "The weight of a tote that is in a run or already consumed cannot be changed")
                 # Feedstock Stability log: one line item per field that actually
                 # changed, who changed it and when.
                 if "ph" in d and new_ph != it["ph"]:
@@ -5659,6 +5681,28 @@ class Handler(BaseHTTPRequestHandler):
         return {"results": [lab_result_public(x) for x in conn.execute("SELECT * FROM lab_results WHERE run_id=? ORDER BY id DESC", (r["id"],))],
                 "coa": coa_evaluate(conn, r), "specs": specs, "metalUnits": ["ppm", "%", "ppb", "mg/kg"]}
 
+    def _lab_regate(self, conn, run, user):
+        """A lab result added or voided AFTER release can make released product non-conforming (a required result removed, or a new failure
+        that the release did not accept). The run's unsold lots are then put on hold and the audit trail says why."""
+        if run["release_state"] not in ("released", "legacy"):
+            return
+        lab = coa_evaluate(conn, run)["summary"]
+        ev = conn.execute("SELECT detail FROM release_events WHERE run_id=? AND event_type IN ('released','legacy_release') ORDER BY id DESC LIMIT 1",
+                          (run["id"],)).fetchone()
+        accepted = set()
+        if ev and ev["detail"]:
+            try:
+                accepted = set(json.loads(ev["detail"]).get("outOfSpec", []))
+            except (ValueError, AttributeError):
+                accepted = set()
+        problems = list(lab["missingRequired"]) + [f for f in lab["failed"] if f not in accepted]
+        if not problems:
+            return
+        moved = self._set_lot_status(conn, run["id"], ("on_hand",), "hold")
+        release_log(conn, run["id"], "lab_result_hold", user, capacity="Quality Manager",
+                    meaning="A lab result change after release left this run non-conforming (%s); its unsold lots were put on hold." % ", ".join(problems),
+                    detail={"problems": problems, "lots": moved})
+
     def route_lab_results(self, method, seg, conn, user):
         rid = int(seg[2])
         r = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
@@ -5666,6 +5710,10 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(404, "Production run not found")
         if len(seg) == 4 and method == "GET":
             return self._lab_results_payload(conn, r)
+        if method == "POST" and len(seg) >= 5:
+            self._require_quality_manager(user, "enter or void lab results")
+        if len(seg) == 4 and method == "POST":
+            self._require_quality_manager(user, "enter or void lab results")
         if len(seg) == 5 and seg[4] == "scan" and method == "POST":
             # read an uploaded lab-report PDF and propose the form's fields (nothing is saved; the user reviews them)
             d = self._body_json()
@@ -5743,6 +5791,7 @@ class Handler(BaseHTTPRequestHandler):
             release_log(conn, rid, "lab_results_added", user, capacity=None,
                         meaning="Laboratory results entered from report %s (%s)." % (report, lab_name),
                         detail={"report": report, "lab": lab_name, "tests": added})
+            self._lab_regate(conn, r, user)
             return self._lab_results_payload(conn, r)
         if len(seg) == 6 and seg[4].isdigit() and seg[5] == "void" and method == "POST":
             d = self._body_json()
@@ -5758,6 +5807,7 @@ class Handler(BaseHTTPRequestHandler):
             release_log(conn, rid, "lab_result_voided", user, capacity=None,
                         meaning="Laboratory result voided: %s (report %s)." % (x["analyte"], x["report_number"]),
                         comment=reason, detail={"report": x["report_number"], "test": x["analyte"], "result": coa_result_text(x)})
+            self._lab_regate(conn, r, user)
             return self._lab_results_payload(conn, r)
         raise ApiError(404, "Unknown lab-results endpoint")
 
@@ -8769,6 +8819,19 @@ class Handler(BaseHTTPRequestHandler):
         return (ph if ph is not None else tote["ph"], ph_updated,
                 orp if orp is not None else tote["orp"], orp_updated)
 
+    @staticmethod
+    def _tote_available_for_run(conn, tote, run_id):
+        """A tote may be put into a run only if it is in stock, already locked to THIS run, or was rejected from this run (a changed decision)."""
+        st = tote["status"]
+        if st == "in_stock":
+            return True
+        if st == "wip":
+            return tote["run_id"] == run_id
+        if st == "hold":
+            return conn.execute("SELECT 1 FROM tote_stability_log WHERE tote_lot_id=? AND run_id=? AND field='Decision' AND new_value='rejected'",
+                                (tote["id"], run_id)).fetchone() is not None
+        return False
+
     def _apply_tote_characterization(self, conn, run_id, tote_lot_id, fd, user, processing_lot):
         """Shared by every path that locks a tote's Feedstock characterization
         into an in-progress run -- the card's own Save button, and the outer
@@ -8784,6 +8847,9 @@ class Handler(BaseHTTPRequestHandler):
         tote = conn.execute("SELECT * FROM tote_lots WHERE id=?", (tote_lot_id,)).fetchone()
         if not tote:
             raise ApiError(404, "Tote not found")
+        if not self._tote_available_for_run(conn, tote, run_id):
+            raise ApiError(409, "Tote %s is not available for this run (status: %s%s)" % (
+                tote["lot_number"], tote["status"], ", locked to another run or batch" if tote["status"] == "wip" else ""))
         fd = fd or {}
         decision = fd.get("decision") or "accepted"
         existing_input = conn.execute(
@@ -9485,10 +9551,12 @@ class Handler(BaseHTTPRequestHandler):
         # Locked once finalized: only the yield-analysis exclusion flag may change
         # without an amendment; run date, reagents, location, operators and notes
         # are production-log entries.
-        if run["status"] == "completed" and not self._open_amendment(conn, rid):
-            if [c for c in updates if c not in ("exclude_from_stats", "exclude_reason")]:
+        if run["status"] == "completed" and [c for c in updates if c not in ("exclude_from_stats", "exclude_reason")]:
+            if not self._open_amendment(conn, rid):
                 raise ApiError(409, "This production run is finalized and its log is locked. Use \"Amend run\" "
                                     "(with a reason) to change production-log entries.", "amendment_required")
+            if not user or not user["can_amend_log"]:
+                raise ApiError(403, "Only users with the Production Log Amender permission can edit a run under amendment")
 
         # Keep consumable stock consistent when preservative amounts are corrected.
         uname = user["name"] if user else None
@@ -9575,6 +9643,8 @@ class Handler(BaseHTTPRequestHandler):
         for r in rows:
             if r["status"] not in ("in_stock", "wip"):
                 raise ApiError(400, "Tote %s is not available (status: %s)" % (r["lot_number"], r["status"]))
+            if r["status"] == "wip" and r["run_id"] != (existing["id"] if existing else None):
+                raise ApiError(409, "Tote %s is locked to another run or batch" % r["lot_number"])
 
         # A tote marked rejected during characterization contributes nothing to
         # this run — no input weight, no consumption — but is still logged (see
@@ -9869,7 +9939,68 @@ class Handler(BaseHTTPRequestHandler):
         return self._finalize_run(conn, self._body_json(), existing=existing, user=user)
 
     # ---- finished goods --------------------------------------------------- #
-    def route_fg(self, method, seg, query, conn):
+    FG_EDIT_STATUSES = ("on_hand", "hold", "sold")
+
+    def _edit_fg_lot(self, conn, it, user):
+        """PUT /api/fg/:id. Status, units on hand and TDS decide whether and how much product can be sold, so a change needs a
+        manager (hold / un-hold: a Quality Manager; units, TDS, on-hand <-> sold: a Production or Quality Manager), a reason, and is
+        written to the audit chain. A lot's location may be changed by anyone (and goes in the move log)."""
+        d = self._body_json()
+        if d.get("location"):
+            self._ensure_location(conn, d.get("location"))
+        changes = {}
+        if "status" in d and d["status"] != it["status"]:
+            new_status = d["status"]
+            if new_status not in self.FG_EDIT_STATUSES:
+                raise ApiError(400, "Status must be On hand, Hold or Sold (Pending Release and Disposed are set by their own processes)")
+            if it["status"] not in self.FG_EDIT_STATUSES:
+                label = "Pending Release" if it["status"] == "pending_release" else it["status"].replace("_", " ")
+                raise ApiError(400, "This lot is %s: its status cannot be changed here" % label + (
+                    " - use Product Release to review and release it" if it["status"] == "pending_release" else ""))
+            run_state = conn.execute("SELECT release_state FROM production_runs WHERE id=?", (it["run_id"],)).fetchone()
+            run_state = run_state["release_state"] if run_state else None
+            if new_status == "on_hand" and run_state not in (None, "legacy", "released"):
+                raise ApiError(400, "This lot's production run has not been released - use Product Release")
+            changes["status"] = (it["status"], new_status)
+        if "qty" in d:
+            new_qty = numn(d["qty"])
+            if new_qty is None or new_qty != new_qty or new_qty in (float("inf"), float("-inf")) or new_qty < 0:
+                raise ApiError(400, "Units on hand must be a number, zero or more")
+            if new_qty != it["qty"]:
+                changes["qty"] = (it["qty"], new_qty)
+        if "tds" in d:
+            new_tds = numn(d["tds"])
+            if new_tds is not None and (new_tds != new_tds or new_tds in (float("inf"), float("-inf")) or new_tds < 0):
+                raise ApiError(400, "TDS must be a number, zero or more")
+            if new_tds != it["tds"]:
+                changes["tds"] = (it["tds"], new_tds)
+        new_loc = it["location"]
+        if "location" in d and (d["location"] or None) != it["location"]:
+            new_loc = (d["location"] or "").strip() or None
+        capacity = None
+        if changes:
+            hold_involved = "status" in changes and "hold" in changes["status"]
+            if hold_involved:
+                self._require_quality_manager(user, "place a finished-goods lot on hold or release it from hold")
+            elif not self._is_manager(user):
+                raise ApiError(403, "Only a Production Manager or Quality Manager can change a lot's status, units on hand or TDS")
+            reason = (d.get("reason") or "").strip()
+            if len(reason) < 3:
+                raise ApiError(400, "Enter the reason for this change (it is recorded in the audit trail)")
+            capacity = "Quality Manager" if self._is_quality_manager(user) else "Production Manager"
+        conn.execute("UPDATE fg_lots SET qty=?, status=?, location=?, tds=? WHERE id=?",
+                     (changes["qty"][1] if "qty" in changes else it["qty"], changes["status"][1] if "status" in changes else it["status"],
+                      new_loc, changes["tds"][1] if "tds" in changes else it["tds"], it["id"]))
+        if new_loc != it["location"]:
+            self._log_move(conn, "fg", it["id"], it["fg_lot_number"], it["location"], new_loc, it["qty"], today_iso(), "Edited")
+        if changes:
+            release_log(conn, it["run_id"] or 0, "fg_lot_edited", user, capacity=capacity,
+                        meaning="Finished-goods lot %s edited: %s." % (it["fg_lot_number"], ", ".join(sorted(changes))),
+                        comment=(d.get("reason") or "").strip(),
+                        detail={"lot": it["fg_lot_number"], "changes": {k: {"from": v[0], "to": v[1]} for k, v in changes.items()}})
+        return {"fg": fg_public(conn.execute("SELECT * FROM fg_lots WHERE id=?", (it["id"],)).fetchone())}
+
+    def route_fg(self, method, seg, query, conn, user):
         if seg == ["api", "fg"] and method == "GET":
             status = query.get("status", [""])[0]
             sql = "SELECT * FROM fg_lots" + (" WHERE status=?" if status else "")
@@ -9949,30 +10080,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(405, "Method not allowed")
 
             if len(seg) == 3 and method == "PUT":
-                d = self._body_json()
-                self._ensure_location(conn, d.get("location"))
-                # Release gate: status in/out of 'pending_release' is only changed
-                # by the sign-off process, and a lot can't be flipped to on_hand
-                # (sellable) by hand unless its run has been released.
-                new_status = d["status"] if "status" in d else it["status"]
-                if new_status != it["status"]:
-                    run_state = conn.execute("SELECT release_state FROM production_runs WHERE id=?",
-                                             (it["run_id"],)).fetchone()
-                    run_state = run_state["release_state"] if run_state else None
-                    if it["status"] == "pending_release":
-                        raise ApiError(400, "This lot is Pending Release - use Product Release to review and release it")
-                    if new_status == "pending_release":
-                        raise ApiError(400, "Pending Release is set by the release process, not by hand")
-                    if new_status == "on_hand" and run_state not in (None, "legacy", "released"):
-                        raise ApiError(400, "This lot's production run has not been released - use Product Release")
-                conn.execute(
-                    "UPDATE fg_lots SET qty=?, status=?, location=?, tds=? WHERE id=?",
-                    (num(d["qty"]) if "qty" in d else it["qty"],
-                     d["status"] if "status" in d else it["status"],
-                     d["location"] if "location" in d else it["location"],
-                     numn(d["tds"]) if "tds" in d else it["tds"], fid))
-                return {"fg": fg_public(conn.execute(
-                    "SELECT * FROM fg_lots WHERE id=?", (fid,)).fetchone())}
+                return self._edit_fg_lot(conn, it, user)
         raise ApiError(404, "Unknown fg endpoint")
 
     # ---- customers -------------------------------------------------------- #
@@ -10085,16 +10193,28 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "Choose a customer")
         raw_lines = d.get("lines") or []
         ship_date = (d.get("shipDate") or today_iso()).strip()
-        # Validate every line against on-hand stock before committing anything.
-        prepared = []
+        # Validate every line against on-hand stock before committing anything. The same lot on several lines is ONE demand on that lot.
+        wanted = {}
         for ln in raw_lines:
-            fg = conn.execute("SELECT * FROM fg_lots WHERE id=?", (ln.get("fgLotId"),)).fetchone()
             qty = num(ln.get("qty"))
-            if not fg or qty <= 0:
+            try:
+                fid = int(ln.get("fgLotId"))
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0 or qty != qty or qty == float("inf"):
+                continue
+            wanted[fid] = wanted.get(fid, 0) + qty
+        prepared = []
+        for fid, qty in wanted.items():
+            fg = conn.execute("SELECT * FROM fg_lots WHERE id=?", (fid,)).fetchone()
+            if not fg:
                 continue
             if fg["status"] != "on_hand":
                 raise ApiError(400, "%s cannot be shipped: it is not released for sale (status: %s)"
                                % (fg["fg_lot_number"], "Pending Release" if fg["status"] == "pending_release" else fg["status"]))
+            rs = conn.execute("SELECT release_state FROM production_runs WHERE id=?", (fg["run_id"],)).fetchone()
+            if rs and rs["release_state"] not in (None, "legacy", "released"):
+                raise ApiError(400, "%s cannot be shipped: its production run has not been released" % fg["fg_lot_number"])
             if qty > fg["qty"]:
                 raise ApiError(400, "Only %g of %s on hand (asked %g)"
                                % (fg["qty"], fg["fg_lot_number"], qty))
@@ -10120,9 +10240,11 @@ class Handler(BaseHTTPRequestHandler):
                 "package_size,qty,litres_each) VALUES (?,?,?,?,?,?,?)",
                 (sid, fg["id"], fg["fg_lot_number"], fg["sku_code"], fg["package_size"], qty,
                  fg["litres_each"]))
-            new_qty = fg["qty"] - qty
-            cur.execute("UPDATE fg_lots SET qty=?, status=? WHERE id=?",
-                        (new_qty, "sold" if new_qty <= 0 else fg["status"], fg["id"]))
+            # relative and conditional: stock can never go below zero, whatever else ran in between
+            cur.execute("UPDATE fg_lots SET qty=qty-?, status=CASE WHEN qty-?<=0 THEN 'sold' ELSE status END WHERE id=? AND qty>=?",
+                        (qty, qty, fg["id"], qty))
+            if cur.rowcount != 1:
+                raise ApiError(409, "%s no longer has %g units on hand" % (fg["fg_lot_number"], qty))
         r = conn.execute("SELECT * FROM shipments WHERE id=?", (sid,)).fetchone()
         return {"shipment": self._shipment_public(conn, r, with_lines=True)}
 
@@ -10142,8 +10264,9 @@ class Handler(BaseHTTPRequestHandler):
                     rs = conn.execute("SELECT release_state FROM production_runs WHERE id=?",
                                       (fg["run_id"],)).fetchone()
                     back = "on_hand" if (not rs or rs["release_state"] in (None, "legacy", "released")) else "pending_release"
-                    conn.execute("UPDATE fg_lots SET qty=?, status=? WHERE id=?",
-                                 (nq, back if fg["status"] == "sold" and nq > 0 else fg["status"], fg["id"]))
+                    # units coming back to a lot that was disposed in the meantime need a Quality decision: hold them
+                    status = back if fg["status"] == "sold" and nq > 0 else ("hold" if fg["status"] == "disposed" and nq > 0 else fg["status"])
+                    conn.execute("UPDATE fg_lots SET qty=?, status=? WHERE id=?", (nq, status, fg["id"]))
         elif old_status == "cancelled" and new_status != "cancelled":
             for ln in conn.execute("SELECT * FROM shipment_lines WHERE shipment_id=?", (r["id"],)):
                 fg = conn.execute("SELECT * FROM fg_lots WHERE id=?", (ln["fg_lot_id"],)).fetchone()
@@ -10152,6 +10275,9 @@ class Handler(BaseHTTPRequestHandler):
                         raise ApiError(400, "%s is not released for sale, so this shipment cannot be reinstated"
                                        % fg["fg_lot_number"])
                     nq = (fg["qty"] or 0) - (ln["qty"] or 0)
+                    if nq < 0:
+                        raise ApiError(400, "Only %g of %s on hand: this shipment (%g) cannot be reinstated"
+                                       % (fg["qty"] or 0, fg["fg_lot_number"], ln["qty"] or 0))
                     conn.execute("UPDATE fg_lots SET qty=?, status=? WHERE id=?",
                                  (nq, "sold" if nq <= 0 else fg["status"], fg["id"]))
         conn.execute(

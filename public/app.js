@@ -4059,6 +4059,7 @@ const RELEASE_EVENTS = {
   amendment_cancelled: 'Amendment cancelled', integrity_repair: 'Integrity repair applied',
   rebaseline: 'Log hash re-baselined (snapshot format change)',
   lab_results_added: 'Lab results entered', lab_result_voided: 'Lab result VOIDED',
+  fg_lot_edited: 'Finished-goods lot edited', lab_result_hold: 'Lots put on HOLD (lab result changed after release)',
 };
 const shortHash = h => h ? h.slice(0, 10) + '…' : '—';
 async function pageRelease(v) {
@@ -4321,10 +4322,19 @@ function editFG(f) {
         : field('Status', selectFrom('', [['on_hand', 'On hand'], ['hold', 'Hold / QA'], ['sold', 'Sold / shipped']], null, 'f_status'))),
     el('div', { class: 'form-row' },
       field('TDS (%)', el('input', { type: 'number', step: '0.1', id: 'f_tds', value: f.tds ?? '' })),
-      field('Location', el('input', { id: 'f_loc', value: f.location || '' }))));
+      field('Location', el('input', { id: 'f_loc', value: f.location || '' }))),
+    field('Reason for the change', el('input', { id: 'f_reason', placeholder: 'Required when status, units or TDS change' })),
+    el('div', { class: 'help' }, 'Only a Production or Quality Manager can change units, TDS or status (placing a lot on hold, or releasing it from hold, is for a Quality Manager). Every change is recorded in the audit trail with your name and the reason. Moving a lot to another location is open to everyone.'));
   if (f.status !== 'pending_release') body.querySelector('#f_status').value = f.status;
   modal('Edit FG lot ' + f.lot, body, async () => {
-    await api('PUT', '/fg/' + f.id, { qty: +body.querySelector('#f_qty').value, status: f.status === 'pending_release' ? f.status : body.querySelector('#f_status').value, tds: body.querySelector('#f_tds').value || null, location: body.querySelector('#f_loc').value });
+    const payload = { location: body.querySelector('#f_loc').value };
+    const q = +body.querySelector('#f_qty').value, st = body.querySelector('#f_status') ? body.querySelector('#f_status').value : f.status;
+    const tds = body.querySelector('#f_tds').value === '' ? null : +body.querySelector('#f_tds').value;
+    if (q !== f.qty) payload.qty = q;
+    if (st !== f.status) payload.status = st;
+    if (tds !== (f.tds ?? null)) payload.tds = tds;
+    if (payload.qty !== undefined || payload.status !== undefined || payload.tds !== undefined) payload.reason = body.querySelector('#f_reason').value;
+    await api('PUT', '/fg/' + f.id, payload);
     toast('Updated'); render();
   }, 'Save');
 }
@@ -7141,7 +7151,8 @@ async function openLabResults(run) {
     body.innerHTML = '';
     // the action bar is part of every redraw (a save or void redraws the window, so it must come back each time)
     body.append(el('div', { style: 'margin-bottom:8px;display:flex;gap:8px;flex-wrap:wrap' },
-      el('button', { type: 'button', onclick: () => addLabReport(run, d, async () => { changed = true; await draw(); }) }, '+ Add lab report'),
+      State.user.isQualityManager ? el('button', { type: 'button', onclick: () => addLabReport(run, d, async () => { changed = true; await draw(); }) }, '+ Add lab report')
+        : el('span', { class: 'help', style: 'align-self:center' }, 'Only a Quality Manager can enter or void lab results.'),
       el('button', { type: 'button', class: 'secondary', onclick: () => window.open(coaPdfUrl(run.id, false), '_blank') }, 'View Certificate of Analysis'),
       el('button', { type: 'button', class: 'secondary', onclick: () => openAttachments(run) }, '📎 Documents')));
     body.append(el('div', { class: 'summary-line' }, sl('Run', run.processingLot), sl('Required', s.requiredReceived + ' of ' + s.requiredTotal),
@@ -7173,7 +7184,7 @@ async function openLabResults(run) {
         hist.map(x => [fmtWhen(x.enteredAt), x.analyte, x.voidedAt ? el('s', {}, x.resultText) : x.resultText,
           [x.labName, x.reportNumber, x.reportDate].filter(Boolean).join(' · '),
           x.enteredBy || '—', x.voidedAt ? el('span', { class: 'help' }, 'Voided by ' + (x.voidedBy || '—') + ': ' + (x.voidReason || ''))
-            : rowActions([['Void', () => voidLabResult(x)]])]), [false, false, false, false, false, false])
+            : (State.user.isQualityManager ? rowActions([['Void', () => voidLabResult(x)]]) : '')]), [false, false, false, false, false, false])
         : el('div', { class: 'help' }, 'Nothing entered yet.'))));
   }
   function voidLabResult(x) {
