@@ -325,7 +325,14 @@ for `main` so a red run blocks the merge.
   recommit_stock, fix_lot_status) need the actor's password and are logged to `release_events`.
   Legacy runs without packaging entries can't be cross-checked and are reported as info only.
 - **Env vars:** `PORT` (8002), `KELP_ERP_DB`, `KELP_ERP_UPLOADS`,
-  `KELP_ERP_SECRET`, `KELP_ERP_ADMIN_EMAIL/PASSWORD`, `KELP_ERP_INITIAL_PASSWORD`.
+  `KELP_ERP_SECRET`, `KELP_ERP_ADMIN_EMAIL/PASSWORD`, `KELP_ERP_INITIAL_PASSWORD`; staging only: `KELP_ERP_ENV=staging`, `KELP_ERP_ALLOW_RESTORE=1`,
+  `KELP_ERP_STAGING_PASSWORD`, `KELP_ERP_MAX_RESTORE_MB`. **Never set the staging ones on the live service.**
+- **Staging** (full guide: `docs/staging.md`, blueprint: `render.staging.yaml`): a second Render service with its own disk that holds a copy of live data.
+  `GET /api/admin/backup?full=1` (admin; `build_full_backup`) = one .zip with a consistent DB snapshot + `uploads/`, `lab_templates/`, `sop_documents/` + `manifest.json`
+  (the plain `/api/admin/backup` is still the DB-only .db). `POST /api/admin/restore` (raw zip body; `restore_backup`) exists ONLY when `ENV_NAME == "staging"` and
+  `ALLOW_RESTORE` (a live server answers 403): it validates everything first (manifest, safe member names, SQLite integrity), replaces the DB via sqlite's backup API and
+  the three folders, re-runs `init_db()` (migrations), then `scrub_for_staging` resets EVERY user's password to `KELP_ERP_STAGING_PASSWORD`. `GET /api/env` (public) drives the
+  amber STAGING banner. Admin UI: "Download full backup" everywhere, the restore box only on staging. Covered by `tests/test_staging.py`.
 
 ## Frontend conventions (`public/app.js`)
 

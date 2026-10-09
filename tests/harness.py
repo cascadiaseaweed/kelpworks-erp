@@ -84,6 +84,19 @@ class ApiClient:
         except urllib.error.HTTPError as e:
             return Response(e.code, e.read(), dict(e.headers))
 
+    def post_bytes(self, path, data, content_type="application/zip", token=None):
+        """POST a raw binary body (a file upload such as a backup .zip)."""
+        req = urllib.request.Request(self.base_url + path, data=data, method="POST")
+        req.add_header("Content-Type", content_type)
+        tok = token if token is not None else self.token
+        if tok:
+            req.add_header("Authorization", "Bearer " + tok)
+        try:
+            with urllib.request.urlopen(req, timeout=max(self.timeout, 120)) as r:
+                return Response(r.status, r.read(), dict(r.headers))
+        except urllib.error.HTTPError as e:
+            return Response(e.code, e.read(), dict(e.headers))
+
     def get(self, path, **kw):
         return self.request("GET", path, **kw)
 
@@ -199,7 +212,7 @@ class Server:
         return c
 
     def make_user(self, role="user", **flags):
-        """Create an extra user through the admin API and return (client logged in as them, user dict). `flags` e.g. isQualityManager=True."""
+        """Create an extra user through the admin API and return (client logged in as them, info dict with their email + password). `flags` e.g. isQualityManager=True."""
         self.users += 1
         email, password = "tester%d@test.local" % self.users, "tester-pass-%d" % (1000 + self.users)
         body = dict({"name": "Tester %d" % self.users, "email": email, "password": password, "role": role, "mustChange": False}, **flags)
@@ -207,4 +220,5 @@ class Server:
         created.raise_for_status()
         c = self.client()
         c.login(email, password).raise_for_status()
-        return c, created.json
+        info = created.json if isinstance(created.json, dict) else {}
+        return c, dict(info, email=email, password=password)

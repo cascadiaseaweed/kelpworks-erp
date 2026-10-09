@@ -1,0 +1,39 @@
+# Render Blueprint for the STAGING site: a second, separate service that holds a COPY of live data for realistic testing.
+# It is deliberately NOT in render.yaml (that file describes the live service). See docs/staging.md for the one-time setup and the
+# routine for refreshing staging from live. Everything about staging (its own database, secret and disk) is independent of the live service.
+#
+# In Render: New + > Blueprint, connect this repo, and set the "Blueprint file path" to render.staging.yaml
+# (or create the web service by hand with the same settings; the doc lists them).
+#
+# NEVER copy KELP_ERP_ENV / KELP_ERP_ALLOW_RESTORE / KELP_ERP_STAGING_PASSWORD onto the live service: they are what allows the
+# data to be overwritten, and the live site must never have them.
+services:
+  - type: web
+    name: kelpworks-erp-staging
+    runtime: docker
+    plan: starter
+    autoDeploy: false               # staging only changes when you click Deploy, so a pull request's branch can be tried before it is merged
+    healthCheckPath: /
+    envVars:
+      - key: KELP_ERP_ENV
+        value: staging              # shows the STAGING banner and allows Restore (together with the next line)
+      - key: KELP_ERP_ALLOW_RESTORE
+        value: "1"
+      - key: KELP_ERP_STAGING_PASSWORD   # the password every user has after a restore (at least 8 characters)
+        sync: false
+      - key: KELP_ERP_SECRET          # signs login tokens; generated here, different from live
+        generateValue: true
+      - key: KELP_ERP_DB
+        value: /var/data/kelp_erp.db
+      - key: KELP_ERP_UPLOADS
+        value: /var/data/uploads
+      - key: KELP_ERP_MAX_RESTORE_MB  # largest backup .zip the Restore button accepts
+        value: "900"
+      - key: KELP_ERP_ADMIN_EMAIL     # the staging admin created on FIRST boot (before any restore)
+        sync: false
+      - key: KELP_ERP_ADMIN_PASSWORD
+        sync: false
+    disk:
+      name: kelpworks-staging-data
+      mountPath: /var/data
+      sizeGB: 1
