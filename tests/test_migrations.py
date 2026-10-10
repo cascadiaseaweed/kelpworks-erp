@@ -63,7 +63,9 @@ def build_legacy_db(commit, workdir):
     with tarfile.open(fileobj=io.BytesIO(tar.stdout)) as t:
         t.extractall(tree)
     db = os.path.join(str(workdir), commit + ".db")
-    env = dict(os.environ, KELP_ERP_DB=db, KELP_ERP_UPLOADS=os.path.join(str(workdir), commit + "_uploads"), PYTHONIOENCODING="utf-8")
+    # KELP_ERP_ENV=development: releases from the secrets batch on only create the seed admin (LEGACY_ADMIN) in development; older ones ignore it
+    env = dict(os.environ, KELP_ERP_DB=db, KELP_ERP_UPLOADS=os.path.join(str(workdir), commit + "_uploads"), PYTHONIOENCODING="utf-8",
+               KELP_ERP_ENV="development")
     r = subprocess.run([sys.executable, "-c", BUILD_LEGACY], cwd=tree, env=env, capture_output=True)
     assert r.returncode == 0, "the old version (%s) did not build its database:\n%s" % (commit, r.stderr.decode("utf-8", "replace")[-800:])
     return db
