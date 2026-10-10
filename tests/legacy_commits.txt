@@ -12,3 +12,5 @@ e56f9bf  2026-09-20  process-log makeover
 f130934  2026-10-08  SGS mineral scans, contacts, merged Sample IDs (live 2026-10-08)
 d0a85f8  2026-10-09  staging support, tests and CI (live now; later commits are documentation only)
 65147e1  2026-10-09  release integrity (batch 1) merged to main and live (docs-only commits after it)
+5754b7b  2026-10-10  migration safety (batch 5), the release live before batch 7
+f66d03c  2026-10-10  data-integrity cleanup (batch 7) merged to main and live
