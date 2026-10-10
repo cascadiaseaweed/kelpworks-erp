@@ -29,9 +29,15 @@ Date: 2026-10-09. Code reviewed: `main` at `c1e5343` (after PRs #4 to #7). Scope
 | R-16 / R-17 | **Fixed** (batch 5): one-time changes run once (`run_once`); a new database gets its reagent types |
 | R-24 shutdown | **Fixed** (batch 5): SIGTERM finishes requests in progress and exits cleanly (verified on the Linux CI) |
 | R-29 migration tests | **Fixed** (batch 5): an old release is run with real data and upgraded; failed-start, snapshot, and soft-step behaviour are tested |
+| R-26 duplicate packaging rows | **Fixed** (batch 7): finalize adds rows up to one total per container; every database rule a request trips is a 409 with a plain message |
+| R-27 drifting totals | **Mostly fixed** (batch 7): the accepted / rejected decision is locked after finalize, `edit_run` no longer changes reagent totals, finalize refuses a draft whose locked totes are missing from the request, NaN / infinity / negative quantities are refused. |
+| R-28 tote delete | **Partly fixed** (batch 7): a tote that appears in a run or pre-processing record cannot be deleted (409). Still open: the stability log and photos of a tote with no run history are deleted with it, and a Fine tote leaves no disposal record |
+| R-30 indexes | **Fixed** (batch 7): every foreign-key column is indexed (automatically, including future tables), plus `consumable_txns(ref)` and the status columns used by the lists |
+| R-31 bad data | **Partly fixed** (batch 7): triggers refuse an unknown status on totes / finished goods / runs / pre-processing batches and negative finished-goods units. Still open: `*_id` columns without foreign keys (cannot be added to existing tables without a rebuild) |
+| R-32 volume drift | **Partly fixed** (batch 7): a run's output litres follow the litres each finished-goods lot was created with, and the IBC count works with the real container name. Still open: pre-processing pack-out is not reconciled; the re-hash of signed logs does not record what changed |
 | R-06 shipments | **Fixed** (batch 1): duplicate lines, un-cancel, disposed-lot return, conditional deduction, write lock |
 | R-14 edit under amendment | **Fixed** (batch 1) |
-| R-15 concurrency | **Partly fixed** (batch 1): writes take the lock up front and wait up to 30 s. Still open: unique-number collisions return 500 instead of 409 |
+| R-15 concurrency | **Fixed** (batches 1 and 7): writes take the lock up front and wait up to 30 s; a unique-number collision is a 409 |
 | all others | Open |
 
 ## Executive summary

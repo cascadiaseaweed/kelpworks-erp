@@ -184,6 +184,17 @@ for `main` so a red run blocks the merge.
   logged and skipped on failure, retried next start); anything a NEW database needs that `seed()` creates afterwards (reagent types) belongs in an `ensure_*` that runs after `seed()`.
   Never call `conn.commit()` inside `migrate()` / `seed()` / `ensure_*`. `SIGTERM` / `SIGINT` finish the requests in progress (up to 15 s) and exit 0 (`main`, `INFLIGHT`).
   Add the live commit to `tests/legacy_commits.txt` after each release; `test_data_written_by_an_older_release_upgrades_intact` runs an OLD release with real data and upgrades it.
+- **Data-integrity rules** (risk review batch 7; tests in `tests/test_integrity_cleanup.py`). A `sqlite3.IntegrityError` (unique number, row still referenced, our own guard triggers) is
+  answered 409 `conflict` with a plain message (`integrity_message`), never a 500. `ensure_indexes` (a soft step at start) indexes EVERY foreign-key column that has no index, so a table
+  added later is covered automatically (a test fails if one is missed); `ensure_constraints` adds triggers because SQLite cannot add CHECK constraints to an existing table: `STATUS_RULES`
+  limit `tote_lots` / `fg_lots` / `production_runs` / `preproc_batches` status to the documented values and `fg_lots.qty` cannot go negative (they only look at what a write CHANGES, so an old odd row never
+  blocks an unrelated edit). **Add a new status value to `STATUS_RULES` or the write is refused.** Finalize adds packaging rows up to ONE total per container unit (one FG lot per unit, so the lot number
+  cannot collide), and `_run_output` is the single calculation of `output_litres` / `ibc_used` (IBC = unit name contains "IBC"; the litres per unit come from the run's existing FG lots, else the
+  container's current size) used by finalize, `_sync_completed_packaging`, the integrity check and its repair. Finalize returns 409 when a tote this draft locked as WIP is missing from the request.
+  The accepted / rejected feedstock decision is fixed once the run is finalized (409 `decision_locked`; other characterization details can still be amended). A run's reagent totals belong to the
+  Dilution & Preservation entries: `edit_run` no longer accepts them (it moved stock by item name outside `run_reagent_commits`). `num` / `numn` return the default / None for NaN and infinity;
+  packaging quantities must be numbers and not negative (400), Sample Point quantities are a whole number 1-10 or blank (400 if not a number). A tote with a `run_inputs` / `preproc_inputs` row
+  cannot be deleted (409 `tote_has_history`; use QAQC Hold or dispose). `seed()` raises when `seed.json` cannot be read (the start rolls back) instead of building an empty system.
 - **Production-log required fields** are defined once, server-side, in `PROGRESS_SECTIONS` /
   `REQUIRED_FEEDSTOCK` (`kelp_erp_server.py`; exposed to the SPA as `refdata.requiredFields`).
   Everything is required except: every Notes field, the Homogenization / Separation /

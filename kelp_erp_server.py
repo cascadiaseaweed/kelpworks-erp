@@ -42,6 +42,7 @@ import io
 import re
 import csv
 import json
+import math
 import time
 import hmac
 import base64
@@ -1547,6 +1548,62 @@ def soft_step(conn, label, fn):
         logger.error("Start-up step '%s' failed and was skipped (it will be tried again at the next start).", label, exc_info=True)
 
 
+# Extra indexes for columns the app filters on that are not foreign keys: (table, column)
+EXTRA_INDEXES = [("consumable_txns", "ref"), ("fg_lots", "status"), ("production_runs", "status")]
+
+
+def ensure_indexes(conn):
+    """Index every foreign-key column that has no index of its own (SQLite does not do it): deleting or updating a parent row, and every
+    "rows of this run / tote / lot" lookup, otherwise scans the whole child table. Generic on purpose, so a table added later is covered
+    without remembering it (tests/test_integrity_cleanup.py fails if a foreign key is left unindexed). Safe to repeat."""
+    tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+    for t in tables:
+        led = set()                                         # columns that already lead an index (or are the single-column primary key)
+        for idx in conn.execute("PRAGMA index_list(%s)" % t).fetchall():
+            cols = conn.execute("PRAGMA index_info(%s)" % idx[1]).fetchall()
+            if cols:
+                led.add(cols[0][2])
+        pk = [r[1] for r in conn.execute("PRAGMA table_info(%s)" % t) if r[5]]
+        if len(pk) == 1:
+            led.add(pk[0])
+        for fk in conn.execute("PRAGMA foreign_key_list(%s)" % t).fetchall():
+            col = fk[3]
+            if col not in led:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_fk_%s_%s ON %s(%s)" % (t, col, t, col))
+                led.add(col)
+    for t, col in EXTRA_INDEXES:
+        have = {r[1] for r in conn.execute("PRAGMA table_info(%s)" % t)}
+        if col in have:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_x_%s_%s ON %s(%s)" % (t, col, t, col))
+
+
+# The values a status column may hold. SQLite cannot add a CHECK constraint to a table that already exists, so these are enforced with triggers
+# (which can be added to a live database); a request that would store anything else is refused (409) and rolled back.
+STATUS_RULES = [
+    ("tote_lots", ("in_stock", "wip", "hold", "consumed", "disposed")),
+    ("fg_lots", ("pending_release", "on_hand", "hold", "sold", "disposed")),
+    ("production_runs", ("draft", "completed")),
+    ("preproc_batches", ("draft", "completed")),
+]
+
+
+def ensure_constraints(conn):
+    """Triggers that keep bad values out of the columns the release and stock rules depend on: an unknown status, a negative finished-goods
+    quantity. They only look at what a write CHANGES, so an old row that already holds an odd value never blocks an unrelated edit."""
+    for table, allowed in STATUS_RULES:
+        listed = ", ".join("'%s'" % v for v in allowed)
+        message = "Not allowed: %s.status must be one of %s" % (table, ", ".join(allowed))
+        conn.execute("CREATE TRIGGER IF NOT EXISTS chk_%s_status_ins BEFORE INSERT ON %s WHEN NEW.status NOT IN (%s) "
+                     "BEGIN SELECT RAISE(ABORT, '%s'); END" % (table, table, listed, message))
+        conn.execute("CREATE TRIGGER IF NOT EXISTS chk_%s_status_upd BEFORE UPDATE OF status ON %s "
+                     "WHEN NEW.status IS NOT OLD.status AND NEW.status NOT IN (%s) BEGIN SELECT RAISE(ABORT, '%s'); END"
+                     % (table, table, listed, message))
+    conn.execute("CREATE TRIGGER IF NOT EXISTS chk_fg_lots_qty_ins BEFORE INSERT ON fg_lots WHEN NEW.qty < 0 "
+                 "BEGIN SELECT RAISE(ABORT, 'Not allowed: finished-goods units cannot be negative'); END")
+    conn.execute("CREATE TRIGGER IF NOT EXISTS chk_fg_lots_qty_upd BEFORE UPDATE OF qty ON fg_lots WHEN NEW.qty < 0 AND NEW.qty < OLD.qty "
+                 "BEGIN SELECT RAISE(ABORT, 'Not allowed: finished-goods units cannot be negative'); END")
+
+
 def code_fingerprint():
     """A short fingerprint of the server code: it changes whenever a deploy changes kelp_erp_server.py (and so possibly the migrations)."""
     with open(os.path.abspath(__file__), "rb") as f:
@@ -1624,6 +1681,8 @@ def init_db():
             ensure_requisition_contact(conn)
             ensure_sgs_analyses(conn)
             ensure_reagent_types(conn)
+            soft_step(conn, "foreign-key indexes", lambda: ensure_indexes(conn))
+            soft_step(conn, "status and quantity guards", lambda: ensure_constraints(conn))
             soft_step(conn, "re-hash signed production logs", lambda: rebaseline_release_hashes(conn))
             soft_step(conn, "sample catalogue for finalized runs", lambda: sync_pending_samples(conn))
 
@@ -4241,6 +4300,13 @@ def ensure_users(conn):
 def seed(conn):
     """First-run seed: admin user + reference data and the stabilized tote lots
     extracted from the 202605 inventory workbook (seed.json)."""
+    try:
+        with open(SEED_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        # An unreadable seed file used to give an empty database with an admin account that then never reseeded. Stop the start instead:
+        # the whole first-start transaction is rolled back (see init_db) and the next start tries again.
+        raise RuntimeError("Cannot read the first-run reference data (%s): %s" % (SEED_FILE, e))
     ts = now_iso()
     cur = conn.cursor()
     admin_pw = ADMIN_PASSWORD
@@ -4252,12 +4318,6 @@ def seed(conn):
         print("=" * 72)
     cur.execute("INSERT INTO users (name,email,password_hash,role,created_at) VALUES (?,?,?,'admin',?)",
                 ("Plant Admin", ADMIN_EMAIL.strip().lower(), hash_password(admin_pw), ts))
-    try:
-        with open(SEED_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        data = {}
-
     for s in data.get("species", []):
         cur.execute("INSERT OR IGNORE INTO species (code,name,common) VALUES (?,?,?)",
                     (s["code"], s["name"], s.get("common")))
@@ -5209,6 +5269,11 @@ class Handler(BaseHTTPRequestHandler):
             conn.rollback()
             self._remove_files(self._created_files)      # files this request wrote for rows that were rolled back
             self._send_json({"error": e.message, **({"code": e.code} if e.code else {})}, status=e.status)
+        except sqlite3.IntegrityError as e:
+            conn.rollback()                              # a rule the database enforces (unique number, row still referenced): the request is refused as a whole
+            self._remove_files(self._created_files)
+            logger.warning("Refused by a database constraint: %s %s: %s", self.command, redact(self.path), e)
+            self._send_json({"error": integrity_message(e), "code": "conflict"}, status=409)
         except (TimeoutError, ConnectionError):
             conn.rollback()                              # the client went silent or hung up mid-request: nothing to answer
             self._remove_files(self._created_files)
@@ -5881,6 +5946,10 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(400, "Cannot delete a tote already consumed by a run")
                 if it["status"] == "wip":
                     raise ApiError(400, "Cannot delete a tote that's locked into an in-progress run")
+                if conn.execute("SELECT 1 FROM run_inputs WHERE tote_lot_id=? UNION ALL SELECT 1 FROM preproc_inputs WHERE tote_lot_id=?",
+                                (tid, tid)).fetchone():
+                    raise ApiError(409, "This tote was inspected for a production run or pre-processing batch, so it is part of that record and "
+                                        "cannot be deleted. Place it on QAQC Hold or dispose of it instead.", "tote_has_history")
                 self._files_to_remove += [os.path.join(UPLOAD_DIR, a["stored_name"]) for a in conn.execute(
                     "SELECT stored_name FROM tote_attachments WHERE tote_lot_id=?", (tid,))]
                 conn.execute("DELETE FROM tote_lots WHERE id=?", (tid,))
@@ -7838,12 +7907,11 @@ class Handler(BaseHTTPRequestHandler):
         return out
 
     # ---- production ------------------------------------------------------- #
-    # Fields a run edit may touch: (db column, json key, label, kind)
+    # Fields a run edit may touch: (db column, json key, label, kind). The reagent amounts are NOT here: they are the Dilution &
+    # Preservation entries (edited under an amendment) and their stock is committed by _commit_reagent_usage, so a second path that
+    # changed the run's totals and moved stock by hand would leave the ledger, run_reagent_commits and the run out of step.
     RUN_EDIT_FIELDS = [
         ("run_date", "runDate", "Run date", "text"),
-        ("citric_kg", "citricKg", "Citric acid (kg)", "num"),
-        ("sorbate_kg", "sorbateKg", "Potassium sorbate (kg)", "num"),
-        ("nabenzoate_kg", "nabenzoateKg", "Sodium benzoate (kg)", "num"),
         ("exclude_from_stats", "excludeFromStats", "Exclude from yield & usage analysis (1 = excluded)", "num"),
         ("exclude_reason", "excludeReason", "Exclusion reason", "text"),
         ("location", "location", "Production Location", "text"),
@@ -8505,9 +8573,7 @@ class Handler(BaseHTTPRequestHandler):
                             % (unit, u["entries"], u["lots"], u["shipped"], u["disposed"], u["accounted"]),
                             "Resync the FG lots to the packaging entries (the packaging rows are the source of truth).",
                             "resync_lots")
-                expected = round(sum(unit_litres[e["container_unit"]] * num(e["qty"]) for e in conn.execute(
-                    "SELECT container_unit, qty FROM run_packaging_entries WHERE run_id=?", (rid,))
-                    if e["container_unit"] in unit_litres and num(e["qty"]) > 0), 2)
+                expected = self._run_output(conn, rid)[0]
                 if abs((r["output_litres"] or 0) - expected) > 0.01:
                     add("warning", "Output litres", r, "Run output is %g L but its packaging entries total %g L."
                         % (r["output_litres"] or 0, expected), "Recompute the run's output litres.", "recompute_output")
@@ -8615,16 +8681,24 @@ class Handler(BaseHTTPRequestHandler):
                     comment=kind, detail=detail)
         return self._integrity_check(conn)
 
-    def _sync_completed_output(self, conn, run_id):
+    def _run_output(self, conn, run_id):
+        """(output litres, IBC count) of a run from its packaging rows. A finished-goods lot keeps the litres per unit it was created with,
+        so a lot that exists decides the size of its unit; a later change to the container's fill volume only affects units without a lot."""
         unit_litres = packaging_container_litres_map(conn)
+        for lot in conn.execute("SELECT package_size, litres_each FROM fg_lots WHERE run_id=? AND litres_each IS NOT NULL", (run_id,)):
+            unit_litres[lot["package_size"]] = lot["litres_each"]
         output, ibc = 0.0, 0
-        for e in conn.execute("SELECT container_unit, qty FROM run_packaging_entries WHERE run_id=?", (run_id,)):
-            qty = num(e["qty"])
-            if e["container_unit"] in unit_litres and qty > 0:
-                output += unit_litres[e["container_unit"]] * qty
-                if e["container_unit"] == "IBC":
+        for unit, qty in self._packaging_totals(conn, run_id).items():
+            qty = num(qty)
+            if unit in unit_litres and qty > 0:
+                output += unit_litres[unit] * qty
+                if is_ibc_unit(unit):
                     ibc += int(qty)
-        conn.execute("UPDATE production_runs SET output_litres=?, ibc_used=? WHERE id=?", (round(output, 2), ibc, run_id))
+        return round(output, 2), ibc
+
+    def _sync_completed_output(self, conn, run_id):
+        output, ibc = self._run_output(conn, run_id)
+        conn.execute("UPDATE production_runs SET output_litres=?, ibc_used=? WHERE id=?", (output, ibc, run_id))
 
     def route_integrity(self, method, seg, conn, user):
         self._integrity_actor(conn, user, {})
@@ -9131,6 +9205,12 @@ class Handler(BaseHTTPRequestHandler):
         d = self._body_json()
         if "decision" in d and d["decision"] not in ("accepted", "rejected"):
             raise ApiError(400, "Choose Accepted or Rejected for the feedstock decision")
+        if "decision" in d and self._run_is_completed(conn, run_id) and (not row["decision_set"] or d["decision"] != row["decision"]):
+            # accepted / rejected decides which totes were processed: it sets the run's input weight, the totes' status and the IBC pool,
+            # and none of those is re-derived after finalize -- so the decision is fixed with the run
+            raise ApiError(409, "The accepted / rejected decision cannot be changed once the run is finalized: it decides which totes "
+                                "were processed and the run's input weight. Other characterization details can still be amended.",
+                           "decision_locked")
         self._apply_feedstock_detail(conn, input_id, d, row["tote_lot_id"])
         return {"inputs": self._run_inputs_public(conn, run_id)}
 
@@ -9653,8 +9733,7 @@ class Handler(BaseHTTPRequestHandler):
             if key not in d:
                 continue
             if kind == "int":
-                v = d[key]
-                updates[col] = max(1, min(10, int(v))) if v not in (None, "") else None
+                updates[col] = sample_qty(d[key])
             else:
                 updates[col] = (d[key] or "").strip() or None
         if updates:
@@ -9737,11 +9816,10 @@ class Handler(BaseHTTPRequestHandler):
         d = self._sample_point_defaults(conn, row, self._body_json())
         old_container, old_qty = row["container"], row["qty"] or 0
         new_container = ((d["container"] or "").strip() or None) if "container" in d else old_container
+        new_qty = old_qty
         if "qty" in d:
-            v = d["qty"]
-            new_qty = max(1, min(10, int(v))) if v not in (None, "") else old_qty
-        else:
-            new_qty = old_qty
+            q = sample_qty(d["qty"])
+            new_qty = q if q is not None else old_qty
         lot = conn.execute("SELECT processing_lot FROM production_runs WHERE id=?", (run_id,)).fetchone()["processing_lot"]
         uname = user["name"] if user else None
         if new_container == old_container:
@@ -9776,7 +9854,12 @@ class Handler(BaseHTTPRequestHandler):
             if key not in d:
                 continue
             if kind == "num":
-                updates[col] = numn(d[key])
+                v = numn(d[key])
+                if d[key] not in (None, "") and v is None:
+                    raise ApiError(400, "Quantity must be a number")
+                if v is not None and v < 0:
+                    raise ApiError(400, "Quantity cannot be negative")
+                updates[col] = v
             else:
                 updates[col] = (d[key] or "").strip() or None
         if updates:
@@ -9856,15 +9939,7 @@ class Handler(BaseHTTPRequestHandler):
             delta = after.get(unit, 0) - before.get(unit, 0)
             if delta:
                 self._adjust_fg_lot(conn, run, unit, delta, unit_litres)
-        output, ibc = 0.0, 0
-        for e in conn.execute("SELECT container_unit, qty FROM run_packaging_entries WHERE run_id=?", (run_id,)):
-            qty = num(e["qty"])
-            if e["container_unit"] in unit_litres and qty > 0:
-                output += unit_litres[e["container_unit"]] * qty
-                if e["container_unit"] == "IBC":
-                    ibc += int(qty)
-        conn.execute("UPDATE production_runs SET output_litres=?, ibc_used=? WHERE id=?",
-                     (round(output, 2), ibc, run_id))
+        self._sync_completed_output(conn, run_id)
 
     def add_packaging_entry(self, conn, run_id, user):
         # On a DRAFT, rows are freely added/edited/removed and none of it
@@ -9966,24 +10041,6 @@ class Handler(BaseHTTPRequestHandler):
             if not user or not user["can_amend_log"]:
                 raise ApiError(403, "Only users with the Production Log Amender permission can edit a run under amendment")
 
-        # Keep consumable stock consistent when preservative amounts are corrected.
-        uname = user["name"] if user else None
-        if "citric_kg" in updates:
-            delta = (updates["citric_kg"] or 0) - (run["citric_kg"] or 0)
-            row = self._consumable_by_name(conn, "Citric Acid")
-            if delta and row:
-                self._consume(conn, row["id"], -delta, "Production run edit", run["processing_lot"], uname)
-        if "sorbate_kg" in updates:
-            delta = (updates["sorbate_kg"] or 0) - (run["sorbate_kg"] or 0)
-            row = self._consumable_by_name(conn, "Potassium Sorbate")
-            if delta and row:
-                self._consume(conn, row["id"], -delta, "Production run edit", run["processing_lot"], uname)
-        if "nabenzoate_kg" in updates:
-            delta = (updates["nabenzoate_kg"] or 0) - (run["nabenzoate_kg"] or 0)
-            row = self._consumable_by_name(conn, "Sodium Benzoate")
-            if delta and row:
-                self._consume(conn, row["id"], -delta, "Production run edit", run["processing_lot"], uname)
-
         sets = ", ".join("%s=?" % c for c in updates)
         conn.execute("UPDATE production_runs SET %s WHERE id=?" % sets,
                      (*updates.values(), rid))
@@ -10053,6 +10110,14 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(400, "Tote %s is not available (status: %s)" % (r["lot_number"], r["status"]))
             if r["status"] == "wip" and r["run_id"] != (existing["id"] if existing else None):
                 raise ApiError(409, "Tote %s is locked to another run or batch" % r["lot_number"])
+        if existing:
+            # a tote this draft locked as WIP that is missing from the request would stay locked to a finished run for good
+            left_out = [t["lot_number"] for t in conn.execute(
+                "SELECT lot_number FROM tote_lots WHERE run_id=? AND status='wip' AND id NOT IN (%s)" % ",".join("?" * len(tote_ids)),
+                (existing["id"], *tote_ids))]
+            if left_out:
+                raise ApiError(409, "Tote(s) %s are locked to this run but were not included in the finalize request. "
+                                    "Reload the run and try again." % ", ".join(left_out))
 
         # A tote marked rejected during characterization contributes nothing to
         # this run — no input weight, no consumption — but is still logged (see
@@ -10074,13 +10139,16 @@ class Handler(BaseHTTPRequestHandler):
         unit_litres = packaging_container_litres_map(conn)
         output_litres = 0.0
         ibc_used = 0
+        pack_totals = {}                              # container unit -> total qty (several rows may name the same container)
         for pe in packaging_entries:
             unit = pe["container_unit"]
             qty = num(pe["qty"])
             if unit not in unit_litres or qty <= 0:
                 continue
+            pack_totals[unit] = pack_totals.get(unit, 0) + qty
+        for unit, qty in pack_totals.items():
             output_litres += unit_litres[unit] * qty
-            if unit == "IBC":
+            if is_ibc_unit(unit):
                 ibc_used += int(qty)
         output_litres = round(output_litres, 2)
 
@@ -10157,13 +10225,9 @@ class Handler(BaseHTTPRequestHandler):
         if used_row and accepted_rows:
             self._consume(conn, used_row["id"], len(accepted_rows), "Emptied by processing", lot, uname)
 
-        # Create FG lots, one per packaging entry (container unit).
+        # Create FG lots, one per container unit (rows naming the same container were added up above: the lot number is unique).
         fg_created = []
-        for pe in packaging_entries:
-            unit = pe["container_unit"]
-            qty = num(pe["qty"])
-            if unit not in unit_litres or qty <= 0:
-                continue
+        for unit, qty in pack_totals.items():
             fg_lot = "%s-%s" % (lot, unit)
             cur.execute(
                 "INSERT INTO fg_lots (fg_lot_number,sku_code,run_id,package_size,qty,litres_each,"
@@ -11435,20 +11499,49 @@ class Handler(BaseHTTPRequestHandler):
             for r in conn.execute(sql, args)]}
 
 
+def sample_qty(v):
+    """A Sample Point's number of containers: a whole number from 1 to 10 (larger / smaller values are clamped), None when blank."""
+    if v in (None, ""):
+        return None
+    f = numn(v)
+    if f is None:
+        raise ApiError(400, "Quantity must be a number")
+    return max(1, min(10, int(f)))
+
+
+def is_ibc_unit(unit):
+    """True for an IBC tote container ('IBC', '1,000 L IBC', ...): ibc_used counts these."""
+    return "IBC" in (unit or "").upper()
+
+
+def integrity_message(e):
+    """A plain-language 409 message for a sqlite3.IntegrityError (the raw text names tables and columns)."""
+    text = str(e)
+    if text.startswith("Not allowed:"):
+        return text                                   # raised by our own trigger (ensure_constraints): already in plain words
+    if text.startswith("UNIQUE"):
+        return "That number or name is already in use, so the change was not saved. Check for a duplicate and try again."
+    if text.startswith("FOREIGN KEY"):
+        return "Other records still refer to this item (or the item it refers to no longer exists), so the change was not saved."
+    return "The change conflicts with existing data and was not saved."
+
+
 def num(v, default=0):
     try:
-        return float(v)
+        f = float(v)
     except (TypeError, ValueError):
         return default
+    return f if math.isfinite(f) else default       # "nan" / "inf" parse as floats but are never a usable quantity
 
 
 def numn(v):
     if v in (None, ""):
         return None
     try:
-        return float(v)
+        f = float(v)
     except (TypeError, ValueError):
         return None
+    return f if math.isfinite(f) else None
 
 
 def month_bounds(month):
