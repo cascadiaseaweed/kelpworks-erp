@@ -5581,8 +5581,8 @@ const CALCULATIONS = [
   },
   {
     title: 'Output (L) / New IBCs filled',
-    formula: 'Output (L) = Σ (entry qty × container unit’s litres each)   ·   New IBCs filled = Σ qty where the container unit is IBC',
-    description: 'A run’s total bottled output and IBC usage, computed from the Packaging table’s entries at finalization using each container’s litres-each value (Inventory Items → Packaging).',
+    formula: 'Output (L) = Σ over container units of (total qty of that unit × litres each)   ·   New IBCs filled = Σ qty of the units whose name contains “IBC”',
+    description: 'A run’s total bottled output and IBC usage, computed from the Packaging table’s entries (rows naming the same container are added up) using each container’s litres-each value (Inventory Items → Packaging). Once a finished-goods lot exists for a unit, the litres-each it was created with are used, so changing a container’s size later does not rewrite a finished run.',
     location: 'Production → Packaging section, applied when a run is finalized',
     settings: [],
   },
