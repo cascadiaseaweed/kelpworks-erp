@@ -203,6 +203,12 @@ SETTINGS_DEFAULTS = [
      "Pre-filled value for a new run's Pasteurization Product set-point (°C) field."),
     ("pasteurization_default_boiler_setpoint_c", 90, "Pasteurization default Boiler set-point (°C)",
      "Pre-filled value for a new run's Pasteurization Boiler set-point (°C) field."),
+    ("sds_review_years", 3, "Safety data sheet review interval (years)",
+     "A safety data sheet is due for review this many years after its issue date (shown on the Documents page)."),
+    ("sds_review_warning_days", 60, "Safety data sheet review warning (days)",
+     "A safety data sheet is flagged \"review soon\" when its review date is this many days away or less."),
+    ("library_scan_stale_days", 3, "SharePoint folder check: warn after (days)",
+     "The Documents page warns administrators when the SOP / safety data sheet folders have not been reported by the sync for longer than this."),
 ]
 
 # The fixed catalog of "QC Check" fields on the production log -- only fields
@@ -572,6 +578,93 @@ CREATE TABLE IF NOT EXISTS sop_document_edits (
     created_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sop_edits_sop ON sop_document_edits(sop_id);
+
+-- Safety data sheets (batch 10). The register is fed from the SharePoint folder 04_Safety-Data-Sheets/Current: one row per chemical + supplier
+-- (`sds_key`), the file of its latest issue, and the inventory items it covers. Replaced files are kept in document_revisions.
+CREATE TABLE IF NOT EXISTS sds_documents (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    chemical     TEXT NOT NULL,
+    supplier     TEXT NOT NULL,
+    sds_key      TEXT NOT NULL UNIQUE,   -- lower-case chemical|supplier: what identifies the sheet across issues
+    issue_date   TEXT,
+    filename     TEXT,
+    content_type TEXT,
+    size         INTEGER,
+    stored_name  TEXT,
+    file_sha256  TEXT,
+    source_path  TEXT,                   -- where the file is in the SharePoint library
+    status       TEXT NOT NULL DEFAULT 'current',   -- current | withdrawn
+    withdrawn_at TEXT,
+    notes        TEXT,
+    uploaded_by  TEXT,
+    uploaded_at  TEXT,
+    updated_at   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sds_items (
+    sds_id        INTEGER NOT NULL REFERENCES sds_documents(id) ON DELETE CASCADE,
+    consumable_id INTEGER NOT NULL REFERENCES consumables(id) ON DELETE CASCADE,
+    PRIMARY KEY (sds_id, consumable_id)
+);
+-- Audit trail of safety data sheet changes (SOP changes use sop_document_edits).
+CREATE TABLE IF NOT EXISTS document_edits (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind       TEXT NOT NULL,
+    doc_id     INTEGER NOT NULL,
+    user_name  TEXT,
+    field      TEXT NOT NULL,
+    old_value  TEXT,
+    new_value  TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_document_edits_doc ON document_edits(kind, doc_id);
+-- Earlier files of an SOP / safety data sheet (kind sop | sds): the file stays on disk in that kind's folder.
+CREATE TABLE IF NOT EXISTS document_revisions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind          TEXT NOT NULL,
+    doc_id        INTEGER NOT NULL,
+    revision      TEXT,
+    issue_date    TEXT,
+    filename      TEXT,
+    content_type  TEXT,
+    size          INTEGER,
+    stored_name   TEXT NOT NULL,
+    file_sha256   TEXT,
+    source_path   TEXT,
+    uploaded_by   TEXT,
+    uploaded_at   TEXT,
+    superseded_at TEXT NOT NULL,
+    superseded_by TEXT,
+    reason        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_document_revisions_doc ON document_revisions(kind, doc_id);
+-- Differences found between the SharePoint folders and the register, waiting for an administrator (change: new | revision | missing | unreadable;
+-- state: pending | accepted | ignored | gone). A file waiting for review is stored in library_inbox/ until it is accepted.
+CREATE TABLE IF NOT EXISTS library_inbox (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,
+    change      TEXT NOT NULL,
+    state       TEXT NOT NULL DEFAULT 'pending',
+    identity    TEXT,
+    source_path TEXT,
+    filename    TEXT,
+    file_sha256 TEXT,
+    size        INTEGER,
+    stored_name TEXT,
+    parsed      TEXT,
+    target_id   INTEGER,
+    detail      TEXT,
+    found_at    TEXT NOT NULL,
+    resolved_by TEXT,
+    resolved_at TEXT,
+    resolution  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_library_inbox_state ON library_inbox(kind, state);
+CREATE TABLE IF NOT EXISTS library_scans (
+    kind       TEXT PRIMARY KEY,
+    scanned_at TEXT,
+    file_count INTEGER,
+    by_who     TEXT
+);
 
 -- Lot-specific quality control measurements, traced back to the production
 -- run (processing lot) they were taken on.
@@ -1592,6 +1685,8 @@ STATUS_RULES = [
     ("fg_lots", ("pending_release", "on_hand", "hold", "sold", "disposed")),
     ("production_runs", ("draft", "completed")),
     ("preproc_batches", ("draft", "completed")),
+    ("sop_documents", ("current", "withdrawn")),
+    ("sds_documents", ("current", "withdrawn")),
 ]
 
 
@@ -4176,6 +4271,12 @@ def migrate(conn):
     sopcols = {r["name"] for r in conn.execute("PRAGMA table_info(sop_documents)")}
     if "key" not in sopcols:
         conn.execute("ALTER TABLE sop_documents ADD COLUMN key TEXT")
+    # (batch 10) the SOP register is also fed from the SharePoint folder: document number, revision, status and the file's fingerprint / source
+    for col, decl in (("doc_number", "TEXT"), ("revision", "TEXT"), ("status", "TEXT NOT NULL DEFAULT 'current'"), ("file_sha256", "TEXT"),
+                      ("source_path", "TEXT"), ("withdrawn_at", "TEXT")):
+        if col not in {r["name"] for r in conn.execute("PRAGMA table_info(sop_documents)")}:
+            conn.execute("ALTER TABLE sop_documents ADD COLUMN %s %s" % (col, decl))
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sop_doc_number ON sop_documents(doc_number) WHERE doc_number IS NOT NULL")
     # Seed the one SOP the Homogenization QC Check links to (by key, not
     # name, so an admin can freely rename it later without breaking that
     # link) -- an admin still has to upload the actual file via Admin > SOP Documents.
@@ -4622,8 +4723,9 @@ ARCHIVE_README = """KelpWorks-Records: folders and file names
                       03_Photos           Feedstock and process photos
                       04_Other            Any other document attached to the run
                     _superseded folders hold earlier versions of a file that changed. runs_index.csv (in _Index) lists every run.
-03_SOPs             Controlled procedures, kept by Quality. Current/ holds what is in force, Superseded/ the older revisions.
-04_Safety-Data-Sheets  Controlled safety data sheets, same Current / Superseded layout.
+03_SOPs             Controlled procedures, kept by Quality. Current/ holds what is in force, Superseded/ the older revisions. KelpWorks reads
+                    Current/ every night (the sync lists the files); new or changed files wait for an administrator to accept them.
+04_Safety-Data-Sheets  Controlled safety data sheets, same Current / Superseded layout and the same nightly check.
 05_Fulfillment      Shipping and sales documents (bill of lading, commercial invoice ...), one folder per shipment.
 
 File names
@@ -4963,6 +5065,239 @@ def archive_status(conn):
             "runsToArchive": conn.execute("SELECT COUNT(*) c FROM production_runs WHERE status='completed'").fetchone()["c"]}
 
 
+# ---------------------------------------------------------------------------------------
+# Controlled documents (SOPs and safety data sheets) kept in the SharePoint library (batch 10)
+#
+# SharePoint is the master: Quality keeps `03_SOPs/Current` and `04_Safety-Data-Sheets/Current`. The sync script on the office PC reports what is in those
+# folders (a listing with a SHA-256 per file) and uploads the files KelpWorks does not have yet. KelpWorks never changes its register by itself: every difference
+# (a new document, a new revision, a removed file, a file whose name cannot be read) waits in the `library_inbox` for an administrator to accept or ignore.
+# ---------------------------------------------------------------------------------------
+SDS_DIR = os.path.join(os.path.dirname(UPLOAD_DIR), "sds_documents")
+LIBRARY_DIR = os.path.join(os.path.dirname(UPLOAD_DIR), "library_inbox")          # files waiting for review (not backed up: the sync uploads them again)
+LIBRARY_FOLDERS = {"sop": "03_SOPs/Current", "sds": "04_Safety-Data-Sheets/Current"}
+LIBRARY_MAX_FILES = 500                                                           # per scan
+LIBRARY_MAX_PENDING_BYTES = 200 * 1024 * 1024                                      # all files waiting for review together
+
+_SOP_RE = re.compile(r"^SOP[-_ ]*0*(\d{1,4})(?:[-_ ]+(.*))?$", re.I)
+_SOP_REV_TAIL = re.compile(r"[-_ ]+(?:rev(?:ision)?[-_ ]*([0-9A-Za-z]{1,6})|[rv][-_ ]?(\d{1,3}))$", re.I)
+_SDS_RE = re.compile(r"^SDS_+([^_]+?)_+([^_]+?)_+(\d{4}-\d{2}-\d{2}|\d{8})$", re.I)
+
+
+def parse_sop_filename(filename):
+    """{docNumber, title, revision} from a name such as SOP-012_Homogenization_rev3.pdf (SOP002_Solid-Liquid-Ratio.pdf also reads: 'SOP-002').
+    The revision may be missing. Raises ValueError (with a message the administrator can act on) when the name does not start with SOP and a number."""
+    stem = os.path.splitext(os.path.basename(filename or ""))[0].strip()
+    m = _SOP_RE.match(stem)
+    if not m:
+        raise ValueError("The name must start with SOP- and the number, for example SOP-012_Homogenization_rev3.pdf")
+    rest, revision = (m.group(2) or "").strip(), None
+    r = _SOP_REV_TAIL.search(rest)
+    if r:
+        revision = r.group(1) or r.group(2)
+        rest = rest[:r.start()]
+    return {"docNumber": "SOP-%03d" % int(m.group(1)), "title": re.sub(r"[-_]+", " ", rest).strip(), "revision": revision}
+
+
+def sds_identity(chemical, supplier):
+    return archive_slug(chemical, 80, "x").lower() + "|" + archive_slug(supplier, 80, "x").lower()
+
+
+def parse_sds_filename(filename):
+    """{chemical, supplier, issueDate, sdsKey} from SDS_Citric-Acid_Univar_2025-03-14.pdf. Raises ValueError when the name does not follow that pattern."""
+    stem = os.path.splitext(os.path.basename(filename or ""))[0].strip()
+    m = _SDS_RE.match(stem)
+    if not m:
+        raise ValueError("The name must look like SDS_Chemical-Name_Supplier_2025-03-14.pdf (chemical, supplier and issue date separated by underscores)")
+    raw = m.group(3)
+    iso = raw if "-" in raw else "%s-%s-%s" % (raw[:4], raw[4:6], raw[6:])
+    try:
+        datetime.date.fromisoformat(iso)
+    except ValueError:
+        raise ValueError("The issue date %s is not a real date (use year-month-day, for example 2025-03-14)" % raw)
+    chemical, supplier = (re.sub(r"-+", " ", x).strip() for x in (m.group(1), m.group(2)))
+    return {"chemical": chemical, "supplier": supplier, "issueDate": iso, "sdsKey": sds_identity(chemical, supplier)}
+
+
+def library_parse(kind, name):
+    return parse_sop_filename(name) if kind == "sop" else parse_sds_filename(name)
+
+
+def library_identity(kind, parsed):
+    return parsed["docNumber"] if kind == "sop" else parsed["sdsKey"]
+
+
+def library_file_ok(name):
+    """Documents only: no temporary / hidden files and nothing that could run (the same refusal list as an upload)."""
+    if not name or name.startswith(("~$", ".")) or name.lower() in ("desktop.ini", "thumbs.db") or name.lower().endswith((".tmp", ".part")):
+        return False
+    return os.path.splitext(name)[1].lower() not in BLOCKED_UPLOAD_EXTENSIONS
+
+
+def library_clean_path(path):
+    p = (path or "").replace("\\", "/").strip().strip("/")
+    parts = p.split("/")
+    if not p or ".." in parts or any(":" in x for x in parts):
+        return ""
+    return p[:300]
+
+
+def library_dir(kind):
+    return SOP_DIR if kind == "sop" else SDS_DIR
+
+
+def library_table(kind):
+    return "sop_documents" if kind == "sop" else "sds_documents"
+
+
+def library_register_row(conn, kind, identity):
+    if kind == "sop":
+        return conn.execute("SELECT * FROM sop_documents WHERE doc_number=?", (identity,)).fetchone()
+    return conn.execute("SELECT * FROM sds_documents WHERE sds_key=?", (identity,)).fetchone()
+
+
+def library_log_edit(conn, kind, doc_id, who, field, old, new):
+    if kind == "sop":
+        conn.execute("INSERT INTO sop_document_edits (sop_id,user_name,field,old_value,new_value,created_at) VALUES (?,?,?,?,?,?)",
+                     (doc_id, who, field, old, new, now_iso()))
+    else:
+        conn.execute("INSERT INTO document_edits (kind,doc_id,user_name,field,old_value,new_value,created_at) VALUES ('sds',?,?,?,?,?,?)",
+                     (doc_id, who, field, old, new, now_iso()))
+
+
+def _inbox_key(r):
+    if r["change"] == "unreadable":
+        return ("unreadable", r["source_path"], r["file_sha256"])
+    if r["change"] == "missing":
+        return ("missing", str(r["target_id"]), None)
+    return (r["change"], r["identity"], r["file_sha256"])
+
+
+def library_reconcile(conn, kind, files, who):
+    """Compare the files now in the SharePoint folder with the register and keep the inbox in step. `files` = [{path, size, sha256}] (the WHOLE folder).
+    Returns {pending, need, warnings, files, drop}: `need` are the files the sync must upload, `drop` are stored copies to delete after the commit."""
+    if kind not in LIBRARY_FOLDERS:
+        raise ApiError(400, "Unknown document kind")
+    if len(files) > LIBRARY_MAX_FILES:
+        raise ApiError(400, "That folder lists more than %d files; something is wrong with it." % LIBRARY_MAX_FILES)
+    now = now_iso()
+    conn.execute("INSERT OR REPLACE INTO library_scans (kind, scanned_at, file_count, by_who) VALUES (?,?,?,?)", (kind, now, len(files), who))
+    seen = []
+    for f in files:
+        path = library_clean_path(f.get("path"))
+        sha = str(f.get("sha256") or "").lower()
+        name = os.path.basename(path)
+        if not path or not re.fullmatch(r"[0-9a-f]{64}", sha) or not library_file_ok(name):
+            continue
+        try:
+            parsed, err = library_parse(kind, name), None
+        except ValueError as e:
+            parsed, err = None, str(e)
+        seen.append({"path": path, "name": name, "sha": sha, "size": int(f.get("size") or 0), "parsed": parsed, "err": err})
+    warnings, desired, renames = [], {}, []
+    count = {}
+    for s in seen:
+        if s["parsed"]:
+            ident = library_identity(kind, s["parsed"])
+            count[ident] = count.get(ident, 0) + 1
+    for s in seen:
+        base = {"path": s["path"], "name": s["name"], "sha": s["sha"], "size": s["size"], "parsed": s["parsed"], "target": None, "identity": None, "detail": None}
+        if s["err"]:
+            desired[("unreadable", s["path"], s["sha"])] = dict(base, change="unreadable", detail=s["err"])
+            continue
+        ident = library_identity(kind, s["parsed"])
+        extra = "Another file with the same number is also in the folder." if count[ident] > 1 else None
+        row = library_register_row(conn, kind, ident)
+        if row is None:
+            desired[("new", ident, s["sha"])] = dict(base, change="new", identity=ident, detail=extra)
+        elif row["file_sha256"] == s["sha"] and row["status"] == "current":
+            if row["source_path"] != s["path"]:
+                renames.append((row, s))
+        elif row["file_sha256"] == s["sha"]:
+            desired[("revision", ident, s["sha"])] = dict(base, change="revision", identity=ident, target=row["id"], detail="A withdrawn document is back in the folder.")
+        else:
+            desired[("revision", ident, s["sha"])] = dict(base, change="revision", identity=ident, target=row["id"], detail=extra)
+    present = {library_identity(kind, s["parsed"]) for s in seen if s["parsed"]}
+    if not seen:
+        warnings.append("The folder looks empty, so nothing was treated as removed. (Is the SharePoint library synced on that PC?)")
+    else:
+        ident_col = "doc_number" if kind == "sop" else "sds_key"
+        for r in conn.execute("SELECT * FROM %s WHERE source_path IS NOT NULL AND status='current'" % library_table(kind)).fetchall():
+            if r[ident_col] and r[ident_col] not in present:
+                desired[("missing", str(r["id"]), None)] = {"path": r["source_path"], "name": r["filename"], "sha": None, "size": None, "parsed": None,
+                                                            "target": r["id"], "identity": r[ident_col], "change": "missing",
+                                                            "detail": "The file is no longer in the folder."}
+    for row, s in renames:                                  # the same file under another name: record it quietly
+        library_log_edit(conn, kind, row["id"], who, "Source file", row["source_path"], s["path"])
+        if kind == "sop" and (s["parsed"].get("revision") or None) != row["revision"]:
+            conn.execute("UPDATE sop_documents SET revision=? WHERE id=?", (s["parsed"].get("revision"), row["id"]))
+        conn.execute("UPDATE %s SET source_path=? WHERE id=?" % library_table(kind), (s["path"], row["id"]))
+
+    by_key = {}
+    for r in conn.execute("SELECT * FROM library_inbox WHERE kind=? AND state IN ('pending','gone','ignored') ORDER BY id DESC", (kind,)).fetchall():
+        by_key.setdefault(_inbox_key(r), []).append(r)
+    need, drop = [], []
+    for key, d in desired.items():
+        row = (by_key.get(key) or [None])[0]
+        parsed_json = json.dumps(d["parsed"]) if d["parsed"] else None
+        if row is None:
+            cur = conn.execute("INSERT INTO library_inbox (kind,change,state,identity,source_path,filename,file_sha256,size,parsed,target_id,detail,found_at)"
+                               " VALUES (?,?,'pending',?,?,?,?,?,?,?,?,?)",
+                               (kind, d["change"], d["identity"], d["path"], d["name"], d["sha"], d["size"], parsed_json, d["target"], d["detail"], now))
+            row = conn.execute("SELECT * FROM library_inbox WHERE id=?", (cur.lastrowid,)).fetchone()
+        elif row["state"] == "gone":
+            conn.execute("UPDATE library_inbox SET state='pending', resolved_at=NULL, resolved_by=NULL, resolution=NULL, source_path=?, filename=?, detail=?, found_at=? WHERE id=?",
+                         (d["path"], d["name"], d["detail"], now, row["id"]))
+            row = conn.execute("SELECT * FROM library_inbox WHERE id=?", (row["id"],)).fetchone()
+        elif row["state"] == "pending" and (row["source_path"] != d["path"] or row["detail"] != d["detail"]):
+            conn.execute("UPDATE library_inbox SET source_path=?, filename=?, detail=? WHERE id=?", (d["path"], d["name"], d["detail"], row["id"]))
+        if row["state"] == "pending" and d["change"] in ("new", "revision") and not row["stored_name"]:
+            need.append({"path": d["path"], "sha256": d["sha"]})
+    for key, rows in by_key.items():
+        if key in desired:
+            continue
+        for r in rows:
+            if r["state"] == "pending":
+                conn.execute("UPDATE library_inbox SET state='gone', resolved_at=?, resolution='No longer in the folder' WHERE id=?", (now, r["id"]))
+                if r["stored_name"]:
+                    drop.append(os.path.join(LIBRARY_DIR, r["stored_name"]))
+                    conn.execute("UPDATE library_inbox SET stored_name=NULL WHERE id=?", (r["id"],))
+    pending = conn.execute("SELECT COUNT(*) c FROM library_inbox WHERE kind=? AND state='pending'", (kind,)).fetchone()["c"]
+    return {"pending": pending, "need": need, "warnings": warnings, "files": len(seen), "drop": drop}
+
+
+def library_pending_count(conn):
+    return conn.execute("SELECT COUNT(*) c FROM library_inbox WHERE state='pending'").fetchone()["c"]
+
+
+def library_scan_info(conn):
+    """When each folder was last reported by the sync, and whether that is too long ago (the PC's sync may have stopped)."""
+    stale_days = float(get_setting_value(conn, "library_scan_stale_days", 3) or 3)
+    out = {}
+    for kind in LIBRARY_FOLDERS:
+        r = conn.execute("SELECT * FROM library_scans WHERE kind=?", (kind,)).fetchone()
+        age = None
+        if r and r["scanned_at"]:
+            try:
+                age = (datetime.datetime.utcnow() - datetime.datetime.fromisoformat(r["scanned_at"].rstrip("Z"))).total_seconds() / 86400.0
+            except ValueError:
+                age = None
+        out[kind] = {"at": r["scanned_at"] if r else None, "files": r["file_count"] if r else None, "by": r["by_who"] if r else None,
+                     "stale": age is None or age > stale_days}
+    return {"scans": out, "staleDays": stale_days}
+
+
+def sds_review(issue_date, years, warn_days, today=None):
+    """(review due date, 'ok' | 'soon' | 'overdue') for a safety data sheet issued on `issue_date`: due = issue date + `years` years."""
+    if not issue_date:
+        return None, None
+    due = add_months(issue_date, int(round(float(years) * 12)))
+    if not due:
+        return None, None
+    today = today or datetime.date.today()
+    left = (datetime.date.fromisoformat(due) - today).days
+    return due, ("overdue" if left < 0 else "soon" if left <= float(warn_days) else "ok")
+
+
 class ApiError(Exception):
     def __init__(self, status, message, code=None):
         self.status = status
@@ -5027,7 +5362,7 @@ RESTORE_LOCK = threading.Lock()
 
 def backup_dirs():
     """(name inside the backup, folder on disk) for every folder of files that belongs to the data."""
-    return [("uploads", UPLOAD_DIR), ("lab_templates", LAB_DIR), ("sop_documents", SOP_DIR)]
+    return [("uploads", UPLOAD_DIR), ("lab_templates", LAB_DIR), ("sop_documents", SOP_DIR), ("sds_documents", SDS_DIR)]
 
 
 def build_full_backup(conn, out_path):
@@ -5320,6 +5655,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"env": ENV_NAME, "restoreEnabled": ALLOW_RESTORE})
         if path.startswith("/api/archive/"):
             return self._archive_get(path)
+        if (path.startswith(("/api/sds-documents/", "/api/doc-revisions/")) and path.endswith("/download")) or \
+                (path.startswith("/api/library/inbox/") and path.endswith("/file")):
+            return self._download_document(path)
         if path.startswith("/api/"):
             return self._handle_api("GET")
         return self._serve_static(path)
@@ -5541,6 +5879,372 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    # ---- controlled documents: SOPs and safety data sheets, synced from the SharePoint library (see the library section above) ----
+    def _library_write(self, fn, pre=None):
+        """A write made by the sync script (archive key) or an administrator: its own transaction, answered like any API call. `pre` reads the request
+        body BEFORE the write lock is taken, so a slow upload never holds the database."""
+        conn = db()
+        self._created_files, self._files_to_remove = [], []
+        try:
+            try:
+                who = self._archive_auth(conn)
+                ctx = pre() if pre else None
+                conn.execute("BEGIN IMMEDIATE")
+                result = fn(conn, who, ctx)
+                conn.commit()
+                self._remove_files(self._files_to_remove)
+                return self._send_json(result)
+            except ApiError as e:
+                conn.rollback()
+                self._remove_files(self._created_files)
+                return self._send_json({"error": e.message, **({"code": e.code} if e.code else {})}, e.status)
+            except sqlite3.IntegrityError as e:
+                conn.rollback()
+                self._remove_files(self._created_files)
+                return self._send_json({"error": integrity_message(e), "code": "conflict"}, 409)
+        except (TimeoutError, ConnectionError):
+            conn.rollback()
+            self._remove_files(self._created_files)
+            self.close_connection = True
+        except Exception as e:  # pragma: no cover
+            conn.rollback()
+            self._remove_files(self._created_files)
+            self._server_error(e)
+        finally:
+            conn.close()
+
+    def _library_scan(self):
+        def work(conn, who, body):
+            files = body.get("files")
+            if not isinstance(files, list):
+                raise ApiError(400, "A list of files is needed")
+            res = library_reconcile(conn, str(body.get("kind") or ""), [f for f in files if isinstance(f, dict)], who)
+            self._files_to_remove += res.pop("drop")
+            return res
+        return self._library_write(work, pre=lambda: self._body_json(limit=2 * 1024 * 1024))
+
+    def _library_upload(self):
+        qs = parse_qs(urlparse(self.path).query)
+
+        def read():
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            if length <= 0:
+                raise ApiError(400, "No file was sent.")
+            if length > MAX_UPLOAD_BYTES:
+                raise ApiError(413, "That file is larger than the %d MB limit." % (MAX_UPLOAD_BYTES // (1024 * 1024)))
+            raw = b""
+            while len(raw) < length:
+                chunk = self.rfile.read(min(1 << 20, length - len(raw)))
+                if not chunk:
+                    raise ApiError(400, "The upload was cut short.")
+                raw += chunk
+            return raw
+
+        def work(conn, who, raw):
+            kind, path, sha = qs.get("kind", [""])[0], library_clean_path(qs.get("path", [""])[0]), qs.get("sha256", [""])[0].lower()
+            if kind not in LIBRARY_FOLDERS or not path:
+                raise ApiError(400, "A document kind and path are needed")
+            if hashlib.sha256(raw).hexdigest() != sha:
+                raise ApiError(400, "The file does not match its checksum; it was damaged on the way.")
+            rows = conn.execute("SELECT * FROM library_inbox WHERE kind=? AND state='pending' AND source_path=? AND file_sha256=? AND change IN ('new','revision')",
+                                (kind, path, sha)).fetchall()
+            if not rows:
+                raise ApiError(404, "KelpWorks is not waiting for that file (it may have changed in the folder; the next scan will say).")
+            if all(r["stored_name"] for r in rows):
+                return {"ok": True, "stored": False}
+            held = conn.execute("SELECT COALESCE(SUM(size),0) s FROM library_inbox WHERE stored_name IS NOT NULL").fetchone()["s"]
+            if held + len(raw) > LIBRARY_MAX_PENDING_BYTES:
+                raise ApiError(507, "Too many documents are waiting for review; review or ignore some first.")
+            self._check_storage_room(conn, len(raw))
+            stored = self._write_upload(LIBRARY_DIR, raw, os.path.splitext(path)[1][:12])
+            conn.execute("UPDATE library_inbox SET stored_name=?, size=? WHERE id IN (%s)" % ",".join("?" * len(rows)), (stored, len(raw), *[r["id"] for r in rows]))
+            return {"ok": True, "stored": True}
+        return self._library_write(work, pre=read)
+
+    def _inbox_public(self, conn, r, detail=False):
+        parsed = json.loads(r["parsed"]) if r["parsed"] else None
+        target = None
+        if r["target_id"]:
+            t = conn.execute("SELECT * FROM %s WHERE id=?" % library_table(r["kind"]), (r["target_id"],)).fetchone()
+            target = (t["name"] if r["kind"] == "sop" else "%s (%s)" % (t["chemical"], t["supplier"])) if t else None
+        out = {"id": r["id"], "kind": r["kind"], "change": r["change"], "state": r["state"], "identity": r["identity"], "filename": r["filename"], "path": r["source_path"],
+               "size": r["size"], "foundAt": r["found_at"], "detail": r["detail"], "parsed": parsed, "targetId": r["target_id"], "targetName": target,
+               "hasFile": bool(r["stored_name"]), "resolution": r["resolution"], "resolvedBy": r["resolved_by"], "resolvedAt": r["resolved_at"]}
+        if detail and r["state"] == "pending" and r["kind"] == "sop" and r["change"] == "new":
+            out["candidates"] = [{"id": x["id"], "name": x["name"]} for x in conn.execute("SELECT id, name FROM sop_documents WHERE doc_number IS NULL ORDER BY name")]
+        return out
+
+    def _library_inbox(self, conn):
+        pending = [self._inbox_public(conn, r, True) for r in conn.execute("SELECT * FROM library_inbox WHERE state='pending' ORDER BY kind, id")]
+        recent = [self._inbox_public(conn, r) for r in conn.execute(
+            "SELECT * FROM library_inbox WHERE state!='pending' ORDER BY resolved_at DESC, id DESC LIMIT 15")]
+        return dict({"pending": pending, "recent": recent}, **library_scan_info(conn))
+
+    def route_library(self, method, seg, conn, user):
+        self._require_admin(user)
+        if seg == ["api", "library", "inbox"] and method == "GET":
+            return self._library_inbox(conn)
+        if len(seg) == 5 and seg[2] == "inbox" and seg[3].isdigit() and method == "POST" and seg[4] in ("accept", "ignore"):
+            row = conn.execute("SELECT * FROM library_inbox WHERE id=?", (int(seg[3]),)).fetchone()
+            if not row:
+                raise ApiError(404, "That item no longer exists")
+            if row["state"] != "pending":
+                raise ApiError(409, "That item was already dealt with (%s)." % row["state"])
+            return self._library_accept(conn, row, user) if seg[4] == "accept" else self._library_ignore(conn, row, user)
+        raise ApiError(404, "Unknown library endpoint")
+
+    def _library_ignore(self, conn, row, user):
+        d = self._body_json()
+        reason = (d.get("reason") or "").strip()[:300] or "Ignored"
+        conn.execute("UPDATE library_inbox SET state='ignored', resolved_by=?, resolved_at=?, resolution=?, stored_name=NULL WHERE id=?",
+                     (user["name"], now_iso(), reason, row["id"]))
+        if row["stored_name"]:
+            self._files_to_remove.append(os.path.join(LIBRARY_DIR, row["stored_name"]))
+        return self._library_inbox(conn)
+
+    def _adopt_pending(self, row):
+        """Copy the file waiting for review into its document folder under a new opaque name (the waiting copy goes after the commit)."""
+        src = os.path.join(LIBRARY_DIR, row["stored_name"] or "-")
+        if not row["stored_name"] or not os.path.isfile(src):
+            raise ApiError(409, "The file has not reached KelpWorks yet: the sync uploads it on its next run. Try again after that.", "file_pending")
+        folder = library_dir(row["kind"])
+        os.makedirs(folder, exist_ok=True)
+        stored = secrets.token_hex(8) + os.path.splitext(row["filename"] or "")[1][:12]
+        dst = os.path.join(folder, stored)
+        shutil.copyfile(src, dst)
+        self._created_files.append(dst)
+        self._files_to_remove.append(src)
+        return stored
+
+    def _library_archive_current(self, conn, kind, row, user, reason):
+        """Keep the file being replaced (or withdrawn): a row in document_revisions pointing at the file that stays on disk."""
+        if not row["stored_name"]:
+            return
+        revision = row["revision"] if kind == "sop" else row["issue_date"]
+        conn.execute("INSERT INTO document_revisions (kind,doc_id,revision,issue_date,filename,content_type,size,stored_name,file_sha256,source_path,uploaded_by,"
+                     "uploaded_at,superseded_at,superseded_by,reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     (kind, row["id"], revision, row["issue_date"] if kind == "sds" else None, row["filename"], row["content_type"], row["size"], row["stored_name"],
+                      row["file_sha256"], row["source_path"], row["uploaded_by"], row["uploaded_at"], now_iso(), user["name"], reason))
+
+    def _library_accept(self, conn, row, user):
+        d = self._body_json()
+        kind, change = row["kind"], row["change"]
+        who = user["name"]
+        parsed = json.loads(row["parsed"]) if row["parsed"] else {}
+        if change == "unreadable":
+            raise ApiError(400, "KelpWorks cannot read this file's name. Rename it in SharePoint (%s), or ignore it." % (row["detail"] or "see the naming convention"))
+        ts = now_iso()
+        table = library_table(kind)
+        summary = None
+        if change == "missing":
+            doc = conn.execute("SELECT * FROM %s WHERE id=?" % table, (row["target_id"],)).fetchone()
+            if not doc:
+                raise ApiError(404, "That document no longer exists")
+            conn.execute("UPDATE %s SET status='withdrawn', withdrawn_at=?, updated_at=? WHERE id=?" % table, (ts, ts, doc["id"]))
+            library_log_edit(conn, kind, doc["id"], who, "Status", "current", "withdrawn (file removed from the SharePoint folder)")
+            summary, doc_id = "Withdrawn", doc["id"]
+        else:
+            stored = self._adopt_pending(row)
+            ctype = served_type(row["filename"])[0]
+            fileset = {"filename": row["filename"], "content_type": ctype, "size": row["size"], "stored_name": stored, "file_sha256": row["file_sha256"],
+                       "source_path": row["source_path"], "status": "current", "withdrawn_at": None, "uploaded_by": who, "uploaded_at": ts, "updated_at": ts}
+            if kind == "sop":
+                doc_id, summary = self._accept_sop(conn, row, d, parsed, fileset, user)
+            else:
+                doc_id, summary = self._accept_sds(conn, row, d, parsed, fileset, user)
+        conn.execute("UPDATE library_inbox SET state='accepted', resolved_by=?, resolved_at=?, resolution=?, target_id=?, stored_name=NULL WHERE id=?",
+                     (who, ts, summary, doc_id, row["id"]))
+        return self._library_inbox(conn)
+
+    def _accept_sop(self, conn, row, d, parsed, fileset, user):
+        who = user["name"]
+        number, revision = parsed.get("docNumber"), parsed.get("revision")
+        if row["change"] == "revision":
+            doc = conn.execute("SELECT * FROM sop_documents WHERE id=?", (row["target_id"],)).fetchone()
+            if not doc:
+                raise ApiError(404, "That document no longer exists")
+            self._library_archive_current(conn, "sop", doc, user, "Replaced by a new revision from the SharePoint folder")
+            sets = dict(fileset, revision=revision)
+            conn.execute("UPDATE sop_documents SET %s WHERE id=?" % ", ".join("%s=?" % c for c in sets), (*sets.values(), doc["id"]))
+            library_log_edit(conn, "sop", doc["id"], who, "File", doc["filename"] or "-", row["filename"])
+            library_log_edit(conn, "sop", doc["id"], who, "Revision", doc["revision"] or "-", revision or "-")
+            return doc["id"], "New revision %s accepted" % (revision or "")
+        link_to = d.get("linkTo")
+        if link_to:
+            doc = conn.execute("SELECT * FROM sop_documents WHERE id=?", (link_to,)).fetchone()
+            if not doc:
+                raise ApiError(404, "The document to link to no longer exists")
+            if doc["doc_number"]:
+                raise ApiError(409, "%s already has a document number (%s)." % (doc["name"], doc["doc_number"]))
+            name = (d.get("name") or doc["name"]).strip()
+            if name != doc["name"] and conn.execute("SELECT 1 FROM sop_documents WHERE name=? AND id!=?", (name, doc["id"])).fetchone():
+                raise ApiError(409, "A document named \"%s\" already exists" % name)
+            self._library_archive_current(conn, "sop", doc, user, "Replaced by the controlled file from the SharePoint folder")
+            sets = dict(fileset, name=name, doc_number=number, revision=revision)
+            conn.execute("UPDATE sop_documents SET %s WHERE id=?" % ", ".join("%s=?" % c for c in sets), (*sets.values(), doc["id"]))
+            library_log_edit(conn, "sop", doc["id"], who, "Document number", "-", number)
+            library_log_edit(conn, "sop", doc["id"], who, "File", doc["filename"] or "-", row["filename"])
+            return doc["id"], "Linked to %s as %s" % (doc["name"], number)
+        name = (d.get("name") or parsed.get("title") or number).strip()
+        if not name:
+            raise ApiError(400, "A document name is required")
+        if conn.execute("SELECT 1 FROM sop_documents WHERE name=?", (name,)).fetchone():
+            raise ApiError(409, "A document named \"%s\" already exists: choose another name, or link this file to it." % name)
+        key = (d.get("key") or "").strip() or None
+        if key and conn.execute("SELECT 1 FROM sop_documents WHERE key=?", (key,)).fetchone():
+            raise ApiError(409, "Reference key \"%s\" is already in use" % key)
+        sets = dict(fileset, name=name, key=key, doc_number=number, revision=revision)
+        cur = conn.execute("INSERT INTO sop_documents (%s) VALUES (%s)" % (", ".join(sets), ",".join("?" * len(sets))), tuple(sets.values()))
+        library_log_edit(conn, "sop", cur.lastrowid, who, "Added from the SharePoint folder", "-", "%s %s" % (number, row["filename"]))
+        return cur.lastrowid, "Added as %s" % name
+
+    def _accept_sds(self, conn, row, d, parsed, fileset, user):
+        who = user["name"]
+        if row["change"] == "revision":
+            doc = conn.execute("SELECT * FROM sds_documents WHERE id=?", (row["target_id"],)).fetchone()
+            if not doc:
+                raise ApiError(404, "That document no longer exists")
+            issue = (d.get("issueDate") or parsed.get("issueDate") or "").strip()
+            self._check_iso_date(issue)
+            self._library_archive_current(conn, "sds", doc, user, "Replaced by a newer issue from the SharePoint folder")
+            sets = dict(fileset, issue_date=issue)
+            conn.execute("UPDATE sds_documents SET %s WHERE id=?" % ", ".join("%s=?" % c for c in sets), (*sets.values(), doc["id"]))
+            library_log_edit(conn, "sds", doc["id"], who, "Issue date", doc["issue_date"] or "-", issue)
+            library_log_edit(conn, "sds", doc["id"], who, "File", doc["filename"] or "-", row["filename"])
+            return doc["id"], "New issue dated %s accepted" % issue
+        chemical = (d.get("chemical") or parsed.get("chemical") or "").strip()
+        supplier = (d.get("supplier") or parsed.get("supplier") or "").strip()
+        issue = (d.get("issueDate") or parsed.get("issueDate") or "").strip()
+        if not chemical or not supplier:
+            raise ApiError(400, "A chemical name and a supplier are needed")
+        self._check_iso_date(issue)
+        identity = sds_identity(chemical, supplier)
+        if conn.execute("SELECT 1 FROM sds_documents WHERE sds_key=?", (identity,)).fetchone():
+            raise ApiError(409, "A safety data sheet for %s from %s already exists." % (chemical, supplier))
+        sets = dict(fileset, chemical=chemical, supplier=supplier, sds_key=identity, issue_date=issue)
+        cur = conn.execute("INSERT INTO sds_documents (%s) VALUES (%s)" % (", ".join(sets), ",".join("?" * len(sets))), tuple(sets.values()))
+        for cid in {int(x) for x in (d.get("itemIds") or []) if str(x).isdigit()}:
+            if conn.execute("SELECT 1 FROM consumables WHERE id=?", (cid,)).fetchone():
+                conn.execute("INSERT OR IGNORE INTO sds_items (sds_id, consumable_id) VALUES (?,?)", (cur.lastrowid, cid))
+        library_log_edit(conn, "sds", cur.lastrowid, who, "Added from the SharePoint folder", "-", row["filename"])
+        return cur.lastrowid, "Added: %s (%s)" % (chemical, supplier)
+
+    @staticmethod
+    def _check_iso_date(value):
+        try:
+            datetime.date.fromisoformat(value or "")
+        except ValueError:
+            raise ApiError(400, "The issue date must be a real date, year-month-day")
+
+    def _sds_public(self, conn, r, items, years, warn):
+        due, review = sds_review(r["issue_date"], years, warn)
+        if r["status"] != "current":
+            review = None                                   # a withdrawn sheet is not due for review
+        return {"id": r["id"], "chemical": r["chemical"], "supplier": r["supplier"], "issueDate": r["issue_date"], "reviewDue": due, "reviewStatus": review,
+                "status": r["status"], "filename": r["filename"], "hasFile": bool(r["stored_name"]), "size": r["size"], "uploadedAt": r["uploaded_at"],
+                "notes": r["notes"], "items": items.get(r["id"], [])}
+
+    def _sds_items_map(self, conn):
+        out = {}
+        for x in conn.execute("SELECT si.sds_id, c.id, c.name, c.item_number FROM sds_items si JOIN consumables c ON c.id=si.consumable_id ORDER BY c.name"):
+            out.setdefault(x["sds_id"], []).append({"id": x["id"], "name": x["name"], "itemNumber": x["item_number"]})
+        return out
+
+    def route_documents(self, method, seg, conn, user):
+        if seg == ["api", "documents"] and method == "GET":
+            years = float(get_setting_value(conn, "sds_review_years", 3) or 3)
+            warn = float(get_setting_value(conn, "sds_review_warning_days", 60) or 60)
+            items = self._sds_items_map(conn)
+            out = {"sops": [self._sop_public(r) for r in conn.execute("SELECT * FROM sop_documents ORDER BY doc_number IS NULL, doc_number, name")],
+                   "sds": [self._sds_public(conn, r, items, years, warn) for r in conn.execute("SELECT * FROM sds_documents ORDER BY chemical, supplier")],
+                   "reviewYears": years, "pending": library_pending_count(conn)}
+            if user["role"] == "admin":
+                out.update(library_scan_info(conn))
+            return out
+        if len(seg) == 5 and seg[2] in ("sop", "sds") and seg[3].isdigit() and seg[4] == "history" and method == "GET":
+            kind, did = seg[2], int(seg[3])
+            doc = conn.execute("SELECT * FROM %s WHERE id=?" % library_table(kind), (did,)).fetchone()
+            if not doc:
+                raise ApiError(404, "Document not found")
+            revs = [{"id": r["id"], "revision": r["revision"], "issueDate": r["issue_date"], "filename": r["filename"], "size": r["size"], "uploadedBy": r["uploaded_by"],
+                     "uploadedAt": r["uploaded_at"], "supersededAt": r["superseded_at"], "supersededBy": r["superseded_by"], "reason": r["reason"]}
+                    for r in conn.execute("SELECT * FROM document_revisions WHERE kind=? AND doc_id=? ORDER BY id DESC", (kind, did))]
+            if kind == "sop":
+                edits = self._sop_edits(conn, did)
+            else:
+                edits = [dict(field=r["field"], oldValue=r["old_value"], newValue=r["new_value"], by=r["user_name"], at=r["created_at"])
+                         for r in conn.execute("SELECT * FROM document_edits WHERE kind='sds' AND doc_id=? ORDER BY id DESC", (did,))]
+            return {"revisions": revs, "edits": edits}
+        raise ApiError(404, "Unknown documents endpoint")
+
+    def route_sds(self, method, seg, conn, user):
+        self._require_admin(user)
+        if len(seg) == 3 and seg[2].isdigit() and method == "PUT":
+            did = int(seg[2])
+            doc = conn.execute("SELECT * FROM sds_documents WHERE id=?", (did,)).fetchone()
+            if not doc:
+                raise ApiError(404, "Safety data sheet not found")
+            d = self._body_json()
+            if "itemIds" in d:
+                ids = {int(x) for x in (d.get("itemIds") or []) if str(x).isdigit()}
+                ids = {i for i in ids if conn.execute("SELECT 1 FROM consumables WHERE id=?", (i,)).fetchone()}
+                old = {r["consumable_id"] for r in conn.execute("SELECT consumable_id FROM sds_items WHERE sds_id=?", (did,))}
+                if ids != old:
+                    conn.execute("DELETE FROM sds_items WHERE sds_id=?", (did,))
+                    for i in ids:
+                        conn.execute("INSERT INTO sds_items (sds_id, consumable_id) VALUES (?,?)", (did, i))
+                    names = lambda s: ", ".join(sorted(r["name"] for r in conn.execute("SELECT name FROM consumables WHERE id IN (%s)" % ",".join("?" * len(s)), tuple(s)))) if s else "-"
+                    library_log_edit(conn, "sds", did, user["name"], "Used for (inventory items)", names(old), names(ids))
+            if "notes" in d:
+                notes = (d.get("notes") or "").strip()[:1000] or None
+                if notes != doc["notes"]:
+                    conn.execute("UPDATE sds_documents SET notes=?, updated_at=? WHERE id=?", (notes, now_iso(), did))
+                    library_log_edit(conn, "sds", did, user["name"], "Notes", doc["notes"] or "-", notes or "-")
+            years = float(get_setting_value(conn, "sds_review_years", 3) or 3)
+            warn = float(get_setting_value(conn, "sds_review_warning_days", 60) or 60)
+            r = conn.execute("SELECT * FROM sds_documents WHERE id=?", (did,)).fetchone()
+            return {"sds": self._sds_public(conn, r, self._sds_items_map(conn), years, warn)}
+        raise ApiError(404, "Unknown safety data sheet endpoint")
+
+    def _download_document(self, path):
+        """/api/sds-documents/:id/download, /api/doc-revisions/:id/download (any signed-in user) and /api/library/inbox/:id/file (administrators)."""
+        conn = db()
+        try:
+            qs = parse_qs(urlparse(self.path).query)
+            try:
+                user = self._token_user(conn)
+            except ApiError as e:
+                return self._send_json({"error": e.message}, e.status)
+            seg = [s for s in path.split("/") if s]
+            row = folder = None
+            if seg[1] == "sds-documents" and len(seg) == 4:
+                row, folder = conn.execute("SELECT * FROM sds_documents WHERE id=?", (int(seg[2]),)).fetchone(), SDS_DIR
+            elif seg[1] == "doc-revisions" and len(seg) == 4:
+                row = conn.execute("SELECT * FROM document_revisions WHERE id=?", (int(seg[2]),)).fetchone()
+                folder = library_dir(row["kind"]) if row else None
+            elif seg[1] == "library" and len(seg) == 5:
+                if user["role"] != "admin":
+                    return self._send_json({"error": "Administrator access required"}, 403)
+                row, folder = conn.execute("SELECT * FROM library_inbox WHERE id=?", (int(seg[3]),)).fetchone(), LIBRARY_DIR
+            if not row or not row["stored_name"]:
+                return self._send_json({"error": "Document not found"}, 404)
+            full = os.path.join(folder, row["stored_name"])
+            if not os.path.isfile(full):
+                return self._send_json({"error": "File missing on disk"}, 404)
+            with open(full, "rb") as f:
+                data = f.read()
+            ctype, inline_ok = served_type(row["filename"])
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", content_disposition(row["filename"], inline_ok and not qs.get("dl", [""])[0]))
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:  # pragma: no cover
+            self._server_error(e)
+        finally:
+            conn.close()
+
     # ---- records archive and backups (see the archive section above) ----
     def _archive_auth(self, conn):
         """Who may read the archive: an administrator (sign-in token), or the sync script with the archive key (X-Archive-Key header, compared in
@@ -5676,6 +6380,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._admin_restore()
         if path == "/api/archive/backup":
             return self._archive_backup_now()
+        if path == "/api/library/scan":
+            return self._library_scan()
+        if path == "/api/library/upload":
+            return self._library_upload()
         return self._handle_api("POST")
 
     def _admin_restore(self):
@@ -5865,6 +6573,12 @@ class Handler(BaseHTTPRequestHandler):
                     sync_samples(conn, int(seg[2]), uname)
                 sync_pending_samples(conn, uname)
             return result
+        if seg[:2] == ["api", "documents"]:
+            return self.route_documents(method, seg, conn, user)
+        if seg[:2] == ["api", "sds-documents"]:
+            return self.route_sds(method, seg, conn, user)
+        if seg[:2] == ["api", "library"]:
+            return self.route_library(method, seg, conn, user)
         if seg[:2] == ["api", "integrity"]:
             return self.route_integrity(method, seg, conn, user)
         if seg[:2] == ["api", "release"]:
@@ -6053,8 +6767,8 @@ class Handler(BaseHTTPRequestHandler):
         # admin at any time; matching by key means that rename is picked up
         # everywhere automatically) without a separate round trip. The full
         # admin CRUD view fetches /api/sop-documents itself.
-        sops = [dict(id=r["id"], name=r["name"], key=r["key"], hasFile=bool(r["stored_name"]))
-                for r in conn.execute("SELECT id, name, key, stored_name FROM sop_documents ORDER BY name")]
+        sops = [dict(id=r["id"], name=r["name"], key=r["key"], hasFile=bool(r["stored_name"]), status=r["status"], revision=r["revision"], docNumber=r["doc_number"])
+                for r in conn.execute("SELECT id, name, key, stored_name, status, revision, doc_number FROM sop_documents ORDER BY name")]
         # Every container type (Packaging output units and Sample Point
         # vessels alike) is just a consumable with is_container=1 -- exposed
         # here (not just via /api/consumables) so the production log's
@@ -6068,7 +6782,7 @@ class Handler(BaseHTTPRequestHandler):
         qc_fields = [dict(id=f[0], stage=f[1], stageLabel=f[2], subtitle=f[3], label=f[4], unit=f[5])
                      for f in QC_FIELD_REGISTRY]
         return {"species": species, "sites": sites, "locations": locations,
-                "skus": skus, "customers": customers, "sops": sops,
+                "skus": skus, "customers": customers, "sops": sops, "libraryPending": library_pending_count(conn),
                 "settings": get_settings(conn), "containers": containers,
                 "qcFields": qc_fields, "requiredFields": required_keys_by_stage()}
 
@@ -6096,7 +6810,8 @@ class Handler(BaseHTTPRequestHandler):
         return {"id": r["id"], "name": r["name"], "key": r["key"], "filename": r["filename"],
                 "hasFile": bool(r["stored_name"]), "size": r["size"],
                 "uploadedBy": r["uploaded_by"], "uploadedAt": r["uploaded_at"],
-                "updatedAt": r["updated_at"]}
+                "updatedAt": r["updated_at"], "docNumber": r["doc_number"], "revision": r["revision"], "status": r["status"],
+                "sourcePath": r["source_path"], "withdrawnAt": r["withdrawn_at"]}
 
     def _sop_edits(self, conn, sid):
         return [dict(field=r["field"], oldValue=r["old_value"], newValue=r["new_value"],
@@ -6218,6 +6933,13 @@ class Handler(BaseHTTPRequestHandler):
                 os.remove(os.path.join(SOP_DIR, row["stored_name"]))
             except OSError:
                 pass
+        for rv in conn.execute("SELECT stored_name FROM document_revisions WHERE kind='sop' AND doc_id=?", (sid,)).fetchall():
+            try:
+                os.remove(os.path.join(SOP_DIR, rv["stored_name"]))
+            except OSError:
+                pass
+        conn.execute("DELETE FROM document_revisions WHERE kind='sop' AND doc_id=?", (sid,))
+        conn.execute("UPDATE library_inbox SET target_id=NULL WHERE kind='sop' AND target_id=?", (sid,))
         conn.execute("DELETE FROM sop_documents WHERE id=?", (sid,))
         return {"ok": True}
 
@@ -7864,7 +8586,11 @@ class Handler(BaseHTTPRequestHandler):
         if seg == ["api", "consumables"]:
             if method == "GET":
                 rows = conn.execute("SELECT * FROM consumables ORDER BY name").fetchall()
-                return {"consumables": [self._consumable_public(r) for r in rows]}
+                sds = {}
+                for x in conn.execute("SELECT si.consumable_id, d.id, d.chemical, d.supplier FROM sds_items si JOIN sds_documents d ON d.id=si.sds_id "
+                                      "WHERE d.status='current' AND d.stored_name IS NOT NULL ORDER BY d.chemical"):
+                    sds.setdefault(x["consumable_id"], []).append({"id": x["id"], "chemical": x["chemical"], "supplier": x["supplier"]})
+                return {"consumables": [dict(self._consumable_public(r), sds=sds.get(r["id"], [])) for r in rows]}
             if method == "POST":
                 d = self._body_json()
                 label_sku = (d.get("labelSku") or "").strip()
@@ -9564,7 +10290,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _check_storage_room(self, conn, nbytes):
         """Refuse an upload that would fill the document store or the disk (every user can upload, and the disk is shared with the database)."""
-        used = sum(conn.execute("SELECT COALESCE(SUM(size),0) FROM %s" % t).fetchone()[0] for t in ("run_attachments", "tote_attachments", "sop_documents"))
+        used = sum(conn.execute("SELECT COALESCE(SUM(size),0) FROM %s" % t).fetchone()[0] for t in ("run_attachments", "tote_attachments", "sop_documents", "sds_documents", "document_revisions", "library_inbox"))
         if used + nbytes > MAX_UPLOAD_TOTAL_BYTES:
             raise ApiError(507, "The document store is full (%d MB used of %d MB). Ask an administrator to remove old documents."
                            % (used // (1024 * 1024), MAX_UPLOAD_TOTAL_BYTES // (1024 * 1024)))

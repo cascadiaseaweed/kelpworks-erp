@@ -206,6 +206,17 @@ for `main` so a red run blocks the merge.
   zip as `build_full_backup`, free-space check, newest `KELP_ERP_BACKUP_KEEP` kept) driven by the `backup_scheduler` thread (after `KELP_ERP_BACKUP_HOUR_UTC`; on by default only in production); `POST /api/archive/backup` runs
   it now OUTSIDE the request transaction (the sqlite backup API waits forever on a connection that holds its own write transaction -- never call `build_full_backup` inside `_handle_api`). The script keeps
   daily / weekly / monthly tiers and uses Windows extended-length paths. Changing a file name rule moves files in the library, so treat the names as a contract: add a test.
+- **Controlled documents: SOPs and safety data sheets synced from SharePoint** (batch 10; tests in `tests/test_documents_library.py`; guide `docs/controlled-documents.md`). SharePoint
+  (`03_SOPs/Current`, `04_Safety-Data-Sheets/Current` of the KelpWorks-Records library) is the master; KelpWorks mirrors it ONLY after an administrator accepts. The sync script reports each folder
+  (`POST /api/library/scan {kind, files:[{path,size,sha256}]}`, the WHOLE folder, archive key or admin) and uploads what is asked for (`POST /api/library/upload?kind&path&sha256`, raw body, <= 25 MB, stored in `library_inbox/`).
+  `library_reconcile` (pure, testable) turns the difference into `library_inbox` rows: **new** (identity not in the register), **revision** (same identity, different sha256, or a withdrawn document back), **missing**
+  (a current document whose file left the folder; never raised when the folder is empty), **unreadable** (name does not parse: `parse_sop_filename` / `parse_sds_filename`). Identity: SOP = `doc_number`
+  (`SOP-012`; `SOP002_...` also reads), SDS = `sds_key` (chemical|supplier; the issue date is the version). A rename with identical content is recorded quietly (`source_path`). Admin routes (`/api/library/inbox`, `/accept`, `/ignore`): accept
+  copies the waiting file into `SOP_DIR` / `SDS_DIR`, puts the file it replaces into `document_revisions` (kept on disk; `GET /api/doc-revisions/:id/download`), logs to `sop_document_edits` / `document_edits`, and never deletes: a removed
+  file = status `withdrawn`. `sop_documents` gained doc_number / revision / status / file_sha256 / source_path (migrate); the existing SOP (`wet_solids_sop`) is linked once via `linkTo` so QC links (by `key`) keep working.
+  New tables: `sds_documents`, `sds_items` (SDS <-> inventory items; shown as an SDS link on Inventory Items), `document_edits`, `document_revisions`, `library_inbox`, `library_scans` (last report per folder; stale after `library_scan_stale_days`).
+  SDS review due = issue date + `sds_review_years` (`sds_review`, Calculations page). `SDS_DIR` is in `backup_dirs()` (the full backup / staging restore); the waiting inbox is not (the sync uploads it again). The UI is the "Documents" tab
+  (`pageDocuments`, `libraryReviewCard`, `reviewLibraryItem`). A new status value for these tables goes in `STATUS_RULES`.
 - **Production-log required fields** are defined once, server-side, in `PROGRESS_SECTIONS` /
   `REQUIRED_FEEDSTOCK` (`kelp_erp_server.py`; exposed to the SPA as `refdata.requiredFields`).
   Everything is required except: every Notes field, the Homogenization / Separation /

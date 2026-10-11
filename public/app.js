@@ -102,10 +102,12 @@ async function boot() {
 /* ---------------- Router ---------------- */
 function render() {
   const v = $('#view'); v.innerHTML = '';
+  const docTab = document.querySelector('#tabs button[data-tab="documents"]');       // the number of changes waiting in the SharePoint folders, for administrators
+  if (docTab) docTab.textContent = 'Documents' + (State.user && State.user.role === 'admin' && State.ref && State.ref.libraryPending ? ' (' + State.ref.libraryPending + ')' : '');
   v.classList.toggle('wrap-wide', State.tab === 'stabilized');   // scopes the Feedstock Inventory table styling (page width stays the standard .wrap, like Inventory Items)
   ({ dashboard: pageDashboard, stabilized: pageStabilized, preproc: pagePreproc, samples: pageSamples, production: pageProduction, cip: pageCIP,
      qc: pageQC, fg: pageFG, shipping: pageShipping, consumables: pageConsumables, reports: pageReports,
-     yieldusage: pageYield, release: pageRelease, calculations: pageCalculations, admin: pageAdmin }[State.tab])(v);
+     yieldusage: pageYield, release: pageRelease, calculations: pageCalculations, admin: pageAdmin, documents: pageDocuments }[State.tab])(v);
 }
 
 /* ---------------- Dashboard ---------------- */
@@ -1148,7 +1150,8 @@ function sopLinkEl(key) {
   const sop = (State.ref.sops || []).find(s => s.key === key);
   if (!sop) return el('div', { class: 'qc-check-sop help' }, '📄 SOP not configured (Admin → SOP Documents)');
   if (!sop.hasFile) return el('div', { class: 'qc-check-sop help' }, '📄 ' + sop.name + ' — not yet uploaded (Admin → SOP Documents)');
-  return el('div', { class: 'qc-check-sop' }, el('a', { href: sopDownloadUrl(sop.id, false), target: '_blank', rel: 'noopener' }, '📄 ' + sop.name));
+  if (sop.status === 'withdrawn') return el('div', { class: 'qc-check-sop help' }, '📄 ' + sop.name + ' — withdrawn (see Documents)');
+  return el('div', { class: 'qc-check-sop' }, el('a', { href: sopDownloadUrl(sop.id, false), target: '_blank', rel: 'noopener' }, '📄 ' + sop.name + (sop.revision ? ' (rev ' + sop.revision + ')' : '')));
 }
 function uploadAtt(rid, file) {
   return new Promise((resolve, reject) => {
@@ -4745,6 +4748,7 @@ async function pageConsumables(v) {
     if (lg === 'sku') headers.push('Package'); else if (lg === 'package') headers.push('SKU'); else if (lg === 'none') headers.push('SKU', 'Package'); else headers.push('Item');
     const bools = headers.map(() => false);
     if (opts.showType) { headers.push('Type'); bools.push(false); }
+    if (opts.showSds) { headers.push('SDS'); bools.push(false); }
     if (opts.showVolume) { headers.push('Volume (L)'); bools.push(true); }
     headers.push('Location', 'On hand', 'Reorder at', 'Cost/unit', '', 'Actions');
     bools.push(false, true, true, true, false, false);
@@ -4756,6 +4760,8 @@ async function pageConsumables(v) {
       else if (lg === 'none') row.push(skuName(c.labelSku), c.labelPackage || '—');
       else row.push(c.name);
       if (opts.showType) row.push(c.reagentType || '—');
+      if (opts.showSds) row.push((c.sds || []).length ? el('span', {}, ...c.sds.flatMap((x, k) => [k ? ', ' : null,
+        el('a', { href: docDownloadUrl('sds', x.id), target: '_blank', rel: 'noopener', title: x.chemical + ' — ' + x.supplier, onclick: e => e.stopPropagation() }, 'SDS')])) : '—');
       if (opts.showVolume) row.push(c.litresEach != null ? fmt(c.litresEach, c.litresEach % 1 ? 2 : 0) : '—');
       // Packaging items and labels are counted in whole units (totes,
       // bottles, labels ...), so their on-hand quantity displays with no
@@ -4795,7 +4801,7 @@ async function pageConsumables(v) {
     const reagents = r.consumables.filter(c => !c.isContainer && !c.labelSku);
     host.append(el('div', { class: 'page-head' }, el('h2', {}, 'Reagents'),
       el('div', { class: 'actions' }, el('button', { onclick: addConsumable }, '+ Add reagent'))));
-    host.append(itemsTable(reagents, { history: true, showType: true }));
+    host.append(itemsTable(reagents, { history: true, showType: true, showSds: true }));
     host.append(el('div', { class: 'help', style: 'margin-top:6px' },
       'Type groups items that are the same reagent (e.g. several Citric Acid grades or suppliers): the production log offers every item of a type and deducts from the one chosen. Set it with Edit.'));
     host.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Packaging'),
@@ -5487,6 +5493,13 @@ const CALCULATIONS = [
     description: 'How long a feedstock tote stabilized. A fine-grind blend counts from the date it was blended (its batch date) rather than the harvest dates of its source totes. While a tote is still in inventory the count runs to today; once it is consumed it is fixed at the date it was processed (its production run’s finalize date, or its Pre-Processing batch’s completion date); once disposed it is fixed at the disposal date. Blank when a needed date is missing.',
     location: 'Feedstock Inventory → Stabilization period (weeks)',
     settings: [],
+  },
+  {
+    title: 'Safety data sheet: review due date',
+    formula: 'Review due = issue date + review interval (years).   Status: Overdue when the due date has passed; Review soon when it is within the warning window; otherwise OK.',
+    description: 'A safety data sheet’s issue date is read from its file name in the SharePoint folder (SDS_Chemical_Supplier_2025-03-14.pdf). The review interval and the warning window are listed below; an administrator can change them.',
+    location: 'Documents → Safety data sheets',
+    settings: ['sds_review_years', 'sds_review_warning_days'],
   },
   {
     title: 'Retention sample discard-by date',
@@ -7130,7 +7143,7 @@ async function pageAdmin(v) {
   else v.append(table(
     ['Name', 'File', 'Uploaded', ''],
     sr.sops.map(s => [
-      s.name,
+      el('span', {}, s.name, s.docNumber ? el('span', { class: 'muted' }, '  ·  ' + s.docNumber + (s.revision ? ' rev ' + s.revision : '')) : null, s.status === 'withdrawn' ? el('span', {}, ' ', badge('disposed', 'Withdrawn')) : null),
       s.hasFile ? el('a', { href: sopDownloadUrl(s.id, false), target: '_blank', rel: 'noopener' }, s.filename || 'Download')
         : el('span', { class: 'muted' }, 'Not yet uploaded'),
       s.uploadedAt ? fmtWhen(s.uploadedAt) + (s.uploadedBy ? ' · ' + s.uploadedBy : '') : '—',
@@ -7413,6 +7426,189 @@ function downloadDbBackup() {
 }
 // The database AND every uploaded document / lab template / SOP as one .zip. This is the file a STAGING server restores; it holds password
 // hashes and all business records, so keep it somewhere private and delete it when finished.
+/* ---------------- Documents: SOPs and safety data sheets (SharePoint is the master) ---------------- */
+// Quality keeps 03_SOPs/Current and 04_Safety-Data-Sheets/Current in SharePoint; the sync on the office PC reports those folders to KelpWorks, and every
+// difference waits here for an administrator to accept or ignore. Everyone can read the lists and open the files.
+function docDownloadUrl(kind, id) { return (kind === 'sop' ? '/api/sop-documents/' : '/api/sds-documents/') + id + '/download?token=' + encodeURIComponent(State.token); }
+function docRevisionUrl(id) { return '/api/doc-revisions/' + id + '/download?dl=1&token=' + encodeURIComponent(State.token); }
+function inboxFileUrl(id) { return '/api/library/inbox/' + id + '/file?token=' + encodeURIComponent(State.token); }
+const LIBRARY_CHANGE = { new: ['New document', 'wip'], revision: ['New revision', 'pending_release'], missing: ['File removed', 'hold'], unreadable: ['Name not readable', 'low'] };
+
+async function pageDocuments(v) {
+  const isAdmin = State.user.role === 'admin';
+  v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Documents')));
+  const d = await api('GET', '/documents');
+  v.append(el('div', { class: 'help', style: 'margin:-8px 0 10px' },
+    'Controlled documents are kept by Quality in SharePoint. KelpWorks keeps a copy of each document’s current file and every earlier one; click a row for its history. '
+    + (isAdmin ? 'New and changed files appear under “Changes in the SharePoint folders” until you accept or ignore them.' : 'Changes are reviewed by an administrator.')));
+  if (isAdmin) await libraryReviewCard(v);
+
+  v.append(el('div', { class: 'page-head', style: 'margin-top:24px' }, el('h2', {}, 'Standard operating procedures')));
+  v.append(table(['SOP no.', 'Name', 'Revision', 'Status', 'File', 'Updated', ''],
+    d.sops.map(s => [
+      s.docNumber ? mono(s.docNumber) : '—', s.name, s.revision ? 'rev ' + s.revision : '—',
+      s.status === 'withdrawn' ? badge('disposed', 'Withdrawn') : badge('on_hand', 'Current'),
+      s.hasFile ? el('a', { href: docDownloadUrl('sop', s.id), target: '_blank', rel: 'noopener' }, s.filename || 'Open') : el('span', { class: 'muted' }, 'No file yet'),
+      s.uploadedAt ? fmtWhen(s.uploadedAt) : '—',
+      rowActions([['History', () => showDocHistory('sop', s.id, s.name)]])]),
+    [false, false, false, false, false, false, false], ri => showDocHistory('sop', d.sops[ri].id, d.sops[ri].name)));
+
+  v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Safety data sheets'), el('div', { class: 'help' }, 'Reviewed every ' + fmt(d.reviewYears, 0) + ' years')));
+  const reviewBadge = s => s.reviewStatus === 'overdue' ? badge('low', 'Overdue') : s.reviewStatus === 'soon' ? badge('hold', 'Review soon') : s.reviewStatus ? badge('ok', 'OK') : null;
+  v.append(table(['Chemical', 'Supplier', 'Issued', 'Review due', 'Used for', 'Status', 'File', ''],
+    d.sds.map(s => [
+      s.chemical, s.supplier, s.issueDate || '—',
+      el('span', {}, s.reviewDue || '—', ' ', reviewBadge(s)),
+      s.items.length ? s.items.map(i => i.name).join(', ') : el('span', { class: 'muted' }, 'not linked yet'),
+      s.status === 'withdrawn' ? badge('disposed', 'Withdrawn') : badge('on_hand', 'Current'),
+      s.hasFile ? el('a', { href: docDownloadUrl('sds', s.id), target: '_blank', rel: 'noopener' }, s.filename || 'Open') : el('span', { class: 'muted' }, 'No file'),
+      rowActions([['History', () => showDocHistory('sds', s.id, s.chemical + ' (' + s.supplier + ')')], isAdmin ? ['Used for…', () => editSdsItems(s)] : null])]),
+    [false, false, false, false, false, false, false, false], ri => showDocHistory('sds', d.sds[ri].id, d.sds[ri].chemical + ' (' + d.sds[ri].supplier + ')')));
+  if (!d.sds.length) v.append(el('div', { class: 'help', style: 'margin-top:6px' },
+    'No safety data sheets yet. Put them in the SharePoint folder 04_Safety-Data-Sheets/Current as SDS_Chemical-Name_Supplier_2025-03-14.pdf; they appear here after the next nightly sync and your approval.'));
+}
+
+async function libraryReviewCard(v) {
+  let r;
+  try { r = await api('GET', '/library/inbox'); } catch (e) { v.append(el('div', { class: 'empty card' }, 'Could not read the SharePoint folder status: ' + e.message)); return; }
+  const checked = k => r.scans[k].at ? fmtWhen(r.scans[k].at) : 'never';
+  const names = { sop: 'SOP', sds: 'safety data sheet' };
+  const stale = Object.keys(names).filter(k => r.scans[k].stale);
+  const card = el('div', { class: 'card' }, el('h3', {}, 'Changes in the SharePoint folders'),
+    el('div', { class: 'summary-line' }, sl('SOP folder last checked', checked('sop')), sl('Safety data sheet folder last checked', checked('sds'))));
+  if (stale.length) card.append(el('div', { class: 'help', style: 'color:var(--danger)' },
+    'The ' + stale.map(k => names[k]).join(' and ') + ' folder' + (stale.length > 1 ? 's have' : ' has') + ' not been reported for over ' + r.staleDays
+    + ' days: the nightly sync on the office PC may have stopped (see docs/controlled-documents.md).'));
+  if (!r.pending.length) card.append(el('div', { class: 'help' }, 'Nothing is waiting: the lists below match the SharePoint folders.'));
+  else card.append(table(['Document type', 'Change', 'File', 'Details', ''],
+    r.pending.map(i => [i.kind === 'sop' ? 'SOP' : 'Safety data sheet', badge(LIBRARY_CHANGE[i.change][1], LIBRARY_CHANGE[i.change][0]),
+      mono(i.filename || '—'), [i.targetName ? 'For ' + i.targetName + '. ' : '', i.detail || ''].join('').trim() || '—',
+      rowActions([['Review', () => reviewLibraryItem(i)], ['Ignore', () => ignoreLibraryItem(i), 'danger']])])));
+  if (r.recent.length) card.append(el('details', { style: 'margin-top:10px' }, el('summary', {}, 'Recently dealt with (' + r.recent.length + ')'),
+    table(['When', 'File', 'Result', 'By'], r.recent.map(i => [i.resolvedAt ? fmtWhen(i.resolvedAt) : '—', mono(i.filename || '—'),
+      i.state === 'accepted' ? i.resolution : (i.state === 'ignored' ? 'Ignored: ' + (i.resolution || '') : 'Gone: ' + (i.resolution || '')), i.resolvedBy || '—']))));
+  v.append(card);
+}
+
+async function acceptLibraryItem(i, body) {
+  await api('POST', '/library/inbox/' + i.id + '/accept', body || {});
+  State.ref = await api('GET', '/refdata');
+  toast('Accepted'); render();
+}
+
+function ignoreLibraryItem(i) {
+  const reason = el('input', { placeholder: 'e.g. a draft, or a duplicate' });
+  modal('Ignore this change?', el('div', {},
+    el('div', { class: 'summary-line' }, sl('File', i.filename || '—')),
+    el('div', { class: 'help' }, 'KelpWorks will not ask about this exact file again. If the file changes in SharePoint, it will come back.'),
+    field('Reason (optional)', reason)), async () => {
+    await api('POST', '/library/inbox/' + i.id + '/ignore', { reason: reason.value.trim() });
+    State.ref = await api('GET', '/refdata'); toast('Ignored'); render();
+  }, 'Ignore');
+}
+
+function libraryFileLine(i) {
+  return el('div', { class: 'help' }, i.hasFile ? el('a', { href: inboxFileUrl(i.id), target: '_blank', rel: 'noopener' }, 'Open the file to check it first')
+    : 'The file has not reached KelpWorks yet: the nightly sync sends it. Accepting is possible once it has.');
+}
+
+// a checklist of inventory items (reagents and CIP agents) for linking a safety data sheet
+function sdsItemChecklist(items, selected) {
+  const boxes = items.map(c => {
+    const cb = el('input', { type: 'checkbox' }); cb.checked = selected.has(c.id);
+    return { id: c.id, cb, row: el('label', { class: 'perm-item' }, cb, el('span', { class: 'perm-text' }, el('b', {}, c.name), el('small', {}, (c.itemNumber ? c.itemNumber + ' · ' : '') + (c.reagentType || c.unit || '')))) };
+  });
+  return { node: el('div', { class: 'perm-box' }, el('div', { class: 'perm-title' }, 'Used for (inventory items this sheet covers)'),
+    el('div', { class: 'perm-list', style: 'max-height:240px;overflow:auto' }, ...boxes.map(b => b.row))), get: () => boxes.filter(b => b.cb.checked).map(b => b.id) };
+}
+async function sdsLinkableItems() {
+  return (await api('GET', '/consumables')).consumables.filter(c => !c.isContainer && !c.labelSku);
+}
+
+async function reviewLibraryItem(i) {
+  const p = i.parsed || {};
+  if (i.change === 'unreadable') {
+    modal('This file’s name cannot be read', el('div', {}, el('div', { class: 'summary-line' }, sl('File', i.filename || '—')),
+      el('div', { class: 'error', style: 'display:block' }, i.detail || ''),
+      el('div', { class: 'help' }, 'Rename the file in SharePoint to follow the naming convention (see README_Naming-Convention.txt in the KelpWorks-Records library). It is picked up at the next nightly sync. Or use Ignore.')),
+      async () => {}, 'Close', { noCancel: true });
+    return;
+  }
+  if (i.change === 'missing') {
+    modal('File removed from SharePoint', el('div', {}, el('div', { class: 'summary-line' }, sl('Document', i.targetName || '—'), sl('Was', i.filename || '—')),
+      el('div', { class: 'help' }, 'It is no longer in the Current folder. Withdrawing marks the document “Withdrawn” and keeps its last file and history. Nothing is deleted.')),
+      () => acceptLibraryItem(i), 'Withdraw');
+    return;
+  }
+  if (i.kind === 'sop' && i.change === 'new') {
+    const name = el('input', { value: p.title || p.docNumber || '' });
+    const key = el('input', { placeholder: 'only if a spot in the production log links to this document' });
+    const link = selectFrom('', [['', '— add as a new SOP —'], ...(i.candidates || []).map(c => [String(c.id), 'This is the existing document: ' + c.name])]);
+    const keyField = field('Reference key (optional, fixed once set)', key);
+    const known = Object.fromEntries((i.candidates || []).map(c => [String(c.id), c.name]));
+    link.addEventListener('change', () => {              // linking to an existing SOP keeps its name (editable); a new SOP starts from the file's title
+      keyField.classList.toggle('hidden', !!link.value);
+      name.value = link.value ? known[link.value] : (p.title || p.docNumber || '');
+    });
+    modal('New SOP ' + (p.docNumber || ''), el('div', {},
+      el('div', { class: 'summary-line' }, sl('File', i.filename || '—'), sl('Number', p.docNumber || '—'), sl('Revision', p.revision ? 'rev ' + p.revision : '—')),
+      libraryFileLine(i),
+      field('Is this an SOP KelpWorks already has?', link), field('Name shown in KelpWorks', name), keyField), async () => {
+      if (!name.value.trim()) throw new Error('Enter a name.');
+      await acceptLibraryItem(i, { name: name.value.trim(), key: key.value.trim() || null, linkTo: link.value ? +link.value : null });
+    }, 'Accept');
+    return;
+  }
+  if (i.kind === 'sop' && i.change === 'revision') {
+    modal('New revision', el('div', {}, el('div', { class: 'summary-line' }, sl('Document', i.targetName || '—'), sl('New file', i.filename || '—'), sl('Revision', p.revision ? 'rev ' + p.revision : '—')),
+      libraryFileLine(i), i.detail ? el('div', { class: 'help' }, i.detail) : null,
+      el('div', { class: 'help' }, 'Accepting makes this the current file. The file it replaces stays in the history. Links from the production log keep working.')),
+      () => acceptLibraryItem(i), 'Accept new revision');
+    return;
+  }
+  if (i.kind === 'sds' && i.change === 'revision') {
+    const issue = el('input', { type: 'date', value: p.issueDate || '' });
+    modal('Newer safety data sheet', el('div', {}, el('div', { class: 'summary-line' }, sl('Sheet', i.targetName || '—'), sl('New file', i.filename || '—')),
+      libraryFileLine(i), i.detail ? el('div', { class: 'help' }, i.detail) : null,
+      field('Issue date', issue),
+      el('div', { class: 'help' }, 'The file it replaces stays in the history. The inventory items it is linked to stay linked.')),
+      () => acceptLibraryItem(i, { issueDate: issue.value }), 'Accept newer issue');
+    return;
+  }
+  // a new safety data sheet
+  const chem = el('input', { value: p.chemical || '' }), sup = el('input', { value: p.supplier || '' }), issue = el('input', { type: 'date', value: p.issueDate || '' });
+  const list = sdsItemChecklist(await sdsLinkableItems(), new Set());
+  modal('New safety data sheet', el('div', {}, el('div', { class: 'summary-line' }, sl('File', i.filename || '—')), libraryFileLine(i),
+    field('Chemical', chem), field('Supplier', sup), field('Issue date', issue), list.node,
+    el('div', { class: 'help' }, 'Linked items show an SDS link on the Inventory Items page. You can change the links later.')), async () => {
+    await acceptLibraryItem(i, { chemical: chem.value.trim(), supplier: sup.value.trim(), issueDate: issue.value, itemIds: list.get() });
+  }, 'Accept');
+}
+
+async function editSdsItems(s) {
+  const list = sdsItemChecklist(await sdsLinkableItems(), new Set(s.items.map(x => x.id)));
+  const notes = el('input', { value: s.notes || '', placeholder: 'e.g. reviewed by QA on …' });
+  modal('Safety data sheet — ' + s.chemical, el('div', {}, el('div', { class: 'summary-line' }, sl('Supplier', s.supplier), sl('Issued', s.issueDate || '—')),
+    list.node, field('Notes', notes)), async () => {
+    await api('PUT', '/sds-documents/' + s.id, { itemIds: list.get(), notes: notes.value });
+    toast('Saved'); render();
+  }, 'Save');
+}
+
+async function showDocHistory(kind, id, title) {
+  const r = await api('GET', '/documents/' + kind + '/' + id + '/history');
+  const body = el('div', {},
+    el('h4', { style: 'margin:0 0 6px' }, 'Earlier files'),
+    !r.revisions.length ? el('div', { class: 'help' }, 'No earlier files: the current file is the first one KelpWorks received.')
+      : table(['Revision / issue', 'File', 'In force from', 'Replaced', 'By', ''], r.revisions.map(x => [
+        x.revision ? 'rev ' + x.revision : (x.issueDate || '—'), x.filename || '—', x.uploadedAt ? fmtWhen(x.uploadedAt) : '—', fmtWhen(x.supersededAt), x.supersededBy || '—',
+        el('a', { href: docRevisionUrl(x.id) }, 'Download')])),
+    el('h4', { style: 'margin:14px 0 6px' }, 'Change log'),
+    !r.edits.length ? el('div', { class: 'help' }, 'No changes logged yet.')
+      : table(['When', 'Field', 'From', 'To', 'By'], r.edits.map(e => [fmtWhen(e.at), e.field, e.oldValue ?? '—', e.newValue ?? '—', e.by || '—'])));
+  modal('History — ' + title, body, async () => {}, 'Close', { noCancel: true, wide: true });
+}
+
 // Records archive + nightly backups (batch 9): what the server keeps on its own disk and whether the sync script's key is set.
 async function adminArchiveSection(v) {
   v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Records archive & backups'),
