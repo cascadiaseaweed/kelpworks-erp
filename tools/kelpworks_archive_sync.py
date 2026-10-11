@@ -55,7 +55,8 @@ class Client:
                 detail = json.loads(e.read().decode("utf-8")).get("error", "")
             except Exception:
                 detail = ""
-            raise SyncError("the server answered %s for %s %s" % (e.code, path.split("?")[0], detail))
+            hint = " (a 404 with no message usually means the address in KELPWORKS_URL / --url is wrong or still the placeholder)" if e.code == 404 and not detail else ""
+            raise SyncError("the server answered %s for %s %s%s" % (e.code, path.split("?")[0], detail, hint))
         except (urllib.error.URLError, OSError) as e:
             raise SyncError("could not reach the server (%s)" % getattr(e, "reason", e))
 
