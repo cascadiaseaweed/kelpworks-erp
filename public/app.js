@@ -7116,6 +7116,8 @@ async function pageAdmin(v) {
     'New users and password resets require the person to set a new password on next sign-in. '
     + 'Permissions: only users flagged Production Manager / Quality Manager can sign product-release steps, and only users flagged Production Log Amender can amend a finalized production log (being an administrator does not grant any of them); changes to these flags are logged.'));
 
+  await adminArchiveSection(v);
+
   // SOP documents: controlled documents a production-log QC Check links to
   // by a stable reference key (never the display name, so a rename here is
   // reflected everywhere that link appears without breaking it) -- admin-only
@@ -7411,6 +7413,36 @@ function downloadDbBackup() {
 }
 // The database AND every uploaded document / lab template / SOP as one .zip. This is the file a STAGING server restores; it holds password
 // hashes and all business records, so keep it somewhere private and delete it when finished.
+// Records archive + nightly backups (batch 9): what the server keeps on its own disk and whether the sync script's key is set.
+async function adminArchiveSection(v) {
+  v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Records archive & backups'),
+    el('div', { class: 'actions' }, el('button', { class: 'secondary', onclick: backUpNow, title: 'Write today’s full backup to the server disk now (replaces today’s file)' }, 'Back up now'))));
+  let st;
+  try { st = await api('GET', '/archive/status'); } catch (e) { v.append(el('div', { class: 'empty card' }, 'Could not read the archive status: ' + e.message)); return; }
+  const last = st.lastBackup ? st.lastBackup.split(' ') : null;
+  v.append(el('div', { class: 'summary-line' },
+    sl('Nightly backup', st.nightlyBackup ? 'on, after ' + String(st.backupHourUtc).padStart(2, '0') + ':00 UTC (newest ' + st.backupKeep + ' kept here)' : 'off on this server'),
+    sl('Last backup', last ? fmtWhen(last[0]) + ' · ' + (last[2] ? fmtBytes(+last[2]) : '') : 'none yet'),
+    sl('Sync key', st.archiveKeyConfigured ? 'set' : (st.archiveKeyTooShort ? 'too short (ignored)' : 'not set')),
+    sl('Finalized runs in the archive', String(st.runsToArchive))));
+  if (st.lastBackupError) v.append(el('div', { class: 'help', style: 'color:var(--danger,#b00020)' }, 'Last backup problem: ' + st.lastBackupError));
+  if (!st.backups.length) v.append(el('div', { class: 'empty card' }, 'No backups on this server yet.'));
+  else v.append(table(['Backup', 'Kind', 'Size', 'Written', ''],
+    st.backups.map(b => [mono(b.name), b.kind === 'nightly' ? 'Nightly (database + documents)' : 'Before a software update (database)', fmtBytes(b.size), fmtWhen(b.modified),
+      el('a', { href: '/api/archive/backup?name=' + encodeURIComponent(b.name) + '&token=' + encodeURIComponent(State.token), download: b.name }, 'Download')]),
+    [false, false, true, false, false]));
+  v.append(el('div', { class: 'help', style: 'margin-top:10px' },
+    'These copies stay on the server disk. An office PC runs the sync script (tools/kelpworks_archive_sync.py) every night to copy them, and every finalized run’s documents, '
+    + 'into the KelpWorks-Records library in SharePoint. See docs/records-archive.md. Backups hold password hashes and all business records: keep them in an administrators-only folder.'));
+}
+async function backUpNow() {
+  toast('Backing up…');
+  try {
+    const r = await api('POST', '/archive/backup', {});
+    toast(r.created ? 'Backup written: ' + r.created : 'Not written: ' + r.skipped, !r.created);
+  } catch (e) { toast(e.message, true); return; }
+  render();
+}
 function downloadFullBackup() {
   const ts = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
   const a = el('a', { href: '/api/admin/backup?full=1&token=' + encodeURIComponent(State.token), download: 'kelpworks-full-backup-' + ts + '.zip' });
