@@ -14,3 +14,4 @@ d0a85f8  2026-10-09  staging support, tests and CI (live now; later commits are 
 65147e1  2026-10-09  release integrity (batch 1) merged to main and live (docs-only commits after it)
 5754b7b  2026-10-10  migration safety (batch 5), the release live before batch 7
 f66d03c  2026-10-10  data-integrity cleanup (batch 7) merged to main and live
+3d85c76  2026-10-11  records archive and nightly backups (batch 9) merged to main and live
