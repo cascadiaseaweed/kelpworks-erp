@@ -4105,9 +4105,9 @@ async function pageRelease(v) {
           : 'AUDIT TRAIL BROKEN at event #' + c.brokenAtEventId + ' (run ' + c.runId + ')', !c.ok);
       } }, 'Verify audit trail'))));
   v.append(el('div', { class: 'help', style: 'margin-bottom:10px' },
-    'Finished goods stay Pending Release (cannot be shipped) until the production log is reviewed and signed off by a Production or Quality Manager, '
-    + 'and then released by a Quality Manager. Your permissions: '
-    + (r.me.canReview ? (State.user.isQualityManager ? 'Quality Manager (review + release)' : 'Production Manager (review)') : 'none — view only')
+    'Finished goods stay Pending Release (cannot be shipped) until the production log is reviewed and signed by a Production Manager, '
+    + 'and then released by a Quality Manager. Heavy metals and microbial tests must pass and TDS must be at or above its lower limit before a run can be released. Your permissions: '
+    + ([r.me.canReview ? 'Production Manager (review)' : '', r.me.canRelease ? 'Quality Manager (release)' : ''].filter(Boolean).join(' + ') || 'none — view only')
     + (r.legacyCount ? '. ' + r.legacyCount + ' earlier run(s) pre-date this process and are treated as released.' : '.')));
   const groups = [
     ['Under amendment', ['amending']],
@@ -4189,6 +4189,23 @@ function printReleaseRecord(d) {
     + '</table><p>Generated ' + new Date().toISOString() + '</p></body></html>');
   w.document.close(); w.focus(); w.print();
 }
+async function openRecallReport(d) {
+  const r = await api('GET', '/release/runs/' + d.id + '/recall');
+  const body = el('div', {});
+  body.append(el('div', { class: 'help' }, 'Every finished-goods lot of ' + d.lot + ', what is still on site and what shipped, so a recall or customer query can be answered in one place.'));
+  body.append(el('h4', { style: 'margin:10px 0 4px' }, 'Customers who received this product (' + r.customers.length + ')'));
+  body.append(r.customers.length ? table(['Customer', 'Contact', 'Email', 'Phone', 'Units', 'Lots'],
+    r.customers.map(c => [c.name, c.contact || '—', c.email || '—', c.phone || '—', num(fmt(c.units)), c.lots.join(', ')]), [false, false, false, false, true, false])
+    : el('div', { class: 'help' }, 'Nothing from this run has shipped.'));
+  body.append(el('h4', { style: 'margin:12px 0 4px' }, 'By lot'));
+  const rows = [];
+  r.lots.forEach(l => {
+    rows.push({ group: el('span', {}, el('b', {}, l.lotNumber), ' — ', fgStatusBadge(l.status), ' · on site: ' + fmt(l.qtyOnHand) + (l.location ? ' (' + l.location + ')' : '') + ' · shipped: ' + fmt(l.unitsShipped)) });
+    l.shipments.forEach(x => rows.push([x.shipmentNo, x.date, x.customer || '—', num(fmt(x.qty)), x.status, x.reference || '—', x.carrier ? x.carrier + (x.tracking ? ' ' + x.tracking : '') : '—']));
+  });
+  body.append(table(['Shipment', 'Date', 'Customer', 'Units', 'Status', 'Reference', 'Carrier'], rows, [false, false, false, true, false, false, false]));
+  modal('Where did ' + d.lot + ' go?', body, async () => {}, 'Close', { wide: true, noCancel: true });
+}
 async function openReleaseRun(id) {
   const d = await api('GET', '/release/runs/' + id);
   const me = d.me;
@@ -4201,10 +4218,14 @@ async function openReleaseRun(id) {
     el('div', { style: 'display:flex;gap:10px;align-items:center;flex-wrap:wrap' }, labBadge(d.lab), el('span', { class: 'help' }, labSummaryText(d.lab)),
       el('button', { type: 'button', class: 'secondary', onclick: () => openLabResults(d.run) }, 'Lab results…'),
       el('button', { type: 'button', class: 'secondary', onclick: () => window.open(coaPdfUrl(id, false), '_blank') }, 'View CoA')),
-    d.lab.missingRequired.length ? el('div', { class: 'help', style: 'color:var(--danger);font-weight:600;margin-top:6px' },
-      'Release is blocked until these results are on file: ' + d.lab.missingRequired.join(', ') + '.') : null,
     d.lab.failed.length ? el('div', { class: 'help', style: 'color:var(--danger);font-weight:600;margin-top:6px' },
       'Outside specification: ' + d.lab.failed.join(', ') + '. A comment is required to release this lot.') : null));
+  const blockedGate = d.gate.filter(g => !g.ok);
+  body.append(el('div', { class: 'sign-box' }, el('h4', {}, 'Release gate — must pass before this run can be released'),
+    el('div', { class: 'help', style: 'margin-bottom:6px;' + (blockedGate.length ? 'color:var(--danger);font-weight:600' : '') },
+      blockedGate.length ? 'Release is blocked: ' + blockedGate.length + ' of ' + d.gate.length + ' checks not met. There is no override.' : 'All ' + d.gate.length + ' checks are met.'),
+    table(['Test', 'Rule', 'Specification', 'Result', 'Check'], d.gate.map(g => [g.name, g.ruleText, g.spec, g.result || '—',
+      g.ok ? badge('on_hand', 'Met') : el('span', {}, badge('hold', 'Not met'), el('div', { class: 'muted' }, g.reason))]))));
   const integrity = [];
   if (d.logMatchesReview === true) integrity.push('Production log unchanged since review (hash ' + shortHash(d.reviewedLogHash) + ').');
   if (d.logMatchesReview === false) integrity.push('WARNING: the production log no longer matches the log that was reviewed.');
@@ -4217,7 +4238,6 @@ async function openReleaseRun(id) {
 
   function signBox(title, attest, decisions, endpoint, opts = {}) {
     const decSel = decisions.length > 1 ? selectFrom('', decisions) : null;
-    const cap = (!opts.quality && State.user.isProductionManager && State.user.isQualityManager) ? selectFrom('', [['Production Manager', 'Production Manager'], ['Quality Manager', 'Quality Manager']]) : null;
     const comment = el('textarea', { rows: '2', placeholder: opts.commentHint || 'Comment (required when returning/rejecting/reopening)' });
     const pw = el('input', { type: 'password', autocomplete: 'off', placeholder: 'Re-enter your password to sign' });
     const err = el('div', { class: 'error' });
@@ -4226,21 +4246,20 @@ async function openReleaseRun(id) {
       err.textContent = ''; btn.disabled = true;
       try {
         await api('POST', '/release/runs/' + id + '/' + endpoint, {
-          decision: decSel ? decSel.value : decisions[0][0], comment: comment.value || null, password: pw.value,
-          capacity: cap ? cap.value : undefined });
+          decision: decSel ? decSel.value : decisions[0][0], comment: comment.value || null, password: pw.value });
         toast('Signature recorded'); await refresh();
       } catch (e) { err.textContent = e.message; btn.disabled = false; }
     });
     return el('div', { class: 'sign-box' }, el('h4', {}, title),
       el('div', { class: 'sign-attest' }, attest),
-      decSel ? field('Decision', decSel) : null, cap ? field('Signing as', cap) : null,
+      decSel ? field('Decision', decSel) : null,
       field('Comment', comment), field('Password', pw), err, btn);
   }
   if (d.state === 'pending_review') {
     body.append(me.canReview ? signBox('Production-log review sign-off',
       'By signing I confirm I have reviewed the production log for ' + d.lot + ' and that it is complete and accurate (or I am returning it for correction).',
       [['approve', 'Approve — log reviewed'], ['return', 'Return for correction']], 'review', { button: 'Sign review' })
-      : el('div', { class: 'help sign-box' }, 'Awaiting review by a Production Manager or Quality Manager. You do not have review permission.'));
+      : el('div', { class: 'help sign-box' }, 'Awaiting review by a Production Manager. You do not have review permission.'));
   } else if (d.state === 'returned') {
     const c = el('textarea', { rows: '2', placeholder: 'What was corrected?' }), e2 = el('div', { class: 'error' });
     const b = el('button', { type: 'button', onclick: async () => {
@@ -4273,7 +4292,8 @@ async function openReleaseRun(id) {
       el('td', { class: 'hashtxt', title: e.logHash || '' }, shortHash(e.logHash))))))));
   body.append(el('div', { style: 'margin-top:8px' },
     el('button', { type: 'button', class: 'secondary', onclick: () => releaseAuditCsv(d) }, '⬇ Audit trail CSV'), ' ',
-    el('button', { type: 'button', class: 'secondary', onclick: () => printReleaseRecord(d) }, '🖨 Print release record')));
+    el('button', { type: 'button', class: 'secondary', onclick: () => printReleaseRecord(d) }, '🖨 Print release record'), ' ',
+    el('button', { type: 'button', class: 'secondary', onclick: () => openRecallReport(d) }, 'Where did this product go?')));
   modal('Product release — ' + d.lot, body, async () => { render(); }, 'Close', { wide: true, noCancel: true });
 }
 
@@ -6282,17 +6302,17 @@ async function drawAdminRequisitionContact(v) {
 async function drawAdminCoaSpecs(v) {
   const { specs, applicationRate, applicationPeriods } = await api('GET', '/coa-specs');
   v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Certificate of Analysis specifications')));
-  v.append(el('div', { class: 'help', style: 'margin:-6px 0 8px' }, 'Limits each run is judged against on its Certificate of Analysis. “Required” results must be on file before Quality can release a run. '
+  v.append(el('div', { class: 'help', style: 'margin:-6px 0 8px' }, 'Limits each run is judged against on its Certificate of Analysis. A test with a release rule must pass before Quality can release a run (there is no override); every change to a limit or rule is logged. '
     + 'Heavy-metal limits are loadings in kg metal per ha; each lab result is converted to kg/ha at the product application rate (' + (applicationRate ? applicationRate + ' kg/ha' : 'not set') + ') × application periods ('
     + applicationPeriods + '), both set on the Calculations page. Changing a limit re-judges every certificate as it is next generated.'));
   const names = { physical: 'Physical & chemical', metals: 'Heavy metals', microbial: 'Microbiological' };
   const rows = [];
   for (const g of ['physical', 'metals', 'microbial']) {
     rows.push({ group: el('b', {}, names[g]) });
-    specs.filter(x => x.group === g).forEach(x => rows.push([x.name, x.specText, x.required ? badge('on_hand', 'Required') : badge('sold', 'Optional'), x.method || '—', x.active ? badge('on_hand', 'On certificate') : badge('hold', 'Lab results only'),
+    specs.filter(x => x.group === g).forEach(x => rows.push([x.name, x.specText, x.releaseRule ? badge('on_hand', x.releaseRuleText) : badge('sold', 'None'), x.method || '—', x.active ? badge('on_hand', 'On certificate') : badge('hold', 'Lab results only'),
       rowActions([['Edit', () => editCoaSpec(x)]])]));
   }
-  v.append(table(['Test', 'Specification', 'Required for release', 'Default method', 'Status', ''], rows));
+  v.append(table(['Test', 'Specification', 'Release rule', 'Default method', 'Status', ''], rows));
 }
 function editCoaSpec(x) {
   const groupName = { physical: 'Physical & chemical', metals: 'Heavy metals', microbial: 'Microbiological' }[x.group] || x.group;
@@ -6302,7 +6322,8 @@ function editCoaSpec(x) {
   const mx = el('input', { value: x.maxVal ?? '', placeholder: 'No maximum', inputmode: 'decimal' });
   const meth = el('input', { value: x.method || '', placeholder: 'e.g. MFHPB-18' });
   const excl = el('input', { type: 'checkbox' }); excl.checked = x.maxExclusive;
-  const req = el('input', { type: 'checkbox' }); req.checked = x.required;
+  const rule = selectFrom('', [['', 'None — not a release condition'], ['pass', 'Must pass the specification'], ['min', 'Must be at or above the lower limit']]);
+  rule.value = x.releaseRule || '';
   const act = el('input', { type: 'checkbox' }); act.checked = x.active;
   const option = (cb, title, hint) => {
     const row = el('label', { class: 'perm-item' + (cb.checked ? ' on' : '') }, cb, el('span', { class: 'perm-text' }, el('b', {}, title), el('small', {}, hint)));
@@ -6329,6 +6350,14 @@ function editCoaSpec(x) {
   [mn, mx].forEach(i => i.addEventListener('input', sync)); excl.addEventListener('change', sync);
   sync();
   const section = (title, ...kids) => el('div', { class: 'perm-box' }, el('div', { class: 'perm-title' }, title), ...kids);
+  const histBox = el('details', { class: 'accordion' }, el('summary', {}, 'Change history'), el('div', { class: 'accordion-body' }, 'Loading…'));
+  histBox.addEventListener('toggle', async () => {
+    if (!histBox.open || histBox.dataset.loaded) return;
+    histBox.dataset.loaded = '1';
+    const h = (await api('GET', '/coa-specs/' + x.code + '/log')).log;
+    const hb = histBox.querySelector('.accordion-body'); hb.innerHTML = '';
+    hb.append(h.length ? table(['When', 'Who', 'Field', 'From', 'To'], h.map(e => [fmtWhen(e.at), e.by || '—', e.field, e.old ?? '—', e.new ?? '—'])) : el('div', { class: 'help' }, 'No changes recorded yet.'));
+  });
   modal('Edit specification — ' + x.name, el('div', {},
     el('div', { class: 'summary-line' }, sl('Test', x.name), sl('Group', groupName), sl('Stated in', x.unit || 'the reported unit')),
     section('Limit',
@@ -6337,13 +6366,15 @@ function editCoaSpec(x) {
       exclRow,
       el('div', { class: 'help', style: 'margin-top:8px' }, 'Printed on the certificate as: ', preview)),
     section('Release and certificate', el('div', { class: 'perm-list' },
-      option(req, 'Required before release', 'Quality cannot release a run until a result for this test is on file.'),
+      field('Release rule', rule),
+      el('div', { class: 'help' }, 'Quality cannot release a run until this test meets its rule. “At or above the lower limit” ignores the upper limit.'),
       option(act, 'Listed on the certificate', 'Untick to keep this test in Lab results but leave it off the Certificate of Analysis.'))),
     section('Method', field('Default method', meth),
-      el('div', { class: 'help' }, 'Filled in when a result for this test is entered; a lab report’s own method replaces it.'))),
+      el('div', { class: 'help' }, 'Filled in when a result for this test is entered; a lab report’s own method replaces it.')),
+    histBox),
     async () => {
       await api('PUT', '/coa-specs/' + x.code, { minVal: absent ? x.minVal : mn.value, maxVal: absent ? x.maxVal : mx.value,
-        maxExclusive: excl.checked, required: req.checked, active: act.checked, method: meth.value });
+        maxExclusive: excl.checked, releaseRule: rule.value, active: act.checked, method: meth.value });
       toast('Specification saved'); render();
     }, 'Save specification');
 }

@@ -209,6 +209,12 @@ SETTINGS_DEFAULTS = [
      "A safety data sheet is flagged \"review soon\" when its review date is this many days away or less."),
     ("library_scan_stale_days", 3, "SharePoint folder check: warn after (days)",
      "The Documents page warns administrators when the SOP / safety data sheet folders have not been reported by the sync for longer than this."),
+    ("release_separate_signers", 0, "Release: reviewer and releaser must be different people (1 = yes)",
+     "When 1, the person who signed a run's production-log review cannot also sign its Quality release."),
+    ("review_not_by_finalizer", 0, "Review: the person who finalized a run cannot review it (1 = yes)",
+     "When 1, a Production Manager cannot review a production log they finalized themselves."),
+    ("lab_result_require_report", 1, "Lab results: a lab report must be attached for tests with a release rule (1 = yes)",
+     "When 1, a result for a heavy-metal, microbial or TDS test (a test that must pass for release) can only be entered with the lab report attached to the run."),
 ]
 
 # The fixed catalog of "QC Check" fields on the production log -- only fields
@@ -1509,6 +1515,19 @@ CREATE TABLE IF NOT EXISTS user_permission_log (
     changed_by  TEXT,
     changed_at  TEXT NOT NULL
 );
+
+-- Every change to a rule the release depends on: a Certificate of Analysis specification (limit, release rule, ...) or a setting. area: spec | setting.
+CREATE TABLE IF NOT EXISTS config_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    area        TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    field       TEXT NOT NULL,
+    old_value   TEXT,
+    new_value   TEXT,
+    changed_by  TEXT,
+    changed_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_config_log_key ON config_log(area, key);
 """
 
 
@@ -2458,6 +2477,11 @@ def ensure_coa_specs(conn):
     # not overwrite a unit or limit an administrator sets afterwards)
     run_once(conn, "coa_metal_limits_kg_ha", lambda: conn.execute(
         "UPDATE coa_specs SET max_val=limit_kg_ha, unit='kg/ha' WHERE basis='metal' AND unit='ppm' AND limit_kg_ha IS NOT NULL"))
+    # (batch 6) what must pass before Quality can release: heavy metals and microbial tests must pass, TDS must be at or above its lower limit. Set once; an
+    # administrator may change a rule afterwards (and every change is logged).
+    run_once(conn, "release_gate_rules_batch6", lambda: (
+        conn.execute("UPDATE coa_specs SET release_rule='pass' WHERE grp IN ('metals','microbial')"),
+        conn.execute("UPDATE coa_specs SET release_rule='min' WHERE code='tds'")))
     for key, label, desc in ((k, l, d) for k, v, l, d in SETTINGS_DEFAULTS if k in ("coa_application_rate_kg_ha", "coa_application_periods")):
         conn.execute("UPDATE settings SET label=?, description=? WHERE key=?", (label, desc, key))
 
@@ -2603,6 +2627,49 @@ def coa_evaluate(conn, r):
                "metalsTotal": sum(1 for x in rows if x["group"] == "metals"),
                "applicationRate": rate or None, "applicationPeriods": periods, "additionalCount": len(additional)}
     return {"rows": rows, "additional": [lab_result_public(x) for x in additional], "summary": summary}
+
+
+RELEASE_RULE_TEXT = {"pass": "Must pass", "min": "Must be at or above the lower limit"}
+
+
+def release_gate(conn, r):
+    """What stands between this run and Quality release: every specification with a release rule, judged now.
+    -> [{code, name, group, rule, ruleText, spec, result, status, ok, reason}]. A run can be released only when every item is ok.
+    Rule 'pass': a result is on file and it passes the specification (a heavy metal that cannot be judged, for example because the application rate is not set,
+    does not pass). Rule 'min': a result is on file and it is at or above the specification's lower limit (the upper limit is not a release condition)."""
+    ev = coa_evaluate(conn, r)
+    rows = {x["code"]: x for x in ev["rows"]}
+    out = []
+    for s in conn.execute("SELECT * FROM coa_specs WHERE release_rule IN ('pass','min') ORDER BY sort, code").fetchall():
+        row = rows[s["code"]]
+        item = {"code": s["code"], "name": s["name"], "group": s["grp"], "rule": s["release_rule"], "ruleText": RELEASE_RULE_TEXT[s["release_rule"]],
+                "spec": row["specText"], "result": row["resultText"] or None, "status": row["status"], "ok": False, "reason": ""}
+        has = bool(row["resultText"]) if s["basis"] == "run" else bool(row["result"])
+        if not has:
+            item["reason"] = ("TDS has not been recorded in the Packaging QC check" if s["code"] == "tds" else
+                              "pH has not been recorded in the Packaging QC check" if s["code"] == "ph" else "no result on file")
+        elif s["release_rule"] == "pass":
+            item["ok"] = row["status"] == "pass"
+            if not item["ok"]:
+                item["reason"] = ("%s is outside the specification (%s)" % (row["resultText"], row["specText"]) if row["status"] == "fail"
+                                  else (row["note"] or "the result cannot be judged") + (" (%s)" % row["resultText"] if row["status"] == "review" else ""))
+        else:                                                  # 'min'
+            if s["basis"] == "run":
+                val, qual = (r["packaging_tds_pct"] if s["code"] == "tds" else r["packaging_qc_ph"] if s["code"] == "ph" else None), ""
+            else:
+                x = conn.execute("SELECT * FROM lab_results WHERE run_id=? AND spec_code=? AND voided_at IS NULL ORDER BY id DESC LIMIT 1", (r["id"], s["code"])).fetchone()
+                val, qual = (x["value_num"], x["qualifier"] or "") if x else (None, "")
+            lo = s["min_val"]
+            if lo is None:
+                item["ok"], item["reason"] = True, "no lower limit is set"
+            elif val is None or qual == "<":
+                item["reason"] = "the result is not a measured value, so it cannot show the lower limit was met"
+            elif val >= lo:
+                item["ok"] = True
+            else:
+                item["reason"] = "%s is below the lower limit %s" % (row["resultText"], coa_num(lo) + ((" " + s["unit"]) if s["unit"] else ""))
+        out.append(item)
+    return out
 
 
 def lab_result_public(x):
@@ -4153,6 +4220,8 @@ def migrate(conn):
     soft_step(conn, "refresh sample ids", refresh_all_sample_ids)
     if "limit_kg_ha" not in {r["name"] for r in conn.execute("PRAGMA table_info(coa_specs)")}:
         conn.execute("ALTER TABLE coa_specs ADD COLUMN limit_kg_ha REAL")
+    if "release_rule" not in {r["name"] for r in conn.execute("PRAGMA table_info(coa_specs)")}:      # (batch 6) '' none | 'pass' must pass | 'min' must meet the lower limit
+        conn.execute("ALTER TABLE coa_specs ADD COLUMN release_rule TEXT")
     lacols = {r["name"] for r in conn.execute("PRAGMA table_info(lab_analyses)")}
     if "method" not in lacols:
         conn.execute("ALTER TABLE lab_analyses ADD COLUMN method TEXT")
@@ -6809,6 +6878,7 @@ class Handler(BaseHTTPRequestHandler):
                 must_change = 0 if d.get("mustChange") is False else 1
                 conn.execute("UPDATE users SET password_hash=?, must_change_password=?, token_version=token_version+1 WHERE id=?",
                              (hash_password(pw), must_change, uid))
+                self._log_permission(conn, uid, target["email"], "Password reset by an administrator", None, None, user)
                 return {"ok": True}
 
             if len(seg) == 3 and method == "PUT":
@@ -6823,6 +6893,10 @@ class Handler(BaseHTTPRequestHandler):
                 conn.execute("UPDATE users SET name=?, role=?, active=?, token_version=token_version+? WHERE id=?",
                              ((d["name"].strip() if d.get("name") else target["name"]),
                               new_role, new_active, 1 if (target["active"] and not new_active) else 0, uid))
+                if new_role != target["role"]:
+                    self._log_permission(conn, uid, target["email"], "Administrator role", int(target["role"] == "admin"), int(new_role == "admin"), user)
+                if new_active != int(target["active"] or 0):
+                    self._log_permission(conn, uid, target["email"], "Account active", int(target["active"] or 0), new_active, user)
                 for key, col, perm in (("isProductionManager", "is_production_manager", "Production Manager"),
                                        ("isQualityManager", "is_quality_manager", "Quality Manager"),
                                        ("canAmendLog", "can_amend_log", "Production Log Amender")):
@@ -6879,6 +6953,10 @@ class Handler(BaseHTTPRequestHandler):
     def route_settings(self, method, seg, conn, user):
         if seg == ["api", "settings"] and method == "GET":
             return {"settings": get_settings(conn)}
+        if seg == ["api", "settings", "log"] and method == "GET":
+            self._require_admin(user)
+            return {"log": [{"key": r["key"], "setting": r["field"], "old": r["old_value"], "new": r["new_value"], "by": r["changed_by"], "at": r["changed_at"]}
+                            for r in conn.execute("SELECT * FROM config_log WHERE area='setting' ORDER BY id DESC LIMIT 200")]}
         if len(seg) == 3 and seg[2] and method == "PUT":
             self._require_admin(user)
             key = seg[2]
@@ -6889,6 +6967,9 @@ class Handler(BaseHTTPRequestHandler):
             value = numn(d.get("value"))
             if value is None:
                 raise ApiError(400, "Enter a numeric value")
+            if value != row["value"]:
+                conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('setting',?,?,?,?,?,?)",
+                             (key, row["label"] or key, None if row["value"] is None else str(row["value"]), str(value), user["name"], now_iso()))
             conn.execute("UPDATE settings SET value=?, updated_at=? WHERE key=?",
                          (value, now_iso(), key))
             return {"settings": get_settings(conn)}
@@ -7523,20 +7604,29 @@ class Handler(BaseHTTPRequestHandler):
                 "coa": coa_evaluate(conn, r), "specs": specs, "metalUnits": ["ppm", "%", "ppb", "mg/kg"]}
 
     def _lab_regate(self, conn, run, user):
-        """A lab result added or voided AFTER release can make released product non-conforming (a required result removed, or a new failure
-        that the release did not accept). The run's unsold lots are then put on hold and the audit trail says why."""
+        """A lab result added or voided AFTER release can make released product non-conforming: a result the release depended on removed or now failing, or a new
+        failure that the release did not accept. The run's unsold lots are then put on hold and the audit trail says why. A run released under the release gate is
+        held to the tests that gate checked (its `released` event lists them); an older run keeps the old rule (required results present, no new failure)."""
         if run["release_state"] not in ("released", "legacy"):
             return
         lab = coa_evaluate(conn, run)["summary"]
         ev = conn.execute("SELECT detail FROM release_events WHERE run_id=? AND event_type IN ('released','legacy_release') ORDER BY id DESC LIMIT 1",
                           (run["id"],)).fetchone()
-        accepted = set()
+        accepted, snapshot = set(), None
         if ev and ev["detail"]:
             try:
-                accepted = set(json.loads(ev["detail"]).get("outOfSpec", []))
+                detail = json.loads(ev["detail"])
+                accepted = set(detail.get("outOfSpec", []))
+                snapshot = detail.get("gate")
             except (ValueError, AttributeError):
                 accepted = set()
-        problems = list(lab["missingRequired"]) + [f for f in lab["failed"] if f not in accepted]
+        if snapshot is not None:
+            held_to = {g["code"] for g in snapshot}
+            gate = release_gate(conn, run)
+            problems = ["%s: %s" % (g["name"], g["reason"]) for g in gate if g["code"] in held_to and not g["ok"]]
+            problems += [f for f in lab["failed"] if f not in accepted and f not in {g["name"] for g in gate if g["rule"] == "pass"}]
+        else:
+            problems = list(lab["missingRequired"]) + [f for f in lab["failed"] if f not in accepted]
         if not problems:
             return
         moved = self._set_lot_status(conn, run["id"], ("on_hand",), "hold")
@@ -7596,6 +7686,9 @@ class Handler(BaseHTTPRequestHandler):
             rows = d.get("results") or []
             if not rows:
                 raise ApiError(400, "Add at least one result")
+            current = {x["code"]: x for x in coa_evaluate(conn, r)["rows"]}
+            need_report = bool(float(get_setting_value(conn, "lab_result_require_report", 1) or 0))
+            gated = {x["code"] for x in conn.execute("SELECT code FROM coa_specs WHERE release_rule IN ('pass','min')")}
             now = now_iso()
             added = []
             for i, x in enumerate(rows, 1):
@@ -7608,6 +7701,11 @@ class Handler(BaseHTTPRequestHandler):
                 analyte = spec["name"] if spec else (x.get("analyte") or "").strip()
                 if not analyte:
                     raise ApiError(400, "Row %d: enter the test name" % i)
+                if code and current.get(code, {}).get("status") == "fail" and current[code].get("result"):
+                    # a failure is never replaced by simply entering another result: it is voided first (with a reason, on the record)
+                    raise ApiError(409, "%s: the result on file is outside the specification. Void it, with the reason, before entering a new result." % analyte, "void_first")
+                if code and code in gated and need_report and not att:
+                    raise ApiError(400, "%s: attach the lab report to the run and choose it here (a result that decides release needs its report)." % analyte, "report_required")
                 try:
                     qual, num, vtext = parse_result_value(x.get("value"))
                 except ApiError as e:
@@ -7656,7 +7754,8 @@ class Handler(BaseHTTPRequestHandler):
         def pub(s):
             return {"code": s["code"], "name": s["name"], "group": s["grp"], "unit": s["unit"], "basis": s["basis"],
                     "minVal": s["min_val"], "maxVal": s["max_val"], "maxExclusive": bool(s["max_exclusive"]),
-                    "required": bool(s["required"]), "active": bool(s["active"]), "method": s["method"], "specText": coa_spec_text(s)}
+                    "required": bool(s["required"]), "active": bool(s["active"]), "method": s["method"], "specText": coa_spec_text(s),
+                    "releaseRule": s["release_rule"] or "", "releaseRuleText": RELEASE_RULE_TEXT.get(s["release_rule"] or "", "None")}
         if seg == ["api", "coa-specs"] and method == "GET":
             return {"specs": [pub(s) for s in conn.execute("SELECT * FROM coa_specs ORDER BY sort, code")],
                     "applicationRate": float(get_setting_value(conn, "coa_application_rate_kg_ha", 0) or 0),
@@ -7681,10 +7780,29 @@ class Handler(BaseHTTPRequestHandler):
             mn, mx = num("minVal", s["min_val"]), num("maxVal", s["max_val"])
             if mn is not None and mx is not None and mn > mx:
                 raise ApiError(400, "Minimum cannot exceed maximum")
-            conn.execute("UPDATE coa_specs SET min_val=?, max_val=?, max_exclusive=?, required=?, active=?, method=? WHERE code=?",
-                         (mn, mx, 1 if d.get("maxExclusive", s["max_exclusive"]) else 0, 1 if d.get("required", s["required"]) else 0,
-                          1 if d.get("active", s["active"]) else 0, (d.get("method", s["method"]) or "").strip() or None, s["code"]))
+            rule = s["release_rule"] or ""
+            if "releaseRule" in d:
+                rule = (d.get("releaseRule") or "").strip()
+                if rule not in ("", "pass", "min"):
+                    raise ApiError(400, "The release rule must be none, must pass, or at or above the lower limit")
+            if rule == "min" and mn is None:
+                raise ApiError(400, "A lower limit is needed for the rule \"at or above the lower limit\"")
+            new = {"min_val": mn, "max_val": mx, "max_exclusive": 1 if d.get("maxExclusive", s["max_exclusive"]) else 0, "release_rule": rule,
+                   "required": s["required"], "active": 1 if d.get("active", s["active"]) else 0,
+                   "method": (d.get("method", s["method"]) or "").strip() or None}
+            labels = {"min_val": "Minimum", "max_val": "Maximum", "max_exclusive": "Strict maximum", "release_rule": "Release rule", "active": "Listed on the certificate",
+                      "method": "Default method"}
+            for col, label in labels.items():
+                old = s[col] if col != "release_rule" else (s["release_rule"] or "")
+                if (old if old is not None else "") != (new[col] if new[col] is not None else "") and str(old) != str(new[col]):
+                    conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('spec',?,?,?,?,?,?)",
+                                 (s["code"], label, None if old is None else str(old), None if new[col] is None else str(new[col]), user["name"], now_iso()))
+            conn.execute("UPDATE coa_specs SET min_val=?, max_val=?, max_exclusive=?, release_rule=?, required=?, active=?, method=? WHERE code=?",
+                         (new["min_val"], new["max_val"], new["max_exclusive"], new["release_rule"] or None, new["required"], new["active"], new["method"], s["code"]))
             return {"spec": pub(conn.execute("SELECT * FROM coa_specs WHERE code=?", (s["code"],)).fetchone())}
+        if len(seg) == 4 and seg[3] == "log" and method == "GET":
+            return {"log": [{"field": r["field"], "old": r["old_value"], "new": r["new_value"], "by": r["changed_by"], "at": r["changed_at"]}
+                            for r in conn.execute("SELECT * FROM config_log WHERE area='spec' AND key=? ORDER BY id DESC LIMIT 100", (seg[2],))]}
         raise ApiError(404, "Unknown endpoint")
 
     # ---- Samples: catalogue, retention inventory, cart, lab requisitions ---------------- #
@@ -10132,14 +10250,9 @@ class Handler(BaseHTTPRequestHandler):
             if not is_qm:
                 raise ApiError(403, "Only a Quality Manager can sign this step")
             return "Quality Manager"
-        if not (is_qm or is_pm):
-            raise ApiError(403, "Only a Production Manager or Quality Manager can sign this step")
-        want = (d.get("capacity") or "").strip()
-        if want == "Quality Manager" and is_qm:
-            return "Quality Manager"
-        if want == "Production Manager" and is_pm:
-            return "Production Manager"
-        return "Production Manager" if is_pm else "Quality Manager"
+        if not is_pm:                                              # the production-log review is the Production Manager's; the release is Quality's
+            raise ApiError(403, "Only a Production Manager can sign the production-log review")
+        return "Production Manager"
 
     def _release_events_public(self, conn, rid):
         return [{"id": e["id"], "type": e["event_type"], "user": e["user_name"], "email": e["user_email"],
@@ -10167,8 +10280,7 @@ class Handler(BaseHTTPRequestHandler):
                 "lab": coa_evaluate(conn, r)["summary"]}
 
     def route_release(self, method, seg, query, conn, user):
-        me = {"canReview": bool(user["is_production_manager"] or user["is_quality_manager"]),
-              "canRelease": bool(user["is_quality_manager"])}
+        me = {"canReview": bool(user["is_production_manager"]), "canRelease": bool(user["is_quality_manager"])}
         if seg == ["api", "release"] and method == "GET":
             runs = [self._release_summary(conn, r) for r in conn.execute(
                 "SELECT * FROM production_runs WHERE status='completed' AND release_state IS NOT NULL"
@@ -10188,11 +10300,36 @@ class Handler(BaseHTTPRequestHandler):
                 out.update({"run": self._run_full(conn, r), "events": self._release_events_public(conn, rid),
                             "me": me, "currentLogHash": now_hash, "reviewedLogHash": r["release_review_hash"],
                             "logMatchesReview": (r["release_review_hash"] == now_hash) if r["release_review_hash"] else None,
-                            "chain": release_verify_chain(conn)})
+                            "chain": release_verify_chain(conn), "gate": release_gate(conn, r),
+                            "separateSigners": bool(float(get_setting_value(conn, "release_separate_signers", 0) or 0))})
                 return out
             if len(seg) == 5 and method == "POST" and seg[4] in ("review", "release", "reopen", "resubmit"):
                 return self._release_action(conn, r, seg[4], self._body_json(), user)
+            if len(seg) == 5 and method == "GET" and seg[4] == "recall":
+                return self._recall_report(conn, r)
         raise ApiError(404, "Unknown release endpoint")
+
+    def _recall_report(self, conn, r):
+        """Where did this run's product go? Every finished-goods lot of the run with what is still here and what shipped, to which customer, on which shipment."""
+        lots = []
+        for l in conn.execute("SELECT * FROM fg_lots WHERE run_id=? ORDER BY fg_lot_number", (r["id"],)).fetchall():
+            ships = [{"shipmentNo": x["shipment_no"], "date": x["ship_date"], "status": x["status"], "customer": x["customer"], "contact": x["contact"],
+                      "email": x["email"], "phone": x["phone"], "reference": x["reference"], "carrier": x["carrier"], "tracking": x["tracking_no"], "qty": x["qty"]}
+                     for x in conn.execute(
+                         "SELECT s.shipment_no, s.ship_date, s.status, s.reference, s.carrier, s.tracking_no, c.name customer, c.contact, c.email, c.phone, sl.qty"
+                         " FROM shipment_lines sl JOIN shipments s ON s.id=sl.shipment_id LEFT JOIN customers c ON c.id=s.customer_id"
+                         " WHERE sl.fg_lot_id=? ORDER BY s.ship_date, s.id", (l["id"],))]
+            lots.append({"lotNumber": l["fg_lot_number"], "status": l["status"], "qtyOnHand": l["qty"], "location": l["location"],
+                         "shipments": ships, "unitsShipped": sum(x["qty"] for x in ships if x["status"] != "cancelled")})
+        customers = {}
+        for l in lots:
+            for x in l["shipments"]:
+                if x["status"] != "cancelled" and x["customer"]:
+                    customers.setdefault(x["customer"], {"name": x["customer"], "contact": x["contact"], "email": x["email"], "phone": x["phone"], "units": 0, "lots": set()})
+                    customers[x["customer"]]["units"] += x["qty"]
+                    customers[x["customer"]]["lots"].add(l["lotNumber"])
+        return {"run": {"id": r["id"], "processingLot": r["processing_lot"], "sku": r["sku_code"], "releaseState": r["release_state"]}, "lots": lots,
+                "customers": [dict(c, lots=sorted(c["lots"])) for c in sorted(customers.values(), key=lambda c: c["name"])]}
 
     def _release_action(self, conn, r, action, d, user):
         rid, state = r["id"], r["release_state"]
@@ -10207,6 +10344,8 @@ class Handler(BaseHTTPRequestHandler):
             if decision == "return" and not comment:
                 raise ApiError(400, "Enter what needs to be corrected before returning the run")
             capacity = self._release_signer(conn, user, d, need_quality=False)
+            if float(get_setting_value(conn, "review_not_by_finalizer", 0) or 0) and (r["finalized_by"] or "") == user["name"]:
+                raise ApiError(403, "You finalized this run, so another Production Manager must review it (setting: review by someone other than the finalizer).", "same_person")
             now_hash = self._release_snapshot_hash(conn, rid)
             if decision == "approve":
                 conn.execute("UPDATE production_runs SET release_state='pending_release', release_review_hash=? WHERE id=?",
@@ -10236,20 +10375,33 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(400, "Choose release or reject")
             if decision == "reject" and not comment:
                 raise ApiError(400, "Enter the reason for rejecting this product")
-            failed = []
+            failed, gate = [], []
             if decision == "release":
+                gate = release_gate(conn, r)
+                blocked = [g for g in gate if not g["ok"]]
+                if blocked:                                       # heavy metals, microbial and TDS must pass: there is no override
+                    raise ApiError(409, "Release blocked - these must pass before a run can be released: " + "; ".join("%s: %s" % (g["name"], g["reason"]) for g in blocked)
+                                   + ". Enter or correct them with the run's Lab results button.", "release_gate")
                 lab = coa_evaluate(conn, r)["summary"]
-                if lab["missingRequired"]:
+                gated = {g["name"] for g in gate if g["rule"] == "pass"}       # judged by the gate already; a 'min' test can still be over its upper limit
+                missing = [m for m in lab["missingRequired"] if m not in gated]
+                if missing:
                     raise ApiError(409, "Release blocked: required lab results are not on file yet (%s). "
-                                        "Enter them with the run's Lab results button (Production tab)." % ", ".join(lab["missingRequired"]))
-                failed = lab["failed"]
+                                        "Enter them with the run's Lab results button (Production tab)." % ", ".join(missing), "release_gate")
+                failed = [f for f in lab["failed"] if f not in gated]            # a test without a release rule (pH, ...) may still be released with a comment
                 if failed and not comment:
                     raise ApiError(400, "Results outside specification (%s). Enter a comment explaining why this lot is being released." % ", ".join(failed))
             capacity = self._release_signer(conn, user, d, need_quality=True)
+            if float(get_setting_value(conn, "release_separate_signers", 0) or 0):
+                rev = conn.execute("SELECT user_id FROM release_events WHERE run_id=? AND event_type='review_approved' ORDER BY id DESC LIMIT 1", (rid,)).fetchone()
+                if rev and rev["user_id"] == user["id"]:
+                    raise ApiError(403, "You signed the production-log review of this run, so another Quality Manager must release it (setting: reviewer and releaser must differ).", "same_person")
             now_hash = self._release_snapshot_hash(conn, rid)
             if now_hash != r["release_review_hash"]:
-                # Belt and braces: a change that slipped past the edit hook.
+                # Belt and braces: a change that slipped past the edit hook. The void is committed BEFORE the error is raised (an error rolls the request
+                # back, which used to undo the void and leave the run released with a log that no longer matched).
                 self._release_void(conn, r, user, now_hash, "Production log differs from the log that was reviewed")
+                conn.commit()
                 raise ApiError(409, "The production log changed after it was reviewed - it has been returned to review")
             if decision == "release":
                 moved = self._set_lot_status(conn, rid, ("pending_release",), "on_hand")
@@ -10258,7 +10410,8 @@ class Handler(BaseHTTPRequestHandler):
                             meaning=("I release this product for sale with results outside specification (%s), for the reason given." % ", ".join(failed))
                             if failed else "I confirm this product conforms to specification and is released for sale.",
                             comment=comment, log_hash=now_hash,
-                            detail=dict({"from": "pending_release", "to": "released", "lots": moved}, **({"outOfSpec": failed} if failed else {})))
+                            detail=dict({"from": "pending_release", "to": "released", "lots": moved, "gate": [
+                                {k: g[k] for k in ("code", "name", "rule", "spec", "result", "status")} for g in gate]}, **({"outOfSpec": failed} if failed else {})))
             else:
                 moved = self._set_lot_status(conn, rid, ("pending_release",), "hold")
                 conn.execute("UPDATE production_runs SET release_state='rejected' WHERE id=?", (rid,))

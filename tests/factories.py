@@ -82,13 +82,32 @@ def sql(server, statement, args=()):
         conn.close()
 
 
+METALS = {c: "1" for c in ("as", "cd", "cr", "co", "cu", "pb", "hg", "mo", "ni", "se", "zn")}      # ppm; judged as a loading once the application rate is set
+
+
+def lab_report(client, run_id, name="lab-report.pdf"):
+    """Attach a lab report document to the run; returns its attachment id."""
+    import base64
+    r = client.post("/api/production/%d/attachments" % run_id, {"filename": name, "contentType": "application/pdf", "dataB64": base64.b64encode(b"%PDF-1.4 test report").decode()})
+    r.raise_for_status()
+    return max(a["id"] for a in r.json["attachments"])
+
+
+def release_ready_results(server, qm, run_id, metals=None, micro=None):
+    """Everything the release gate asks for: the product application rate (so heavy metals can be judged), the lab report, and passing metals + microbial results."""
+    sql(server, "UPDATE settings SET value=1000 WHERE key='coa_application_rate_kg_ha'")
+    att = lab_report(qm, run_id)
+    results = [{"specCode": c, "value": v} for c, v in dict(MICROBIAL, **(micro or {})).items()] + [{"specCode": c, "value": v} for c, v in dict(METALS, **(metals or {})).items()]
+    r = qm.post("/api/production/%d/lab-results" % run_id, {"labName": "Test Lab", "reportNumber": "T-1", "attachmentId": att, "results": results})
+    r.raise_for_status()
+    return att
+
+
 def release_run(server, run_id, pm, pm_password, qm, qm_password):
-    """The real sign-off flow: Production Manager reviews the log, Quality Manager enters the required lab results and releases."""
+    """The real sign-off flow: Production Manager reviews the log, Quality Manager enters the gated lab results and releases."""
     r = pm.post("/api/release/runs/%d/review" % run_id, {"decision": "approve", "password": pm_password})
     r.raise_for_status()
-    r = qm.post("/api/production/%d/lab-results" % run_id, {"labName": "Test Lab", "reportNumber": "T-1",
-                                                             "results": [{"specCode": c, "value": v} for c, v in MICROBIAL.items()]})
-    r.raise_for_status()
+    release_ready_results(server, qm, run_id)
     r = qm.post("/api/release/runs/%d/release" % run_id, {"decision": "release", "password": qm_password,
                                                                  "comment": "Test data: TDS and pH are not set to specification"})
     r.raise_for_status()
