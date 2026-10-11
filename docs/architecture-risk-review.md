@@ -15,7 +15,12 @@ Date: 2026-10-09. Code reviewed: `main` at `c1e5343` (after PRs #4 to #7). Scope
 | Finding | Status |
 |---|---|
 | R-01 finished-goods edits | **Fixed** (batch 1): permissions, status whitelist, reason, audit event |
-| R-02 lab results | **Partly fixed** (batch 1): Quality Manager only; released product is held when a required result is voided or a new failure appears. Still open: required attachment / second-person check, wider gate scope (R-11) |
+| R-02 lab results | **Fixed** (batches 1 and 6): Quality Manager only; a failed result must be voided before a retest; the lab report must be attached for tests that decide release; released product is held when a gated result is voided or fails |
+| R-11 release gate | **Fixed** (batch 6): heavy metals and microbial tests must pass and TDS must be at or above its lower limit; no override |
+| R-18 change control | **Fixed** (batch 6): spec and setting changes are logged (who, field, old, new) |
+| R-19 audit | **Partly fixed** (batch 6): the hash-mismatch void is committed; password resets, role and active changes are logged. Still open: keyed chain / external anchor |
+| R-20 separation of duties | **Partly fixed** (batch 6): the review is Production Manager only, the release Quality Manager only; optional settings forbid the same person doing both or reviewing their own finalized run; role / password changes are logged |
+| R-21 recall | **Partly fixed** (batch 6): a lot-to-customers recall report. Still open: reagent / packaging lot numbers |
 | R-03 tote reuse | **Fixed** (batch 1): ownership check at draft save and finalize; tote status/weight edits restricted |
 | R-04 secrets and defaults | **Fixed** (batch 2): no public secret (generated key file), no default passwords outside development, must-change enforced by the server, no prefilled login. Still to do in Render: confirm `KELP_ERP_SECRET` / `KELP_ERP_ADMIN_PASSWORD` are set on live and staging |
 | R-12 token revocation | **Mostly fixed** (batch 2): token versions end sessions on password change / reset / deactivation; downloads use the same authentication as the API. Still open: `?token=` is a full-scope bearer token (short-lived download tokens) |
@@ -225,7 +230,7 @@ Each item below is one pull request on a `hardening/` branch with tests that fai
 3. **XSS and uploads (R-05, R-25).** Allow-listed content types with attachment disposition; escape the print windows; a CSP; filename and header handling; upload quota.
 4. **Request limits and logging (R-08, R-09, R-10).** Body caps, socket timeout, bounded parsing, traceback logging, generic error messages.
 5. **Migration safety (R-07, R-16, R-17, R-24, R-29).** Pre-migration snapshot, transactional migrations with a version table, one-time steps gated, SIGTERM handling, a populated migration fixture.
-6. **Release gate policy (R-11, R-18, R-19, R-20, R-21).** Needs a decision from Quality first: which specs must pass, who may enter lab results, whether separation of duties is required, and what a recall report must show. Then implement.
+6. **Release gate policy (R-11, R-18, R-19, R-20, R-21).** **Done (batch 6).** Decisions: heavy metals, microbial and TDS (at or above the lower limit) must pass before release; review = Production Manager, release = Quality Manager; separate signers is an optional setting.
 7. **Data-integrity cleanup (R-26, R-27, R-28, R-30, R-31, R-32).** Smaller fixes and indexes.
 8. **Structure (R-35).** Split the backend into modules and the frontend into page files, one module per PR, after the items above so the tests are in place.
 

@@ -6,7 +6,7 @@ import threading
 
 import pytest
 
-from factories import finalize_run, finished_run, harvest_totes, lots_of, release_run, sql
+from factories import finalize_run, finished_run, harvest_totes, lab_report, lots_of, release_run, sql
 from harness import Server
 
 
@@ -105,7 +105,7 @@ def test_anyone_can_move_a_lot_and_the_move_is_logged(srv, people):
 
 def test_only_a_quality_manager_can_enter_or_void_lab_results(srv, people):
     rid = finished_run(people["admin"])
-    body = {"labName": "Some Lab", "reportNumber": "R-1", "results": [{"specCode": "salm", "value": "Negative"}]}
+    body = {"labName": "Some Lab", "reportNumber": "R-1", "attachmentId": lab_report(people["qm"], rid), "results": [{"specCode": "salm", "value": "Negative"}]}
     for who in ("plain", "pm", "amender", "admin"):
         assert people[who].post("/api/production/%d/lab-results" % rid, body).status == 403, who
     added = people["qm"].post("/api/production/%d/lab-results" % rid, body)
@@ -120,7 +120,7 @@ def test_release_needs_the_required_results(srv, people):
     rid = finished_run(people["admin"])
     people["pm"].post("/api/release/runs/%d/review" % rid, {"decision": "approve", "password": people["pm_pw"]}).raise_for_status()
     r = people["qm"].post("/api/release/runs/%d/release" % rid, {"decision": "release", "password": people["qm_pw"]})
-    assert r.status == 409 and "required lab results" in r.text
+    assert r.status == 409 and r.json["code"] == "release_gate" and "no result on file" in r.text
 
 
 def test_voiding_a_required_result_after_release_holds_the_lots(srv, people):
@@ -135,7 +135,7 @@ def test_voiding_a_required_result_after_release_holds_the_lots(srv, people):
 def test_a_failing_result_after_release_holds_the_lots(srv, people):
     rid, lots = released(srv, people)
     r = people["qm"].post("/api/production/%d/lab-results" % rid, {"labName": "Test Lab", "reportNumber": "T-2",
-                                                                    "results": [{"specCode": "salm", "value": "Positive"}]})
+                                                                    "attachmentId": lab_report(people["qm"], rid), "results": [{"specCode": "salm", "value": "Positive"}]})
     assert r.status == 200, r.text
     assert {l["status"] for l in lots_of(srv, rid)} == {"hold"}
 

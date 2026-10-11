@@ -16,7 +16,7 @@ import zipfile
 import pytest
 
 import kelp_erp_server as K
-from factories import finalize_run, finished_run, harvest_totes, release_run, sql
+from factories import finalize_run, finished_run, harvest_totes, lab_report, release_run, sql
 from harness import ROOT, Server
 
 KEY = "archive-key-for-tests-0123456789abcdef"
@@ -197,7 +197,7 @@ def test_versions_are_stable_until_the_content_changes(srv, people):
             client.base_url = srv.url                                                      # (a restart picks a new port)
     v2 = {f["path"].split("/")[-1]: f["version"] for f in manifest(srv)["files"] if lot in f["path"]}
     assert v1 == v2
-    assert qm.post("/api/production/%d/lab-results" % rid, {"labName": "Lab", "reportNumber": "R1", "results": [{"specCode": "salm", "value": "Negative"}]}).status == 200
+    assert qm.post("/api/production/%d/lab-results" % rid, {"labName": "Lab", "reportNumber": "R1", "attachmentId": lab_report(qm, rid), "results": [{"specCode": "salm", "value": "Negative"}]}).status == 200
     v3 = {f["path"].split("/")[-1]: f["version"] for f in manifest(srv)["files"] if lot in f["path"]}
     assert v3["%s_CoA_PRELIMINARY.pdf" % lot] != v1["%s_CoA_PRELIMINARY.pdf" % lot]       # a lab result changes the certificate
 
@@ -376,7 +376,7 @@ def test_a_changed_document_replaces_the_file_and_keeps_the_old_one(srv, people,
     root = tmp_path / "lib"
     assert sync(srv, root, "--init", "--skip-backups")[0] == 0
     coa = [f for f in tree(root) if f.endswith("%s_CoA_PRELIMINARY.pdf" % lot)][0]
-    assert qm.post("/api/production/%d/lab-results" % rid, {"labName": "Lab", "reportNumber": "R9", "results": [{"specCode": "salm", "value": "Negative"}]}).status == 200
+    assert qm.post("/api/production/%d/lab-results" % rid, {"labName": "Lab", "reportNumber": "R9", "attachmentId": lab_report(qm, rid), "results": [{"specCode": "salm", "value": "Negative"}]}).status == 200
     code, out = sync(srv, root, "--skip-backups")
     assert code == 0 and "1 earlier copies kept" in out or "earlier copies kept in _superseded" in out
     kept = [f for f in tree(root) if "/_superseded/" in f and "%s_CoA_PRELIMINARY_old-" % lot in f]

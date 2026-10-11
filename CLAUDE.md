@@ -131,8 +131,9 @@ for `main` so a red run blocks the merge.
   can't move a lot in/out of `pending_release` or to `on_hand` unless the run is released).
   A user flagged `is_production_manager` or `is_quality_manager` (Admin > Users; admin role
   alone grants nothing; flag changes go to `user_permission_log`) signs the production-log
-  review (-> `pending_release`, awaiting QA), then a Quality Manager signs release (lots ->
-  `on_hand`) or rejects (lots -> `hold`); the same person may do both. Endpoints under
+  review (-> `pending_release`, awaiting QA; **Production Manager only**), then a Quality Manager signs release (lots ->
+  `on_hand`) or rejects (lots -> `hold`); one person holding both flags may do both unless the setting `release_separate_signers` is 1
+  (and `review_not_by_finalizer` = 1 bars the finalizer from reviewing their own run; both default 0, both 403 `same_person`). Endpoints under
   `/api/release` (`route_release`/`_release_action`); every signature re-checks the password.
   Audit = append-only `release_events`, hash-chained (`release_log` / `release_verify_chain`),
   each with the SHA-256 of the production-log snapshot (`_release_snapshot_hash`, built from
@@ -152,6 +153,15 @@ for `main` so a red run blocks the merge.
   (`qty=qty-? WHERE qty>=?`), a reinstated shipment needs the stock, units returned to a disposed lot go on hold. *Run edits under an amendment* need
   `can_amend_log`. *Writes*: every non-GET request (except login) starts `BEGIN IMMEDIATE` and `db()` waits up to 30 s for the write lock, so read-check-write
   sequences cannot interleave. Don't add a mutating endpoint that skips these rules; add a test to that file.
+- **Release gate** (risk review batch 6; tests in `tests/test_release_gate.py`). `coa_specs.release_rule` is `''` (not a release condition), `pass` (a result is on file and passes the specification; a heavy metal that cannot
+  be judged -- application rate not set, unit unknown -- does not pass) or `min` (a result is on file and is at or above the lower limit; the upper limit is not a release condition, a `<` result does not prove it).
+  Defaults (set once by `run_once("release_gate_rules_batch6")`): heavy metals + microbial = `pass`, TDS = `min`; pH / potash = none. Admin > Certificate of Analysis specifications edits the rule (the old
+  "Required" checkbox is gone; `required` stays as the older "must be on file" flag). `release_gate(conn, run)` judges every ruled spec; `_release_action` refuses release with 409 `release_gate` listing what is not met --
+  **no override, a comment does not help**. Tests without a rule that fail still need a release comment (pH). The result is stored in the `released` event (`detail.gate`); after release `_lab_regate` holds a run's lots when a
+  test in that snapshot stops passing (void or a new failing result) -- older releases without a snapshot keep the old rule. **Lab results**: a failed result must be VOIDED (reason) before another is entered for that test
+  (409 `void_first`); a test with a release rule needs the lab report attached (`lab_result_require_report`, 400 `report_required`). The hash-mismatch void at release is committed before the error is raised.
+  **Change control**: spec edits and setting edits write `config_log` (`GET /api/coa-specs/<code>/log`, `GET /api/settings/log`, admin); password resets, admin-role and active changes write `user_permission_log`.
+  **Recall**: `GET /api/release/runs/<id>/recall` (`_recall_report`: each FG lot -> shipments -> customers; Product Release "Where did this product go?"). Heavy metals are judged only when `coa_application_rate_kg_ha` > 0 on the Calculations page.
 - **Secrets and sessions** (risk review batch 2; tests in `tests/test_secrets_sessions.py`). Every authenticated route, including the `?token=` downloads, goes through
   `_user_from_token`: valid signature, the user exists and is active, and the token's `tv` equals `users.token_version` (bumped by a password change, an admin reset and a
   deactivation, so those end the user's other sessions; `POST /api/me/password` returns a fresh token for the current one). A user with `must_change_password` gets 403
