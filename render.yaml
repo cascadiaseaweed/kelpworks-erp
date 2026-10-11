@@ -21,6 +21,8 @@ services:
         value: /var/data/kelp_erp.db
       - key: KELP_ERP_UPLOADS         # attachment files on the persistent disk
         value: /var/data/uploads
+      - key: KELP_ERP_ARCHIVE_KEY     # 24+ random characters: lets the office PC's records-sync script read the archive and backups (docs/records-archive.md)
+        sync: false
       - key: KELP_ERP_ADMIN_EMAIL     # admin account created on FIRST deploy only
         sync: false
       - key: KELP_ERP_ADMIN_PASSWORD  # set a STRONG password BEFORE the first deploy

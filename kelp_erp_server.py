@@ -1358,6 +1358,14 @@ CREATE TABLE IF NOT EXISTS run_revisions (
 );
 CREATE INDEX IF NOT EXISTS idx_run_revisions_run ON run_revisions(run_id);
 
+-- Records archive: the folder a finalized run was given in the records library the first time it was archived. It never changes afterwards (an
+-- amendment of the run's date or product must not move its folder).
+CREATE TABLE IF NOT EXISTS archive_runs (
+    run_id     INTEGER PRIMARY KEY REFERENCES production_runs(id) ON DELETE CASCADE,
+    folder     TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 -- A finalized run's production log is locked; changing it requires an
 -- amendment (reason + category). While open the run is 'amending' and its
 -- unsold finished goods are held. prior_* lets a no-change amendment be
@@ -4564,6 +4572,397 @@ def run_public(r):
 # --------------------------------------------------------------------------- #
 # HTTP plumbing
 # --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------------------
+# Records archive + nightly backups (batch 9)
+#
+# The ERP decides WHAT is archived and HOW it is named; a small standard-library script (tools/kelpworks_archive_sync.py) running on an office PC
+# copies it into the synced SharePoint library. `archive_manifest` is a pure function of the database (plus the fixed folder a run was given the first
+# time it was archived), so the script only has to compare versions. Nothing here deletes anything: an archive only grows.
+# ---------------------------------------------------------------------------------------
+ARCHIVE_ROOT_NAME = "KelpWorks-Records"
+ARCHIVE_KEY = os.environ.get("KELP_ERP_ARCHIVE_KEY", "").strip()      # lets the sync script read the archive and backups WITHOUT an administrator password
+ARCHIVE_KEY_MIN = 24                                                  # a shorter key is ignored (and reported on the Admin page)
+ARCHIVE_PDF_AUTHOR = "KelpWorks records archive"
+
+
+def _env_int(name, default, low, high):
+    try:
+        return max(low, min(high, int(os.environ.get(name, "") or default)))
+    except ValueError:
+        return default
+
+
+_NB = os.environ.get("KELP_ERP_NIGHTLY_BACKUP", "").strip()
+NIGHTLY_BACKUP = _NB == "1" or (_NB == "" and ENV_NAME == "production")   # on for the live service; off in development and staging unless asked for
+BACKUP_HOUR_UTC = _env_int("KELP_ERP_BACKUP_HOUR_UTC", 10, 0, 23)         # 10:00 UTC = 3 am Pacific
+BACKUP_FIRST_CHECK_SECONDS = _env_int("KELP_ERP_BACKUP_FIRST_CHECK_SECONDS", 30, 1, 600)   # (tests shorten this)
+BACKUP_KEEP = _env_int("KELP_ERP_BACKUP_KEEP", 2, 1, 30)                  # nightly zips kept on the server disk (small: the sync script keeps the long history)
+NIGHTLY_RE = re.compile(r"^kelp_erp_(\d{4}-\d{2}-\d{2})\.zip$")
+PREMIGRATE_RE = re.compile(r"^pre-migrate-[0-9A-Za-z-]+\.db\.gz$")
+
+ARCHIVE_SKELETON = [
+    "01_System-Backups/daily", "01_System-Backups/weekly", "01_System-Backups/monthly", "01_System-Backups/pre-migrate",
+    "02_Production-Runs/_Index",
+    "03_SOPs/Current", "03_SOPs/Superseded",
+    "04_Safety-Data-Sheets/Current", "04_Safety-Data-Sheets/Superseded",
+    "05_Fulfillment",
+]
+ARCHIVE_README_PATH = "README_Naming-Convention.txt"
+ARCHIVE_INDEX_PATH = "02_Production-Runs/_Index/runs_index.csv"
+ARCHIVE_README = """KelpWorks-Records: folders and file names
+==========================================
+
+01_System-Backups   Nightly copies of the KelpWorks database and documents (daily / weekly / monthly) and the snapshot taken before each
+                    software update. For restoring the system; administrators only.
+02_Production-Runs  One folder per finalized production run, written automatically by KelpWorks. Do not edit or rename (it is not read back).
+                    <year>/<year-month>/<processing lot>_<product>_<run date>/
+                      01_Report-and-CoA   Production summary (rev1, rev2 ... after each amendment) and the Certificate of Analysis
+                                          (PRELIMINARY until the run is released, then RELEASED)
+                      02_Lab              Lab requisitions, sample lists and the lab reports
+                      03_Photos           Feedstock and process photos
+                      04_Other            Any other document attached to the run
+                    _superseded folders hold earlier versions of a file that changed. runs_index.csv (in _Index) lists every run.
+03_SOPs             Controlled procedures, kept by Quality. Current/ holds what is in force, Superseded/ the older revisions.
+04_Safety-Data-Sheets  Controlled safety data sheets, same Current / Superseded layout.
+05_Fulfillment      Shipping and sales documents (bill of lading, commercial invoice ...), one folder per shipment.
+
+File names
+  Letters, numbers, hyphens and underscores only (no spaces). Fields are separated by an underscore, dates are 2026-10-10 style,
+  and the key (lot or document number) comes first so a search for it finds everything.
+  SOPs        SOP-<number>_<Title-In-Hyphens>_rev<n>.pdf                  e.g. SOP-012_Homogenization_rev3.pdf
+  SDS         SDS_<Chemical-Name>_<Supplier>_<issue date>.pdf             e.g. SDS_Citric-Acid_Univar_2025-03-14.pdf
+  Run files   <processing lot>_<document type>_<detail>.<extension>       e.g. PR-20261006-053_CoA_RELEASED.pdf
+  Shipments   <shipment number>_<document type>_<detail>.pdf              e.g. SH-20261010-001_BOL.pdf
+"""
+
+IMAGE_EXTS = {"jpg", "jpeg", "png", "gif", "webp", "heic", "bmp", "tif", "tiff"}
+
+
+def archive_slug(text, maxlen=40, default="x"):
+    """A file-name-safe piece of text: letters, numbers and single hyphens."""
+    s = re.sub(r"[^A-Za-z0-9]+", "-", text or "").strip("-")[:maxlen].strip("-")
+    return s or default
+
+
+def archive_ext(filename):
+    ext = re.sub(r"[^a-z0-9]", "", os.path.splitext(filename or "")[1].lower())[:5]
+    return ext or "bin"
+
+
+def archive_content_key(S):
+    """What a generated PDF says, without the line that records when / by whom it was generated: the version of the document."""
+    d = {k: v for k, v in S.items() if k not in ("generatedAt", "generatedBy")}
+    return hashlib.sha256(json.dumps(d, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+
+def archive_handler():
+    """The report builders are Handler methods that only read the database; they never touch a request, so an unconnected instance serves them."""
+    return Handler.__new__(Handler)
+
+
+def archive_run_folder(conn, run):
+    """The run's folder inside the records library. Fixed the first time the run is archived: a later amendment of its date or product never moves it."""
+    row = conn.execute("SELECT folder FROM archive_runs WHERE run_id=?", (run["id"],)).fetchone()
+    if row:
+        return row["folder"]
+    day = (run["run_date"] or "")[:10]
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+        day = (run["finalized_at"] or "")[:10]
+    year, month = (day[:4], day[:7]) if re.match(r"^\d{4}-\d{2}-\d{2}$", day) else ("undated", "undated")
+    name = "%s_%s_%s" % (run["processing_lot"], archive_slug(run["sku_code"], 24, "SKU"), day or "undated")
+    folder = "02_Production-Runs/%s/%s/%s" % (year, month, name)
+    conn.execute("INSERT OR IGNORE INTO archive_runs (run_id, folder, created_at) VALUES (?,?,?)", (run["id"], folder, now_iso()))
+    return folder
+
+
+def archive_run_entries(conn, run, handler=None):
+    """(entries, problems) for one finalized run. An entry is {path, kind, version, size, runId, src, supersedes}; `version` changes when the file's
+    content does, `src` says where its bytes come from (see archive_file_bytes)."""
+    handler = handler or archive_handler()
+    rid, lot = run["id"], run["processing_lot"]
+    folder = archive_run_folder(conn, run)
+    entries, problems = [], []
+
+    def add(sub, name, kind, version, size, src, supersedes=()):
+        entries.append({"path": "%s/%s/%s" % (folder, sub, name), "kind": kind, "version": version, "size": size, "runId": rid, "src": src,
+                        "supersedes": ["%s/%s/%s" % (folder, sub, s) for s in supersedes]})
+
+    rev = conn.execute("SELECT COALESCE(MAX(rev_no),1) n FROM run_revisions WHERE run_id=?", (rid,)).fetchone()["n"]
+    pdf_user = {"name": ARCHIVE_PDF_AUTHOR}
+    try:
+        add("01_Report-and-CoA", "%s_Production-Summary_rev%d.pdf" % (lot, rev), "summary",
+            archive_content_key(handler._run_summary_data(conn, rid, pdf_user)), None, "summary")
+    except Exception as e:
+        logger.warning("Archive: no production summary for %s: %s", lot, e)
+        problems.append({"run": lot, "what": "production summary", "error": str(e)})
+    try:
+        S = handler._coa_data(conn, rid, pdf_user)
+        label = "RELEASED" if S.get("released") else "PRELIMINARY"
+        add("01_Report-and-CoA", "%s_CoA_%s.pdf" % (lot, label), "coa", archive_content_key(S) + "-" + label, None, "coa",
+            supersedes=("%s_CoA_PRELIMINARY.pdf" % lot,) if label == "RELEASED" else ())
+    except Exception as e:
+        logger.warning("Archive: no certificate of analysis for %s: %s", lot, e)
+        problems.append({"run": lot, "what": "certificate of analysis", "error": str(e)})
+
+    taken = {e["path"].lower() for e in entries}
+
+    def unique(sub, name, uid):
+        base, ext = os.path.splitext(name)
+        cand = name
+        n = 1
+        while ("%s/%s/%s" % (folder, sub, cand)).lower() in taken:
+            cand = "%s_%s%s" % (base, uid if n == 1 else "%s-%d" % (uid, n), ext)
+            n += 1
+        taken.add(("%s/%s/%s" % (folder, sub, cand)).lower())
+        return cand
+
+    requisition = {}
+    for r in conn.execute("SELECT * FROM lab_requisitions WHERE run_id=? ORDER BY id", (rid,)).fetchall():
+        if r["attachment_id"]:
+            requisition[r["attachment_id"]] = ("Requisition", r)
+        if r["sheet_attachment_id"]:
+            requisition[r["sheet_attachment_id"]] = ("Requisition-Samples", r)
+    report = {}
+    for r in conn.execute("SELECT attachment_id, lab_name, report_number FROM lab_results WHERE run_id=? AND attachment_id IS NOT NULL ORDER BY id", (rid,)):
+        report.setdefault(r["attachment_id"], (r["lab_name"], r["report_number"]))
+    photo = {}
+    for r in conn.execute("SELECT i.surface_photo, i.striation_photo, t.lot_number FROM run_inputs i JOIN tote_lots t ON t.id=i.tote_lot_id WHERE i.run_id=?", (rid,)):
+        for col, label in (("surface_photo", "surface"), ("striation_photo", "striation")):
+            v = str(r[col] or "").strip()
+            if v.isdigit():
+                photo[int(v)] = (r["lot_number"], label)
+
+    for a in conn.execute("SELECT * FROM run_attachments WHERE run_id=? ORDER BY id", (rid,)).fetchall():
+        if not os.path.isfile(os.path.join(UPLOAD_DIR, a["stored_name"])):
+            problems.append({"run": lot, "what": "document %s" % a["filename"], "error": "the file is missing on the server disk"})
+            continue
+        ext = archive_ext(a["filename"])
+        stem = archive_slug(os.path.splitext(a["filename"] or "")[0], 40, "file")
+        if a["id"] in requisition:
+            doc, rq = requisition[a["id"]]
+            sub, name = "02_Lab", "%s_%s_%s_%s.%s" % (lot, doc, archive_slug(rq["lab_name"], 28, "Lab"), rq["req_number"], ext)
+            kind = "requisition" if doc == "Requisition" else "sample-list"
+        elif a["id"] in report:
+            lab, number = report[a["id"]]
+            sub, name = "02_Lab", "%s_Lab-Report_%s_%s.%s" % (lot, archive_slug(lab, 28, "Lab"), archive_slug(number, 30, stem), ext)
+            kind = "lab-report"
+        elif a["id"] in photo:
+            tote, which = photo[a["id"]]
+            sub, name, kind = "03_Photos", "%s_Photo_%s_%s.%s" % (lot, archive_slug(tote, 30), which, ext), "photo"
+        elif ext in IMAGE_EXTS:
+            sub, name, kind = "03_Photos", "%s_Photo_%s.%s" % (lot, stem, ext), "photo"
+        else:
+            sub, name, kind = "04_Other", "%s_Document_%s.%s" % (lot, stem, ext), "document"
+        add(sub, unique(sub, name, a["id"]), kind, "att-%d" % a["id"], a["size"], "att:%d" % a["id"])
+
+    totes = conn.execute("SELECT DISTINCT t.id, t.lot_number FROM run_inputs i JOIN tote_lots t ON t.id=i.tote_lot_id WHERE i.run_id=? ORDER BY t.id", (rid,)).fetchall()
+    for t in totes:
+        for a in conn.execute("SELECT * FROM tote_attachments WHERE tote_lot_id=? ORDER BY id", (t["id"],)).fetchall():
+            if not os.path.isfile(os.path.join(UPLOAD_DIR, a["stored_name"])):
+                continue
+            ext = archive_ext(a["filename"])
+            stem = archive_slug(os.path.splitext(a["filename"] or "")[0], 40, "file")
+            if ext in IMAGE_EXTS:
+                sub, name, kind = "03_Photos", "%s_Tote-Photo_%s_%s.%s" % (lot, archive_slug(t["lot_number"], 30), stem, ext), "photo"
+            else:
+                sub, name, kind = "04_Other", "%s_Tote-Document_%s_%s.%s" % (lot, archive_slug(t["lot_number"], 30), stem, ext), "document"
+            add(sub, unique(sub, name, "t%d" % a["id"]), kind, "tote-att-%d" % a["id"], a["size"], "tote_att:%d" % a["id"])
+    return entries, problems
+
+
+def archive_index_csv(rows):
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\r\n")
+    w.writerow(["processing_lot", "product", "run_date", "finalized_at", "release_status", "log_revision", "files", "folder"])
+    for r in rows:
+        w.writerow([r["lot"], r["product"], r["runDate"], r["finalizedAt"], r["release"], r["rev"], r["files"], r["folder"]])
+    return buf.getvalue().encode("utf-8-sig")                 # the BOM makes Excel read the accents correctly
+
+
+def archive_manifest(conn, only_run=None, handler=None):
+    """Everything the records library should hold right now. `only_run` limits it to one run's files (used to serve a single file)."""
+    return _archive_build(conn, only_run, handler)[0]
+
+
+def _archive_build(conn, only_run=None, handler=None):
+    """(manifest, runs_index.csv bytes)."""
+    handler = handler or archive_handler()
+    sql = "SELECT * FROM production_runs WHERE status='completed'" + (" AND id=?" if only_run else "") + " ORDER BY id"
+    skus = {r["code"]: r["name"] for r in conn.execute("SELECT code, name FROM fg_skus")}
+    files, problems, rows = [], [], []
+    for run in conn.execute(sql, (only_run,) if only_run else ()).fetchall():
+        entries, probs = archive_run_entries(conn, run, handler)
+        files += entries
+        problems += probs
+        folder = archive_run_folder(conn, run)
+        rev = conn.execute("SELECT COALESCE(MAX(rev_no),1) n FROM run_revisions WHERE run_id=?", (run["id"],)).fetchone()["n"]
+        rows.append({"lot": run["processing_lot"], "product": skus.get(run["sku_code"], run["sku_code"]), "runDate": run["run_date"],
+                     "finalizedAt": run["finalized_at"], "release": RELEASE_LABELS.get(run["release_state"], run["release_state"] or ""),
+                     "rev": rev, "files": len(entries), "folder": folder})
+    index = archive_index_csv(rows)
+    if not only_run:
+        readme = ARCHIVE_README.encode("utf-8")
+        files.insert(0, {"path": ARCHIVE_README_PATH, "kind": "readme", "version": hashlib.sha256(readme).hexdigest()[:16], "size": len(readme),
+                         "runId": None, "src": "readme", "supersedes": []})
+        files.insert(1, {"path": ARCHIVE_INDEX_PATH, "kind": "index", "version": hashlib.sha256(index).hexdigest()[:16], "size": len(index),
+                         "runId": None, "src": "index", "supersedes": []})
+    return ({"format": "kelpworks-records-manifest", "version": 1, "generatedAt": now_iso(), "root": ARCHIVE_ROOT_NAME, "env": ENV_NAME,
+             "skeleton": ARCHIVE_SKELETON, "runs": len(rows), "files": files, "problems": problems}, index)
+
+
+def archive_file_bytes(conn, run_id, path, handler=None):
+    """(bytes, version, content type) for one archive path, or None when it is not (or no longer) part of the archive."""
+    handler = handler or archive_handler()
+    if run_id is None:
+        if path == ARCHIVE_README_PATH:
+            data = ARCHIVE_README.encode("utf-8")
+            return data, hashlib.sha256(data).hexdigest()[:16], "text/plain; charset=utf-8"
+        if path == ARCHIVE_INDEX_PATH:
+            data = _archive_build(conn, None, handler)[1]
+            return data, hashlib.sha256(data).hexdigest()[:16], "text/csv; charset=utf-8"
+        return None
+    run = conn.execute("SELECT * FROM production_runs WHERE id=? AND status='completed'", (run_id,)).fetchone()
+    if not run:
+        return None
+    ent = next((e for e in archive_run_entries(conn, run, handler)[0] if e["path"] == path), None)
+    if not ent:
+        return None
+    if ent["src"] in ("summary", "coa"):
+        fn = handler._run_summary_data if ent["src"] == "summary" else handler._coa_data
+        S = fn(conn, run_id, {"name": ARCHIVE_PDF_AUTHOR})
+        version = archive_content_key(S)
+        if ent["src"] == "coa":
+            version += "-" + ("RELEASED" if S.get("released") else "PRELIMINARY")
+        S = dict(S, generatedAt=today_iso(), generatedBy=ARCHIVE_PDF_AUTHOR)
+        build = build_coa_pdf if ent["src"] == "coa" else build_run_summary_pdf
+        return build(S, os.path.join(PUBLIC_DIR, "logo.png")), version, "application/pdf"
+    kind, _, ident = ent["src"].partition(":")
+    table = "run_attachments" if kind == "att" else "tote_attachments"
+    row = conn.execute("SELECT * FROM %s WHERE id=?" % table, (int(ident),)).fetchone()
+    if not row:
+        return None
+    full = os.path.join(UPLOAD_DIR, row["stored_name"])
+    if not os.path.isfile(full):
+        return None
+    with open(full, "rb") as f:
+        return f.read(), ent["version"], served_type(row["filename"])[0]
+
+
+# ---- backups on the server disk ----
+
+def nightly_dir():
+    return os.path.join(backups_dir(), "nightly")
+
+
+def list_backups():
+    """The backup files on the server disk, newest first: nightly full backups (.zip) and the snapshots taken before an update (.db.gz)."""
+    out = []
+    for kind, folder, pattern in (("nightly", nightly_dir(), NIGHTLY_RE), ("pre-migrate", backups_dir(), PREMIGRATE_RE)):
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for n in names:
+            full = os.path.join(folder, n)
+            if pattern.match(n) and os.path.isfile(full):
+                st = os.stat(full)
+                out.append({"kind": kind, "name": n, "size": st.st_size, "modified": datetime.datetime.utcfromtimestamp(st.st_mtime).replace(microsecond=0).isoformat() + "Z",
+                            "path": full})
+    return sorted(out, key=lambda b: (b["modified"], b["name"]), reverse=True)
+
+
+def _folder_bytes(folder):
+    total = 0
+    for root, _dirs, files in os.walk(folder):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def run_nightly_backup(conn, today=None, keep=None, force=False):
+    """Write today's full backup (database + documents) to backups/nightly/kelp_erp_<date>.zip and keep only the newest `keep`.
+    Returns {"created": name} or {"skipped": reason}. The caller commits (the result is also noted in app_flags)."""
+    today = today or datetime.datetime.utcnow().date().isoformat()
+    keep = keep or BACKUP_KEEP
+    folder = nightly_dir()
+    os.makedirs(folder, exist_ok=True)
+    for stray in [n for n in os.listdir(folder) if n.endswith(".zip.tmp")]:       # half-written by a stopped / crashed process
+        try:
+            os.remove(os.path.join(folder, stray))
+        except OSError:
+            pass
+    name = "kelp_erp_%s.zip" % today
+    final = os.path.join(folder, name)
+    if os.path.exists(final) and not force:
+        return {"skipped": "today's backup already exists"}
+    need = int((os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0) + sum(_folder_bytes(d) for _n, d in backup_dirs())) + 100 * 1024 * 1024
+    try:
+        free = shutil.disk_usage(folder).free
+    except OSError:
+        free = need
+    if free < need:
+        msg = "not enough free disk space for a backup (%d MB free, about %d MB needed)" % (free // 1048576, need // 1048576)
+        logger.error("Nightly backup skipped: %s", msg)
+        conn.execute("INSERT OR REPLACE INTO app_flags (key,value) VALUES ('last_backup_error', ?)", ("%s: %s" % (now_iso(), msg),))
+        return {"skipped": msg}
+    tmp = final + ".tmp"
+    try:
+        build_full_backup(conn, tmp)
+        os.replace(tmp, final)
+    except Exception as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        logger.error("Nightly backup failed: %s", e, exc_info=True)
+        conn.execute("INSERT OR REPLACE INTO app_flags (key,value) VALUES ('last_backup_error', ?)", ("%s: %s" % (now_iso(), e),))
+        return {"skipped": "the backup failed (see the server log)"}
+    mine = sorted(n for n in os.listdir(folder) if NIGHTLY_RE.match(n))
+    for old in mine[:-keep]:
+        try:
+            os.remove(os.path.join(folder, old))
+        except OSError:
+            pass
+    conn.execute("INSERT OR REPLACE INTO app_flags (key,value) VALUES ('last_backup', ?)", ("%s %s %d" % (now_iso(), name, os.path.getsize(final)),))
+    conn.execute("DELETE FROM app_flags WHERE key='last_backup_error'")
+    logger.info("Nightly backup written: %s (%d MB)", name, os.path.getsize(final) // 1048576)
+    return {"created": name}
+
+
+def backup_due(now=None):
+    now = now or datetime.datetime.utcnow()
+    return NIGHTLY_BACKUP and now.hour >= BACKUP_HOUR_UTC and not os.path.exists(os.path.join(nightly_dir(), "kelp_erp_%s.zip" % now.date().isoformat()))
+
+
+def backup_scheduler(stop):
+    """Background thread: check every few minutes whether tonight's backup is due (it also catches up after a restart or a deploy)."""
+    first = True
+    while not stop.wait(BACKUP_FIRST_CHECK_SECONDS if first else 300):
+        first = False
+        try:
+            if backup_due():
+                conn = db()
+                try:
+                    run_nightly_backup(conn)
+                    conn.commit()
+                finally:
+                    conn.close()
+        except Exception:
+            logger.error("The nightly backup check failed.", exc_info=True)
+
+
+def archive_status(conn):
+    flag = lambda k: (conn.execute("SELECT value FROM app_flags WHERE key=?", (k,)).fetchone() or {"value": None})["value"]
+    backups = [{k: v for k, v in b.items() if k != "path"} for b in list_backups()]
+    return {"nightlyBackup": NIGHTLY_BACKUP, "backupHourUtc": BACKUP_HOUR_UTC, "backupKeep": BACKUP_KEEP,
+            "archiveKeyConfigured": len(ARCHIVE_KEY) >= ARCHIVE_KEY_MIN, "archiveKeyTooShort": 0 < len(ARCHIVE_KEY) < ARCHIVE_KEY_MIN,
+            "lastBackup": flag("last_backup"), "lastBackupError": flag("last_backup_error"), "backups": backups,
+            "runsToArchive": conn.execute("SELECT COUNT(*) c FROM production_runs WHERE status='completed'").fetchone()["c"]}
+
+
 class ApiError(Exception):
     def __init__(self, status, message, code=None):
         self.status = status
@@ -4919,6 +5318,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._admin_backup()
         if path == "/api/env":                       # public: the login page shows a STAGING banner from this
             return self._send_json({"env": ENV_NAME, "restoreEnabled": ALLOW_RESTORE})
+        if path.startswith("/api/archive/"):
+            return self._archive_get(path)
         if path.startswith("/api/"):
             return self._handle_api("GET")
         return self._serve_static(path)
@@ -5140,6 +5541,102 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    # ---- records archive and backups (see the archive section above) ----
+    def _archive_auth(self, conn):
+        """Who may read the archive: an administrator (sign-in token), or the sync script with the archive key (X-Archive-Key header, compared in
+        constant time, throttled like a sign-in). Returns who it was, for the log."""
+        key = self.headers.get("X-Archive-Key", "")
+        if key:
+            ip = self._client_ip()
+            wait = login_wait_seconds(ip, "archive-key")
+            if wait:
+                raise ApiError(429, "Too many failed attempts. Try again in %d seconds." % wait)
+            if len(ARCHIVE_KEY) >= ARCHIVE_KEY_MIN and hmac.compare_digest(key.encode("utf-8"), ARCHIVE_KEY.encode("utf-8")):
+                login_succeeded(ip, "archive-key")
+                return "archive key"
+            login_failed(ip, "archive-key")
+            raise ApiError(403, "The archive key is not accepted")
+        user = self._token_user(conn)
+        self._require_admin(user)
+        return user["name"]
+
+    def _archive_get(self, path):
+        conn = db()
+        try:
+            try:
+                self._archive_auth(conn)
+                qs = parse_qs(urlparse(self.path).query)
+                if path == "/api/archive/manifest":
+                    out = archive_manifest(conn)
+                    conn.commit()                                     # a run archived for the first time is given its folder
+                    return self._send_json(out)
+                if path == "/api/archive/status":
+                    return self._send_json(archive_status(conn))
+                if path == "/api/archive/backups":
+                    return self._send_json({"backups": [{k: v for k, v in b.items() if k != "path"} for b in list_backups()]})
+                if path == "/api/archive/file":
+                    return self._archive_send_file(conn, qs)
+                if path == "/api/archive/backup":
+                    return self._archive_send_backup(qs)
+            except ApiError as e:
+                return self._send_json({"error": e.message}, e.status)
+            return self._send_json({"error": "Unknown archive endpoint"}, 404)
+        except Exception as e:  # pragma: no cover
+            self._server_error(e)
+        finally:
+            conn.close()
+
+    def _archive_send_file(self, conn, qs):
+        rel = (qs.get("path", [""])[0] or "").replace("\\", "/")
+        run = qs.get("run", [""])[0]
+        if not rel or rel.startswith("/") or ".." in rel.split("/") or (run and not run.isdigit()):
+            raise ApiError(400, "A run number and a path inside the archive are needed")
+        res = archive_file_bytes(conn, int(run) if run else None, rel)
+        if not res:
+            raise ApiError(404, "That file is not part of the archive")
+        data, version, ctype = res
+        conn.commit()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Archive-Version", version)
+        self.send_header("X-Archive-Sha256", hashlib.sha256(data).hexdigest())
+        self.send_header("Content-Disposition", content_disposition(rel.split("/")[-1], False))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _archive_send_backup(self, qs):
+        name = qs.get("name", [""])[0]
+        match = next((b for b in list_backups() if b["name"] == name), None)          # only a name from the listing, never a path from the caller
+        if not match:
+            raise ApiError(404, "No such backup")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip" if name.endswith(".zip") else "application/gzip")
+        self.send_header("Content-Length", str(match["size"]))
+        self.send_header("Content-Disposition", content_disposition(name, False))
+        self.end_headers()
+        with open(match["path"], "rb") as f:
+            shutil.copyfileobj(f, self.wfile, 1 << 20)
+
+    def _archive_backup_now(self):
+        """POST /api/archive/backup (administrators): the nightly backup, now. It runs outside the request transaction on purpose -- the sqlite backup
+        API cannot copy a database whose own connection holds an open write transaction (it would wait forever)."""
+        conn = db()
+        try:
+            try:
+                user = self._token_user(conn)
+                self._require_admin(user)
+                self._body_json(limit=1024)
+                res = run_nightly_backup(conn, force=True)           # replaces today's file
+                conn.commit()
+                return self._send_json(res)
+            except ApiError as e:
+                return self._send_json({"error": e.message}, e.status)
+        except Exception as e:  # pragma: no cover
+            self._server_error(e)
+        finally:
+            conn.close()
+
     def _download_lab_template(self, path):
         """/api/labs/starter-template/download or /api/labs/:id/template/download (token via header or ?token=)."""
         conn = db()
@@ -5174,8 +5671,11 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
 
     def do_POST(self):
-        if urlparse(self.path).path == "/api/admin/restore":
+        path = urlparse(self.path).path
+        if path == "/api/admin/restore":
             return self._admin_restore()
+        if path == "/api/archive/backup":
+            return self._archive_backup_now()
         return self._handle_api("POST")
 
     def _admin_restore(self):
@@ -11969,6 +12469,14 @@ def main():
     if SECRET_SOURCE != "environment":
         print("NOTE: KELP_ERP_SECRET is not set; using a generated signing key (%s). Set KELP_ERP_SECRET in production." % SECRET_SOURCE)
     server = ThreadingHTTPServer((HOST, PORT), Handler)
+    stop_backups = threading.Event()
+    if NIGHTLY_BACKUP:
+        threading.Thread(target=backup_scheduler, args=(stop_backups,), daemon=True, name="nightly-backup").start()
+        logger.info("Nightly backup is on: after %02d:00 UTC, keeping the newest %d on this disk.", BACKUP_HOUR_UTC, BACKUP_KEEP)
+    else:
+        logger.info("Nightly backup is off (KELP_ERP_NIGHTLY_BACKUP=1 turns it on).")
+    if 0 < len(ARCHIVE_KEY) < ARCHIVE_KEY_MIN:
+        logger.warning("KELP_ERP_ARCHIVE_KEY is shorter than %d characters and is ignored.", ARCHIVE_KEY_MIN)
 
     def stop(signum, _frame):
         logger.info("Stop requested (signal %s): finishing the requests in progress.", signum)
@@ -11980,6 +12488,7 @@ def main():
     try:
         server.serve_forever()
     finally:
+        stop_backups.set()
         deadline = time.time() + SHUTDOWN_WAIT_SECONDS
         while INFLIGHT[0] > 0 and time.time() < deadline:
             time.sleep(0.1)

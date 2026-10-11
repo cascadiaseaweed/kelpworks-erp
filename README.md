@@ -60,6 +60,9 @@ created and seeded automatically.
 | `KELP_ERP_UPLOADS` | `./uploads` | folder for attached documents |
 | `KELP_ERP_SECRET` | generated key in `kelp_secret.key` next to the database | token signing secret — **set it when hosting** (a value that is the old public default is ignored) |
 | `KELP_ERP_MAX_UPLOADS_MB` | `600` | total size of all uploaded documents; further uploads are refused (the Render disk is 1 GB) |
+| `KELP_ERP_ARCHIVE_KEY` | (none) | at least 24 characters; lets the records-sync script read the archive and backups without a login (docs/records-archive.md). Under 24 characters it is ignored |
+| `KELP_ERP_NIGHTLY_BACKUP` | on for the live service, off in development and staging | `1` / `0` forces the nightly full backup on or off |
+| `KELP_ERP_BACKUP_HOUR_UTC` / `KELP_ERP_BACKUP_KEEP` | `10` / `2` | the hour (UTC) after which tonight's backup is made, and how many nightly zips stay on the server disk |
 | `KELP_ERP_SOCKET_TIMEOUT` | `30` | seconds a client may stay silent in the middle of a request before it is dropped |
 | `KELP_ERP_ENV` | (production) | `development` enables the convenience login defaults; `staging` is the staging site (see docs/staging.md) |
 | `KELP_ERP_ADMIN_EMAIL` / `KELP_ERP_ADMIN_PASSWORD` | `admin@kelp.local` / generated and printed once (`kelp1234` only in development) | first-run admin account |

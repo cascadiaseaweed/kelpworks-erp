@@ -195,6 +195,17 @@ for `main` so a red run blocks the merge.
   Dilution & Preservation entries: `edit_run` no longer accepts them (it moved stock by item name outside `run_reagent_commits`). `num` / `numn` return the default / None for NaN and infinity;
   packaging quantities must be numbers and not negative (400), Sample Point quantities are a whole number 1-10 or blank (400 if not a number). A tote with a `run_inputs` / `preproc_inputs` row
   cannot be deleted (409 `tote_has_history`; use QAQC Hold or dispose). `seed()` raises when `seed.json` cannot be read (the start rolls back) instead of building an empty system.
+- **Records archive and nightly backups** (batch 9; tests in `tests/test_records_archive.py`; guide `docs/records-archive.md`). The ERP decides what is archived and how it is named; the stdlib script
+  `tools/kelpworks_archive_sync.py` (an office PC, Task Scheduler) copies it into the synced SharePoint library `KelpWorks-Records`. `archive_manifest` (`GET /api/archive/manifest`) is a pure function of the
+  database: for every FINALIZED run `archive_run_entries` lists the files with a `version` (generated PDFs: `archive_content_key` = hash of the report data without the generated-at line; documents: the attachment id),
+  and `GET /api/archive/file?run=&path=` serves one (the production summary / CoA PDFs are built by the same Handler methods as the download buttons, through `archive_handler()`). Naming:
+  `<processing lot>_<document type>_<detail>.<ext>` via `archive_slug` (letters, numbers, hyphens); run folder `02_Production-Runs/<year>/<year-month>/<lot>_<SKU>_<run date>/` is stored once in `archive_runs`
+  and never changes; documents are classified by what refers to them (`lab_requisitions`, `lab_results.attachment_id`, `run_inputs` photos, tote photos, else image / other). **The archive only grows**: the script
+  moves a replaced file into `_superseded` and never deletes a record (the CoA entry `supersedes` its PRELIMINARY file when released). Access = an administrator, or the `X-Archive-Key` header (env
+  `KELP_ERP_ARCHIVE_KEY`, 24+ characters, constant-time compare, throttled like a sign-in); the key can read only `/api/archive/*`. **Nightly backup** = `run_nightly_backup` (`backups/nightly/kelp_erp_<date>.zip`, the same
+  zip as `build_full_backup`, free-space check, newest `KELP_ERP_BACKUP_KEEP` kept) driven by the `backup_scheduler` thread (after `KELP_ERP_BACKUP_HOUR_UTC`; on by default only in production); `POST /api/archive/backup` runs
+  it now OUTSIDE the request transaction (the sqlite backup API waits forever on a connection that holds its own write transaction -- never call `build_full_backup` inside `_handle_api`). The script keeps
+  daily / weekly / monthly tiers and uses Windows extended-length paths. Changing a file name rule moves files in the library, so treat the names as a contract: add a test.
 - **Production-log required fields** are defined once, server-side, in `PROGRESS_SECTIONS` /
   `REQUIRED_FEEDSTOCK` (`kelp_erp_server.py`; exposed to the SPA as `refdata.requiredFields`).
   Everything is required except: every Notes field, the Homogenization / Separation /

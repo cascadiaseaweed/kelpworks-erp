@@ -9,3 +9,5 @@ lab_templates/
 .pytest_cache/
 kelp_secret.key
 backups/
+tools/archive-key.txt
+tools/sync.log

@@ -35,6 +35,7 @@ Date: 2026-10-09. Code reviewed: `main` at `c1e5343` (after PRs #4 to #7). Scope
 | R-30 indexes | **Fixed** (batch 7): every foreign-key column is indexed (automatically, including future tables), plus `consumable_txns(ref)` and the status columns used by the lists |
 | R-31 bad data | **Partly fixed** (batch 7): triggers refuse an unknown status on totes / finished goods / runs / pre-processing batches and negative finished-goods units. Still open: `*_id` columns without foreign keys (cannot be added to existing tables without a rebuild) |
 | R-32 volume drift | **Partly fixed** (batch 7): a run's output litres follow the litres each finished-goods lot was created with, and the IBC count works with the real container name. Still open: pre-processing pack-out is not reconciled; the re-hash of signed logs does not record what changed |
+| R-23 backups | **Mostly fixed** (batch 9): nightly full backup on the server disk with rotation, a free-space check and an admin "Back up now"; an office PC copies the backups (daily / weekly / monthly tiers) and every run's documents to SharePoint. Still to do: confirm Render disk snapshots are enabled, and a rehearsed live-restore runbook |
 | R-06 shipments | **Fixed** (batch 1): duplicate lines, un-cancel, disposed-lot return, conditional deduction, write lock |
 | R-14 edit under amendment | **Fixed** (batch 1) |
 | R-15 concurrency | **Fixed** (batches 1 and 7): writes take the lock up front and wait up to 30 s; a unique-number collision is a 409 |

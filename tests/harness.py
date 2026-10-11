@@ -152,7 +152,8 @@ class Server:
         self.port = free_port()
         env = dict(os.environ, PORT=str(self.port), HOST="127.0.0.1", PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8",
                    KELP_ERP_DB=self.db_path, KELP_ERP_UPLOADS=os.path.join(self.tmp, "uploads"), KELP_ERP_SECRET=SIGNING_SECRET,
-                   KELP_ERP_ADMIN_EMAIL=ADMIN_EMAIL, KELP_ERP_ADMIN_PASSWORD=ADMIN_PASSWORD, KELP_ERP_INITIAL_PASSWORD="initial-pass-123")
+                   KELP_ERP_ADMIN_EMAIL=ADMIN_EMAIL, KELP_ERP_ADMIN_PASSWORD=ADMIN_PASSWORD, KELP_ERP_INITIAL_PASSWORD="initial-pass-123",
+                   KELP_ERP_NIGHTLY_BACKUP="0")                 # the nightly backup thread is off unless a test asks for it (it would run on the production default)
         env.update(self.extra_env)
         for k in [k for k, v in env.items() if v is None]:      # env={"NAME": None} removes the variable (it is not set at all)
             del env[k]

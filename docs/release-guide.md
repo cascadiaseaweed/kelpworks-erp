@@ -128,6 +128,8 @@ Staging never auto-deploys, and its Restore function exists only there: the live
   upgrade of an existing database is preceded by a compressed copy at `/var/data/backups/pre-migrate-<date>.db.gz` (the last three are kept). To go back to one: stop the service
   (or suspend it in Render), open the Render shell, run `gunzip -c /var/data/backups/pre-migrate-<date>.db.gz > /var/data/kelp_erp.db`, delete `/var/data/kelp_erp.db-wal` and
   `/var/data/kelp_erp.db-shm`, then deploy the previous version. Anything entered since that snapshot is lost, so use this only when the data itself was damaged.
+- **Backups:** the server writes a full backup (database + documents) every night to `/var/data/backups/nightly/` (the newest 3 stay on the disk) and an office PC copies it, and every run's documents, into the
+  SharePoint library `KelpWorks-Records` (setup, retention and restore notes: `docs/records-archive.md`). Check Admin > Records archive & backups after a deploy: the nightly backup should say **on**.
 - **Protect live data:** never edit the live database directly; never copy a local or staging database over it. The Render disk holds the only copy: take regular disk snapshots or download full backups (Admin > Download full backup).
 - **Never set** `KELP_ERP_ENV`, `KELP_ERP_ALLOW_RESTORE` or `KELP_ERP_STAGING_PASSWORD` on the live service.
 
