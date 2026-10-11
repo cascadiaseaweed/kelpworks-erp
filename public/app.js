@@ -1141,18 +1141,41 @@ function sopDownloadUrl(sid, dl) {
   return '/api/sop-documents/' + sid + '/download?' +
     (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(State.token);
 }
-// A QC Check's link to its governing SOP, resolved by its stable reference
-// key (not its display name) against the admin-managed list
-// (State.ref.sops) -- so an admin renaming the document in Admin > SOP
-// Documents never breaks this link, and the current name always shows here.
-// Reads sensibly even before an admin has uploaded the file yet, too.
-function sopLinkEl(key) {
-  const sop = (State.ref.sops || []).find(s => s.key === key);
-  if (!sop) return el('div', { class: 'qc-check-sop help' }, '📄 SOP not configured (Admin → SOP Documents)');
-  if (!sop.hasFile) return el('div', { class: 'qc-check-sop help' }, '📄 ' + sop.name + ' — not yet uploaded (Admin → SOP Documents)');
-  if (sop.status === 'withdrawn') return el('div', { class: 'qc-check-sop help' }, '📄 ' + sop.name + ' — withdrawn (see Documents)');
-  return el('div', { class: 'qc-check-sop' }, el('a', { href: sopDownloadUrl(sop.id, false), target: '_blank', rel: 'noopener' }, '📄 ' + sop.name + (sop.revision ? ' (rev ' + sop.revision + ')' : '')));
+// SOP links: an administrator chooses which SOPs are linked at each place of the production log, the CIP log, Samples and Shipping (Admin > SOPs). A spot is any element carrying
+// data-sop-spot="<key>" (a section, a box) or a window whose title starts with one of SOP_WINDOW_SPOTS: a small "SOP" line with links to the SOPs'
+// current files is placed in it automatically (and kept up to date as the page changes). The keys are SOP_SPOTS on the server; a test keeps both lists in step.
+const SOP_WINDOW_SPOTS = [['Log CIP', 'cip.event_window'], ['Edit CIP —', 'cip.event_window'], ['Sample —', 'samples.sample_window'],
+  ['Preview requisition —', 'samples.requisition_window'], ['Requisition REQ-', 'samples.requisition_window'], ['Requisitions created', 'samples.requisition_window'],
+  ['New shipment', 'shipping.shipment_window'], ['Edit shipment —', 'shipping.shipment_window']];
+const SAMPLE_VIEW_SPOTS = { catalogue: 'samples.catalogue', retention: 'samples.retention', cart: 'samples.cart', requisitions: 'samples.requisitions' };
+function sopSlotNode(spot) {
+  const ids = (State.ref && State.ref.sopLinks && State.ref.sopLinks[spot]) || [];
+  const sops = ids.map(id => (State.ref.sops || []).find(s => s.id === id)).filter(Boolean);
+  if (!sops.length) return null;
+  const label = s => (s.docNumber ? s.docNumber + ' ' : '') + s.name + (s.revision ? ' (rev ' + s.revision + ')' : '');
+  const items = sops.map(s => s.status === 'withdrawn' ? el('span', { class: 'muted', title: 'This SOP has been withdrawn' }, '📄 ' + label(s) + ' — withdrawn')
+    : !s.hasFile ? el('span', { class: 'muted' }, '📄 ' + label(s) + ' — no file yet')
+    : el('a', { href: sopDownloadUrl(s.id, false), target: '_blank', rel: 'noopener' }, '📄 ' + label(s)));
+  return el('div', { class: 'sop-slot' }, el('span', { class: 'sop-slot-label' }, 'SOP'), ...items.flatMap((x, i) => [i ? ' · ' : null, x]));
 }
+function applySopSlots(root) {
+  (root || document).querySelectorAll('[data-sop-spot]').forEach(host => {
+    const want = sopSlotNode(host.getAttribute('data-sop-spot'));
+    const have = host._sopSlot;
+    if (have && want && have.isConnected && have.textContent === want.textContent && have.innerHTML === want.innerHTML) return;   // already showing the same thing
+    if (have) have.remove();
+    host._sopSlot = want;
+    if (!want) return;
+    let at = null;                                                       // where in the element: after a box's title / subtitle, at the top of a section or window
+    if (host.classList.contains('qc-check-box')) at = host.querySelector(':scope > .qc-check-subtitle') || host.querySelector(':scope > .qc-check-title');
+    else if (host.classList.contains('modal')) at = host.querySelector(':scope > h3');
+    if (at) at.after(want);
+    else (host.querySelector(':scope > .accordion-body') || host).prepend(want);
+  });
+}
+let sopSlotTimer = null;
+new MutationObserver(() => { clearTimeout(sopSlotTimer); sopSlotTimer = setTimeout(() => applySopSlots(document.body), 100); })
+  .observe(document.body, { childList: true, subtree: true });
 function uploadAtt(rid, file) {
   return new Promise((resolve, reject) => {
     if (file.size > 25 * 1024 * 1024) return reject(new Error(file.name + ' exceeds the 25 MB limit'));
@@ -1921,7 +1944,7 @@ function buildPasteurizationSection(getRunId, values, samplePoints, processingLo
   function refreshTds() { currentTds = getSeparationTds ? getSeparationTds() : null; refreshDilutionReq(); }
   [tank5aInp, tank5bInp, start6aInp, start6bInp].forEach(i => i.addEventListener('input', refreshDilutionReq));
   receivingSel.addEventListener('change', refreshDilutionReq);
-  const dilutionProcessCheckBox = el('div', { class: 'qc-check-box' },
+  const dilutionProcessCheckBox = el('div', { class: 'qc-check-box', 'data-sop-spot': 'production.pasteurization.process_check' },
     el('div', { class: 'qc-check-title' }, 'Process Check'),
     el('div', { class: 'qc-check-subtitle' }, 'Dilution plan — Tanks 5A/5B → 6A/6B'),
     summaryHost,
@@ -1940,7 +1963,7 @@ function buildPasteurizationSection(getRunId, values, samplePoints, processingLo
 
   const postCollectedInp = el('input', { type: 'datetime-local',
     value: values.postSampleCollectedAt ? values.postSampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
-  const postSamplePointBox = el('div', { class: 'qc-check-box theme-sample' },
+  const postSamplePointBox = el('div', { class: 'qc-check-box theme-sample', 'data-sop-spot': 'production.pasteurization.sample_point' },
     el('div', { class: 'qc-check-title' }, 'Sample Point'),
     el('div', { class: 'qc-check-subtitle' }, 'Post-pasteurization microbial check'),
     field('Collection date and time', postCollectedInp),
@@ -1973,7 +1996,7 @@ function buildPasteurizationSection(getRunId, values, samplePoints, processingLo
   refreshTds();
   return {
     refreshTds,
-    box: el('details', { class: 'accordion' }, el('summary', {}, 'Pasteurization'),
+    box: el('details', { class: 'accordion', 'data-sop-spot': 'production.pasteurization' }, el('summary', {}, 'Pasteurization'),
       el('div', { class: 'accordion-body' },
         el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Start Conditions'),
         el('div', { class: 'form-row' }, rfield('pasteurization', 'startedAt', 'Started at', startedAt)),
@@ -2052,7 +2075,7 @@ function buildQualityCheckBox(subtitle, values, opts) {
       ...(opts.omitSlurrySolids ? [] : [qf('rhoSlurryGMl', 'ρslurry (g/mL)', rhoSlurryInp)]),
       qf('rhoLiquidGMl', 'ρliquid (g/mL)', rhoLiquidInp)),
   ];
-  const box = el('div', { class: 'qc-check-box theme-quality' }, ...boxChildren);
+  const box = el('div', { class: 'qc-check-box theme-quality', ...(opts.spot ? { 'data-sop-spot': opts.spot } : {}) }, ...boxChildren);
   function getPayload() {
     const payload = {
       qcPh: qcPhInp.value.trim() === '' ? null : qcParseValue(qcPhInp.value),
@@ -2096,7 +2119,7 @@ function buildExtractionSection(getRunId, values, onSaved) {
   attachNumericMask(startingPowerInp, 2);
   if (values.startingPowerW != null) startingPowerInp.value = formatQcValue(values.startingPowerW, 2);
 
-  const qcCheck = buildQualityCheckBox('Extraction Performance', values, { reqStage: 'extraction' });
+  const qcCheck = buildQualityCheckBox('Extraction Performance', values, { reqStage: 'extraction', spot: 'production.extraction.qc_check' });
 
   const status = el('span', { class: 'help' });
   const saveBtn = el('button', { type: 'button', class: 'secondary section-save', onclick: save }, 'Save');
@@ -2123,7 +2146,7 @@ function buildExtractionSection(getRunId, values, onSaved) {
     } catch (e) { status.textContent = e.message; }
     saveBtn.disabled = false;
   }
-  return el('details', { class: 'accordion' }, el('summary', {}, 'Extraction'),
+  return el('details', { class: 'accordion', 'data-sop-spot': 'production.extraction' }, el('summary', {}, 'Extraction'),
     el('div', { class: 'accordion-body' },
       el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Start Conditions'),
       el('div', { class: 'form-row' }, rfield('extraction', 'startedAt', 'Started at', startedAt)),
@@ -2166,14 +2189,14 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot, o
   // form-row-compact wrapper, so each stacks on its own row).
   const moistureScrewInp = el('input', { inputmode: 'decimal', placeholder: '%' }); attachNumericMask(moistureScrewInp, 1);
   if (values.pctMoistureScrew != null) moistureScrewInp.value = formatQcValue(values.pctMoistureScrew, 1);
-  const solidsQcBox = el('div', { class: 'qc-check-box theme-quality' },
+  const solidsQcBox = el('div', { class: 'qc-check-box theme-quality', 'data-sop-spot': 'production.separation.solids_qc' },
     el('div', { class: 'qc-check-title' }, 'QC Check'),
     el('div', { class: 'qc-check-subtitle' }, 'Solids characterization'),
     rfield('separation', 'pctMoisture', el('span', { html: '%Moisture<sub>centrifuge_solids</sub>' }), moistureInp),
     rfield('separation', 'pctMoistureScrew', el('span', { html: '%Moisture<sub>screw_solids</sub>' }), moistureScrewInp));
   const solidsCollectedInp = el('input', { type: 'datetime-local',
     value: values.solidsSampleCollectedAt ? values.solidsSampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
-  const solidsSamplePointBox = el('div', { class: 'qc-check-box theme-sample' },
+  const solidsSamplePointBox = el('div', { class: 'qc-check-box theme-sample', 'data-sop-spot': 'production.separation.sample_point' },
     el('div', { class: 'qc-check-title' }, 'Sample Point'),
     el('div', { class: 'qc-check-subtitle' }, 'Separation Characterization'),
     field('Collection date and time', solidsCollectedInp),
@@ -2184,7 +2207,7 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot, o
     qcPh: values.liquidQcPh, tdsPct: values.liquidTdsPct, brixPct: values.liquidBrixPct,
     mannitolPct: values.liquidMannitolPct, tsLiquidPct: values.liquidTsLiquidPct,
     rhoLiquidGMl: values.liquidRhoLiquidGMl,
-  }, { omitSlurrySolids: true, reqStage: 'separation', keyMap: {
+  }, { omitSlurrySolids: true, reqStage: 'separation', spot: 'production.separation.filtrate_qc', keyMap: {
     qcPh: 'liquidQcPh', tdsPct: 'liquidTdsPct', brixPct: 'liquidBrixPct', mannitolPct: 'liquidMannitolPct',
     tsLiquidPct: 'liquidTsLiquidPct', rhoLiquidGMl: 'liquidRhoLiquidGMl' } });
 
@@ -2216,7 +2239,7 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot, o
     } catch (e) { status.textContent = e.message; }
     saveBtn.disabled = false;
   }
-  return el('details', { class: 'accordion' }, el('summary', {}, 'Separation'),
+  return el('details', { class: 'accordion', 'data-sop-spot': 'production.separation' }, el('summary', {}, 'Separation'),
     el('div', { class: 'accordion-body' },
       el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Start Conditions'),
       el('div', { class: 'form-row' }, rfield('separation', 'startedAt', 'Started at', startedAt)),
@@ -2267,15 +2290,14 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
     resultValue.textContent = fmtPct1(calcPctWetSolids());
     refreshDilutionTarget();
   }));
-  const processCheck1Box = el('div', { class: 'qc-check-box' },
+  const processCheck1Box = el('div', { class: 'qc-check-box', 'data-sop-spot': 'production.homogenization.process_check' },
     el('div', { class: 'qc-check-title' }, 'Process Check'),
     el('div', { class: 'qc-check-subtitle' }, 'Solids loading'),
     el('div', { class: 'form-row' },
       rfield('homogenization', 'wetSolidsWtG', 'Wet-solids-wt (g)', wetInp),
       rfield('homogenization', 'liquidWtG', 'Liquid-wt (g)', liquidInp)),
     el('div', { class: 'qc-check-result' },
-      el('span', { class: 'qc-check-result-label' }, 'Measured %Solids Loading, (w/w)'), resultValue),
-    sopLinkEl('wet_solids_sop'));
+      el('span', { class: 'qc-check-result-label' }, 'Measured %Solids Loading, (w/w)'), resultValue));
 
   // Output: the Target %Solids Loading, (w/w) to dilute the tank down to, and the
   // Recommended Dilution Water (L) to get there. Mass-conservation dilution
@@ -2338,14 +2360,14 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
   // QC Check (lot characterization): liquid-phase and slurry/solids-phase
   // readings, each its own compact wrapping row -- shared with Extraction
   // Out, which uses the same card under its own subtitle.
-  const qcCheck = buildQualityCheckBox('Lot characterization', values, { showSolidsLoading: true, reqStage: 'homogenization' });
+  const qcCheck = buildQualityCheckBox('Lot characterization', values, { showSolidsLoading: true, reqStage: 'homogenization', spot: 'production.homogenization.qc_check' });
   const qcCheckBox = qcCheck.box;
 
   // Sample Point (lot input): a repeatable table of samples taken at this
   // point in the process -- see buildSamplePointsSection, below.
   const collectedInp = el('input', { type: 'datetime-local',
     value: values.sampleCollectedAt ? values.sampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
-  const samplePointBox = el('div', { class: 'qc-check-box theme-sample' },
+  const samplePointBox = el('div', { class: 'qc-check-box theme-sample', 'data-sop-spot': 'production.homogenization.sample_point' },
     el('div', { class: 'qc-check-title' }, 'Sample Point'),
     el('div', { class: 'qc-check-subtitle' }, 'Lot input'),
     field('Collection date and time', collectedInp),
@@ -2376,7 +2398,7 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
     } catch (e) { status.textContent = e.message; }
     saveBtn.disabled = false;
   }
-  return el('details', { class: 'accordion' }, el('summary', {}, 'Homogenization'),
+  return el('details', { class: 'accordion', 'data-sop-spot': 'production.homogenization' }, el('summary', {}, 'Homogenization'),
     el('div', { class: 'accordion-body' },
       el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Homogenization In'),
       el('div', { class: 'form-row' }, rfield('homogenization', 'startedAt', 'Started at', startedAt)),
@@ -2387,7 +2409,7 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
       el('div', { class: 'qc-check-section-title' }, 'Homogenization Out'),
       // Dilution card: the target and the water recommended for it, then what was actually
       // added and the resulting tank level, then the lot %solids that follows from them.
-      el('div', { class: 'qc-check-box' },
+      el('div', { class: 'qc-check-box', 'data-sop-spot': 'production.homogenization.dilution' },
         el('div', { class: 'qc-check-title' }, 'Dilution'),
         el('div', { class: 'qc-check-subtitle' }, 'Target, water added and final volume'),
         el('div', { class: 'form-row' },
@@ -2561,7 +2583,7 @@ function buildPackagingEntriesSection(initial, getRunId) {
     }
   }, '+');
   return {
-    box: el('div', {},
+    box: el('div', { 'data-sop-spot': 'production.packaging.entries' },
       el('div', { class: 'help' }, reqLabel('At least one packaged output quantity is required')),
       el('table', { class: 'qc-check-checklist' },
         el('thead', {}, el('tr', {}, el('th', {}, 'Container unit'), el('th', {}, 'Qty'), el('th', {}, ''))),
@@ -2839,7 +2861,7 @@ function buildFeedstockCard(opts) {
   // its own outer button (no per-field Save here) always has a current
   // snapshot to send, even if the user never touches this card at all.
   if (opts.onChange) notifyChange();
-  return el('details', { class: 'accordion feedstock-tote' },
+  return el('details', { class: 'accordion feedstock-tote', ...(opts.sopSpot ? { 'data-sop-spot': opts.sopSpot } : {}) },
     el('summary', {}, opts.label + (v.decision === 'rejected' ? '  ⚠ Rejected' : '')),
     el('div', { class: 'accordion-body' }, ...bodyEls));
 }
@@ -3080,7 +3102,7 @@ function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsor
   refresh();
   return {
     reagentWatch,
-    box: el('div', {},
+    box: el('div', { 'data-sop-spot': 'production.dilution.preservation' },
       el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Dilution'),
       noPlanNote,
       el('div', { class: 'form-row-3' },
@@ -3265,7 +3287,7 @@ function buildDilutionPassCard(pass, ctx) {
   const removeBtn = ctx.isLast ? el('button', { type: 'button', class: 'danger', onclick: () => ctx.onRemove() }, 'Remove pass ' + pass.passNo) : null;
   refresh();
   const prevRem = ctx.getPrevRemaining();
-  const box = el('div', { class: 'qc-check-box pass-card' },
+  const box = el('div', { class: 'qc-check-box pass-card', 'data-sop-spot': 'production.dilution.pass' },
     el('div', { class: 'qc-check-title' }, 'Dilution pass ' + pass.passNo),
     el('div', { class: 'qc-check-subtitle' }, 'Tanks 5A/5B → 6A/6B' + (prevRem != null ? ' · about ' + fmtL(prevRem) + ' was left in 5A/5B after the previous pass' : '')),
     el('div', { class: 'qc-check-section-title', style: 'margin-top:4px' }, 'Plan'),
@@ -3610,6 +3632,7 @@ async function openRun(draftSummary, opts) {
     if (!chosen.length) { feedstockHost.append(el('div', { class: 'help' }, 'Select totes above to characterize the feedstock.')); return; }
     for (const t of chosen) {
       feedstockHost.append(buildFeedstockCard({
+        sopSpot: 'production.feedstock.characterization',
         markRequired: true,
         label: t.lot + (t.site ? '  ·  ' + t.site : ''),
         initial: feedstockState[t.id],
@@ -3702,10 +3725,10 @@ async function openRun(draftSummary, opts) {
   // Dilution & Preservation -- still packaging-stage columns/endpoints under
   // the hood (unchanged), just relocated in the UI, so they get their own
   // Save action separate from packagedAt's.
-  const packagingQcCheck = buildQualityCheckBox('LKE characterization', stages.packaging || {}, { omitSlurrySolids: true, reqStage: 'packaging' });
+  const packagingQcCheck = buildQualityCheckBox('LKE characterization', stages.packaging || {}, { omitSlurrySolids: true, reqStage: 'packaging', spot: 'production.dilution.qc_check' });
   const packagingSampleCollectedInp = el('input', { type: 'datetime-local',
     value: stages.packaging?.sampleCollectedAt ? stages.packaging.sampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
-  const packagingSamplePointBox = el('div', { class: 'qc-check-box theme-sample' },
+  const packagingSamplePointBox = el('div', { class: 'qc-check-box theme-sample', 'data-sop-spot': 'production.dilution.sample_point' },
     el('div', { class: 'qc-check-title' }, 'Sample Point'),
     el('div', { class: 'qc-check-subtitle' }, 'LKE characterization'),
     rfield('packaging', 'sampleCollectedAt', 'Collection date and time', packagingSampleCollectedInp),
@@ -3757,7 +3780,7 @@ async function openRun(draftSummary, opts) {
     draft ? el('div', { class: 'summary-line', style: 'margin-bottom:10px' },
       sl('Run code', mono(draft.processingLot)), sl('SKU', skuName(draft.sku))) : null,
     progressHost, reqLegend(),
-    el('details', { class: 'accordion' }, el('summary', {}, 'Initiation'),
+    el('details', { class: 'accordion', 'data-sop-spot': 'production.initiation' }, el('summary', {}, 'Initiation'),
       el('div', { class: 'accordion-body' },
         el('div', { class: 'form-row' },
           field(reqLabel('Product SKU'), skuSel),
@@ -3767,7 +3790,7 @@ async function openRun(draftSummary, opts) {
           field(reqLabel('Production Location'), productionLocationSelect('r_loc', draft?.location)),
           field(reqLabel('Operators'), operatorsSelect.el)),
         field('Notes', el('textarea', { id: 'r_notes', rows: '2', placeholder: 'Optional batch notes' }, draft?.notes || '')))),
-    el('details', { class: 'accordion', ...(fresh ? { open: '' } : {}) }, el('summary', {}, 'Feedstock'),
+    el('details', { class: 'accordion', 'data-sop-spot': 'production.feedstock', ...(fresh ? { open: '' } : {}) }, el('summary', {}, 'Feedstock'),
       el('div', { class: 'accordion-body' },
         field('Filter totes', generalFilterInp),
         field('Stabilization method', stabFilterSel),
@@ -3775,13 +3798,13 @@ async function openRun(draftSummary, opts) {
         el('h4', { style: 'margin:14px 0 4px;font-size:13px' }, 'Feedstock characterization'), feedstockHost)),
     homogenizationSection, extractionSection, separationSection,
     pasteurizationSection.box,
-    el('details', { class: 'accordion' }, el('summary', {}, 'Dilution & Preservation'),
+    el('details', { class: 'accordion', 'data-sop-spot': 'production.dilution' }, el('summary', {}, 'Dilution & Preservation'),
       el('div', { class: 'accordion-body' },
         dilutionSummary.box, dilutionPasses.box, dilutionsSection,
         packagingQcCheck.box,
         packagingSamplePointBox,
         el('div', { style: 'margin-top:6px' }, packagingQcSaveBtn, packagingQcStatus))),
-    el('details', { class: 'accordion' }, el('summary', {}, 'Packaging'),
+    el('details', { class: 'accordion', 'data-sop-spot': 'production.packaging' }, el('summary', {}, 'Packaging'),
       el('div', { class: 'accordion-body' },
         rfield('packaging', 'packagedAt', 'Packaging date and time', packagingPackagedInp),
         packagingEntriesSection.box,
@@ -3876,6 +3899,7 @@ async function openProcessLog(run, section) {
   const feedstockHost = el('div', {});
   (run.inputs || []).forEach(inp => {
     feedstockHost.append(buildFeedstockCard({
+      sopSpot: 'production.feedstock.characterization',
       markRequired: true,
       label: inp.toteLot + (inp.site ? '  ·  ' + inp.site : ''),
       initial: inp,
@@ -3936,10 +3960,10 @@ async function openProcessLog(run, section) {
   // Dilution & Preservation -- still packaging-stage columns/endpoints under
   // the hood (unchanged), just relocated in the UI, so they get their own
   // Save action separate from packagedAt's.
-  const packagingQcCheck = buildQualityCheckBox('LKE characterization', stages.packaging || {}, { omitSlurrySolids: true, reqStage: 'packaging' });
+  const packagingQcCheck = buildQualityCheckBox('LKE characterization', stages.packaging || {}, { omitSlurrySolids: true, reqStage: 'packaging', spot: 'production.dilution.qc_check' });
   const packagingSampleCollectedInp = el('input', { type: 'datetime-local',
     value: stages.packaging?.sampleCollectedAt ? stages.packaging.sampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
-  const packagingSamplePointBox = el('div', { class: 'qc-check-box theme-sample' },
+  const packagingSamplePointBox = el('div', { class: 'qc-check-box theme-sample', 'data-sop-spot': 'production.dilution.sample_point' },
     el('div', { class: 'qc-check-title' }, 'Sample Point'),
     el('div', { class: 'qc-check-subtitle' }, 'LKE characterization'),
     rfield('packaging', 'sampleCollectedAt', 'Collection date and time', packagingSampleCollectedInp),
@@ -3991,7 +4015,7 @@ async function openProcessLog(run, section) {
     } catch (e) { plStatus.textContent = e.message; }
     plSave.disabled = false;
   } }, 'Save');
-  const initiationSection = el('details', { class: 'accordion' }, el('summary', {}, 'Initiation'),
+  const initiationSection = el('details', { class: 'accordion', 'data-sop-spot': 'production.initiation' }, el('summary', {}, 'Initiation'),
     el('div', { class: 'accordion-body' },
       el('div', { class: 'summary-line' }, sl('Product', skuName(run.sku)), el('span', { class: 'muted' }, 'fixed once the run is finalized')),
       el('div', { class: 'form-row' }, field(reqLabel('Run date'), plDate), field(reqLabel('Production Location'), plLoc)),
@@ -4008,17 +4032,17 @@ async function openProcessLog(run, section) {
     logProgressHost, reqLegend(),
     logLockBanner(run),
     initiationSection,
-    el('details', { class: 'accordion' }, el('summary', {}, 'Feedstock characterization'),
+    el('details', { class: 'accordion', 'data-sop-spot': 'production.feedstock' }, el('summary', {}, 'Feedstock characterization'),
       el('div', { class: 'accordion-body' }, feedstockHost)),
     homogenizationSection, extractionSection, separationSection,
     pasteurizationSection.box,
-    el('details', { class: 'accordion' }, el('summary', {}, 'Dilution & Preservation'),
+    el('details', { class: 'accordion', 'data-sop-spot': 'production.dilution' }, el('summary', {}, 'Dilution & Preservation'),
       el('div', { class: 'accordion-body' },
         dilutionSummary.box, dilutionPasses.box, dilutionsSection,
         packagingQcCheck.box,
         packagingSamplePointBox,
         el('div', { style: 'margin-top:6px' }, packagingQcSaveBtn, packagingQcStatus))),
-    el('details', { class: 'accordion' }, el('summary', {}, 'Packaging'),
+    el('details', { class: 'accordion', 'data-sop-spot': 'production.packaging' }, el('summary', {}, 'Packaging'),
       el('div', { class: 'accordion-body' },
         rfield('packaging', 'packagedAt', 'Packaging date and time', packagingPackagedInp),
         packagingEntriesSection.box,
@@ -4353,6 +4377,7 @@ async function pageShipping(v) {
     el('div', { class: 'actions' },
       el('button', { class: 'secondary', onclick: manageCustomers }, 'Customers'),
       el('button', { onclick: newShipment }, '+ New shipment'))));
+  v.append(el('div', { 'data-sop-spot': 'shipping.page' }));
   const custF = selectFrom('', [['', 'All customers'], ...State.ref.customers.map(c => [c.id, c.name])], reload, 'sh_cust');
   v.append(el('div', { class: 'toolbar' }, el('label', { style: 'margin:0 8px 0 0' }, 'Customer'), custF));
   const host = el('div', {});
@@ -4570,6 +4595,7 @@ async function pageCIP(v) {
   let events = [];
   v.append(el('div', { class: 'page-head' }, el('h2', {}, 'CIP Log'),
     el('div', { class: 'actions' }, el('button', { onclick: () => openCipModal(null, events) }, '+ Log CIP'))));
+  v.append(el('div', { 'data-sop-spot': 'cip.page' }));
   events = (await api('GET', '/cip')).events;
   v.append(el('div', { class: 'help', style: 'margin-bottom:10px' },
     'Every Clean In Place on the plant’s equipment. The chemicals logged here are deducted from the CIP agents in Inventory Items.'));
@@ -5755,7 +5781,8 @@ async function pageSamples(v) {
     el('div', { class: 'actions' }, ...views.map(([k, label]) => el('button', {
       class: State.samplesView === k ? '' : 'secondary', onclick: () => { State.samplesView = k; render(); }
     }, k === 'cart' ? 'Cart (' + cartCount + ')' : label)))));
-  const host = el('div', {}); v.append(host);
+  v.append(el('div', { 'data-sop-spot': 'samples.page' }));
+  const host = el('div', { 'data-sop-spot': SAMPLE_VIEW_SPOTS[State.samplesView] }); v.append(host);
   if (State.samplesView === 'catalogue') await drawSampleCatalogue(host);
   else if (State.samplesView === 'retention') await drawRetentionInventory(host);
   else if (State.samplesView === 'cart') await drawSampleCart(host);
@@ -7059,7 +7086,8 @@ function modal(title, body, onSubmit, submitLabel = 'Save', opts = {}) {
     actions.append(extraBtn);
   }
   actions.append(submitBtn);
-  const card = el('div', { class: 'modal' + (opts.wide ? ' wide' : '') },
+  const sopSpot = opts.sopSpot || (SOP_WINDOW_SPOTS.find(([p]) => String(title).startsWith(p)) || [])[1];
+  const card = el('div', { class: 'modal' + (opts.wide ? ' wide' : ''), ...(sopSpot ? { 'data-sop-spot': sopSpot } : {}) },
     opts.closeX ? el('button', { type: 'button', class: 'modal-close-x', 'aria-label': 'Close', title: 'Close', onclick: () => { close(); if (opts.onClose) opts.onClose(); } }, '×') : null,
     el('h3', {}, title), body, errBox, actions);
   // Backdrop clicks do NOT close the dialog — only Cancel or completing the
@@ -7131,29 +7159,7 @@ async function pageAdmin(v) {
 
   await adminArchiveSection(v);
 
-  // SOP documents: controlled documents a production-log QC Check links to
-  // by a stable reference key (never the display name, so a rename here is
-  // reflected everywhere that link appears without breaking it) -- admin-only
-  // to add/edit/delete, but the list (and download) is readable by anyone
-  // signed in. Clicking a row (not its action buttons) opens its edit history.
-  v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'SOP Documents'),
-    el('div', { class: 'actions' }, el('button', { onclick: addSop }, '+ Add SOP document'))));
-  const sr = await api('GET', '/sop-documents');
-  if (!sr.sops.length) v.append(el('div', { class: 'empty card' }, 'No SOP documents yet.'));
-  else v.append(table(
-    ['Name', 'File', 'Uploaded', ''],
-    sr.sops.map(s => [
-      el('span', {}, s.name, s.docNumber ? el('span', { class: 'muted' }, '  ·  ' + s.docNumber + (s.revision ? ' rev ' + s.revision : '')) : null, s.status === 'withdrawn' ? el('span', {}, ' ', badge('disposed', 'Withdrawn')) : null),
-      s.hasFile ? el('a', { href: sopDownloadUrl(s.id, false), target: '_blank', rel: 'noopener' }, s.filename || 'Download')
-        : el('span', { class: 'muted' }, 'Not yet uploaded'),
-      s.uploadedAt ? fmtWhen(s.uploadedAt) + (s.uploadedBy ? ' · ' + s.uploadedBy : '') : '—',
-      rowActions([
-        ['Edit', () => editSop(s)],
-        ['Delete', () => deleteSop(s), 'danger'],
-      ])
-    ]), [false, false, false, false], ri => showSopHistory(sr.sops[ri])));
-  v.append(el('div', { class: 'help', style: 'margin-top:10px' },
-    'A QC Check in the production log links to an SOP by its reference key, not its name — renaming a document here is picked up everywhere it’s linked. Click a row to see its change history.'));
+  await adminSopSection(v);
   await drawAdminLabs(v);
   await drawAdminRequisitionContact(v);
   await drawAdminCoaSpecs(v);
@@ -7348,57 +7354,187 @@ function readFileAsBase64(file) {
     reader.readAsDataURL(file);
   });
 }
-function addSop() {
-  const nameInp = el('input', { id: 's_name', placeholder: 'e.g. Determining % Wet Solids SOP' });
-  const keyInp = el('input', { id: 's_key', placeholder: 'e.g. wet_solids_sop' });
-  const fileInp = el('input', { type: 'file', id: 's_file' });
-  const body = el('div', {},
-    field('Document name', nameInp),
-    field('Reference key (optional)', keyInp),
-    el('div', { class: 'help', style: 'margin-top:-8px' },
-      'Only needed if a spot in the production log will link to this document — set once and can’t be changed later, so the link keeps working even if the name above is edited afterward.'),
-    field('File (optional — can be added later)', fileInp));
-  modal('Add SOP document', body, async () => {
-    const name = nameInp.value.trim();
-    if (!name) throw new Error('Enter a document name.');
-    const file = fileInp.files[0];
-    const payload = { name, key: keyInp.value.trim() || null };
-    if (file) {
-      payload.filename = file.name; payload.contentType = file.type || 'application/octet-stream';
-      payload.dataB64 = await readFileAsBase64(file);
-    }
-    await api('POST', '/sop-documents', payload);
-    State.ref = await api('GET', '/refdata');
-    toast('SOP document added'); render();
-  }, 'Add');
+// Admin > SOPs: the same list as the Documents tab, with a reference key per SOP and the places where each SOP is linked.
+async function adminSopSection(v) {
+  const sr = await api('GET', '/sop-documents');
+  v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'SOPs')));
+  v.append(el('div', { class: 'help', style: 'margin:-8px 0 10px' },
+    'The same list as the Documents tab: every SOP in the SharePoint folder appears here once it is accepted. Here you can give an SOP a reference key and choose where it is linked. '
+    + 'Everything else follows SharePoint: an SOP’s name is the title in its file name, and its file, revisions and removal are controlled there (a file taken out of the Current folder shows here as Withdrawn).'));
+  v.append(sopTable(sr.sops, { admin: true }));
+  v.append(el('div', { class: 'page-head', style: 'margin-top:22px' }, el('h2', {}, 'Where SOPs are linked')));
+  v.append(el('div', { class: 'help', style: 'margin:-8px 0 10px' },
+    'A link appears as a small “SOP” line at the top of that section, box or page, opening the SOP’s current file. Tick several places (or a whole group) and add an SOP to all of them at once, '
+    + 'or use “Link to…” on an SOP above, or “Choose SOPs…” for one place.'));
+  drawSopSpotsTable(v);
 }
-function editSop(s) {
-  const nameInp = el('input', { id: 'es_name', value: s.name });
-  const fileInp = el('input', { type: 'file', id: 'es_file' });
-  const body = el('div', {},
-    field('Document name', nameInp),
-    s.key ? el('div', { class: 'help', style: 'margin-top:-8px' }, 'Reference key: ' + s.key + ' (fixed)') : null,
-    field(s.hasFile ? 'Replace file (optional)' : 'Upload file', fileInp),
-    s.hasFile ? el('div', { class: 'help' }, 'Current file: ' + (s.filename || '—')) : null);
-  modal('Edit SOP document', body, async () => {
-    const name = nameInp.value.trim();
-    if (!name) throw new Error('Enter a document name.');
-    const file = fileInp.files[0];
-    const payload = { name };
-    if (file) {
-      payload.filename = file.name; payload.contentType = file.type || 'application/octet-stream';
-      payload.dataB64 = await readFileAsBase64(file);
-    }
-    await api('PUT', '/sop-documents/' + s.id, payload);
-    State.ref = await api('GET', '/refdata');
-    toast('SOP document updated'); render();
-  }, 'Save');
+// ---- Places for SOP links: the filters and grouping shared by the "Link to…" window and the "Where SOPs are linked" table ----
+const SOP_KIND_ORDER = ['Section', 'Page', 'View', 'Process Check', 'QC Check', 'Sample Point', 'Other box', 'Window'];
+const SOP_KIND_PLURAL = { 'Section': 'Sections', 'Page': 'Pages', 'View': 'Views', 'Process Check': 'Process Checks', 'QC Check': 'QC Checks', 'Sample Point': 'Sample Points', 'Other box': 'Other boxes', 'Window': 'Windows' };
+function loadPlaceView() {                                       // the user's own choices (area filter, grouping) are remembered in this browser
+  const view = { areas: new Set(), groupBy: 'stage', search: '' };
+  try {
+    const x = JSON.parse(localStorage.getItem('kelp.sopPlaces') || 'null');
+    if (x && Array.isArray(x.areas)) view.areas = new Set(x.areas);
+    if (x && (x.groupBy === 'stage' || x.groupBy === 'kind')) view.groupBy = x.groupBy;
+  } catch (e) { /* the choices simply start fresh */ }
+  return view;
 }
-async function deleteSop(s) {
-  if (!confirm('Delete "' + s.name + '"? This cannot be undone, and any QC Check linking to it will show it as not configured.')) return;
-  await api('DELETE', '/sop-documents/' + s.id);
+function savePlaceView(view) { try { localStorage.setItem('kelp.sopPlaces', JSON.stringify({ areas: [...view.areas], groupBy: view.groupBy })); } catch (e) { /* ignore */ } }
+const placeStage = sp => sp.area === 'Production log' ? sp.stage : sp.area;
+function sopPlaceControls(view, onChange, extra) {
+  const areas = [...new Set((State.ref.sopSpots || []).map(x => x.area))];
+  const search = el('input', { type: 'search', class: 'pick-search', placeholder: 'Search places, e.g. QC, homogenization, cart…', value: view.search });
+  search.addEventListener('input', () => { view.search = search.value; onChange(); });
+  const chips = el('div', { class: 'pick-chips' });
+  function drawChips() {
+    chips.innerHTML = '';
+    const chip = (label, on, fn) => chips.append(el('button', { type: 'button', class: 'pick-chip' + (on ? ' on' : ''), onclick: fn }, label));
+    chip('All', !view.areas.size, () => { view.areas.clear(); savePlaceView(view); drawChips(); onChange(); });
+    areas.forEach(a => chip(a, view.areas.has(a), () => {
+      if (view.areas.has(a)) view.areas.delete(a); else view.areas.add(a);
+      if (view.areas.size === areas.length) view.areas.clear();
+      savePlaceView(view); drawChips(); onChange();
+    }));
+  }
+  drawChips();
+  const group = selectFrom('', [['stage', 'Area and section'], ['kind', 'Type (section, QC check, …)']], () => { view.groupBy = group.value; savePlaceView(view); onChange(); });
+  group.value = view.groupBy;
+  return el('div', { class: 'pick-controls' }, search,
+    el('div', { class: 'pick-line' }, el('span', { class: 'pick-label' }, 'Show'), chips),
+    el('div', { class: 'pick-line' }, el('span', { class: 'pick-label' }, 'Group by'), group, extra || null));
+}
+// The places that pass the view's filters, in groups: by area and section (registry order) or by type (Section, Page, View, Process Check, QC Check, Sample Point, …).
+function sopPlaceGroups(view) {
+  const words = view.search.toLowerCase().split(/\s+/).filter(Boolean);
+  const spots = (State.ref.sopSpots || []).filter(sp => (!view.areas.size || view.areas.has(sp.area))
+    && words.every(w => (sp.area + ' ' + sp.stage + ' ' + sp.kind + ' ' + sp.label).toLowerCase().includes(w)));
+  const groups = [], index = new Map();
+  const add = (title, sp) => { if (!index.has(title)) { const g = { title, items: [] }; index.set(title, g); groups.push(g); } index.get(title).items.push(sp); };
+  if (view.groupBy === 'kind') {
+    spots.forEach(sp => add(SOP_KIND_PLURAL[sp.kind] || sp.kind, sp));
+    const rank = g => { const i = SOP_KIND_ORDER.findIndex(k => (SOP_KIND_PLURAL[k] || k) === g.title); return i < 0 ? 99 : i; };
+    groups.sort((a, b) => rank(a) - rank(b));
+  } else spots.forEach(sp => add(sp.area === 'Production log' ? 'Production log › ' + sp.stage : sp.area, sp));
+  return groups;
+}
+// What a place is called in a list: its name, and a small tag with the other half (the type when grouped by area, the area / section when grouped by type).
+function sopPlaceCell(sp, groupBy) {
+  return el('span', { class: 'pick-name' }, el('span', { class: 'pick-tag' + (groupBy === 'kind' ? ' wide' : '') }, groupBy === 'kind' ? placeStage(sp) : sp.kind), sp.label);
+}
+// A tidy ticklist of places for one SOP. get() returns every ticked place, also those the filters currently hide.
+function sopPlacePicker(selected) {
+  const view = loadPlaceView();
+  const chosen = new Set(selected);
+  let onlyTicked = false;
+  const list = el('div', { class: 'pick-scroll' });
+  const counter = el('div', { class: 'pick-counter' });
+  const only = el('input', { type: 'checkbox' });
+  only.addEventListener('change', () => { onlyTicked = only.checked; draw(); });
+  function draw() {
+    const top = list.scrollTop;
+    list.innerHTML = '';
+    let groups = sopPlaceGroups(view);
+    if (onlyTicked) groups = groups.map(g => ({ title: g.title, items: g.items.filter(sp => chosen.has(sp.key)) })).filter(g => g.items.length);
+    if (!groups.length) list.append(el('div', { class: 'pick-empty' }, onlyTicked ? 'Nothing ticked here yet.' : 'No places match. Clear the search or choose “All”.'));
+    for (const g of groups) {
+      const n = g.items.filter(sp => chosen.has(sp.key)).length;
+      const all = el('input', { type: 'checkbox', title: 'Tick every place in this group' });
+      all.checked = n === g.items.length; all.indeterminate = n > 0 && n < g.items.length;
+      all.addEventListener('change', () => { g.items.forEach(sp => { if (all.checked) chosen.add(sp.key); else chosen.delete(sp.key); }); draw(); });
+      list.append(el('div', { class: 'pick-group' },
+        el('label', { class: 'pick-group-head' }, all, el('span', {}, g.title), el('span', { class: 'count' }, n + ' of ' + g.items.length)),
+        ...g.items.map(sp => {
+          const cb = el('input', { type: 'checkbox' });
+          cb.checked = chosen.has(sp.key);
+          cb.addEventListener('change', () => { if (cb.checked) chosen.add(sp.key); else chosen.delete(sp.key); draw(); });
+          return el('label', { class: 'pick-row' + (cb.checked ? ' on' : '') }, cb, sopPlaceCell(sp, view.groupBy));
+        })));
+    }
+    list.scrollTop = top;
+    counter.textContent = chosen.size + ' place' + (chosen.size === 1 ? '' : 's') + ' ticked' + (chosen.size && view.areas.size ? ' (including any hidden by the filter)' : '');
+  }
+  draw();
+  const controls = sopPlaceControls(view, draw, el('label', { class: 'pick-only' }, only, ' Only ticked'));
+  return { node: el('div', {}, controls, list, counter), get: () => [...chosen] };
+}
+
+function drawSopSpotsTable(v) {
+  const sops = new Map((State.ref.sops || []).map(x => [x.id, x]));
+  const view = loadPlaceView();
+  const selected = new Set();
+  const bar = el('div', { class: 'bulkbar hidden' });
+  const host = el('div', {});
+  v.append(sopPlaceControls(view, () => draw()), bar, host);
+  function updateBar() {
+    bar.classList.toggle('hidden', !selected.size); bar.innerHTML = '';
+    if (!selected.size) return;
+    bar.append(el('span', {}, el('b', {}, selected.size), ' place' + (selected.size === 1 ? '' : 's') + ' selected'),
+      el('button', { onclick: () => bulkSopLinks('add', [...selected]) }, 'Add an SOP to these places…'),
+      el('button', { class: 'secondary', onclick: () => bulkSopLinks('remove', [...selected]) }, 'Remove an SOP from these places…'),
+      el('button', { class: 'secondary', onclick: () => { selected.clear(); draw(); } }, 'Clear'));
+  }
+  function draw() {
+    host.innerHTML = '';
+    const rows = [];
+    for (const g of sopPlaceGroups(view)) {
+      const gcb = el('input', { type: 'checkbox', class: 'rowcheck', title: 'Select every place in this group' });
+      gcb.checked = g.items.every(sp => selected.has(sp.key));
+      gcb.addEventListener('change', () => { g.items.forEach(sp => { if (gcb.checked) selected.add(sp.key); else selected.delete(sp.key); }); draw(); });
+      rows.push({ group: el('label', { style: 'display:flex;gap:10px;align-items:center;justify-content:flex-start;cursor:pointer;margin:0;text-align:left' }, gcb, el('b', {}, g.title)) });
+      for (const sp of g.items) {
+        const cb = el('input', { type: 'checkbox', class: 'rowcheck' });
+        cb.checked = selected.has(sp.key);
+        cb.addEventListener('change', () => { if (cb.checked) selected.add(sp.key); else selected.delete(sp.key); updateBar(); });
+        const linked = ((State.ref.sopLinks || {})[sp.key] || []).map(id => sops.get(id)).filter(Boolean);
+        rows.push([cb, sopPlaceCell(sp, view.groupBy), linked.length ? linked.map(x => (x.docNumber ? x.docNumber + ' ' : '') + x.name).join(', ') : el('span', { class: 'muted' }, '—'),
+          rowActions([['Choose SOPs…', () => editSpotSops(sp)]])]);
+      }
+    }
+    if (!rows.length) host.append(el('div', { class: 'empty card' }, 'No places match. Clear the search or choose “All”.'));
+    else host.append(table(['', 'Place', 'SOPs linked', ''], rows, [false, false, false, false]));
+    updateBar();
+  }
+  draw();
+}
+function bulkSopLinks(action, spots) {
+  const list = (State.ref.sops || []).filter(x => action === 'add' ? true : spots.some(k => ((State.ref.sopLinks || {})[k] || []).includes(x.id)));
+  if (!list.length) { toast(action === 'add' ? 'There are no SOPs yet.' : 'None of the selected places has an SOP linked.', true); return; }
+  const sel = selectFrom('', list.map(x => [String(x.id), (x.docNumber ? x.docNumber + ' ' : '') + x.name]));
+  const n = spots.length + ' place' + (spots.length === 1 ? '' : 's');
+  modal(action === 'add' ? 'Add an SOP to ' + n : 'Remove an SOP from ' + n,
+    el('div', {}, field('SOP', sel), el('div', { class: 'help' }, action === 'add' ? 'It is added to every selected place and stays linked where it already was.'
+      : 'It is removed from every selected place; its other links stay.')),
+    async () => { await api('POST', '/sop-links/bulk', { sopId: +sel.value, action, spots }); await sopChanged(action === 'add' ? 'SOP linked' : 'SOP unlinked'); }, action === 'add' ? 'Add' : 'Remove');
+}
+async function sopChanged(msg) {
   State.ref = await api('GET', '/refdata');
-  toast('SOP document deleted'); render();
+  toast(msg); render();
+}
+function editSopKey(s) {
+  const key = el('input', { value: s.key || '', placeholder: 'e.g. wet_solids_sop' });
+  modal('Reference key — ' + s.name, el('div', {},
+    field('Reference key (optional)', key),
+    el('div', { class: 'help' }, 'A short code to identify this SOP (for example in reports or conversations). It can be changed or cleared. Where the SOP is linked is chosen with “Link to…”, not by the key.')),
+    async () => { await api('PUT', '/sop-documents/' + s.id, { name: s.name, key: key.value.trim() }); await sopChanged('Reference key saved'); }, 'Save');
+}
+function editSopSpots(s) {
+  const picker = sopPlacePicker(new Set(s.spots || []));
+  modal('Link to… — ' + s.name, el('div', {},
+    el('div', { class: 'help', style: 'margin-top:0' }, 'Tick every place where this SOP should appear as a link. Filter by area, group the list by section or by type, and use the box beside a group to tick all of it.'),
+    picker.node),
+    async () => { await api('PUT', '/sop-documents/' + s.id + '/links', { spots: picker.get() }); await sopChanged('Links saved'); }, 'Save', { wide: true });
+}
+function editSpotSops(sp) {
+  const chosen = new Set(((State.ref.sopLinks || {})[sp.key]) || []);
+  const rows = (State.ref.sops || []).map(x => {
+    const cb = el('input', { type: 'checkbox' }); cb.checked = chosen.has(x.id);
+    return { id: x.id, cb, row: el('label', { class: 'pick-row' }, cb, el('span', { class: 'pick-name' }, el('span', { class: 'pick-tag' }, x.docNumber || 'SOP'), x.name + (x.revision ? ' (rev ' + x.revision + ')' : ''))) };
+  });
+  modal('SOPs linked at — ' + placeStage(sp) + ': ' + sp.label, el('div', {},
+    el('div', { class: 'help', style: 'margin-top:0' }, sp.kind + ' · ' + sp.area),
+    rows.length ? el('div', { class: 'pick-scroll' }, el('div', { class: 'pick-group' }, ...rows.map(r => r.row))) : el('div', { class: 'help' }, 'There are no SOPs yet.')),
+    async () => { await api('PUT', '/sop-links/' + sp.key, { sopIds: rows.filter(r => r.cb.checked).map(r => r.id) }); await sopChanged('Links saved'); }, 'Save');
 }
 async function showSopHistory(s) {
   const r = await api('GET', '/sop-documents/' + s.id + '/edits');
@@ -7444,14 +7580,7 @@ async function pageDocuments(v) {
   if (isAdmin) await libraryReviewCard(v);
 
   v.append(el('div', { class: 'page-head', style: 'margin-top:24px' }, el('h2', {}, 'Standard operating procedures')));
-  v.append(table(['SOP no.', 'Name', 'Revision', 'Status', 'File', 'Updated', ''],
-    d.sops.map(s => [
-      s.docNumber ? mono(s.docNumber) : '—', s.name, s.revision ? 'rev ' + s.revision : '—',
-      s.status === 'withdrawn' ? badge('disposed', 'Withdrawn') : badge('on_hand', 'Current'),
-      s.hasFile ? el('a', { href: docDownloadUrl('sop', s.id), target: '_blank', rel: 'noopener' }, s.filename || 'Open') : el('span', { class: 'muted' }, 'No file yet'),
-      s.uploadedAt ? fmtWhen(s.uploadedAt) : '—',
-      rowActions([['History', () => showDocHistory('sop', s.id, s.name)]])]),
-    [false, false, false, false, false, false, false], ri => showDocHistory('sop', d.sops[ri].id, d.sops[ri].name)));
+  v.append(sopTable(d.sops, {}));
 
   v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Safety data sheets'), el('div', { class: 'help' }, 'Reviewed every ' + fmt(d.reviewYears, 0) + ' years')));
   const reviewBadge = s => s.reviewStatus === 'overdue' ? badge('low', 'Overdue') : s.reviewStatus === 'soon' ? badge('hold', 'Review soon') : s.reviewStatus ? badge('ok', 'OK') : null;
@@ -7466,6 +7595,32 @@ async function pageDocuments(v) {
     [false, false, false, false, false, false, false, false], ri => showDocHistory('sds', d.sds[ri].id, d.sds[ri].chemical + ' (' + d.sds[ri].supplier + ')')));
   if (!d.sds.length) v.append(el('div', { class: 'help', style: 'margin-top:6px' },
     'No safety data sheets yet. Put them in the SharePoint folder 04_Safety-Data-Sheets/Current as SDS_Chemical-Name_Supplier_2025-03-14.pdf; they appear here after the next nightly sync and your approval.'));
+}
+
+// Where an SOP is linked, as the areas it appears in (the whole list is in the tooltip): "Homogenization ×3 · Pasteurization · CIP Log".
+function sopLinkedAt(s) {
+  const spots = s.spots || [];
+  if (!spots.length) return el('span', { class: 'muted' }, 'nowhere yet');
+  const info = new Map((State.ref.sopSpots || []).map(x => [x.key, x]));
+  const counts = new Map();
+  spots.forEach(k => { const x = info.get(k); if (x) counts.set(x.group, (counts.get(x.group) || 0) + 1); });
+  const tip = spots.map(k => { const x = info.get(k); return x ? x.group + ': ' + x.label : k; }).join('\n');
+  return el('span', { title: tip }, [...counts].map(([g, n]) => g.replace('Production log: ', '') + (n > 1 ? ' ×' + n : '')).join(' · '));
+}
+// The SOP list: the same table on the Documents tab and in Admin (which adds the reference key and the actions).
+function sopTable(sops, opts) {
+  const admin = !!(opts && opts.admin);
+  const headers = ['SOP no.', 'Name', 'Revision', 'Status', 'File', 'Updated'].concat(admin ? ['Reference key'] : []).concat(['Linked at', '']);
+  const rows = sops.map(s => [
+    s.docNumber ? mono(s.docNumber) : '—', s.name, s.revision ? 'rev ' + s.revision : '—',
+    s.status === 'withdrawn' ? badge('disposed', 'Withdrawn') : badge('on_hand', 'Current'),
+    s.hasFile ? el('a', { href: docDownloadUrl('sop', s.id), target: '_blank', rel: 'noopener' }, s.filename || 'Open') : el('span', { class: 'muted' }, 'No file yet'),
+    s.uploadedAt ? fmtWhen(s.uploadedAt) : '—',
+    ...(admin ? [s.key ? mono(s.key) : '—'] : []),
+    sopLinkedAt(s),
+    rowActions([['History', () => showDocHistory('sop', s.id, s.name)],
+      ...(admin ? [['Key…', () => editSopKey(s)], ['Link to…', () => editSopSpots(s)]] : [])])]);
+  return table(headers, rows, headers.map(() => false), ri => showDocHistory('sop', sops[ri].id, sops[ri].name));
 }
 
 async function libraryReviewCard(v) {
@@ -7541,47 +7696,43 @@ async function reviewLibraryItem(i) {
     return;
   }
   if (i.kind === 'sop' && i.change === 'new') {
-    const name = el('input', { value: p.title || p.docNumber || '' });
-    const key = el('input', { placeholder: 'only if a spot in the production log links to this document' });
+    const shownName = p.title || p.docNumber || '—';
+    const key = el('input', { placeholder: 'optional: a short code' });
     const link = selectFrom('', [['', '— add as a new SOP —'], ...(i.candidates || []).map(c => [String(c.id), 'This is the existing document: ' + c.name])]);
-    const keyField = field('Reference key (optional, fixed once set)', key);
-    const known = Object.fromEntries((i.candidates || []).map(c => [String(c.id), c.name]));
-    link.addEventListener('change', () => {              // linking to an existing SOP keeps its name (editable); a new SOP starts from the file's title
-      keyField.classList.toggle('hidden', !!link.value);
-      name.value = link.value ? known[link.value] : (p.title || p.docNumber || '');
-    });
+    const keyField = field('Reference key (optional)', key);
+    link.addEventListener('change', () => keyField.classList.toggle('hidden', !!link.value));
     modal('New SOP ' + (p.docNumber || ''), el('div', {},
-      el('div', { class: 'summary-line' }, sl('File', i.filename || '—'), sl('Number', p.docNumber || '—'), sl('Revision', p.revision ? 'rev ' + p.revision : '—')),
+      el('div', { class: 'summary-line' }, sl('File', i.filename || '—'), sl('Number', p.docNumber || '—'), sl('Revision', p.revision ? 'rev ' + p.revision : '—'), sl('Name in KelpWorks', shownName)),
+      el('div', { class: 'help' }, 'The name comes from the file name in SharePoint (to change it, rename the file there; the next nightly sync updates it).'),
       libraryFileLine(i),
-      field('Is this an SOP KelpWorks already has?', link), field('Name shown in KelpWorks', name), keyField), async () => {
-      if (!name.value.trim()) throw new Error('Enter a name.');
-      await acceptLibraryItem(i, { name: name.value.trim(), key: key.value.trim() || null, linkTo: link.value ? +link.value : null });
+      field('Is this an SOP KelpWorks already has?', link),
+      el('div', { class: 'help', style: 'margin-top:-6px' }, 'If so, the existing entry keeps its links but takes its name from this file.'),
+      keyField), async () => {
+      await acceptLibraryItem(i, { key: key.value.trim() || null, linkTo: link.value ? +link.value : null });
     }, 'Accept');
     return;
   }
   if (i.kind === 'sop' && i.change === 'revision') {
     modal('New revision', el('div', {}, el('div', { class: 'summary-line' }, sl('Document', i.targetName || '—'), sl('New file', i.filename || '—'), sl('Revision', p.revision ? 'rev ' + p.revision : '—')),
       libraryFileLine(i), i.detail ? el('div', { class: 'help' }, i.detail) : null,
-      el('div', { class: 'help' }, 'Accepting makes this the current file. The file it replaces stays in the history. Links from the production log keep working.')),
+      p.title && p.title !== i.targetName ? el('div', { class: 'help' }, 'The name will change from “' + i.targetName + '” to “' + p.title + '”, following the file name.') : null,
+      el('div', { class: 'help' }, 'Accepting makes this the current file. The file it replaces stays in the history. Links to this SOP keep working.')),
       () => acceptLibraryItem(i), 'Accept new revision');
     return;
   }
   if (i.kind === 'sds' && i.change === 'revision') {
-    const issue = el('input', { type: 'date', value: p.issueDate || '' });
-    modal('Newer safety data sheet', el('div', {}, el('div', { class: 'summary-line' }, sl('Sheet', i.targetName || '—'), sl('New file', i.filename || '—')),
+    modal('Newer safety data sheet', el('div', {}, el('div', { class: 'summary-line' }, sl('Sheet', i.targetName || '—'), sl('New file', i.filename || '—'), sl('Issue date', p.issueDate || '—')),
       libraryFileLine(i), i.detail ? el('div', { class: 'help' }, i.detail) : null,
-      field('Issue date', issue),
-      el('div', { class: 'help' }, 'The file it replaces stays in the history. The inventory items it is linked to stay linked.')),
-      () => acceptLibraryItem(i, { issueDate: issue.value }), 'Accept newer issue');
+      el('div', { class: 'help' }, 'The issue date comes from the file name. The file it replaces stays in the history. The inventory items it is linked to stay linked.')),
+      () => acceptLibraryItem(i), 'Accept newer issue');
     return;
   }
-  // a new safety data sheet
-  const chem = el('input', { value: p.chemical || '' }), sup = el('input', { value: p.supplier || '' }), issue = el('input', { type: 'date', value: p.issueDate || '' });
+  // a new safety data sheet: chemical, supplier and issue date come from the file name; only the items it covers are chosen here
   const list = sdsItemChecklist(await sdsLinkableItems(), new Set());
-  modal('New safety data sheet', el('div', {}, el('div', { class: 'summary-line' }, sl('File', i.filename || '—')), libraryFileLine(i),
-    field('Chemical', chem), field('Supplier', sup), field('Issue date', issue), list.node,
+  modal('New safety data sheet', el('div', {}, el('div', { class: 'summary-line' }, sl('File', i.filename || '—'), sl('Chemical', p.chemical || '—'), sl('Supplier', p.supplier || '—'), sl('Issue date', p.issueDate || '—')),
+    el('div', { class: 'help' }, 'These come from the file name in SharePoint (to change them, rename the file there).'), libraryFileLine(i), list.node,
     el('div', { class: 'help' }, 'Linked items show an SDS link on the Inventory Items page. You can change the links later.')), async () => {
-    await acceptLibraryItem(i, { chemical: chem.value.trim(), supplier: sup.value.trim(), issueDate: issue.value, itemIds: list.get() });
+    await acceptLibraryItem(i, { itemIds: list.get() });
   }, 'Accept');
 }
 

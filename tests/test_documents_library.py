@@ -200,10 +200,10 @@ def test_a_new_sop_is_reviewed_then_added(srv, admin, plain):
     assert upload(srv, "sop", reply["need"][0]["path"], data) == (200, {"ok": True, "stored": False})     # sending it twice is harmless
     assert waiting(admin, "sop", identity="SOP-310")[0]["hasFile"]
     assert admin.get("/api/library/inbox/%d/file" % item["id"]).body == data                 # the administrator can look at it before deciding
-    r = accept(admin, item, name="Homogenization SOP")
+    r = accept(admin, item, name="A name typed by hand")                                      # a typed name is ignored: the name is the title in the file name
     assert r.status == 200, r.text
     sop = [s for s in docs(plain)["sops"] if s["docNumber"] == "SOP-310"][0]
-    assert (sop["name"], sop["revision"], sop["status"], sop["hasFile"]) == ("Homogenization SOP", "3", "current", True)
+    assert (sop["name"], sop["revision"], sop["status"], sop["hasFile"]) == ("Homogenization", "3", "current", True)
     assert plain.get("/api/sop-documents/%d/download" % sop["id"]).body == data
     assert not waiting(admin, "sop", id=item["id"])
     assert report(srv, "sop")["need"] == [] and not waiting(admin, "sop", identity="SOP-310")  # the next night: nothing to say
@@ -211,11 +211,17 @@ def test_a_new_sop_is_reviewed_then_added(srv, admin, plain):
     assert sql(srv, "SELECT stored_name FROM library_inbox WHERE id=?", (item["id"],))[0][0] is None
 
 
-def test_a_name_that_is_already_taken_is_refused(srv, admin):
-    put(srv, "sop", "SOP-311_Twin_rev1.pdf", b"%PDF twin")
-    item = waiting(admin, "sop", identity="SOP-311")[0]
-    assert accept(admin, item, name="Homogenization SOP").status == 409                      # used by the previous test's document
-    assert accept(admin, item, name="Twin Procedure").status == 200
+def test_two_sops_with_the_same_title_are_told_apart_by_their_number(srv, admin, plain):
+    put(srv, "sop", "SOP-311_Homogenization_rev1.pdf", b"%PDF twin")                         # SOP-310 already shows "Homogenization"
+    assert accept(admin, waiting(admin, "sop", identity="SOP-311")[0]).status == 200
+    names = {s["docNumber"]: s["name"] for s in docs(plain)["sops"] if s["docNumber"] in ("SOP-310", "SOP-311")}
+    assert names == {"SOP-310": "Homogenization", "SOP-311": "Homogenization (SOP-311)"}
+
+
+def test_a_file_without_a_title_is_shown_by_its_number(srv, admin, plain):
+    put(srv, "sop", "SOP-312.pdf", b"%PDF no title")
+    assert accept(admin, waiting(admin, "sop", identity="SOP-312")[0]).status == 200
+    assert [s for s in docs(plain)["sops"] if s["docNumber"] == "SOP-312"][0]["name"] == "SOP-312"
 
 
 def test_a_file_can_be_linked_to_an_sop_that_already_exists(srv, admin, plain):
@@ -227,7 +233,7 @@ def test_a_file_can_be_linked_to_an_sop_that_already_exists(srv, admin, plain):
     assert {"id": wet["id"], "name": wet["name"]} in item["candidates"]
     assert accept(admin, item, linkTo=wet["id"]).status == 200
     now = [s for s in docs(plain)["sops"] if s["id"] == wet["id"]][0]
-    assert (now["docNumber"], now["key"], now["name"], now["hasFile"]) == ("SOP-002", "wet_solids_sop", "Determining % Wet Solids SOP", True)   # the QC link keeps working
+    assert (now["docNumber"], now["key"], now["name"], now["hasFile"]) == ("SOP-002", "wet_solids_sop", "Solid Liquid Ratio & Density Analysis compressed", True)   # the key stays, the name follows the file
     refdata = {s["key"]: s for s in plain.get("/api/refdata").json["sops"] if s["key"]}
     assert refdata["wet_solids_sop"]["hasFile"] and refdata["wet_solids_sop"]["docNumber"] == "SOP-002"
     assert plain.get("/api/sop-documents/%d/download" % wet["id"]).body == data
@@ -243,7 +249,7 @@ def test_a_new_revision_replaces_the_file_and_keeps_the_old_one(srv, admin, plai
     reply = put(srv, "sop", "SOP-320_Extraction_rev2.pdf", new)
     assert reply["need"]
     item = waiting(admin, "sop", identity="SOP-320")[0]
-    assert item["change"] == "revision" and item["targetId"] == doc["id"] and item["targetName"] == "Extraction SOP"
+    assert item["change"] == "revision" and item["targetId"] == doc["id"] and item["targetName"] == "Extraction"
     assert not waiting(admin, "sop", identity="SOP-320", change="missing")                   # (the old name leaving is not a removal: its replacement is waiting)
     assert plain.get("/api/sop-documents/%d/download" % doc["id"]).body == old               # nothing changes until it is accepted
     assert accept(admin, item).status == 200
@@ -253,6 +259,19 @@ def test_a_new_revision_replaces_the_file_and_keeps_the_old_one(srv, admin, plai
     assert len(hist["revisions"]) == 1 and hist["revisions"][0]["revision"] == "1" and hist["revisions"][0]["supersededBy"]
     assert plain.get("/api/doc-revisions/%d/download" % hist["revisions"][0]["id"]).body == old
     assert {e["field"] for e in hist["edits"]} >= {"File", "Revision"}
+
+
+def test_a_new_revision_takes_the_title_of_its_new_file_name(srv, admin, plain):
+    add_sop(srv, admin, 321, "ignored", 1, b"%PDF one", "Old-Title")
+    doc = [s for s in docs(plain)["sops"] if s["docNumber"] == "SOP-321"][0]
+    assert doc["name"] == "Old Title"
+    FOLDERS["sop"].pop("SOP-321_Old-Title_rev1.pdf")
+    put(srv, "sop", "SOP-321_New-Title_rev2.pdf", b"%PDF two")
+    item = waiting(admin, "sop", identity="SOP-321")[0]
+    assert accept(admin, item).status == 200
+    doc = [s for s in docs(plain)["sops"] if s["id"] == doc["id"]][0]
+    assert (doc["name"], doc["revision"]) == ("New Title", "2")
+    assert ("Name", "Old Title", "New Title") in [tuple(e) for e in sql(srv, "SELECT field, old_value, new_value FROM sop_document_edits WHERE sop_id=?", (doc["id"],))]
 
 
 def test_a_removed_file_withdraws_the_document_and_it_can_come_back(srv, admin, plain):
@@ -293,6 +312,10 @@ def test_the_same_file_under_a_new_name_is_recorded_quietly(srv, admin, plain):
     assert reply["need"] == [] and len(pending(admin)) == n                                  # same content: no review needed
     doc = [s for s in docs(plain)["sops"] if s["docNumber"] == "SOP-340"][0]
     assert doc["revision"] == "2" and doc["sourcePath"].endswith("SOP-340_Rename_rev2.pdf")
+    FOLDERS["sop"].pop("SOP-340_Rename_rev2.pdf")
+    reply = put(srv, "sop", "SOP-340_A-Better-Title_rev2.pdf", data)                         # QA gives the file a better title: the SOP's name follows
+    assert reply["need"] == [] and len(pending(admin)) == n
+    assert [s for s in docs(plain)["sops"] if s["docNumber"] == "SOP-340"][0]["name"] == "A Better Title"
 
 
 # ---- files KelpWorks cannot read, ignored items, files that vanish ----
@@ -377,6 +400,16 @@ def test_a_safety_data_sheet_is_added_linked_to_items_and_reviewed(srv, admin, p
     assert {e["field"] for e in hist["edits"]} >= {"Issue date", "Added from the SharePoint folder"}
 
 
+def test_a_safety_data_sheets_details_come_from_its_file_name_not_from_what_is_typed(srv, admin, plain):
+    put(srv, "sds", "SDS_Glycerol_Univar_2025-05-05.pdf", b"%PDF glycerol")
+    item = waiting(admin, "sds", identity="glycerol|univar")[0]
+    assert accept(admin, item, chemical="Hacked", supplier="Nobody", issueDate="1999-01-01").status == 200
+    sheet = [s for s in docs(plain)["sds"] if s["chemical"] == "Glycerol"][0]
+    assert (sheet["supplier"], sheet["issueDate"]) == ("Univar", "2025-05-05")
+    assert not waiting(admin, "sds", identity="glycerol|univar")                              # and the next scan agrees: nothing new, nothing missing
+    assert not waiting(admin, "sds", change="missing")
+
+
 def test_an_old_sheet_is_overdue_and_items_can_be_relinked_by_administrators_only(srv, admin, plain):
     put(srv, "sds", "SDS_Potassium-Sorbate_Univar_2019-05-20.pdf", b"%PDF old sheet")
     assert accept(admin, waiting(admin, "sds", identity="potassium-sorbate|univar")[0]).status == 200
@@ -442,19 +475,52 @@ def test_an_unknown_document_status_is_refused_by_the_database(srv):
         sql(srv, "UPDATE sop_documents SET status='lost'")
 
 
-def test_deleting_an_sop_removes_its_kept_revisions_too(srv, admin):
-    add_sop(srv, admin, 370, "Delete me", 1, b"%PDF first", "Delete")
+def test_a_numbered_sops_file_cannot_be_replaced_by_hand(srv, admin, plain):
+    import base64
+    original = b"%PDF original controlled copy"
+    add_sop(srv, admin, 380, "ignored", 1, original, "Hand")
+    doc = [s for s in docs(plain)["sops"] if s["docNumber"] == "SOP-380"][0]
+    mine = {"filename": "mine.pdf", "contentType": "application/pdf", "dataB64": base64.b64encode(b"%PDF edited by hand").decode()}
+    r = admin.put("/api/sop-documents/%d" % doc["id"], mine)
+    assert r.status == 409 and r.json["code"] == "controlled_in_sharepoint" and "SOP-380" in r.json["error"]
+    assert plain.get("/api/sop-documents/%d/download" % doc["id"]).body == original         # the controlled file is untouched
+    r = admin.put("/api/sop-documents/%d" % doc["id"], dict(mine, name="Hand edit, renamed"))   # nothing is half-applied
+    assert r.status == 409 and [s for s in docs(plain)["sops"] if s["id"] == doc["id"]][0]["name"] == "Hand"
+    r = admin.put("/api/sop-documents/%d" % doc["id"], {"name": "Renamed by hand"})            # the name follows the file name in SharePoint, not a typed name
+    assert r.status == 409 and r.json["code"] == "controlled_in_sharepoint" and "rename the file" in r.json["error"]
+    assert admin.put("/api/sop-documents/%d" % doc["id"], {"name": "Hand", "key": "hand_sop"}).status == 200      # the same name with a key is fine
+    FOLDERS["sop"].pop("SOP-380_Hand_rev1.pdf")
+    report(srv, "sop")
+
+
+def test_an_sop_entry_without_a_number_gets_its_file_from_the_folder(srv, admin, plain):
+    made = admin.post("/api/sop-documents", {"name": "Entry made first", "key": "entry_made_first"})
+    assert made.status == 200
+    entry_id = made.json["sop"]["id"]
+    assert not made.json["sop"]["hasFile"] and made.json["sop"]["docNumber"] is None
+    put(srv, "sop", "SOP-390_Entry-Made-First_rev1.pdf", b"%PDF linked later")
+    assert accept(admin, waiting(admin, "sop", identity="SOP-390")[0], linkTo=entry_id).status == 200
+    doc = [s for s in docs(plain)["sops"] if s["id"] == entry_id][0]
+    assert (doc["docNumber"], doc["key"], doc["name"], doc["hasFile"]) == ("SOP-390", "entry_made_first", "Entry Made First", True)
+    FOLDERS["sop"].pop("SOP-390_Entry-Made-First_rev1.pdf")
+    report(srv, "sop")
+
+
+def test_an_sop_cannot_be_deleted_in_kelpworks_only_withdrawn_in_sharepoint(srv, admin, plain):
+    add_sop(srv, admin, 370, "Keep me", 1, b"%PDF first", "Keep")
     doc = [s for s in docs(admin)["sops"] if s["docNumber"] == "SOP-370"][0]
-    FOLDERS["sop"].pop("SOP-370_Delete_rev1.pdf")
-    put(srv, "sop", "SOP-370_Delete_rev2.pdf", b"%PDF second")
+    FOLDERS["sop"].pop("SOP-370_Keep_rev1.pdf")
+    put(srv, "sop", "SOP-370_Keep_rev2.pdf", b"%PDF second")
     accept(admin, waiting(admin, "sop", identity="SOP-370")[0])
     kept = sql(srv, "SELECT stored_name FROM document_revisions WHERE kind='sop' AND doc_id=?", (doc["id"],))[0][0]
+    for who in (admin, plain):
+        r = who.delete("/api/sop-documents/%d" % doc["id"])
+        assert r.status == 409 and r.json["code"] == "controlled_in_sharepoint" and "SharePoint" in r.json["error"]
+    assert [s for s in docs(admin)["sops"] if s["id"] == doc["id"]]                          # still there, with its kept earlier file
     assert os.path.isfile(os.path.join(srv.tmp, "sop_documents", kept))
-    assert admin.delete("/api/sop-documents/%d" % doc["id"]).status == 200
-    assert not os.path.exists(os.path.join(srv.tmp, "sop_documents", kept))
-    assert sql(srv, "SELECT COUNT(*) FROM document_revisions WHERE kind='sop' AND doc_id=?", (doc["id"],))[0][0] == 0
-    FOLDERS["sop"].pop("SOP-370_Delete_rev2.pdf")
-    report(srv, "sop")
+    remove(srv, "sop", "SOP-370_Keep_rev2.pdf")                                              # the way out is SharePoint: the document is withdrawn
+    assert accept(admin, waiting(admin, "sop", change="missing", identity="SOP-370")[0]).status == 200
+    assert [s for s in docs(plain)["sops"] if s["id"] == doc["id"]][0]["status"] == "withdrawn"
 
 
 # ---- the sync script, folder -> KelpWorks ----

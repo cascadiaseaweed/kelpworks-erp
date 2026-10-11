@@ -16,6 +16,42 @@ Every night the same sync that copies the production-run archive (see `records-a
 KelpWorks does not have yet. KelpWorks then shows the differences on the **Documents** tab. **Nothing changes in KelpWorks by itself:** an administrator accepts or ignores each
 difference, with one click. Everyone can read the lists and open the files; only administrators review.
 
+## Where SOPs are managed
+
+- **Documents tab:** the one place everyone reads SOPs and safety data sheets, sees revisions and history, and sees **where each SOP is linked** ("Linked at"). Administrators also review changes from SharePoint here. Nothing is uploaded by hand.
+- **Admin > SOPs:** the same list, with what only an administrator can do: **Key…** (an optional reference key, changeable or clearable) and **Link to…** (where the SOP is linked, see below).
+- **The SharePoint file name is the single source of truth.** An SOP's **name** is the title in its file name (`SOP-012_Homogenization_rev3.pdf` shows as "Homogenization"; a file with no title shows its number;
+  if another SOP already has that name, the number is added: "Homogenization (SOP-311)"). There is no Rename in KelpWorks: rename the file in SharePoint and the next nightly sync updates the name (a new
+  revision with a new title, or the same file renamed). The same holds for a safety data sheet's chemical, supplier and issue date, which come from its file name.
+- **SOPs are never deleted in KelpWorks, and their files are never replaced by hand.** Both happen in SharePoint: take the file out of `Current` and the next sync offers the document as *withdrawn* (its files and
+  history are kept); put a new revision in `Current` and it is offered as a new revision. The server refuses a delete or a hand-uploaded file with "controlled in SharePoint".
+
+## Linking an SOP to places in the app
+
+An SOP can be shown as a small **SOP** line, with a link to its current file, at the places below. Choose them in three ways, all with the same result:
+
+- **Admin > SOPs > Link to...** on one SOP: a tidy ticklist of the places with your own **filters and grouping**:
+  - **Search** by any word (for example `qc`, `homogenization`, `cart`).
+  - **Show** one or more areas (Production log, CIP Log, Samples, Shipping) with the buttons; "All" shows everything.
+  - **Group by** *Area and section* (Production log > Homogenization, CIP Log, ...) or *Type* (Sections, Pages, Views, Process Checks, QC Checks, Sample Points, Other boxes, Windows), for example to tick every QC Check at once.
+  - A box beside each group ticks the whole group (only the places currently shown); **Only ticked** shows what is already chosen; a counter shows how many places are ticked.
+  The same filters and grouping are on the **Where SOPs are linked** table. Your choices are remembered in your browser.
+- **Admin > Where SOPs are linked:** the table of places (with the same filters and grouping): tick several places (or a whole group) and **Add an SOP to these places...** (or **Remove an SOP from these places...**) in one go. **Choose SOPs...** on a row sets all the SOPs for that place.
+- Several SOPs can share a place and one SOP can be at many places.
+
+The places (grouped in the picker by area):
+
+- **Production log**, one group per stage: Initiation, Feedstock, Homogenization, Extraction, Separation, Pasteurization, Dilution & Preservation, Packaging. Each group has *Whole section* and the boxes inside it:
+  for example Homogenization > Process Check (the solids-loading box that carried the one fixed SOP link before), each QC Check, each Sample Point, the dilution boxes and each additional dilution pass,
+  the packaging table, and each tote's feedstock characterization card. (Windows of the production log, such as the Process log or Lab results windows, are not offered.)
+- **CIP Log:** the whole page, and the Log / edit CIP window.
+- **Samples:** the whole page (all views), each view (Analysis catalogue, Retention inventory, Cart, Requisitions), the sample details window, and the requisition windows.
+- **Shipping:** the whole page, and the New / edit shipment window.
+
+The link always opens the SOP's **current** file, so a new revision is picked up automatically; a withdrawn SOP shows "withdrawn". Every change is written to the SOP's history (Linked at / Unlinked from).
+The earlier link (Homogenization > Process Check to the wet-solids SOP) was carried over. To make another place available, a developer adds a `data-sop-spot` key in the app (or a window title prefix in
+`SOP_WINDOW_SPOTS`) and the same key to `SOP_SPOTS` in the server; a test keeps the two lists equal.
+
 ## File names (what Quality does)
 
 | Document | Name | Example |
@@ -38,8 +74,8 @@ difference, with one click. Everyone can read the lists and open the files; only
 
 | Change | What it means | Review does |
 |---|---|---|
-| **New document** | A number / chemical KelpWorks does not have | SOP: choose a name, or say "this is an SOP KelpWorks already has" (links the controlled file to it and keeps its reference key, so QC checks keep linking). SDS: check chemical, supplier and issue date, and tick the inventory items it covers |
-| **New revision** | The same document with different content | Makes the new file current. The file it replaces stays in the history (**History** button on the row) |
+| **New document** | A number / chemical KelpWorks does not have | SOP: shows the name it will get (from the file name); or say "this is an SOP KelpWorks already has" (links the controlled file to it, keeping its links and reference key; it takes its name from the file). SDS: shows chemical, supplier and issue date (from the file name); tick the inventory items it covers |
+| **New revision** | The same document with different content | Makes the new file current (and the name follows the new file name). The file it replaces stays in the history (**History** button on the row) |
 | **File removed** | A current document's file is no longer in `Current` | Marks the document **Withdrawn**: its last file and history are kept; nothing is deleted. A withdrawn SOP shows "withdrawn" where the production log links to it |
 | **Name not readable** | The file name does not follow the convention | Cannot be accepted: rename it in SharePoint, or **Ignore** |
 

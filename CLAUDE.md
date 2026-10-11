@@ -213,10 +213,19 @@ for `main` so a red run blocks the merge.
   (a current document whose file left the folder; never raised when the folder is empty), **unreadable** (name does not parse: `parse_sop_filename` / `parse_sds_filename`). Identity: SOP = `doc_number`
   (`SOP-012`; `SOP002_...` also reads), SDS = `sds_key` (chemical|supplier; the issue date is the version). A rename with identical content is recorded quietly (`source_path`). Admin routes (`/api/library/inbox`, `/accept`, `/ignore`): accept
   copies the waiting file into `SOP_DIR` / `SDS_DIR`, puts the file it replaces into `document_revisions` (kept on disk; `GET /api/doc-revisions/:id/download`), logs to `sop_document_edits` / `document_edits`, and never deletes: a removed
-  file = status `withdrawn`. `sop_documents` gained doc_number / revision / status / file_sha256 / source_path (migrate); the existing SOP (`wet_solids_sop`) is linked once via `linkTo` so QC links (by `key`) keep working.
+  file = status `withdrawn`. `sop_documents` gained doc_number / revision / status / file_sha256 / source_path (migrate); the existing SOP (`wet_solids_sop`) is linked once via `linkTo` (its links and key stay).
+  **The SharePoint file name is the single source of truth**: an SOP's `name` = `sop_name_from_file` (the file's title, else the number; the number is appended when another SOP has that name) on accept, on a new revision and
+  on a same-content rename (`library_reconcile`); a typed name is ignored and `PUT /api/sop-documents/:id` refuses to rename a numbered SOP (409 `controlled_in_sharepoint`); an SDS's chemical / supplier / issue date also come only from the file name.
   New tables: `sds_documents`, `sds_items` (SDS <-> inventory items; shown as an SDS link on Inventory Items), `document_edits`, `document_revisions`, `library_inbox`, `library_scans` (last report per folder; stale after `library_scan_stale_days`).
   SDS review due = issue date + `sds_review_years` (`sds_review`, Calculations page). `SDS_DIR` is in `backup_dirs()` (the full backup / staging restore); the waiting inbox is not (the sync uploads it again). The UI is the "Documents" tab
-  (`pageDocuments`, `libraryReviewCard`, `reviewLibraryItem`). A new status value for these tables goes in `STATUS_RULES`.
+  (`pageDocuments`, `libraryReviewCard`, `reviewLibraryItem`). A new status value for these tables goes in `STATUS_RULES`. Admin > "SOPs" is the same table as Documents (`sopTable`; "Linked at" is shown to everyone) plus the optional,
+  editable `key` (nothing is coded against it) and **SOP links**: `sop_links (spot, sop_id)` chosen by an administrator (`PUT /api/sop-documents/:id/links {spots}`, `PUT /api/sop-links/<spot> {sopIds}`,
+  `POST /api/sop-links/bulk {sopId, action: add|remove, spots}`; every change goes to the SOP's history). A spot is a key in `SOP_SPOTS` (server; a row is `(key, area, stage, kind, label)`: area = Production log / CIP Log / Samples /
+  Shipping, stage = the section, kind = Section / Page / View / Process Check / QC Check / Sample Point / Other box / Window, mirrored by `SOP_KIND_ORDER` in app.js; the picker (`sopPlacePicker`, `sopPlaceControls`,
+  `sopPlaceGroups`) filters by area and groups by section or by kind, and is shared with the "Where SOPs are linked" table; the production-log WINDOWS are deliberately not offered; links to places no longer listed are pruned at start) and an element with `data-sop-spot="<key>"` (app.js: sections, boxes,
+  pages, `buildQualityCheckBox` opts.spot, `buildFeedstockCard` opts.sopSpot, `SAMPLE_VIEW_SPOTS`) or a window whose title starts with an entry of `SOP_WINDOW_SPOTS`; a debounced MutationObserver
+  (`applySopSlots`) puts the "SOP" line in each spot, from `refdata.sopLinks`. `tests/test_sop_links.py` fails when the two key lists differ: add a new place in BOTH. **An SOP cannot be deleted in
+  KelpWorks** (`DELETE` answers 409 `controlled_in_sharepoint`: remove the file in SharePoint and the document is withdrawn) and `_update_sop` refuses a hand-uploaded file for a numbered SOP (same code).
 - **Production-log required fields** are defined once, server-side, in `PROGRESS_SECTIONS` /
   `REQUIRED_FEEDSTOCK` (`kelp_erp_server.py`; exposed to the SPA as `refdata.requiredFields`).
   Everything is required except: every Notes field, the Homogenization / Separation /
