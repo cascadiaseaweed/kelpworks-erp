@@ -579,6 +579,17 @@ CREATE TABLE IF NOT EXISTS sop_document_edits (
 );
 CREATE INDEX IF NOT EXISTS idx_sop_edits_sop ON sop_document_edits(sop_id);
 
+-- Where an SOP is linked in the app (a section, a box or a window of the production log): chosen by an administrator, shown as a link to the SOP's current file
+-- wherever the spot appears. `spot` is one of SOP_SPOTS.
+CREATE TABLE IF NOT EXISTS sop_links (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    spot       TEXT NOT NULL,
+    sop_id     INTEGER NOT NULL REFERENCES sop_documents(id) ON DELETE CASCADE,
+    created_by TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (spot, sop_id)
+);
+
 -- Safety data sheets (batch 10). The register is fed from the SharePoint folder 04_Safety-Data-Sheets/Current: one row per chemical + supplier
 -- (`sds_key`), the file of its latest issue, and the inventory items it covers. Replaced files are kept in document_revisions.
 CREATE TABLE IF NOT EXISTS sds_documents (
@@ -1786,6 +1797,8 @@ def init_db():
             ensure_reagent_types(conn)
             soft_step(conn, "foreign-key indexes", lambda: ensure_indexes(conn))
             soft_step(conn, "status and quantity guards", lambda: ensure_constraints(conn))
+            soft_step(conn, "SOP links to places that no longer exist", lambda: conn.execute(
+                "DELETE FROM sop_links WHERE spot NOT IN (%s)" % ",".join("?" * len(SOP_SPOT_KEYS)), tuple(SOP_SPOT_KEYS)))
             soft_step(conn, "re-hash signed production logs", lambda: rebaseline_release_hashes(conn))
             soft_step(conn, "sample catalogue for finalized runs", lambda: sync_pending_samples(conn))
 
@@ -4284,6 +4297,10 @@ def migrate(conn):
                  ("Determining % Wet Solids SOP", "wet_solids_sop", now_iso()))
     conn.execute("UPDATE sop_documents SET key='wet_solids_sop'"
                  " WHERE name='Determining % Wet Solids SOP' AND key IS NULL")
+    # (batch 11) SOP links are chosen per spot now; the one link that used to be coded against a key (the Homogenization solids-loading check) is carried over once
+    run_once(conn, "sop_link_wet_solids", lambda: conn.execute(
+        "INSERT OR IGNORE INTO sop_links (spot, sop_id, created_by, created_at) "
+        "SELECT 'production.homogenization.process_check', id, 'SYSTEM', ? FROM sop_documents WHERE key='wet_solids_sop'", (now_iso(),)))
     # Seed every known calculation constant -- INSERT OR IGNORE so an admin's
     # already-edited value is never overwritten, but a newly-added constant
     # (from a later code update) still appears for existing deployments.
@@ -5072,6 +5089,59 @@ def archive_status(conn):
 # folders (a listing with a SHA-256 per file) and uploads the files KelpWorks does not have yet. KelpWorks never changes its register by itself: every difference
 # (a new document, a new revision, a removed file, a file whose name cannot be read) waits in the `library_inbox` for an administrator to accept or ignore.
 # ---------------------------------------------------------------------------------------
+# Where an SOP can be linked in the app: (key, area, stage, kind, label). `area` is the part of the app (a filter in the picker), `stage` the section it belongs to, `kind` what
+# it is (Section, Page, View, Process Check, QC Check, Sample Point, Other box, Window: the picker can group by it). Each key is wired in public/app.js as
+# data-sop-spot="<key>" or as a window title prefix in SOP_WINDOW_SPOTS; tests/test_sop_links.py fails when the two lists differ. Windows of the production log are
+# deliberately not offered.
+SOP_SPOTS = [
+    ("production.initiation", "Production log", "Initiation", "Section", "Whole section"),
+    ("production.feedstock", "Production log", "Feedstock", "Section", "Whole section"),
+    ("production.feedstock.characterization", "Production log", "Feedstock", "Other box", "Each tote's characterization card"),
+    ("production.homogenization", "Production log", "Homogenization", "Section", "Whole section"),
+    ("production.homogenization.process_check", "Production log", "Homogenization", "Process Check", "Solids loading"),
+    ("production.homogenization.dilution", "Production log", "Homogenization", "Other box", "Dilution (target, water added, final volume)"),
+    ("production.homogenization.sample_point", "Production log", "Homogenization", "Sample Point", "Lot input"),
+    ("production.homogenization.qc_check", "Production log", "Homogenization", "QC Check", "Lot characterization"),
+    ("production.extraction", "Production log", "Extraction", "Section", "Whole section"),
+    ("production.extraction.qc_check", "Production log", "Extraction", "QC Check", "Extraction performance"),
+    ("production.separation", "Production log", "Separation", "Section", "Whole section"),
+    ("production.separation.solids_qc", "Production log", "Separation", "QC Check", "Solids characterization"),
+    ("production.separation.filtrate_qc", "Production log", "Separation", "QC Check", "Filtrate characterization"),
+    ("production.separation.sample_point", "Production log", "Separation", "Sample Point", "Solids"),
+    ("production.pasteurization", "Production log", "Pasteurization", "Section", "Whole section"),
+    ("production.pasteurization.process_check", "Production log", "Pasteurization", "Process Check", "Dilution plan, tanks 5A/5B to 6A/6B"),
+    ("production.pasteurization.sample_point", "Production log", "Pasteurization", "Sample Point", "Post-pasteurization microbial check"),
+    ("production.dilution", "Production log", "Dilution & Preservation", "Section", "Whole section"),
+    ("production.dilution.preservation", "Production log", "Dilution & Preservation", "Other box", "Dilution check and preservatives"),
+    ("production.dilution.pass", "Production log", "Dilution & Preservation", "Other box", "Each additional dilution pass"),
+    ("production.dilution.qc_check", "Production log", "Dilution & Preservation", "QC Check", "LKE characterization"),
+    ("production.dilution.sample_point", "Production log", "Dilution & Preservation", "Sample Point", "LKE characterization"),
+    ("production.packaging", "Production log", "Packaging", "Section", "Whole section"),
+    ("production.packaging.entries", "Production log", "Packaging", "Other box", "Containers filled (packaging table)"),
+    ("cip.page", "CIP Log", "CIP Log", "Page", "Whole page"),
+    ("cip.event_window", "CIP Log", "CIP Log", "Window", "Log / edit CIP"),
+    ("samples.page", "Samples", "Samples", "Page", "Whole page (all views)"),
+    ("samples.catalogue", "Samples", "Samples", "View", "Analysis catalogue"),
+    ("samples.retention", "Samples", "Samples", "View", "Retention inventory"),
+    ("samples.cart", "Samples", "Samples", "View", "Cart"),
+    ("samples.requisitions", "Samples", "Samples", "View", "Requisitions"),
+    ("samples.sample_window", "Samples", "Samples", "Window", "Sample details"),
+    ("samples.requisition_window", "Samples", "Samples", "Window", "Requisitions (preview, created, details)"),
+    ("shipping.page", "Shipping", "Shipping", "Page", "Whole page"),
+    ("shipping.shipment_window", "Shipping", "Shipping", "Window", "New / edit shipment"),
+]
+
+
+def _sop_spot_info(row):
+    key, area, stage, kind, label = row
+    return {"key": key, "area": area, "stage": stage, "kind": kind, "label": label,
+            "group": ("%s: %s" % (area, stage)) if area == "Production log" else area}      # "Production log: Homogenization" / "CIP Log"
+
+
+SOP_SPOT_INFO = {r[0]: _sop_spot_info(r) for r in SOP_SPOTS}
+SOP_SPOT_KEYS = set(SOP_SPOT_INFO)
+
+
 SDS_DIR = os.path.join(os.path.dirname(UPLOAD_DIR), "sds_documents")
 LIBRARY_DIR = os.path.join(os.path.dirname(UPLOAD_DIR), "library_inbox")          # files waiting for review (not backed up: the sync uploads them again)
 LIBRARY_FOLDERS = {"sop": "03_SOPs/Current", "sds": "04_Safety-Data-Sheets/Current"}
@@ -5096,6 +5166,17 @@ def parse_sop_filename(filename):
         revision = r.group(1) or r.group(2)
         rest = rest[:r.start()]
     return {"docNumber": "SOP-%03d" % int(m.group(1)), "title": re.sub(r"[-_]+", " ", rest).strip(), "revision": revision}
+
+
+def sop_name_from_file(conn, parsed, exclude_id=None):
+    """The name an SOP shows is the title in its SharePoint file name (SOP-012_Homogenization_rev3.pdf -> "Homogenization"), or its number when the file has no title.
+    Names are unique: one that another SOP already shows gets the SOP number added."""
+    number = parsed["docNumber"]
+    base = (parsed.get("title") or "").strip() or number
+    for cand in (base, "%s (%s)" % (base, number)):
+        if not conn.execute("SELECT 1 FROM sop_documents WHERE name=? AND id IS NOT ?", (cand, exclude_id)).fetchone():
+            return cand
+    return number
 
 
 def sds_identity(chemical, supplier):
@@ -5226,10 +5307,15 @@ def library_reconcile(conn, kind, files, who):
                 desired[("missing", str(r["id"]), None)] = {"path": r["source_path"], "name": r["filename"], "sha": None, "size": None, "parsed": None,
                                                             "target": r["id"], "identity": r[ident_col], "change": "missing",
                                                             "detail": "The file is no longer in the folder."}
-    for row, s in renames:                                  # the same file under another name: record it quietly
+    for row, s in renames:                                  # the same file under another name: record it quietly (an SOP's name follows its file name)
         library_log_edit(conn, kind, row["id"], who, "Source file", row["source_path"], s["path"])
-        if kind == "sop" and (s["parsed"].get("revision") or None) != row["revision"]:
-            conn.execute("UPDATE sop_documents SET revision=? WHERE id=?", (s["parsed"].get("revision"), row["id"]))
+        if kind == "sop":
+            if (s["parsed"].get("revision") or None) != row["revision"]:
+                conn.execute("UPDATE sop_documents SET revision=? WHERE id=?", (s["parsed"].get("revision"), row["id"]))
+            new_name = sop_name_from_file(conn, s["parsed"], row["id"])
+            if new_name != row["name"]:
+                conn.execute("UPDATE sop_documents SET name=? WHERE id=?", (new_name, row["id"]))
+                library_log_edit(conn, kind, row["id"], who, "Name", row["name"], new_name)
         conn.execute("UPDATE %s SET source_path=? WHERE id=?" % library_table(kind), (s["path"], row["id"]))
 
     by_key = {}
@@ -6064,10 +6150,13 @@ class Handler(BaseHTTPRequestHandler):
             if not doc:
                 raise ApiError(404, "That document no longer exists")
             self._library_archive_current(conn, "sop", doc, user, "Replaced by a new revision from the SharePoint folder")
-            sets = dict(fileset, revision=revision)
+            name = sop_name_from_file(conn, parsed, doc["id"])
+            sets = dict(fileset, revision=revision, name=name)
             conn.execute("UPDATE sop_documents SET %s WHERE id=?" % ", ".join("%s=?" % c for c in sets), (*sets.values(), doc["id"]))
             library_log_edit(conn, "sop", doc["id"], who, "File", doc["filename"] or "-", row["filename"])
             library_log_edit(conn, "sop", doc["id"], who, "Revision", doc["revision"] or "-", revision or "-")
+            if name != doc["name"]:
+                library_log_edit(conn, "sop", doc["id"], who, "Name", doc["name"], name)
             return doc["id"], "New revision %s accepted" % (revision or "")
         link_to = d.get("linkTo")
         if link_to:
@@ -6076,20 +6165,16 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(404, "The document to link to no longer exists")
             if doc["doc_number"]:
                 raise ApiError(409, "%s already has a document number (%s)." % (doc["name"], doc["doc_number"]))
-            name = (d.get("name") or doc["name"]).strip()
-            if name != doc["name"] and conn.execute("SELECT 1 FROM sop_documents WHERE name=? AND id!=?", (name, doc["id"])).fetchone():
-                raise ApiError(409, "A document named \"%s\" already exists" % name)
+            name = sop_name_from_file(conn, parsed, doc["id"])             # the existing entry takes the name from the controlled file
             self._library_archive_current(conn, "sop", doc, user, "Replaced by the controlled file from the SharePoint folder")
             sets = dict(fileset, name=name, doc_number=number, revision=revision)
             conn.execute("UPDATE sop_documents SET %s WHERE id=?" % ", ".join("%s=?" % c for c in sets), (*sets.values(), doc["id"]))
             library_log_edit(conn, "sop", doc["id"], who, "Document number", "-", number)
             library_log_edit(conn, "sop", doc["id"], who, "File", doc["filename"] or "-", row["filename"])
+            if name != doc["name"]:
+                library_log_edit(conn, "sop", doc["id"], who, "Name", doc["name"], name)
             return doc["id"], "Linked to %s as %s" % (doc["name"], number)
-        name = (d.get("name") or parsed.get("title") or number).strip()
-        if not name:
-            raise ApiError(400, "A document name is required")
-        if conn.execute("SELECT 1 FROM sop_documents WHERE name=?", (name,)).fetchone():
-            raise ApiError(409, "A document named \"%s\" already exists: choose another name, or link this file to it." % name)
+        name = sop_name_from_file(conn, parsed)
         key = (d.get("key") or "").strip() or None
         if key and conn.execute("SELECT 1 FROM sop_documents WHERE key=?", (key,)).fetchone():
             raise ApiError(409, "Reference key \"%s\" is already in use" % key)
@@ -6104,7 +6189,7 @@ class Handler(BaseHTTPRequestHandler):
             doc = conn.execute("SELECT * FROM sds_documents WHERE id=?", (row["target_id"],)).fetchone()
             if not doc:
                 raise ApiError(404, "That document no longer exists")
-            issue = (d.get("issueDate") or parsed.get("issueDate") or "").strip()
+            issue = (parsed.get("issueDate") or "").strip()
             self._check_iso_date(issue)
             self._library_archive_current(conn, "sds", doc, user, "Replaced by a newer issue from the SharePoint folder")
             sets = dict(fileset, issue_date=issue)
@@ -6112,9 +6197,9 @@ class Handler(BaseHTTPRequestHandler):
             library_log_edit(conn, "sds", doc["id"], who, "Issue date", doc["issue_date"] or "-", issue)
             library_log_edit(conn, "sds", doc["id"], who, "File", doc["filename"] or "-", row["filename"])
             return doc["id"], "New issue dated %s accepted" % issue
-        chemical = (d.get("chemical") or parsed.get("chemical") or "").strip()
-        supplier = (d.get("supplier") or parsed.get("supplier") or "").strip()
-        issue = (d.get("issueDate") or parsed.get("issueDate") or "").strip()
+        chemical = (parsed.get("chemical") or "").strip()                  # all three come from the file name: SharePoint is the single source
+        supplier = (parsed.get("supplier") or "").strip()
+        issue = (parsed.get("issueDate") or "").strip()
         if not chemical or not supplier:
             raise ApiError(400, "A chemical name and a supplier are needed")
         self._check_iso_date(issue)
@@ -6155,7 +6240,8 @@ class Handler(BaseHTTPRequestHandler):
             years = float(get_setting_value(conn, "sds_review_years", 3) or 3)
             warn = float(get_setting_value(conn, "sds_review_warning_days", 60) or 60)
             items = self._sds_items_map(conn)
-            out = {"sops": [self._sop_public(r) for r in conn.execute("SELECT * FROM sop_documents ORDER BY doc_number IS NULL, doc_number, name")],
+            links = self._sop_spots_by_sop(conn)
+            out = {"sops": [self._sop_public(r, links.get(r["id"])) for r in conn.execute("SELECT * FROM sop_documents ORDER BY doc_number IS NULL, doc_number, name")],
                    "sds": [self._sds_public(conn, r, items, years, warn) for r in conn.execute("SELECT * FROM sds_documents ORDER BY chemical, supplier")],
                    "reviewYears": years, "pending": library_pending_count(conn)}
             if user["role"] == "admin":
@@ -6577,6 +6663,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.route_documents(method, seg, conn, user)
         if seg[:2] == ["api", "sds-documents"]:
             return self.route_sds(method, seg, conn, user)
+        if seg[:2] == ["api", "sop-links"]:
+            return self.route_sop_links(method, seg, conn, user)
         if seg[:2] == ["api", "library"]:
             return self.route_library(method, seg, conn, user)
         if seg[:2] == ["api", "integrity"]:
@@ -6783,6 +6871,7 @@ class Handler(BaseHTTPRequestHandler):
                      for f in QC_FIELD_REGISTRY]
         return {"species": species, "sites": sites, "locations": locations,
                 "skus": skus, "customers": customers, "sops": sops, "libraryPending": library_pending_count(conn),
+                "sopSpots": list(SOP_SPOT_INFO.values()), "sopLinks": self._sop_links_by_spot(conn),
                 "settings": get_settings(conn), "containers": containers,
                 "qcFields": qc_fields, "requiredFields": required_keys_by_stage()}
 
@@ -6806,12 +6895,12 @@ class Handler(BaseHTTPRequestHandler):
         raise ApiError(404, "Unknown settings endpoint")
 
     # ---- SOP documents (controlled documents, admin-managed) -------------- #
-    def _sop_public(self, r):
+    def _sop_public(self, r, spots=None):
         return {"id": r["id"], "name": r["name"], "key": r["key"], "filename": r["filename"],
                 "hasFile": bool(r["stored_name"]), "size": r["size"],
                 "uploadedBy": r["uploaded_by"], "uploadedAt": r["uploaded_at"],
                 "updatedAt": r["updated_at"], "docNumber": r["doc_number"], "revision": r["revision"], "status": r["status"],
-                "sourcePath": r["source_path"], "withdrawnAt": r["withdrawn_at"]}
+                "sourcePath": r["source_path"], "withdrawnAt": r["withdrawn_at"], "spots": spots or []}
 
     def _sop_edits(self, conn, sid):
         return [dict(field=r["field"], oldValue=r["old_value"], newValue=r["new_value"],
@@ -6827,8 +6916,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def route_sop_documents(self, method, seg, conn, user):
         if seg == ["api", "sop-documents"] and method == "GET":
-            rows = conn.execute("SELECT * FROM sop_documents ORDER BY name").fetchall()
-            return {"sops": [self._sop_public(r) for r in rows]}
+            rows = conn.execute("SELECT * FROM sop_documents ORDER BY doc_number IS NULL, doc_number, name").fetchall()
+            links = self._sop_spots_by_sop(conn)
+            return {"sops": [self._sop_public(r, links.get(r["id"])) for r in rows]}
         if seg == ["api", "sop-documents"] and method == "POST":
             self._require_admin(user)
             return self._create_sop(conn, user)
@@ -6841,14 +6931,93 @@ class Handler(BaseHTTPRequestHandler):
                 self._require_admin(user)
                 return self._update_sop(conn, sid, row, user)
             if method == "DELETE":
-                self._require_admin(user)
-                return self._delete_sop(conn, sid, row)
+                raise ApiError(409, "SOPs are removed in SharePoint: take the file out of the Current folder and the next nightly sync offers the document as withdrawn "
+                                    "(its files and history are kept).", "controlled_in_sharepoint")
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "edits" and method == "GET":
             sid = int(seg[2])
             if not conn.execute("SELECT 1 FROM sop_documents WHERE id=?", (sid,)).fetchone():
                 raise ApiError(404, "Document not found")
             return {"edits": self._sop_edits(conn, sid)}
+        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "links" and method == "PUT":
+            self._require_admin(user)
+            return self._set_sop_spots(conn, int(seg[2]), user)
         raise ApiError(404, "Unknown SOP documents endpoint")
+
+    def _sop_links_by_spot(self, conn):
+        """{spot: [sop id, ...]} for the production log (SOPs by number, then name)."""
+        out = {}
+        for r in conn.execute("SELECT l.spot, l.sop_id FROM sop_links l JOIN sop_documents d ON d.id=l.sop_id ORDER BY d.doc_number IS NULL, d.doc_number, d.name"):
+            out.setdefault(r["spot"], []).append(r["sop_id"])
+        return out
+
+    def _sop_spots_by_sop(self, conn):
+        out = {}
+        for r in conn.execute("SELECT spot, sop_id FROM sop_links ORDER BY id"):
+            out.setdefault(r["sop_id"], []).append(r["spot"])
+        return out
+
+    def _set_sop_spots(self, conn, sid, user):
+        """PUT /api/sop-documents/:id/links {spots: [...]}: the spots this SOP is linked at (replaces the set; each change is logged)."""
+        row = conn.execute("SELECT * FROM sop_documents WHERE id=?", (sid,)).fetchone()
+        if not row:
+            raise ApiError(404, "Document not found")
+        d = self._body_json()
+        want = d.get("spots")
+        if not isinstance(want, list):
+            raise ApiError(400, "A list of spots is needed")
+        want = {str(x) for x in want}
+        unknown = sorted(want - SOP_SPOT_KEYS)
+        if unknown:
+            raise ApiError(400, "Unknown place: %s" % unknown[0])
+        self._apply_sop_spots(conn, sid, want, user)
+        return {"sop": self._sop_public(conn.execute("SELECT * FROM sop_documents WHERE id=?", (sid,)).fetchone(), self._sop_spots_by_sop(conn).get(sid))}
+
+    def _apply_sop_spots(self, conn, sid, want, user):
+        have = {r["spot"] for r in conn.execute("SELECT spot FROM sop_links WHERE sop_id=?", (sid,))}
+        label = {k: "%s: %s (%s)" % (v["group"], v["label"], v["kind"]) for k, v in SOP_SPOT_INFO.items()}
+        for spot in sorted(want - have):
+            conn.execute("INSERT INTO sop_links (spot, sop_id, created_by, created_at) VALUES (?,?,?,?)", (spot, sid, user["name"], now_iso()))
+            self._log_sop_edit(conn, sid, user, "Linked at", "-", label[spot])
+        for spot in sorted(have - want):
+            conn.execute("DELETE FROM sop_links WHERE spot=? AND sop_id=?", (spot, sid))
+            self._log_sop_edit(conn, sid, user, "Unlinked from", label.get(spot, spot), "-")
+
+    def route_sop_links(self, method, seg, conn, user):
+        """PUT /api/sop-links/<spot> {sopIds: [...]}: the SOPs shown at one spot (the other direction of /api/sop-documents/:id/links)."""
+        self._require_admin(user)
+        if seg == ["api", "sop-links", "bulk"] and method == "POST":
+            d = self._body_json()
+            sid = d.get("sopId")
+            row = conn.execute("SELECT * FROM sop_documents WHERE id=?", (sid,)).fetchone() if str(sid).isdigit() else None
+            if not row:
+                raise ApiError(404, "SOP not found")
+            action, want = d.get("action"), d.get("spots")
+            if action not in ("add", "remove") or not isinstance(want, list):
+                raise ApiError(400, "An action (add or remove) and a list of places are needed")
+            want = {str(x) for x in want}
+            if want - SOP_SPOT_KEYS:
+                raise ApiError(400, "Unknown place: %s" % sorted(want - SOP_SPOT_KEYS)[0])
+            have = {r["spot"] for r in conn.execute("SELECT spot FROM sop_links WHERE sop_id=?", (row["id"],))}
+            self._apply_sop_spots(conn, row["id"], (have | want) if action == "add" else (have - want), user)
+            return {"sopLinks": self._sop_links_by_spot(conn)}
+        if len(seg) == 3 and method == "PUT":
+            spot = seg[2]
+            if spot not in SOP_SPOT_KEYS:
+                raise ApiError(404, "Unknown place")
+            d = self._body_json()
+            ids = d.get("sopIds")
+            if not isinstance(ids, list):
+                raise ApiError(400, "A list of SOPs is needed")
+            ids = {int(x) for x in ids if str(x).isdigit()}
+            have = {r["sop_id"] for r in conn.execute("SELECT sop_id FROM sop_links WHERE spot=?", (spot,))}
+            for sid in sorted(ids | have):
+                if not conn.execute("SELECT 1 FROM sop_documents WHERE id=?", (sid,)).fetchone():
+                    raise ApiError(400, "An SOP in the list no longer exists")
+                spots = {r["spot"] for r in conn.execute("SELECT spot FROM sop_links WHERE sop_id=?", (sid,))}
+                spots = (spots | {spot}) if sid in ids else (spots - {spot})
+                self._apply_sop_spots(conn, sid, spots, user)
+            return {"sopLinks": self._sop_links_by_spot(conn)}
+        raise ApiError(404, "Unknown SOP links endpoint")
 
     def _store_sop_file(self, filename, content_type, data_b64):
         """Decode+store one base64 file under SOP_DIR -- the tote/run
@@ -6904,13 +7073,28 @@ class Handler(BaseHTTPRequestHandler):
             name = (d.get("name") or "").strip()
             if not name:
                 raise ApiError(400, "A document name is required")
+            if name != row["name"] and row["doc_number"]:
+                raise ApiError(409, "%s takes its name from its file name in SharePoint: rename the file there. The next nightly sync updates the name." % row["doc_number"],
+                               "controlled_in_sharepoint")
             dup = conn.execute("SELECT 1 FROM sop_documents WHERE name=? AND id!=?", (name, sid)).fetchone()
             if dup:
                 raise ApiError(400, "A document named \"%s\" already exists" % name)
         updates = {"name": name, "updated_at": now_iso()}
         if name != row["name"]:
             self._log_sop_edit(conn, sid, user, "Name", row["name"], name)
+        if "key" in d:
+            # an optional short reference code (nothing in the app is coded against it any more: production-log links are chosen per spot)
+            key = (d.get("key") or "").strip()[:60] or None
+            if key != row["key"]:
+                if key and conn.execute("SELECT 1 FROM sop_documents WHERE key=? AND id!=?", (key, sid)).fetchone():
+                    raise ApiError(409, "Reference key \"%s\" is already in use" % key)
+                updates["key"] = key
+                self._log_sop_edit(conn, sid, user, "Reference key", row["key"] or "-", key or "-")
         if d.get("dataB64"):
+            if row["doc_number"]:
+                # a numbered SOP's file is controlled in SharePoint: a hand upload would bypass the review, the checksum and the revision history
+                raise ApiError(409, "%s is controlled in SharePoint: replace its file there. The next nightly sync offers it on the Documents tab for review." % row["doc_number"],
+                               "controlled_in_sharepoint")
             filename, stored, size = self._store_sop_file(d.get("filename"), d.get("contentType"), d["dataB64"])
             old_stored = row["stored_name"]
             updates.update(filename=filename, content_type=served_type(filename)[0], size=size,
@@ -6926,22 +7110,6 @@ class Handler(BaseHTTPRequestHandler):
         conn.execute("UPDATE sop_documents SET %s WHERE id=?" % sets, (*updates.values(), sid))
         return {"sop": self._sop_public(conn.execute(
             "SELECT * FROM sop_documents WHERE id=?", (sid,)).fetchone())}
-
-    def _delete_sop(self, conn, sid, row):
-        if row["stored_name"]:
-            try:
-                os.remove(os.path.join(SOP_DIR, row["stored_name"]))
-            except OSError:
-                pass
-        for rv in conn.execute("SELECT stored_name FROM document_revisions WHERE kind='sop' AND doc_id=?", (sid,)).fetchall():
-            try:
-                os.remove(os.path.join(SOP_DIR, rv["stored_name"]))
-            except OSError:
-                pass
-        conn.execute("DELETE FROM document_revisions WHERE kind='sop' AND doc_id=?", (sid,))
-        conn.execute("UPDATE library_inbox SET target_id=NULL WHERE kind='sop' AND target_id=?", (sid,))
-        conn.execute("DELETE FROM sop_documents WHERE id=?", (sid,))
-        return {"ok": True}
 
     # ---- dashboard -------------------------------------------------------- #
     def dashboard(self, conn):

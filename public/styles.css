@@ -334,6 +334,41 @@ th.sortable:hover { background: #e2ece9; }
 .qc-check-result-value { font-size: 20px; font-weight: 700; color: var(--teal-dark); font-variant-numeric: tabular-nums; }
 .qc-check-sop { margin-top: 10px; font-size: 13px; }
 .qc-check-sop a { font-weight: 600; }
+/* SOP links an administrator chose for a section, box or window (Admin > SOPs) */
+.sop-slot { margin: 6px 0 10px; font-size: 13px; padding: 5px 10px; border-radius: 8px; background: #f1f6f5; border: 1px solid var(--line); }
+.sop-slot-label { display: inline-block; margin-right: 8px; font-size: 10.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
+.sop-slot a { font-weight: 600; }
+
+/* The place picker for SOP links (filters, grouping, ticklist) */
+.pick-controls { display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; }
+.pick-controls .pick-search { width: 100%; }
+.pick-line { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.pick-line select { width: auto; min-width: 220px; }
+.pick-label { font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); min-width: 58px; }
+.pick-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.pick-chip { border: 1px solid var(--line); background: #fff; color: var(--ink, #1d2b2a); border-radius: 999px; padding: 3px 12px; font-size: 12.5px; font-weight: 600; cursor: pointer; }
+.pick-chip:hover { background: #f1f6f5; }
+.pick-chip.on { background: var(--teal-dark); border-color: var(--teal-dark); color: #fff; }
+.pick-only { margin: 0 0 0 auto; font-size: 13px; font-weight: normal; display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.pick-scroll { max-height: 50vh; overflow: auto; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
+.pick-group + .pick-group { border-top: 1px solid var(--line); }
+.pick-group-head { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; gap: 10px; margin: 0; padding: 7px 12px; background: #eef4f3; border-bottom: 1px solid var(--line); font-size: 12.5px; font-weight: 700; color: var(--teal-dark); cursor: pointer; }
+.pick-group-head .count { margin-left: auto; font-weight: 400; color: var(--muted); }
+.pick-row { display: flex; align-items: center; gap: 10px; margin: 0; padding: 7px 12px 7px 30px; font-weight: normal; font-size: 13.5px; cursor: pointer; border-bottom: 1px solid #f0f4f3; }
+.pick-row:last-child { border-bottom: 0; }
+.pick-row:hover { background: #f6faf9; }
+.pick-row.on { background: #edf7f4; }
+.pick-name { display: inline-flex; align-items: baseline; gap: 10px; }
+.pick-tag { display: inline-block; min-width: 96px; font-size: 10.5px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+.pick-group-head input[type=checkbox], .pick-row input[type=checkbox], .pick-only input[type=checkbox] { width: 16px; height: 16px; flex: none; margin: 0; padding: 0; accent-color: var(--teal); }
+.pick-group-head span:not(.count), .pick-name { text-align: left; }
+.pick-name { flex: 1; min-width: 0; }
+.pick-only { white-space: nowrap; }
+.pick-controls .pick-search { margin: 0; }
+.pick-line select { margin: 0; }
+.pick-tag.wide { min-width: 170px; }
+.pick-counter { margin-top: 8px; font-size: 12.5px; color: var(--muted); }
+.pick-empty { padding: 22px; text-align: center; color: var(--muted); font-size: 13px; }
 /* Quality-check family: same shell, purple fill/title -- QC Check #1 (lot
    characterization) in Homogenization Output. */
 .qc-check-box.theme-quality { background: #f2eaf9; }
