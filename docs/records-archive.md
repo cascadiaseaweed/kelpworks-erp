@@ -85,5 +85,5 @@ the data itself is damaged.
 
 ## Not in this first version
 
-- SOPs and safety data sheets flowing from SharePoint **into** KelpWorks (the review-and-accept page), and shipment documents. The folders are created now so the structure is in place.
+- Shipment documents. (SOPs and safety data sheets flowing from SharePoint **into** KelpWorks are in `controlled-documents.md`.)
 - Pushing straight to SharePoint from the server (Microsoft Graph) so no PC is needed. The manifest and file names are the same; only the last step would change.

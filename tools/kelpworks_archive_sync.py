@@ -9,6 +9,8 @@ What it does (see docs/records-archive.md):
   * for every finalized production run, downloads each document the server lists into its run folder, under the names the server chose;
     a file that changed on the server is downloaded again and the old copy is moved to an `_superseded` folder beside it;
   * downloads the newest nightly backups into 01_System-Backups/daily and keeps weekly and monthly copies, pruning only what it created;
+  * the other way round, reports what is in 03_SOPs/Current and 04_Safety-Data-Sheets/Current to KelpWorks and uploads the files it does not have, so an administrator
+    can accept new and changed controlled documents there (SharePoint stays the master; KelpWorks never changes its list by itself);
   * NEVER deletes a record: a document removed in KelpWorks stays in the archive.
 
 Exit code 0 = everything done, 1 = some files failed (the rest were still copied), 2 = bad settings or the server could not be reached.
@@ -46,8 +48,11 @@ class Client:
     def __init__(self, base_url, key, timeout=300):
         self.base, self.key, self.timeout = base_url.rstrip("/"), key, timeout
 
-    def _open(self, path):
-        req = urllib.request.Request(self.base + path, headers={"X-Archive-Key": self.key})
+    def _open(self, path, data=None, content_type=None):
+        headers = {"X-Archive-Key": self.key}
+        if content_type:
+            headers["Content-Type"] = content_type
+        req = urllib.request.Request(self.base + path, data=data, headers=headers, method="POST" if data is not None else "GET")
         try:
             return urllib.request.urlopen(req, timeout=self.timeout)
         except urllib.error.HTTPError as e:
@@ -62,6 +67,14 @@ class Client:
 
     def get_json(self, path):
         with self._open(path) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    def post_json(self, path, obj):
+        with self._open(path, json.dumps(obj).encode("utf-8"), "application/json") as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    def post_bytes(self, path, data):
+        with self._open(path, data, "application/octet-stream") as r:
             return json.loads(r.read().decode("utf-8"))
 
     def download(self, path, dest):
@@ -187,6 +200,56 @@ def sync_files(client, root, state, dry_run=False):
     return counts
 
 
+# ---- controlled documents: SOPs and safety data sheets (SharePoint is the master) ----
+
+DOC_FOLDERS = (("sop", "03_SOPs/Current", "SOPs"), ("sds", "04_Safety-Data-Sheets/Current", "Safety data sheets"))
+
+
+def list_documents(folder, rel):
+    """The files directly inside `folder` as the server wants them: [{path, size, sha256}] (temporary and hidden files left out)."""
+    out = []
+    for name in sorted(os.listdir(folder)):
+        full = os.path.join(folder, name)
+        if os.path.isdir(full):
+            say("WARNING: the sub-folder %s/%s is ignored: put controlled documents directly in the Current folder" % (rel, name))
+        elif name.startswith(("~$", ".")) or name.lower() in ("desktop.ini", "thumbs.db") or name.lower().endswith((".tmp", ".part")):
+            continue
+        else:
+            out.append({"path": "%s/%s" % (rel, name), "size": os.path.getsize(full), "sha256": sha256_file(full)})
+    return out
+
+
+def sync_documents(client, root, dry_run=False):
+    failed = 0
+    for kind, rel, label in DOC_FOLDERS:
+        folder = safe_join(root, rel)
+        if not os.path.isdir(folder):
+            say("WARNING: %s: the folder %s does not exist here (a normal sync creates it; check that the library is synced)" % (label, rel))
+            continue
+        try:
+            files = list_documents(folder, rel)
+            if dry_run:
+                say("%s: would report %d file(s) to KelpWorks" % (label, len(files)))
+                continue
+            reply = client.post_json("/api/library/scan", {"kind": kind, "files": files})
+            for w in reply.get("warnings", []):
+                say("WARNING: %s: %s" % (label, w))
+            sent = 0
+            by_path = {f["path"]: f for f in files}
+            for need in reply.get("need", []):
+                f = by_path.get(need["path"])
+                if not f:
+                    continue
+                with open(safe_join(root, f["path"]), "rb") as fh:
+                    client.post_bytes("/api/library/upload?" + urllib.parse.urlencode({"kind": kind, "path": f["path"], "sha256": f["sha256"]}), fh.read())
+                sent += 1
+            say("%s: %d file(s) in the folder, %d sent to KelpWorks, %d change(s) waiting for an administrator to review" % (label, len(files), sent, reply.get("pending", 0)))
+        except (SyncError, OSError) as e:
+            failed += 1
+            say("FAILED: %s: %s" % (label, e))
+    return {"failed": failed}
+
+
 # ---- backups ----
 
 def tier_names(day):
@@ -303,7 +366,8 @@ def parse_args(argv):
     p.add_argument("--keep-monthly", type=int, default=24)
     p.add_argument("--keep-premigrate", type=int, default=6)
     p.add_argument("--skip-runs", action="store_true", help="only sync the backups")
-    p.add_argument("--skip-backups", action="store_true", help="only sync the production-run documents")
+    p.add_argument("--skip-backups", action="store_true", help="do not copy the backups")
+    p.add_argument("--skip-documents", action="store_true", help="do not report the SOP / safety data sheet folders to KelpWorks")
     p.add_argument("--dry-run", action="store_true", help="show what would be copied; change nothing")
     p.add_argument("--init", action="store_true", help="create --root if it does not exist (otherwise a wrong path is an error)")
     return p.parse_args(argv)
@@ -335,6 +399,8 @@ def main(argv=None):
     try:
         if not a.skip_runs:
             problems += sync_files(client, root, state, a.dry_run)["failed"]
+        if not a.skip_documents:
+            problems += sync_documents(client, root, a.dry_run)["failed"]
         if not a.skip_backups:
             problems += sync_backups(client, root, state, a.keep_daily, a.keep_weekly, a.keep_monthly, a.keep_premigrate, a.dry_run)["failed"]
     except SyncError as e:
