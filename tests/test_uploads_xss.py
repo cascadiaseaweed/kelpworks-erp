@@ -24,7 +24,7 @@ def upload(client, run_id, filename, content=b"hello", content_type="application
 
 def fetch(server, client, url_path):
     """GET a path with the token in ?token= (how the app opens documents) and return (status, headers, body)."""
-    req = urllib.request.Request("%s%s%stoken=%s" % (server.url, url_path, "&" if "?" in url_path else "?", client.token))
+    req = urllib.request.Request("%s%s%stoken=%s" % (server.url, url_path, "&" if "?" in url_path else "?", client.download_token()))
     try:
         with urllib.request.urlopen(req) as r:
             return r.status, r.headers, r.read()

@@ -110,6 +110,12 @@ class ApiClient:
     def delete(self, path, **kw):
         return self.request("DELETE", path, **kw)
 
+    def download_token(self):
+        """A short-lived download token: what the app puts in a file link (?token=)."""
+        r = self.post("/api/auth/download-token")
+        r.raise_for_status()
+        return r.json["token"]
+
     def login(self, email, password):
         """Log in and keep the token on this client. Returns the login Response (check `.status` for a failed login)."""
         r = self.post("/api/auth/login", {"email": email, "password": password}, token="")
