@@ -121,6 +121,7 @@ def load_secret():
 
 SECRET, SECRET_SOURCE = load_secret()
 TOKEN_TTL = 60 * 60 * 12  # 12 hours
+DOWNLOAD_TOKEN_TTL = 15 * 60  # a download link (?token=) lives 15 minutes and opens files only
 
 ADMIN_EMAIL = os.environ.get("KELP_ERP_ADMIN_EMAIL", "admin@kelp.local")
 # Convenience defaults (admin kelp1234, staff Cascadia123!) exist ONLY for local development: start with KELP_ERP_ENV=development.
@@ -209,6 +210,8 @@ SETTINGS_DEFAULTS = [
      "A safety data sheet is flagged \"review soon\" when its review date is this many days away or less."),
     ("library_scan_stale_days", 3, "SharePoint folder check: warn after (days)",
      "The Documents page warns administrators when the SOP / safety data sheet folders have not been reported by the sync for longer than this."),
+    ("upload_user_daily_mb", 300, "Uploads: most one person may upload in 24 hours (MB; 0 = no limit)",
+     "Documents and photos together. A person who reaches it is told to try again later; an administrator can raise it."),
     ("release_separate_signers", 0, "Release: reviewer and releaser must be different people (1 = yes)",
      "When 1, the person who signed a run's production-log review cannot also sign its Quality release."),
     ("review_not_by_finalizer", 0, "Review: the person who finalized a run cannot review it (1 = yes)",
@@ -1516,6 +1519,16 @@ CREATE TABLE IF NOT EXISTS user_permission_log (
     changed_at  TEXT NOT NULL
 );
 
+-- A record of something deleted on purpose (a tote with no run history): what it was, who removed it and when. Append-only.
+CREATE TABLE IF NOT EXISTS deleted_records (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_type TEXT NOT NULL,
+    ref         TEXT,
+    snapshot    TEXT NOT NULL,
+    deleted_by  TEXT,
+    deleted_at  TEXT NOT NULL
+);
+
 -- Every change to a rule the release depends on: a Certificate of Analysis specification (limit, release rule, ...) or a setting. area: spec | setting.
 CREATE TABLE IF NOT EXISTS config_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1750,7 +1763,7 @@ def backups_dir():
 MIGRATION_SNAPSHOTS_KEPT = 3
 
 
-def snapshot_before_migrating(conn, stamp=None):
+def snapshot_before_migrating(conn, stamp=None, prefix="pre-migrate"):
     """Copy the database (compressed, with sqlite's backup API) into backups/ next to it BEFORE a new version of the code migrates it, so a bad
     migration can be undone by restoring the file. Skipped when the disk is too full to do it safely. Returns the file path or None."""
     try:
@@ -1762,7 +1775,7 @@ def snapshot_before_migrating(conn, stamp=None):
             return None
         stamp = stamp or datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
         raw_copy = os.path.join(folder, "snapshot-%s.tmp" % stamp)
-        target = os.path.join(folder, "pre-migrate-%s.db.gz" % stamp)
+        target = os.path.join(folder, "%s-%s.db.gz" % (prefix, stamp))
         dst = sqlite3.connect(raw_copy)
         try:
             conn.backup(dst)
@@ -1771,7 +1784,7 @@ def snapshot_before_migrating(conn, stamp=None):
         with open(raw_copy, "rb") as src, gzip.open(target, "wb", compresslevel=6) as out:
             shutil.copyfileobj(src, out, 1 << 20)
         os.remove(raw_copy)
-        for old in sorted(f for f in os.listdir(folder) if f.startswith("pre-migrate-") and f.endswith(".db.gz"))[:-MIGRATION_SNAPSHOTS_KEPT]:
+        for old in sorted(f for f in os.listdir(folder) if f.startswith(prefix + "-") and f.endswith(".db.gz"))[:-MIGRATION_SNAPSHOTS_KEPT]:
             os.remove(os.path.join(folder, old))
         logger.info("Database snapshot before migrating: %s", target)
         return target
@@ -3928,17 +3941,22 @@ RELEASE_SNAPSHOT_VERSION = 5
 
 def rebaseline_release_hashes(conn):
     ver = conn.execute("PRAGMA user_version").fetchone()[0]
+    if ver > RELEASE_SNAPSHOT_VERSION:
+        # this code is OLDER than the database (a rollback after a snapshot-format change): signed logs will not match their hashes until the newer code is back
+        logger.warning("The database was written by a newer snapshot format (%d) than this code knows (%d): release sign-offs may show as changed until the newer version is deployed.",
+                       ver, RELEASE_SNAPSHOT_VERSION)
     if ver >= RELEASE_SNAPSHOT_VERSION:
         return
     h = Handler.__new__(Handler)   # snapshot helpers only need a connection, not a request
-    for r in conn.execute("SELECT id, release_state FROM production_runs"
+    for r in conn.execute("SELECT id, release_state, release_review_hash FROM production_runs"
                           " WHERE release_state IN ('pending_release','released') AND release_review_hash IS NOT NULL").fetchall():
         new_hash = h._release_snapshot_hash(conn, r["id"])
-        conn.execute("UPDATE production_runs SET release_review_hash=? WHERE id=?", (new_hash, r["id"]))
+        conn.execute("UPDATE production_runs SET release_review_hash=? WHERE id=?", (new_hash, r["id"]))      # the signed hash it replaces stays in the event below
         release_log(conn, r["id"], "rebaseline", None, capacity="System",
                     meaning="Production-log snapshot format changed (version %d); the signed log hash was recomputed "
                             "from the current log." % RELEASE_SNAPSHOT_VERSION,
-                    log_hash=new_hash, detail={"snapshotVersion": RELEASE_SNAPSHOT_VERSION, "state": r["release_state"]})
+                    log_hash=new_hash, detail={"snapshotVersion": RELEASE_SNAPSHOT_VERSION, "previousVersion": ver, "state": r["release_state"],
+                                               "previousHash": r["release_review_hash"]})
     conn.execute("PRAGMA user_version=%d" % RELEASE_SNAPSHOT_VERSION)
 
 
@@ -4552,8 +4570,11 @@ def _unb64(s):
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
-def make_token(user_id, token_version=0):
-    payload = {"uid": user_id, "exp": int(time.time()) + TOKEN_TTL, "tv": int(token_version or 0)}
+def make_token(user_id, token_version=0, scope="", ttl=None):
+    """A signed token. scope '' = a session token (Authorization header, everything); scope 'dl' = a download token (?token= on a file route only, short-lived)."""
+    payload = {"uid": user_id, "exp": int(time.time()) + (ttl or TOKEN_TTL), "tv": int(token_version or 0)}
+    if scope:
+        payload["sc"] = scope
     body = _b64(json.dumps(payload).encode("utf-8"))
     sig = _b64(hmac.new(SECRET, body.encode("ascii"), hashlib.sha256).digest())
     return f"{body}.{sig}"
@@ -5589,6 +5610,12 @@ def restore_backup(zip_path):
         raise ApiError(403, "Restore is disabled on this server (it is only available on a staging server).")
     if len(STAGING_PASSWORD) < MIN_PASSWORD_LEN:
         raise ApiError(400, "Set KELP_ERP_STAGING_PASSWORD (at least %d characters) on this server before restoring." % MIN_PASSWORD_LEN)
+    return _restore_zip(zip_path, scrub=True)
+
+
+def _restore_zip(zip_path, scrub, safety_copy=False):
+    """Validate a full backup .zip completely, then replace the database and the document folders with it and migrate it. scrub=True is the staging restore
+    (every password reset); safety_copy=True keeps a compressed copy of the data being replaced (the live restore)."""
     try:
         zf = zipfile.ZipFile(zip_path)
     except (zipfile.BadZipFile, OSError):
@@ -5627,6 +5654,14 @@ def restore_backup(zip_path):
             if not ok or not has_users:
                 raise ApiError(400, "The database inside the backup is damaged or is not a KelpWorks database; nothing was restored.")
             with RESTORE_LOCK:
+                if safety_copy and os.path.isfile(DB_PATH) and os.path.getsize(DB_PATH) > 0:
+                    cur_db = sqlite3.connect(DB_PATH, timeout=60)
+                    try:
+                        kept = snapshot_before_migrating(cur_db, prefix="pre-restore")
+                    finally:
+                        cur_db.close()
+                    if kept is None:
+                        raise ApiError(507, "There is not enough free disk to keep a copy of the current data first; nothing was restored.")
                 src = sqlite3.connect(tmp_db)
                 dst = sqlite3.connect(DB_PATH, timeout=60)
                 try:
@@ -5655,8 +5690,9 @@ def restore_backup(zip_path):
                 init_db()                                             # bring the restored data up to this version's schema
                 conn = db()
                 try:
-                    scrub_for_staging(conn)
-                    conn.commit()
+                    if scrub:
+                        scrub_for_staging(conn)
+                        conn.commit()
                     users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
                 finally:
                     conn.close()
@@ -5725,12 +5761,14 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             raise ApiError(400, "Invalid JSON body")
 
-    def _user_from_token(self, conn, token):
+    def _user_from_token(self, conn, token, scope=""):
         """The user a token belongs to, or an ApiError. Rejects an expired / forged token, a token from before the user's last password change
-        or deactivation (token_version), and a deactivated user."""
+        or deactivation (token_version), a deactivated user, and a token of the wrong kind (a session token where a download token is needed, or the reverse)."""
         payload = read_token(token or "")
         if not payload:
             raise ApiError(401, "Invalid or expired token")
+        if (payload.get("sc") or "") != scope:
+            raise ApiError(401, "Invalid or expired token" if scope == "" else "This link has expired. Open the file again from the app.")
         row = conn.execute("SELECT * FROM users WHERE id=?", (payload["uid"],)).fetchone()
         if not row:
             raise ApiError(401, "User not found")
@@ -5747,12 +5785,16 @@ class Handler(BaseHTTPRequestHandler):
         return self._user_from_token(conn, header[7:])
 
     def _token_user(self, conn):
-        """Authenticate a download: the token comes from the Authorization header, or from ?token= (so a file can open in a browser tab)."""
+        """Authenticate a download: a session token in the Authorization header, or a short-lived DOWNLOAD token in ?token= (so a file can open in a browser tab).
+        A session token in the address is refused: addresses end up in browser history and logs."""
         header = self.headers.get("Authorization", "")
-        tok = header[7:] if header.startswith("Bearer ") else (parse_qs(urlparse(self.path).query).get("token", [""])[0])
-        if not tok:
-            raise ApiError(401, "Missing token")
-        user = self._user_from_token(conn, tok)
+        if header.startswith("Bearer "):
+            user = self._user_from_token(conn, header[7:])
+        else:
+            tok = parse_qs(urlparse(self.path).query).get("token", [""])[0]
+            if not tok:
+                raise ApiError(401, "Missing token")
+            user = self._user_from_token(conn, tok, scope="dl")
         if user["must_change_password"]:
             raise ApiError(403, "You must change your password before continuing.", "password_change_required")
         return user
@@ -6659,6 +6701,8 @@ class Handler(BaseHTTPRequestHandler):
         if user["must_change_password"] and seg not in (["api", "me"], ["api", "me", "password"]):
             raise ApiError(403, "You must change your password before continuing.", "password_change_required")
 
+        if method == "POST" and seg == ["api", "auth", "download-token"]:
+            return {"token": make_token(user["id"], user["token_version"], scope="dl", ttl=DOWNLOAD_TOKEN_TTL), "expiresIn": DOWNLOAD_TOKEN_TTL}
         if method == "GET" and seg == ["api", "me"]:
             return self._me(user)
         if method == "POST" and seg == ["api", "me", "password"]:
@@ -7421,8 +7465,14 @@ class Handler(BaseHTTPRequestHandler):
                                 (tid, tid)).fetchone():
                     raise ApiError(409, "This tote was inspected for a production run or pre-processing batch, so it is part of that record and "
                                         "cannot be deleted. Place it on QAQC Hold or dispose of it instead.", "tote_has_history")
-                self._files_to_remove += [os.path.join(UPLOAD_DIR, a["stored_name"]) for a in conn.execute(
-                    "SELECT stored_name FROM tote_attachments WHERE tote_lot_id=?", (tid,))]
+                files = conn.execute("SELECT * FROM tote_attachments WHERE tote_lot_id=?", (tid,)).fetchall()
+                self._files_to_remove += [os.path.join(UPLOAD_DIR, a["stored_name"]) for a in files]
+                # what the tote was goes on the record before its rows are removed (the stability log and photos go with it, so they are described here)
+                conn.execute("INSERT INTO deleted_records (entity_type, ref, snapshot, deleted_by, deleted_at) VALUES ('tote', ?, ?, ?, ?)",
+                             (it["lot_number"], _canon({"tote": dict(it), "stabilityLog": [dict(r) for r in conn.execute(
+                                 "SELECT * FROM tote_stability_log WHERE tote_lot_id=? ORDER BY id", (tid,))],
+                                 "files": [{"filename": a["filename"], "size": a["size"], "uploadedBy": a["uploaded_by"], "uploadedAt": a["uploaded_at"]} for a in files]}),
+                              user["name"], now_iso()))
                 conn.execute("DELETE FROM tote_lots WHERE id=?", (tid,))
                 return {"ok": True}
         raise ApiError(404, "Unknown totes endpoint")
@@ -10622,6 +10672,17 @@ class Handler(BaseHTTPRequestHandler):
         if free - nbytes < MIN_FREE_DISK_BYTES:
             raise ApiError(507, "The server is almost out of disk space; the upload was refused.")
 
+    def _check_user_quota(self, conn, uploaded_by, nbytes):
+        """One person cannot fill the document store: what they uploaded in the last 24 hours (documents and photos) plus this file stays within upload_user_daily_mb."""
+        limit_mb = float(get_setting_value(conn, "upload_user_daily_mb", 300) or 0)
+        if limit_mb <= 0 or not uploaded_by:
+            return
+        since = (datetime.datetime.utcnow() - datetime.timedelta(hours=24)).replace(microsecond=0).isoformat() + "Z"
+        used = sum(conn.execute("SELECT COALESCE(SUM(size),0) FROM %s WHERE uploaded_by=? AND uploaded_at>=?" % t, (uploaded_by, since)).fetchone()[0]
+                   for t in ("run_attachments", "tote_attachments"))
+        if used + nbytes > limit_mb * 1024 * 1024:
+            raise ApiError(429, "You have reached the upload limit for today (%d MB in 24 hours). Try again later, or ask an administrator to raise it." % limit_mb, "upload_quota")
+
     def _write_upload(self, directory, raw, ext):
         """Write an uploaded file under an opaque name. The path is remembered so it is deleted again if the request fails before its commit."""
         os.makedirs(directory, exist_ok=True)
@@ -10656,6 +10717,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "File exceeds the %d MB limit" % (MAX_UPLOAD_BYTES // (1024 * 1024)))
         check_upload_filename(filename)
         self._check_storage_room(conn, len(raw))
+        self._check_user_quota(conn, uploaded_by, len(raw))
         stored = self._write_upload(UPLOAD_DIR, raw, os.path.splitext(filename)[1][:12])
         cur = conn.cursor()
         cur.execute(
@@ -10991,6 +11053,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "File exceeds the %d MB limit" % (MAX_UPLOAD_BYTES // (1024 * 1024)))
         check_upload_filename(filename)
         self._check_storage_room(conn, len(raw))
+        self._check_user_quota(conn, uploaded_by, len(raw))
         stored = self._write_upload(UPLOAD_DIR, raw, os.path.splitext(filename)[1][:12])
         cur = conn.cursor()
         cur.execute(
@@ -13502,8 +13565,47 @@ def boot_summary():
         return "Database: %s (could not be summarised: %s)" % (DB_PATH, e)
 
 
+def require_mounted_volume():
+    """If the persistent disk fails to mount, the service would start on the container's temporary filesystem with a freshly seeded database, the default
+    admin and the seed data, and still pass the health check. KELP_ERP_REQUIRE_MOUNT=<the disk's mount path, e.g. /var/data> makes the server refuse to start
+    unless that path really is a mounted volume."""
+    want = os.environ.get("KELP_ERP_REQUIRE_MOUNT", "").strip()
+    if want and not os.path.ismount(want):
+        logger.critical("KELP_ERP_REQUIRE_MOUNT=%s but that path is not a mounted volume: the persistent disk is missing, so starting would create a NEW empty database. "
+                        "Refusing to start. Check the disk in the Render dashboard.", want)
+        raise SystemExit(1)
+
+
+def restore_on_boot():
+    """Restore the LIVE data from a full backup, safely: the server is not serving while it happens. The operator puts the .zip on the disk and sets
+    KELP_ERP_RESTORE_FROM=<path> and KELP_ERP_RESTORE_CONFIRM=replace-live-data, then restarts the service (docs/restore-runbook.md). A copy of the data being
+    replaced is kept in backups/ first; the .zip is renamed afterwards so the next start does not restore again; passwords are NOT reset."""
+    path = os.environ.get("KELP_ERP_RESTORE_FROM", "").strip()
+    if not path:
+        return
+    if os.environ.get("KELP_ERP_RESTORE_CONFIRM", "") != "replace-live-data":
+        logger.critical("KELP_ERP_RESTORE_FROM is set but KELP_ERP_RESTORE_CONFIRM=replace-live-data is not: nothing was restored and the server will not start. "
+                        "Set both to restore, or remove KELP_ERP_RESTORE_FROM.")
+        raise SystemExit(1)
+    if not os.path.isfile(path):
+        logger.warning("KELP_ERP_RESTORE_FROM points to %s, which does not exist (already restored?). Nothing to restore: remove KELP_ERP_RESTORE_FROM and "
+                       "KELP_ERP_RESTORE_CONFIRM from the environment.", path)
+        return
+    try:
+        info = _restore_zip(path, scrub=False, safety_copy=True)
+    except ApiError as e:
+        logger.critical("RESTORE FAILED, nothing was replaced: %s", e.message)
+        raise SystemExit(1)
+    done = "%s.restored-%s" % (path, datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S"))
+    os.replace(path, done)
+    logger.warning("RESTORED from %s (backup made %s): %d users, files %s. A copy of the previous data is in backups/pre-restore-*.db.gz. "
+                   "Remove KELP_ERP_RESTORE_FROM and KELP_ERP_RESTORE_CONFIRM from the environment now.", done, info.get("backupCreatedAt"), info["users"], info["files"])
+
+
 def main():
     configure_logging()
+    require_mounted_volume()
+    restore_on_boot()
     try:
         init_db()
     except Exception:

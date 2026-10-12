@@ -87,7 +87,8 @@ def test_a_user_who_must_change_their_password_can_do_nothing_else(server, admin
     assert login.status == 200 and login.json["user"]["mustChange"] is True
     refused = c.get("/api/refdata")
     assert refused.status == 403 and refused.json.get("code") == "password_change_required"
-    assert c.get("/api/reports/xlsx?token=%s" % c.token).status == 403                  # downloads too
+    assert c.post("/api/auth/download-token").status == 403                              # no download link either
+    assert c.get("/api/reports/xlsx?token=%s" % c.token, token="").status == 401
     assert c.get("/api/me").status == 200
     changed = c.post("/api/me/password", {"currentPassword": pw, "newPassword": "a-new-long-password"})
     assert changed.status == 200
@@ -128,10 +129,11 @@ def test_a_deactivated_user_loses_api_and_download_access(server, admin):
     email, pw, uid = make(server, admin, "deactivate")
     c = server.client()
     c.login(email, pw)
-    assert c.get("/api/reports/xlsx?token=%s" % c.token).status == 200
+    dl = c.download_token()
+    assert c.get("/api/reports/xlsx?token=%s" % dl, token="").status == 200
     assert admin.put("/api/users/%d" % uid, {"active": False}).status == 200
     assert c.get("/api/me").status in (401, 403)
-    assert c.get("/api/reports/xlsx?token=%s" % c.token).status in (401, 403)           # this used to keep working for up to 12 hours
+    assert c.get("/api/reports/xlsx?token=%s" % dl, token="").status in (401, 403)           # this used to keep working for up to 12 hours
 
 
 # ---- R-13: login throttling, no account-existence oracle ----
@@ -183,3 +185,37 @@ def test_unknown_and_known_accounts_take_similar_time():
             return (time.time() - start) / 3
         known, unknown = average("admin@test.local"), average("nobody@test.local")
         assert unknown > known * 0.5, "unknown email answered in %.3fs vs %.3fs for a known one" % (unknown, known)
+
+
+# ---- batch 8: a link carries a short-lived DOWNLOAD token, never the session token ----
+
+def test_a_session_token_in_the_address_is_refused_but_a_download_token_opens_the_file(server, admin):
+    assert admin.get("/api/reports/xlsx?token=%s" % admin.token, token="").status == 401
+    dl = admin.download_token()
+    assert dl != admin.token
+    assert admin.get("/api/reports/xlsx?token=%s" % dl, token="").status == 200
+
+
+def test_a_download_token_is_not_a_session_token(server, admin):
+    dl = admin.download_token()
+    assert admin.get("/api/me", token=dl).status == 401                                  # not accepted as a Bearer token for the API
+    assert admin.get("/api/admin/backup", token=dl).status == 401                        # nor in the header of a download
+    assert admin.post("/api/auth/download-token", token=dl).status == 401                # and it cannot mint more of itself
+
+
+def test_a_download_token_expires_and_ends_with_the_session(server, admin):
+    import base64, hashlib, hmac, json, time
+    from harness import SIGNING_SECRET
+
+    def signed(uid, exp):                                                                  # the same signing the server does, to build a token that is already out of date
+        body = base64.urlsafe_b64encode(json.dumps({"uid": uid, "exp": exp, "tv": 0, "sc": "dl"}).encode()).decode().rstrip("=")
+        return body + "." + base64.urlsafe_b64encode(hmac.new(SIGNING_SECRET.encode(), body.encode(), hashlib.sha256).digest()).decode().rstrip("=")
+    uid = admin.get("/api/me").json["id"]
+    assert admin.get("/api/reports/xlsx?token=%s" % signed(uid, int(time.time()) + 60), token="").status == 200       # the control: valid now
+    assert admin.get("/api/reports/xlsx?token=%s" % signed(uid, int(time.time()) - 5), token="").status == 401        # the same token, expired
+    email, pw, uid = make(server, admin, "dlpw")
+    c = server.client()
+    c.login(email, pw)
+    dl = c.download_token()
+    assert admin.post("/api/users/%d/password" % uid, {"password": "another-long-password-1", "mustChange": False}).status == 200
+    assert c.get("/api/reports/xlsx?token=%s" % dl, token="").status == 401                        # a password reset ends it too

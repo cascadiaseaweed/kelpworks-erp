@@ -190,9 +190,10 @@ def test_a_server_error_gives_a_reference_and_leaves_a_traceback_in_the_log(srv,
 
 
 def test_tokens_never_reach_the_log(srv, admin):
-    admin.get("/api/reports/xlsx?token=%s" % admin.token)
+    dl = admin.download_token()
+    admin.get("/api/reports/xlsx?token=%s" % dl, token="")
     log = wait_for_log(srv, "token=REDACTED")
-    assert "token=REDACTED" in log and admin.token not in log
+    assert "token=REDACTED" in log and dl not in log and admin.token not in log
 
 
 def test_api_requests_are_logged_with_their_result(srv, admin):

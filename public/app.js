@@ -17,6 +17,24 @@ async function api(method, path, body) {
   return data;
 }
 
+/* A link that opens a file in the browser carries a SHORT-LIVED download token (15 minutes, files only), never the session token. It is refreshed in the
+   background and swapped into a link at the moment it is clicked, so a page left open for hours still downloads. */
+const DL = { token: '', at: 0 };
+function dlToken() { return DL.token; }
+async function refreshDlToken() {
+  if (!State.token) return;
+  try {
+    const r = await fetch('/api/auth/download-token', { method: 'POST', headers: { Authorization: 'Bearer ' + State.token } });
+    if (r.ok) { DL.token = (await r.json()).token; DL.at = Date.now(); }
+  } catch (e) { /* the next refresh tries again */ }
+}
+setInterval(() => { if (State.token) refreshDlToken(); }, 5 * 60 * 1000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden && Date.now() - DL.at > 4 * 60 * 1000) refreshDlToken(); });
+document.addEventListener('click', e => {
+  const a = e.target.closest && e.target.closest('a[href*="token="]');
+  if (a && DL.token) a.setAttribute('href', a.getAttribute('href').replace(/([?&]token=)[^&]*/, (m, p) => p + encodeURIComponent(DL.token)));
+}, true);
+
 /* ---------------- helpers ---------------- */
 const $ = (sel, el = document) => el.querySelector(sel);
 const el = (tag, attrs = {}, ...kids) => {
@@ -91,6 +109,7 @@ async function boot() {
       changePasswordModal(true);                       // its Save signs in again with the new password and calls boot()
       return;
     }
+    await refreshDlToken();
     State.ref = await api('GET', '/refdata');
     $('#whoName').textContent = State.user.name;
     $('#tabs [data-tab=admin]').closest('.tab-group').classList.toggle('hidden', State.user.role !== 'admin');
@@ -1131,15 +1150,15 @@ function fileIcon(ct) {
 }
 function attDownloadUrl(rid, aid, dl) {
   return '/api/production/' + rid + '/attachments/' + aid + '/download?' +
-    (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(State.token);
+    (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(dlToken());
 }
 function toteAttDownloadUrl(tid, aid, dl) {
   return '/api/totes/' + tid + '/attachments/' + aid + '/download?' +
-    (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(State.token);
+    (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(dlToken());
 }
 function sopDownloadUrl(sid, dl) {
   return '/api/sop-documents/' + sid + '/download?' +
-    (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(State.token);
+    (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(dlToken());
 }
 // SOP links: an administrator chooses which SOPs are linked at each place of the production log, the CIP log, Samples and Shipping (Admin > SOPs). A spot is any element carrying
 // data-sop-spot="<key>" (a section, a box) or a window whose title starts with one of SOP_WINDOW_SPOTS: a small "SOP" line with links to the SOPs'
@@ -1193,10 +1212,10 @@ function uploadAtt(rid, file) {
   });
 }
 function coaPdfUrl(rid, dl) {
-  return '/api/production/' + rid + '/coa.pdf?' + (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(State.token);
+  return '/api/production/' + rid + '/coa.pdf?' + (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(dlToken());
 }
 function summaryPdfUrl(rid, dl) {
-  return '/api/production/' + rid + '/summary.pdf?' + (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(State.token);
+  return '/api/production/' + rid + '/summary.pdf?' + (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(dlToken());
 }
 async function openAttachments(run) {
   const listHost = el('div', {});
@@ -5227,7 +5246,7 @@ function printReport(d) {
 function downloadReportXlsx() {
   const r = State.reportRange;
   if (!r || !r.from || !r.to) return toast('Pick a date range first.', true);
-  const url = '/api/reports/xlsx?from=' + encodeURIComponent(r.from) + '&to=' + encodeURIComponent(r.to) + '&token=' + encodeURIComponent(State.token);
+  const url = '/api/reports/xlsx?from=' + encodeURIComponent(r.from) + '&to=' + encodeURIComponent(r.to) + '&token=' + encodeURIComponent(dlToken());
   const a = el('a', { href: url, download: 'kelpworks-report-' + r.from + '_' + r.to + '.xlsx' });
   document.body.append(a); a.click(); a.remove();
 }
@@ -5348,7 +5367,7 @@ async function pageYield(v) {
     el('div', { class: 'actions' },
       el('button', { class: 'secondary', onclick: () => exportYieldCsv(data) }, '⬇ CSV'),
       el('button', { class: 'secondary', onclick: () => {
-        const a = el('a', { href: '/api/yield-usage/xlsx' + yuQuery(s) + '&token=' + encodeURIComponent(State.token), download: 'kelpworks-yield-usage.xlsx' });
+        const a = el('a', { href: '/api/yield-usage/xlsx' + yuQuery(s) + '&token=' + encodeURIComponent(dlToken()), download: 'kelpworks-yield-usage.xlsx' });
         document.body.append(a); a.click(); a.remove();
       } }, '⬇ Excel'))));
   v.append(el('div', { class: 'help', style: 'margin-bottom:10px' },
@@ -6396,7 +6415,7 @@ function analysisChips(l) {
 }
 async function drawAdminLabs(v) {
   v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Labs & analyses'),
-    el('div', { class: 'actions' }, el('button', { class: 'secondary', onclick: () => { window.location = '/api/labs/starter-template/download?token=' + encodeURIComponent(State.token); } }, '⬇ Starter requisition template'),
+    el('div', { class: 'actions' }, el('button', { class: 'secondary', onclick: () => { window.location = '/api/labs/starter-template/download?token=' + encodeURIComponent(dlToken()); } }, '⬇ Starter requisition template'),
       el('button', { onclick: () => editLab(null) }, '+ Add lab'))));
   const { labs } = await api('GET', '/labs');
   if (!labs.length) { v.append(el('div', { class: 'empty card' }, 'No labs yet.')); }
@@ -6526,7 +6545,7 @@ function labTemplateModal(l) {
   const tokens = '{{req_number}} {{date}} {{date_long}} {{po_number}} {{po_check}} {{company}} {{lab_name}} {{lab_contact}} {{lab_email}} {{lab_phone}} {{lab_address}} {{customer_phone}} {{customer_email_1}} … {{customer_email_5}} {{submitter_name}} {{submitter_phone}} {{submitter_email}} {{results_name}} {{results_phone}} {{results_emails}} {{results_email_1}} … {{results_email_5}} {{br}} {{processing_lot}} {{run_date}} {{product}} {{requested_by}} {{requested_by_email}} {{sample_count}} {{analyses}} {{notes}}';
   const body = el('div', {},
     el('div', { class: 'help' }, l.hasTemplate ? 'Current template: ' + l.templateName : 'No template uploaded — requisitions use the built-in layout.'),
-    l.hasTemplate ? el('div', { style: 'margin:6px 0' }, el('a', { href: '/api/labs/' + l.id + '/template/download?token=' + encodeURIComponent(State.token) }, '⬇ Download current template'),
+    l.hasTemplate ? el('div', { style: 'margin:6px 0' }, el('a', { href: '/api/labs/' + l.id + '/template/download?token=' + encodeURIComponent(dlToken()) }, '⬇ Download current template'),
       '  ', el('button', { class: 'secondary', onclick: async () => { await api('DELETE', '/labs/' + l.id + '/template'); toast('Template removed'); document.querySelector('.modal-bg')?.remove(); render(); } }, 'Remove')) : null,
     l.readyTemplate ? el('div', { style: 'margin:8px 0;padding:10px 12px;background:#eef8f6;border-radius:10px' }, el('b', {}, 'Ready-made form available'),
       el('div', { class: 'help' }, l.readyTemplate + ' — the lab’s own form with the placeholders already in place.'),
@@ -7586,7 +7605,7 @@ async function showSopHistory(s) {
 // original doesn't help if that disk is lost.
 function downloadDbBackup() {
   const ts = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
-  const url = '/api/admin/backup?token=' + encodeURIComponent(State.token);
+  const url = '/api/admin/backup?token=' + encodeURIComponent(dlToken());
   const a = el('a', { href: url, download: 'kelpworks-backup-' + ts + '.db' });
   document.body.append(a); a.click(); a.remove();
   toast('Backup downloading…');
@@ -7596,9 +7615,9 @@ function downloadDbBackup() {
 /* ---------------- Documents: SOPs and safety data sheets (SharePoint is the master) ---------------- */
 // Quality keeps 03_SOPs/Current and 04_Safety-Data-Sheets/Current in SharePoint; the sync on the office PC reports those folders to KelpWorks, and every
 // difference waits here for an administrator to accept or ignore. Everyone can read the lists and open the files.
-function docDownloadUrl(kind, id) { return (kind === 'sop' ? '/api/sop-documents/' : '/api/sds-documents/') + id + '/download?token=' + encodeURIComponent(State.token); }
-function docRevisionUrl(id) { return '/api/doc-revisions/' + id + '/download?dl=1&token=' + encodeURIComponent(State.token); }
-function inboxFileUrl(id) { return '/api/library/inbox/' + id + '/file?token=' + encodeURIComponent(State.token); }
+function docDownloadUrl(kind, id) { return (kind === 'sop' ? '/api/sop-documents/' : '/api/sds-documents/') + id + '/download?token=' + encodeURIComponent(dlToken()); }
+function docRevisionUrl(id) { return '/api/doc-revisions/' + id + '/download?dl=1&token=' + encodeURIComponent(dlToken()); }
+function inboxFileUrl(id) { return '/api/library/inbox/' + id + '/file?token=' + encodeURIComponent(dlToken()); }
 const LIBRARY_CHANGE = { new: ['New document', 'wip'], revision: ['New revision', 'pending_release'], missing: ['File removed', 'hold'], unreadable: ['Name not readable', 'low'] };
 
 async function pageDocuments(v) {
@@ -7807,7 +7826,7 @@ async function adminArchiveSection(v) {
   if (!st.backups.length) v.append(el('div', { class: 'empty card' }, 'No backups on this server yet.'));
   else v.append(table(['Backup', 'Kind', 'Size', 'Written', ''],
     st.backups.map(b => [mono(b.name), b.kind === 'nightly' ? 'Nightly (database + documents)' : 'Before a software update (database)', fmtBytes(b.size), fmtWhen(b.modified),
-      el('a', { href: '/api/archive/backup?name=' + encodeURIComponent(b.name) + '&token=' + encodeURIComponent(State.token), download: b.name }, 'Download')]),
+      el('a', { href: '/api/archive/backup?name=' + encodeURIComponent(b.name) + '&token=' + encodeURIComponent(dlToken()), download: b.name }, 'Download')]),
     [false, false, true, false, false]));
   v.append(el('div', { class: 'help', style: 'margin-top:10px' },
     'These copies stay on the server disk. An office PC runs the sync script (tools/kelpworks_archive_sync.py) every night to copy them, and every finalized run’s documents, '
@@ -7823,7 +7842,7 @@ async function backUpNow() {
 }
 function downloadFullBackup() {
   const ts = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
-  const a = el('a', { href: '/api/admin/backup?full=1&token=' + encodeURIComponent(State.token), download: 'kelpworks-full-backup-' + ts + '.zip' });
+  const a = el('a', { href: '/api/admin/backup?full=1&token=' + encodeURIComponent(dlToken()), download: 'kelpworks-full-backup-' + ts + '.zip' });
   document.body.append(a); a.click(); a.remove();
   toast('Full backup downloading…');
 }

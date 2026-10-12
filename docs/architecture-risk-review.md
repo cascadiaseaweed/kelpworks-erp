@@ -23,10 +23,10 @@ Date: 2026-10-09. Code reviewed: `main` at `c1e5343` (after PRs #4 to #7). Scope
 | R-21 recall | **Partly fixed** (batch 6): a lot-to-customers recall report. Still open: reagent / packaging lot numbers |
 | R-03 tote reuse | **Fixed** (batch 1): ownership check at draft save and finalize; tote status/weight edits restricted |
 | R-04 secrets and defaults | **Fixed** (batch 2): no public secret (generated key file), no default passwords outside development, must-change enforced by the server, no prefilled login. Still to do in Render: confirm `KELP_ERP_SECRET` / `KELP_ERP_ADMIN_PASSWORD` are set on live and staging |
-| R-12 token revocation | **Mostly fixed** (batch 2): token versions end sessions on password change / reset / deactivation; downloads use the same authentication as the API. Still open: `?token=` is a full-scope bearer token (short-lived download tokens) |
+| R-12 token revocation | **Fixed** (batches 2 and 8): token versions end sessions on password change / reset / deactivation; downloads use the same authentication as the API; a file link carries a 15-minute download-only token, never the session token |
 | R-13 login | **Fixed** (batch 2): throttling and no timing difference for unknown emails |
 | R-05 stored XSS | **Fixed** (batch 3): files are served by their name's type only (non-PDF/image = download), script-capable types refused, print windows escape their data, a Content-Security-Policy on the app page |
-| R-25 uploads | **Mostly fixed** (batch 3): header injection and non-ASCII filenames, total size limit and disk-free check, files removed when a draft is discarded or a request fails. Still open: per-user quota |
+| R-25 uploads | **Fixed** (batches 3 and 8): header injection and non-ASCII filenames, total size limit and disk-free check, files removed when a draft is discarded or a request fails, a per-person daily limit |
 | R-08 logging | **Fixed** (batch 4): tracebacks and one line per API request go to the Render log (tokens redacted), a boot line with database size and counts, users see a short reference instead of raw errors |
 | R-09 request limits | **Fixed** (batch 4): 40 MB body cap (8 KB for login) refused before reading, 30 s socket timeout |
 | R-10 parsing bombs | **Fixed** (batch 4): bounded unpacking of docx / xlsx / pdf, capped previews |
@@ -36,11 +36,13 @@ Date: 2026-10-09. Code reviewed: `main` at `c1e5343` (after PRs #4 to #7). Scope
 | R-29 migration tests | **Fixed** (batch 5): an old release is run with real data and upgraded; failed-start, snapshot, and soft-step behaviour are tested |
 | R-26 duplicate packaging rows | **Fixed** (batch 7): finalize adds rows up to one total per container; every database rule a request trips is a 409 with a plain message |
 | R-27 drifting totals | **Mostly fixed** (batch 7): the accepted / rejected decision is locked after finalize, `edit_run` no longer changes reagent totals, finalize refuses a draft whose locked totes are missing from the request, NaN / infinity / negative quantities are refused. |
-| R-28 tote delete | **Partly fixed** (batch 7): a tote that appears in a run or pre-processing record cannot be deleted (409). Still open: the stability log and photos of a tote with no run history are deleted with it, and a Fine tote leaves no disposal record |
+| R-28 tote delete | **Fixed** (batches 7 and 8): a tote that appears in a run or pre-processing record cannot be deleted (409); deleting any other tote leaves an append-only record of what it was (including its stability log and file list) and who removed it |
 | R-30 indexes | **Fixed** (batch 7): every foreign-key column is indexed (automatically, including future tables), plus `consumable_txns(ref)` and the status columns used by the lists |
 | R-31 bad data | **Partly fixed** (batch 7): triggers refuse an unknown status on totes / finished goods / runs / pre-processing batches and negative finished-goods units. Still open: `*_id` columns without foreign keys (cannot be added to existing tables without a rebuild) |
 | R-32 volume drift | **Partly fixed** (batch 7): a run's output litres follow the litres each finished-goods lot was created with, and the IBC count works with the real container name. Still open: pre-processing pack-out is not reconciled; the re-hash of signed logs does not record what changed |
-| R-23 backups | **Mostly fixed** (batch 9): nightly full backup on the server disk with rotation, a free-space check and an admin "Back up now"; an office PC copies the backups (daily / weekly / monthly tiers) and every run's documents to SharePoint. Still to do: confirm Render disk snapshots are enabled, and a rehearsed live-restore runbook |
+| R-23 backups | **Mostly fixed** (batches 9 and 8): nightly full backup on the server disk with rotation, a free-space check and an admin "Back up now"; an office PC copies the backups (daily / weekly / monthly tiers) and every run's documents to SharePoint; `docs/restore-runbook.md` + a safe start-up restore for live. Still to do: confirm Render disk snapshots are enabled, and rehearse the runbook once |
+| R-22 missing disk | **Fixed** (batch 8, once switched on): `KELP_ERP_REQUIRE_MOUNT=/var/data` makes the server refuse to start when the disk is not mounted |
+| R-33 rebaseline | **Fixed** (batch 8): the rebaseline event records the hash it replaced and the previous version; starting older code on a newer database logs a warning |
 | R-06 shipments | **Fixed** (batch 1): duplicate lines, un-cancel, disposed-lot return, conditional deduction, write lock |
 | R-14 edit under amendment | **Fixed** (batch 1) |
 | R-15 concurrency | **Fixed** (batches 1 and 7): writes take the lock up front and wait up to 30 s; a unique-number collision is a 409 |

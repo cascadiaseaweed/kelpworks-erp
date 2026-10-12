@@ -167,7 +167,11 @@ for `main` so a red run blocks the merge.
   deactivation, so those end the user's other sessions; `POST /api/me/password` returns a fresh token for the current one). A user with `must_change_password` gets 403
   `password_change_required` from everything except `/api/me` and `/api/me/password` (the SPA asks for the new password before loading). Sign-in is throttled in memory
   (`login_wait_seconds`: 8 failures per account+address, 40 per address, per 5 minutes -> 429) and an unknown email still pays for a password check (`dummy_verify`).
-  The address is the LAST `X-Forwarded-For` entry on Render only. `?token=` is still a full-scope bearer token (short-lived download tokens are a later item).
+  The address is the LAST `X-Forwarded-For` entry on Render only. **Download links** (`?token=`) carry a SHORT-LIVED download token, never the session token: `POST /api/auth/download-token`
+  returns a `scope: 'dl'` token (`make_token(..., scope="dl", ttl=DOWNLOAD_TOKEN_TTL)`, 15 minutes); `_token_user` accepts a session token only in the Authorization header and only a `dl` token in `?token=`,
+  `_auth` / `_user_from_token` refuse a `dl` token as a Bearer token, and a password change / reset / deactivation ends it like any session. The SPA keeps one fresh (`dlToken()`, refreshed every 5 minutes
+  and on return to the tab; a capture-phase click handler swaps the current token into any `a[href*="token="]` at click time), so build every file URL with `encodeURIComponent(dlToken())`, never `State.token`.
+  Tests that follow a link must send NO Authorization header (`client.get(path, token="")`); `ApiClient.download_token()` mints one.
 - **Uploads, downloads and browser headers** (risk review batch 3; tests in `tests/test_uploads_xss.py`). What a stored file is served as comes from its FILE NAME only
   (`served_type`): PDFs and images may open inline, everything else is a download with a server-chosen type (`SAFE_INLINE_TYPES` / `DOWNLOAD_TYPES`); the type a client
   sends is ignored, including for rows stored before this rule. Script-capable extensions (`BLOCKED_UPLOAD_EXTENSIONS`: html, svg, js, xml, exe ...) are refused at upload
@@ -205,6 +209,13 @@ for `main` so a red run blocks the merge.
   Dilution & Preservation entries: `edit_run` no longer accepts them (it moved stock by item name outside `run_reagent_commits`). `num` / `numn` return the default / None for NaN and infinity;
   packaging quantities must be numbers and not negative (400), Sample Point quantities are a whole number 1-10 or blank (400 if not a number). A tote with a `run_inputs` / `preproc_inputs` row
   cannot be deleted (409 `tote_has_history`; use QAQC Hold or dispose). `seed()` raises when `seed.json` cannot be read (the start rolls back) instead of building an empty system.
+- **Small hardening batch** (tests in `tests/test_hardening_small.py`; guide `docs/restore-runbook.md`). *Upload quota*: `_check_user_quota` (after `_check_storage_room`, in `_store_attachment` /
+  `_store_tote_attachment`) stops one person uploading more than `upload_user_daily_mb` (default 300, 0 = off) in 24 hours across run and tote documents (429 `upload_quota`). *Deleted totes*:
+  deleting a tote with no run / pre-processing history first writes an append-only `deleted_records` row (the tote, its stability log and its file list, who and when). *Rebaseline*: the SYSTEM `rebaseline`
+  event keeps `previousHash` / `previousVersion`, and booting older code on a newer database logs a warning. *Live restore*: `restore_on_boot` (runs in `main` before `init_db`) restores a full backup .zip when
+  `KELP_ERP_RESTORE_FROM=<path>` AND `KELP_ERP_RESTORE_CONFIRM=replace-live-data` are set: it validates everything (`_restore_zip`, the same core as the staging restore), keeps `backups/pre-restore-<utc>.db.gz`,
+  does NOT reset passwords, renames the zip to `.restored-<utc>` and a failure stops the start (nothing changed). *Missing disk*: `KELP_ERP_REQUIRE_MOUNT=<path>` makes the server refuse to start when that
+  path is not a mounted volume (otherwise a missing Render disk gives a fresh seeded database).
 - **Records archive and nightly backups** (batch 9; tests in `tests/test_records_archive.py`; guide `docs/records-archive.md`). The ERP decides what is archived and how it is named; the stdlib script
   `tools/kelpworks_archive_sync.py` (an office PC, Task Scheduler) copies it into the synced SharePoint library `KelpWorks-Records`. `archive_manifest` (`GET /api/archive/manifest`) is a pure function of the
   database: for every FINALIZED run `archive_run_entries` lists the files with a `version` (generated PDFs: `archive_content_key` = hash of the report data without the generated-at line; documents: the attachment id),
@@ -421,7 +432,8 @@ for `main` so a red run blocks the merge.
   Legacy runs without packaging entries can't be cross-checked and are reported as info only.
 - **Env vars:** `PORT` (8002), `KELP_ERP_DB`, `KELP_ERP_UPLOADS`,
   `KELP_ERP_SECRET` (when unset or equal to the old public default, a random key is generated once into `kelp_secret.key` next to the database), `KELP_ERP_ADMIN_EMAIL/PASSWORD`,
-  `KELP_ERP_INITIAL_PASSWORD`, `KELP_ERP_ENV=development` (convenience defaults), `KELP_ERP_TRUST_PROXY=1` (trust the last `X-Forwarded-For` entry; always on Render); staging only: `KELP_ERP_ENV=staging`, `KELP_ERP_ALLOW_RESTORE=1`,
+  `KELP_ERP_INITIAL_PASSWORD`, `KELP_ERP_REQUIRE_MOUNT` (refuse to start unless this path is a mounted volume), `KELP_ERP_RESTORE_FROM` + `KELP_ERP_RESTORE_CONFIRM=replace-live-data` (one-time live restore at start;
+  remove both afterwards), `KELP_ERP_ENV=development` (convenience defaults), `KELP_ERP_TRUST_PROXY=1` (trust the last `X-Forwarded-For` entry; always on Render); staging only: `KELP_ERP_ENV=staging`, `KELP_ERP_ALLOW_RESTORE=1`,
   `KELP_ERP_STAGING_PASSWORD`, `KELP_ERP_MAX_RESTORE_MB`. **Never set the staging ones on the live service.**
 - **Staging** (full guide: `docs/staging.md`, blueprint: `render.staging.yaml`): a second Render service with its own disk that holds a copy of live data.
   `GET /api/admin/backup?full=1` (admin; `build_full_backup`) = one .zip with a consistent DB snapshot + `uploads/`, `lab_templates/`, `sop_documents/` + `manifest.json`
