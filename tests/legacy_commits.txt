@@ -18,3 +18,4 @@ f66d03c  2026-10-10  data-integrity cleanup (batch 7) merged to main and live
 2243bc9  2026-10-11  SOP and safety data sheet sync, Documents tab (batch 10) merged to main and live
 a2d966f  2026-10-11  SOP register: file name is the source of truth (the release before batch 6)
 08b4be2  2026-10-11  release gate (batch 6) merged to main and live
+be689db  2026-10-12  small hardening batch (download tokens, upload quota, live restore) merged to main and live
