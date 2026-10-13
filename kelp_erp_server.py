@@ -210,6 +210,8 @@ SETTINGS_DEFAULTS = [
      "A safety data sheet is flagged \"review soon\" when its review date is this many days away or less."),
     ("library_scan_stale_days", 3, "SharePoint folder check: warn after (days)",
      "The Documents page warns administrators when the SOP / safety data sheet folders have not been reported by the sync for longer than this."),
+    ("historical_entry_enabled", 0, "Historical run entry: administrators may enter past runs (1 = on)",
+     "While on, an administrator can create a production run with its ORIGINAL processing lot and run date, finalize it without every required field, choose whether it touches inventory and whether it needs a release. Switch it off when the history is entered."),
     ("lot_expiry_warning_days", 30, "Lots: flag stock expiring within (days)",
      "A lot with stock left whose expiry date is this close (or past) is flagged on the Lots list and in the lot finder."),
     ("upload_user_daily_mb", 300, "Uploads: most one person may upload in 24 hours (MB; 0 = no limit)",
@@ -4198,6 +4200,11 @@ def migrate(conn):
         ("exclude_from_stats", "INTEGER NOT NULL DEFAULT 0"), ("exclude_reason", "TEXT"),
         ("finalized_at", "TEXT"),
         ("finalized_by", "TEXT"),
+        ("is_historical", "INTEGER NOT NULL DEFAULT 0"),   # entered retrospectively by an administrator (original lot number and run date)
+        ("hist_deduct", "INTEGER NOT NULL DEFAULT 1"),     # 0 = this run does not move inventory (no ledger lines, no lots)
+        ("hist_release", "TEXT"),                          # review (normal release) | grandfather (released as of entry, no gate)
+        ("hist_note", "TEXT"),                             # the required fields that were missing at finalize
+        ("hist_entered_by", "TEXT"), ("hist_entered_at", "TEXT"),
         ("release_state", "TEXT"),          # pending_review | pending_release | released | returned | rejected | legacy
         ("release_review_hash", "TEXT"),    # log snapshot hash the approving review signed
         ("packaging_started_at", "TEXT"), ("packaging_packaged_at", "TEXT"),
@@ -4746,6 +4753,9 @@ def run_public(r):
          "finalizedAt": r["finalized_at"],
          "location": r["location"], "notes": r["notes"], "status": r["status"],
          "operators": r["operators"], "createdAt": r["created_at"]}
+    if r["is_historical"]:
+        d["historical"] = {"deductInventory": bool(r["hist_deduct"]), "release": r["hist_release"], "note": r["hist_note"], "enteredBy": r["hist_entered_by"],
+                           "enteredAt": r["hist_entered_at"]}
     try:
         d["rejectedFeedstock"] = json.loads(r["rejected_feedstock_json"]) if r["rejected_feedstock_json"] else []
     except ValueError:
@@ -7725,6 +7735,8 @@ class Handler(BaseHTTPRequestHandler):
         held to the tests that gate checked (its `released` event lists them); an older run keeps the old rule (required results present, no new failure)."""
         if run["release_state"] not in ("released", "legacy"):
             return
+        if run["is_historical"] and run["release_state"] == "legacy":
+            return                                                       # grandfathered at entry: results added later are recorded, they do not hold lots
         lab = coa_evaluate(conn, run)["summary"]
         ev = conn.execute("SELECT detail FROM release_events WHERE run_id=? AND event_type IN ('released','legacy_release') ORDER BY id DESC LIMIT 1",
                           (run["id"],)).fetchone()
@@ -9026,6 +9038,8 @@ class Handler(BaseHTTPRequestHandler):
         if not supplier_lot:
             raise ApiError(400, "Enter the supplier's lot number (it is printed on the package)")
         received = self._iso_date(d.get("receivedDate"), "received date") or today_iso()
+        if received > today_iso():
+            raise ApiError(400, "The received date cannot be in the future")
         expiry = self._iso_date(d.get("expiryDate"), "expiry date")
         if expiry and expiry < received:
             raise ApiError(400, "The expiry date is before the received date")
@@ -9526,22 +9540,29 @@ class Handler(BaseHTTPRequestHandler):
         return {"updated": updated}
 
     def _consume(self, conn, consumable_id, delta, reason, ref, user_name=None):
+        as_of = None
+        if ref:
+            hist = conn.execute("SELECT run_date, hist_deduct FROM production_runs WHERE processing_lot=? AND is_historical=1", (ref,)).fetchone()
+            if hist:
+                if not hist["hist_deduct"]:
+                    return                                       # a historical run entered "without touching inventory": no stock, no ledger, no lots
+                as_of = hist["run_date"]
         conn.execute("UPDATE consumables SET on_hand = on_hand + ? WHERE id=?", (delta, consumable_id))
         conn.execute("INSERT INTO consumable_txns (consumable_id,delta,reason,ref,user_name,created_at)"
                      " VALUES (?,?,?,?,?,?)", (consumable_id, delta, reason, ref, user_name, now_iso()))
         if delta < 0:
-            self._lots_allocate(conn, consumable_id, -delta, ref, reason)       # recall traceability: which lot(s) the stock came from
+            self._lots_allocate(conn, consumable_id, -delta, ref, reason, as_of)  # recall traceability: which lot(s) the stock came from
         elif delta > 0 and ref:
             self._lots_refund(conn, consumable_id, delta, ref)                  # a refund of what that reference used goes back to the same lot(s)
 
-    def _lots_allocate(self, conn, cid, qty, ref, reason):
+    def _lots_allocate(self, conn, cid, qty, ref, reason, as_of=None):
         """Assign a use of `qty` to lots: not-expired lots first by earliest expiry (no expiry last), then expired ones, never a lot on hold. Whatever the
         lots cannot cover is simply untraced (stock never blocks a run)."""
-        today = datetime.date.today().isoformat()
+        today = (as_of or datetime.date.today().isoformat())[:10]            # a historical run draws on what had been received BY its date, and judges expiry as of that date
         left = qty
         for lot in conn.execute(
-                "SELECT id, qty_remaining FROM consumable_lots WHERE consumable_id=? AND qty_remaining>0 AND on_hold=0"
-                " ORDER BY (expiry_date IS NOT NULL AND expiry_date<?), (expiry_date IS NULL), expiry_date, received_date, id", (cid, today)).fetchall():
+                "SELECT id, qty_remaining FROM consumable_lots WHERE consumable_id=? AND qty_remaining>0 AND on_hold=0 AND received_date<=?"
+                " ORDER BY (expiry_date IS NOT NULL AND expiry_date<?), (expiry_date IS NULL), expiry_date, received_date, id", (cid, today, today)).fetchall():
             if left <= 1e-9:
                 break
             take = round(min(lot["qty_remaining"], left), 6)
@@ -12052,6 +12073,14 @@ class Handler(BaseHTTPRequestHandler):
         notes = d.get("notes")
         operators = (d.get("operators") or "").strip() or None
         feedstock_details = d.get("feedstockDetails") or {}
+        hist = bool(existing and existing["is_historical"])
+        if hist and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", run_date):
+            raise ApiError(400, "Enter the run date of this historical run")
+        if hist and run_date > today_iso():
+            raise ApiError(400, "A historical run cannot be dated in the future")
+        grandfather = hist and existing["hist_release"] == "grandfather"
+        lot_status = "on_hand" if grandfather else "pending_release"
+        run_state = "legacy" if grandfather else "pending_review"
 
         # Validate totes are available -- either never touched yet (in_stock)
         # or already locked to this same draft as WIP by an earlier
@@ -12114,7 +12143,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # Processing lot number: reserved at draft creation (or, for a direct
         # one-shot run, right here) from the row's own id — see lot_number_for.
-        ts = now_iso()
+        ts = (run_date + "T12:00:00Z") if hist else now_iso()          # a historical run is finalized as of its own date (stabilization period, yield report, archive)
         cur = conn.cursor()
         if existing:
             run_id = existing["id"]
@@ -12129,10 +12158,10 @@ class Handler(BaseHTTPRequestHandler):
                 " input_kg=?, target_tds=?, output_litres=?, citric_kg=COALESCE(citric_kg,0)+?,"
                 " sorbate_kg=COALESCE(sorbate_kg,0)+?, ibc_used=?,"
                 " location=?, notes=?, operators=?, status='completed', draft_data=NULL,"
-                " finalized_at=?, finalized_by=?, release_state='pending_review' WHERE id=?",
+                " finalized_at=?, finalized_by=?, release_state=? WHERE id=?",
                 (lot, run_date, species, sku, input_kg, target_tds, output_litres,
                  citric, sorbate, ibc_used, location, notes, operators, ts,
-                 user["name"] if user else None, run_id))
+                 user["name"] if user else None, run_state, run_id))
         else:
             placeholder = "TEMP-" + secrets.token_hex(6)
             cur.execute(
@@ -12188,9 +12217,9 @@ class Handler(BaseHTTPRequestHandler):
             cur.execute(
                 "INSERT INTO fg_lots (fg_lot_number,sku_code,run_id,package_size,qty,litres_each,"
                 "produced_date,tds,location,status,created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?, 'pending_release', ?)",
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (fg_lot, sku, run_id, unit, qty, unit_litres[unit], run_date,
-                 target_tds, location, ts))
+                 target_tds, location, lot_status, ts))
             fg_created.append(fg_lot)
             # (FG labels were consumed with the containers by the packaging
             # commit above -- see _commit_label_stock.)
@@ -12200,16 +12229,26 @@ class Handler(BaseHTTPRequestHandler):
         # so a run missing data is never half-finalized.
         problems = self._required_problems(
             conn, conn.execute("SELECT * FROM production_runs WHERE id=?", (run_id,)).fetchone())
-        if problems:
+        if problems and not hist:
             raise ApiError(400, "Cannot finalize - required fields are missing:" + problems)
-        self._add_revision(conn, run_id, "finalized", user, "Run finalized (original record)", [],
+        if hist:                                                         # a historical log is as complete as the old records are: what is missing is written down, not enforced
+            conn.execute("UPDATE production_runs SET hist_note=? WHERE id=?", ((problems or "").strip()[:2000] or None, run_id))
+        self._add_revision(conn, run_id, "finalized", user, "Run finalized (original record)" if not hist else "Historical run entered (original record)", [],
                            self._release_snapshot_hash(conn, run_id))
-        # Hold the finished goods for release: the run enters the review queue
-        # (its FG lots were created 'pending_release' above).
-        release_log(conn, run_id, "submitted", user, capacity=None,
-                    meaning="Production run finalized; finished goods held pending release.",
-                    log_hash=self._release_snapshot_hash(conn, run_id),
-                    detail={"to": "pending_review", "fgLots": fg_created})
+        if not grandfather:
+            # Hold the finished goods for release: the run enters the review queue
+            # (its FG lots were created 'pending_release' above).
+            release_log(conn, run_id, "submitted", user, capacity=None,
+                        meaning="Production run finalized; finished goods held pending release.",
+                        log_hash=self._release_snapshot_hash(conn, run_id),
+                        detail={"to": "pending_review", "fgLots": fg_created})
+        if hist:
+            release_log(conn, run_id, "historical_entry", user, capacity="Administrator",
+                        meaning=("Entered retrospectively as a historical run dated %s. " % run_date)
+                        + ("Grandfathered as released: no production-log review or Quality sign-off." if grandfather
+                           else "It goes through the normal review and Quality release."),
+                        log_hash=self._release_snapshot_hash(conn, run_id),
+                        detail={"to": run_state, "fgLots": fg_created, "deductInventory": bool(existing["hist_deduct"]), "missingRequired": bool(problems)})
         return {"processingLot": lot, "runId": run_id, "inputKg": input_kg,
                 "outputLitres": output_litres, "fgLots": fg_created}
 
@@ -12272,6 +12311,9 @@ class Handler(BaseHTTPRequestHandler):
         tote_ids = [int(x) for x in (d.get("toteIds") or [])]
         feedstock_details = d.get("feedstockDetails") or {}
 
+        hist = d.get("historical")
+        if rid is None and hist:
+            return self._create_historical_draft(conn, d, hist, user, sku, species, target_tds, citric, sorbate, location, notes, operators, run_date)
         if rid is None:
             cur = conn.cursor()
             placeholder = "TEMP-" + secrets.token_hex(6)
@@ -12294,6 +12336,10 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(404, "Draft not found")
             if run["status"] != "draft":
                 raise ApiError(409, "This run has already been finalized")
+            if run["is_historical"] and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", run_date or ""):
+                raise ApiError(400, "Enter the run date of this historical run")
+            if run["is_historical"] and run_date > today_iso():
+                raise ApiError(400, "A historical run cannot be dated in the future")
             # citric_kg / sorbate_kg / nabenzoate_kg are deliberately NOT written
             # here: the run's reagent totals are accumulated by
             # _commit_reagent_usage from Dilution & Preservation saves, and the
@@ -12320,6 +12366,37 @@ class Handler(BaseHTTPRequestHandler):
         return {"run": run_public(conn.execute(
             "SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()),
             "rejectedToteIds": rejected_ids}
+
+    HISTORICAL_LOT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,38}$")
+
+    def _create_historical_draft(self, conn, d, hist, user, sku, species, target_tds, citric, sorbate, location, notes, operators, run_date):
+        """A run entered retrospectively (administrators, while historical_entry_enabled is on): it keeps its ORIGINAL processing lot and run date, so the number on
+        the labels, the customer's paperwork and the lab reports stays true. See _finalize_run for what is different about it."""
+        self._require_admin(user)
+        if not float(get_setting_value(conn, "historical_entry_enabled", 0) or 0):
+            raise ApiError(403, "Historical run entry is switched off. An administrator turns it on with the setting \"Historical run entry\" (Calculations page).", "historical_off")
+        lot = (hist.get("processingLot") or "").strip()
+        if not self.HISTORICAL_LOT_RE.match(lot):
+            raise ApiError(400, "Enter the run's original processing lot (letters, numbers, dots, dashes; for example PR-20260506-012)")
+        if conn.execute("SELECT 1 FROM production_runs WHERE UPPER(processing_lot)=UPPER(?)", (lot,)).fetchone():
+            raise ApiError(409, "A run with the processing lot %s already exists" % lot, "lot_exists")
+        run_date = (d.get("runDate") or "").strip()                    # no default to today: the date of the run is the point
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", run_date):
+            raise ApiError(400, "Enter the run date of this historical run")
+        if run_date > today_iso():
+            raise ApiError(400, "A historical run cannot be dated in the future")
+        release = (hist.get("release") or "review").strip()
+        if release not in ("review", "grandfather"):
+            raise ApiError(400, "Choose how the run is released: normal review and release, or grandfathered")
+        deduct = 0 if hist.get("deductInventory") in (False, 0, "0", "false") else 1
+        ts = now_iso()
+        cur = conn.execute(
+            "INSERT INTO production_runs (processing_lot,run_date,species_code,sku_code,target_tds,citric_kg,sorbate_kg,location,notes,operators,status,created_at,"
+            "is_historical,hist_deduct,hist_release,hist_entered_by,hist_entered_at) VALUES (?,?,?,?,?,?,?,?,?,?, 'draft', ?, 1, ?, ?, ?, ?)",
+            (lot, run_date, species, sku, target_tds, citric, sorbate, location, notes, operators, ts, deduct, release, user["name"] if user else None, ts))
+        rid = cur.lastrowid
+        # no default sample points: for a historical run only the samples that really exist (retention samples) are entered
+        return {"run": run_public(conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()), "rejectedToteIds": []}
 
     def delete_draft(self, conn, rid, user):
         r = conn.execute("SELECT * FROM production_runs WHERE id=? AND status='draft'", (rid,)).fetchone()

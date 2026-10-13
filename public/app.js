@@ -750,7 +750,9 @@ async function openFeedstockImport() {
 async function pageProduction(v) {
   v.append(el('div', { class: 'page-head' },
     el('h2', {}, 'Production Runs'),
-    el('div', { class: 'actions' }, el('button', { onclick: () => openNewRun() }, '+ New production run'))));
+    el('div', { class: 'actions' },
+      State.user.role === 'admin' && settingValue('historical_entry_enabled', 0) ? el('button', { class: 'secondary', onclick: () => openHistoricalRun(), title: 'Enter a run that already happened, with its original lot number and date' }, '+ Historical run') : null,
+      el('button', { onclick: () => openNewRun() }, '+ New production run'))));
   const [r, dr] = await Promise.all([api('GET', '/production'), api('GET', '/production/drafts')]);
   if (dr.drafts.length) {
     v.append(el('h3', { style: 'margin:0 0 8px' }, 'In progress'));
@@ -763,6 +765,7 @@ async function pageProduction(v) {
       el('div', { class: 'page-head', style: 'margin:0 0 8px' },
         el('h3', { style: 'margin:0' }, mono(run.processingLot),
           run.excludeFromStats ? el('span', { class: 'pill', style: 'margin-left:6px', title: run.excludeReason || '' }, 'Excluded from analysis') : null,
+          run.historical ? el('span', { class: 'pill', style: 'margin-left:6px', title: 'Entered retrospectively by ' + (run.historical.enteredBy || '—') + '. ' + (run.historical.release === 'grandfather' ? 'Grandfathered as released. ' : '') + (run.historical.deductInventory ? '' : 'Did not move inventory. ') + (run.historical.note ? 'Log was incomplete at entry.' : '') }, 'Historical') : null,
           run.release && run.release.state && run.release.state !== 'legacy' ? [' ', releaseBadge(run.release.state)] : null,
           ' ', analysisInfoButton(run)),
         el('div', { class: 'actions' },
@@ -1070,7 +1073,7 @@ function draftCard(d) {
   const pkgSummary = (d.packages || []).filter(p => p.qty > 0).map(p => `${fmt(p.qty)} × ${p.size}`).join(', ') || '—';
   return el('div', { class: 'card' },
     el('div', { class: 'page-head', style: 'margin:0 0 8px' },
-      el('h3', { style: 'margin:0' }, mono(d.processingLot), '  ', el('span', { class: 'badge hold' }, 'Not yet submitted')),
+      el('h3', { style: 'margin:0' }, mono(d.processingLot), '  ', el('span', { class: 'badge hold' }, 'Not yet submitted'), d.historical ? [' ', el('span', { class: 'pill' }, 'Historical')] : null),
       el('div', { class: 'actions' },
         el('button', { onclick: () => openRun(d) }, 'Resume'),
         el('button', { class: 'secondary', onclick: () => openSampleLabels(d) }, 'Print sample labels'),
@@ -3497,6 +3500,39 @@ async function openNewRun() {
     openRun(r.run, { fresh: true });
   }, 'Create run');
 }
+// Administrators only, while the setting "Historical run entry" is on: a run that already happened, entered with its ORIGINAL processing lot and run date.
+async function openHistoricalRun() {
+  const skus = State.ref.skus.filter(s => s.active);
+  const lot = el('input', { placeholder: 'e.g. PR-20260506-012' });
+  const skuSel = selectFrom('', [['', 'Select a SKU…'], ...skus.map(s => [s.code, s.name])]);
+  const dateInp = el('input', { type: 'date', max: new Date().toISOString().slice(0, 10) });
+  const locSel = productionLocationSelect('hr_loc');
+  const operatorsSelect = buildOperatorsSelect('');
+  const inv = selectFrom('', [['count', 'Count it: deduct stock and assign supplier lots as of the run date'], ['skip', 'Leave inventory alone: no stock or lot effect']]);
+  const rel = selectFrom('', [['review', 'Normal review and Quality release (needs lab results for the gate)'], ['grandfather', 'Grandfathered: released as entered, no review or Quality sign-off']]);
+  const body = el('div', {},
+    el('div', { class: 'help', style: 'margin-bottom:8px' }, 'Enter a run that already happened. It keeps the lot number and date you type, and its log does not have to be complete. Enter runs from oldest to newest.'),
+    el('div', { class: 'form-row' }, field(reqLabel('Original processing lot'), lot), field(reqLabel('Run date'), dateInp)),
+    el('div', { class: 'form-row' }, field(reqLabel('Product SKU'), skuSel), field('Production location', locSel)),
+    field('Operators', operatorsSelect.el),
+    field('Inventory', inv),
+    el('div', { class: 'help', style: 'margin-top:-6px' }, 'Count it only if you have entered the deliveries (with their received dates) this run used; otherwise leave inventory alone so today’s counts are not distorted.'),
+    field('Release', rel),
+    el('div', { class: 'help', style: 'margin-top:-6px' }, 'Grandfathering skips the release gate and is recorded in the audit trail. Use it only for product that was already released and sold.'),
+    field('Notes', el('textarea', { id: 'hr_notes', rows: '2', placeholder: 'Optional' })));
+  modal('New historical run', body, async () => {
+    if (!lot.value.trim()) throw new Error('Enter the original processing lot.');
+    if (!dateInp.value) throw new Error('Enter the run date.');
+    if (!skuSel.value) throw new Error('Choose a product SKU.');
+    const r = await api('POST', '/production/drafts', {
+      sku: skuSel.value, runDate: dateInp.value, location: locSel.value || '', operators: operatorsSelect.value, notes: body.querySelector('#hr_notes').value,
+      toteIds: [], packages: [], feedstockDetails: {},
+      historical: { processingLot: lot.value.trim(), deductInventory: inv.value === 'count', release: rel.value }
+    });
+    toast('Historical run ' + r.run.processingLot + ' created.');
+    openRun(r.run, { fresh: true });
+  }, 'Create run');
+}
 async function openRun(draftSummary, opts) {
   // `fresh` is only true right after openNewRun() just created this draft --
   // that's the one case that keeps its current default-open Feedstock
@@ -3904,6 +3940,13 @@ async function openRun(draftSummary, opts) {
     if (failed.length) throw new Error('Progress was saved, but a section could not be saved: ' + failed[0]);
     toast('Progress saved — resume it anytime from “In progress”.'); render();
   }
+  if (draft && draft.historical) {
+    const h = draft.historical;
+    body.prepend(el('div', { class: 'sign-box', style: 'margin-bottom:10px' }, el('b', {}, 'Historical run. '),
+      'Original lot ' + draft.processingLot + ' dated ' + draft.runDate + '. Required fields are not enforced when you finalize (what is missing is recorded). Inventory: ',
+      el('b', {}, h.deductInventory ? 'counted (stock and supplier lots as of the run date)' : 'left alone'), '. Release: ',
+      el('b', {}, h.release === 'grandfather' ? 'grandfathered, no review or Quality sign-off' : 'normal review and Quality release'), '.'));
+  }
   modal(draft ? 'Production run — ' + draft.processingLot : 'New production run', body, finalizeRun, 'Finalize run',
     { extraLabel: 'Save & close', onExtra: saveAndClose, wide: true, closeX: true, onClose: () => render() });
   if (opts && opts.section) jumpToSection(body, opts.section);
@@ -4108,7 +4151,7 @@ const RELEASE_EVENTS = {
   reopened: 'Reopened', voided: 'Sign-off VOIDED (log changed)', legacy_release: 'Grandfathered as released',
   amendment_opened: 'Amendment OPENED (log unlocked)', amendment_submitted: 'Amendment submitted for review',
   amendment_cancelled: 'Amendment cancelled', integrity_repair: 'Integrity repair applied',
-  rebaseline: 'Log hash re-baselined (snapshot format change)',
+  rebaseline: 'Log hash re-baselined (snapshot format change)', historical_entry: 'Entered retrospectively (historical run)',
   lab_results_added: 'Lab results entered', lab_result_voided: 'Lab result VOIDED',
   fg_lot_edited: 'Finished-goods lot edited', lab_result_hold: 'Lots put on HOLD (lab result changed after release)',
 };
