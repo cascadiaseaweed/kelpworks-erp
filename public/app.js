@@ -5024,7 +5024,7 @@ function addContainerType() {
 // or finalized. Unrelated to the internal barcode labels printed from a row's Label button.
 function addFgLabel() {
   const locs = State.ref.locations.map(l => [l, l]);
-  const skuSel = selectFrom('', (State.ref.skus || []).filter(s => s.active).map(s => [s.code, s.name]));
+  const skuSel = selectFrom('', (State.ref.skus || []).filter(s => s.active && s.usesLabels !== false).map(s => [s.code, s.name]));
   const pkgSel = selectFrom('', (State.ref.containers || []).filter(c => c.litresEach != null).map(c => [c.name, c.name]));
   const body = el('div', {},
     el('div', { class: 'form-row' }, field('Product SKU', skuSel), field('Package type', pkgSel)),

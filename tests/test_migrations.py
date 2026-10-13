@@ -87,7 +87,13 @@ def snapshot(path):
             if t in tables and col in [r[1] for r in conn.execute('PRAGMA table_info("%s")' % t)]:
                 keys[t] = {r[0] for r in conn.execute('SELECT "%s" FROM "%s"' % (col, t))}
         fk = len(conn.execute("PRAGMA foreign_key_check").fetchall())
-        return {"tables": tables, "counts": counts, "keys": keys, "fk": fk, "integrity": conn.execute("PRAGMA integrity_check").fetchone()[0]}
+        # rows a migration removes ON PURPOSE: the label items of the two products that use no labels (an item with stock history is kept, so only unused ones go)
+        removable = 0
+        if {"consumables", "consumable_txns", "run_label_commits"} <= set(tables) and "label_sku_code" in [r[1] for r in conn.execute("PRAGMA table_info(consumables)")]:
+            removable = conn.execute(
+                "SELECT COUNT(*) FROM consumables WHERE label_sku_code IN ('SACC-LKE','MACRO-LKE')"
+                " AND id NOT IN (SELECT consumable_id FROM consumable_txns) AND id NOT IN (SELECT consumable_id FROM run_label_commits)").fetchone()[0]
+        return {"tables": tables, "counts": counts, "keys": keys, "fk": fk, "removable": {"consumables": removable}, "integrity": conn.execute("PRAGMA integrity_check").fetchone()[0]}
     finally:
         conn.close()
 
@@ -111,7 +117,8 @@ def test_current_code_upgrades_an_older_database(commit, legacy_dir):
     assert after["integrity"] == "ok"
     for t in before["tables"]:
         if t in after["counts"]:                             # a table may be retired, but a kept table must not lose rows
-            assert after["counts"][t] >= before["counts"][t], "%s lost rows: %d -> %d" % (t, before["counts"][t], after["counts"][t])
+            allowed = before["removable"].get(t, 0)
+            assert after["counts"][t] >= before["counts"][t] - allowed, "%s lost rows: %d -> %d" % (t, before["counts"][t], after["counts"][t])
     for t, vals in before["keys"].items():
         missing = vals - after["keys"].get(t, set())
         assert not missing, "%s lost %s" % (t, sorted(missing)[:5])

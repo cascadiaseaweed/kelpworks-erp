@@ -17,7 +17,7 @@ What it models (a kelp -> liquid extract process):
   2. Production runs       : pull stabilized totes, dilute to a target TDS, add
      citric acid + potassium sorbate as preservatives, and bottle Liquid Kelp
      Extract (LKE) finished goods. Each run gets a Processing Lot # (PR-...).
-  3. Finished goods        : two SKUs (Saccharina LKE, Macrocystis LKE) in IBC /
+  3. Finished goods        : product SKUs (Kelpivex, RegenaKelp, FieldKelp, ... and the Sugar / Macrocystis Kelp Extracts) in IBC /
      4L / 1L / 250 ml packs.
   4. Reagents & packaging  : Citric Acid, Potassium Sorbate, Sodium Benzoate,
      containers (IBC totes, drums, bottles) and finished-good labels --
@@ -824,7 +824,7 @@ CREATE TABLE IF NOT EXISTS consumable_txns (
 );
 
 CREATE TABLE IF NOT EXISTS fg_skus (
-    code               TEXT PRIMARY KEY,        -- SACC-LKE, MACRO-LKE
+    code               TEXT PRIMARY KEY,        -- KELPIVEX, FIELDKELP, SACC-LKE (Sugar Kelp Extract), MACRO-LKE (Macrocystis Kelp Extract), ...
     name               TEXT NOT NULL,
     species_code       TEXT REFERENCES species(code),  -- legacy single-species FK, unused
     tds_target         REAL,   -- product spec: target TDS (%)
@@ -4277,6 +4277,7 @@ def migrate(conn):
     for col, decl in [
         ("tds_target", "REAL"), ("ph_target", "REAL"), ("ksorbate_target", "REAL"),
         ("nabenzoate_target", "REAL"), ("active", "INTEGER NOT NULL DEFAULT 1"),
+        ("uses_labels", "INTEGER NOT NULL DEFAULT 1"),          # 0 = no finished-good label items / label stock is tracked for this product
     ]:
         if col not in skucols:
             conn.execute("ALTER TABLE fg_skus ADD COLUMN %s %s" % (col, decl))
@@ -4314,27 +4315,26 @@ def migrate(conn):
     # the old name so already-running databases pick up the new one too.
     conn.execute("UPDATE fg_skus SET name='Sugar Kelp Extract'"
                  " WHERE code='SACC-LKE' AND name != 'Sugar Kelp Extract'")
-    # REF_productSKU.xlsx (2026-09-22): the real product line, replacing the
-    # 2 placeholder SKUs. The old ones stay (real historical runs reference
-    # them) but are deactivated so they drop out of the picker.
-    for code in ("SACC-LKE", "MACRO-LKE"):
-        conn.execute("UPDATE fg_skus SET active=0 WHERE code=?", (code,))
-    for code, name, tds, ph, ksorb, nabenz, species_codes in [
-        ("KELPIVEX", "Kelpivex", 1.8, 3.7, 0.0025, 0, ("SL",)),
-        ("REGENAKELP", "RegenaKelp", 1.8, 3.7, 0.0025, 0, ("MT",)),
-        ("FIELDKELP", "FieldKelp", 1.8, 3.7, 0.0025, 0, ("SL", "MT")),
-        ("KELPIVEX-O", "Kelpivex - O", 1.8, 3.7, 0.0025, 0, ("SL",)),
-        ("REGENAKELP-O", "RegenaKelp - O", 1.8, 3.7, 0.0025, 0, ("MT",)),
-        ("FIELDKELP-O", "FieldKelp - O", 1.8, 3.7, 0.0025, 0, ("SL", "MT")),
+    # REF_productSKU.xlsx (2026-09-22): the real product line. Sugar Kelp Extract and Macrocystis Kelp Extract (SACC-LKE / MACRO-LKE) were deactivated then;
+    # they are products again (2026-10) and, unlike the others, use NO finished-good labels (uses_labels = 0).
+    for code, name, tds, ph, ksorb, nabenz, species_codes, labels in [
+        ("KELPIVEX", "Kelpivex", 1.8, 3.7, 0.0025, 0, ("SL",), 1),
+        ("REGENAKELP", "RegenaKelp", 1.8, 3.7, 0.0025, 0, ("MT",), 1),
+        ("FIELDKELP", "FieldKelp", 1.8, 3.7, 0.0025, 0, ("SL", "MT"), 1),
+        ("KELPIVEX-O", "Kelpivex - O", 1.8, 3.7, 0.0025, 0, ("SL",), 1),
+        ("REGENAKELP-O", "RegenaKelp - O", 1.8, 3.7, 0.0025, 0, ("MT",), 1),
+        ("FIELDKELP-O", "FieldKelp - O", 1.8, 3.7, 0.0025, 0, ("SL", "MT"), 1),
+        ("SACC-LKE", "Sugar Kelp Extract", 1.8, 3.7, 0.0025, 0, ("SL",), 0),
+        ("MACRO-LKE", "Macrocystis Kelp Extract", 1.8, 3.7, 0.0025, 0, ("MT",), 0),
     ]:
         conn.execute(
             "INSERT INTO fg_skus (code,name,tds_target,ph_target,ksorbate_target,"
-            "nabenzoate_target,active) VALUES (?,?,?,?,?,?,1)"
+            "nabenzoate_target,active,uses_labels) VALUES (?,?,?,?,?,?,1,?)"
             " ON CONFLICT(code) DO UPDATE SET name=excluded.name,"
             " tds_target=excluded.tds_target, ph_target=excluded.ph_target,"
             " ksorbate_target=excluded.ksorbate_target,"
-            " nabenzoate_target=excluded.nabenzoate_target, active=1",
-            (code, name, tds, ph, ksorb, nabenz))
+            " nabenzoate_target=excluded.nabenzoate_target, active=1, uses_labels=excluded.uses_labels",
+            (code, name, tds, ph, ksorb, nabenz, labels))
         for sp in species_codes:
             # a brand-new database has no species yet (seed() adds them after migrate()); init_db() runs this again once they exist
             conn.execute("INSERT OR IGNORE INTO fg_sku_species (sku_code,species_code)"
@@ -4469,7 +4469,7 @@ def migrate(conn):
     for pkg in ("New 1,000 L IBC Tote", "55 gallon drum"):
         if not conn.execute("SELECT 1 FROM consumables WHERE is_container=1 AND name=?", (pkg,)).fetchone():
             continue
-        for sku in conn.execute("SELECT code, name FROM fg_skus ORDER BY code").fetchall():
+        for sku in conn.execute("SELECT code, name FROM fg_skus WHERE COALESCE(uses_labels,1)=1 ORDER BY code").fetchall():
             if conn.execute("SELECT 1 FROM consumables WHERE label_sku_code=? AND label_package=?",
                             (sku["code"], pkg)).fetchone():
                 continue
@@ -4478,6 +4478,18 @@ def migrate(conn):
                 continue
             conn.execute("INSERT INTO consumables (name,unit,on_hand,reorder_level,label_sku_code,label_package)"
                          " VALUES (?,'ea',0,0,?,?)", (name, sku["code"], pkg))
+    # Products that use no labels: their label items are removed once. One that already has stock history (a ledger line or a run's label commit) is kept
+    # as it is, so nothing in the records is orphaned, and no new label stock is deducted for the product (see _commit_label_stock).
+    def remove_unused_labels():
+        gone = conn.execute(
+            "DELETE FROM consumables WHERE label_sku_code IN (SELECT code FROM fg_skus WHERE COALESCE(uses_labels,1)=0)"
+            " AND id NOT IN (SELECT consumable_id FROM consumable_txns) AND id NOT IN (SELECT consumable_id FROM run_label_commits)"
+            " AND id NOT IN (SELECT consumable_id FROM sds_items)").rowcount
+        kept = conn.execute("SELECT COUNT(*) FROM consumables WHERE label_sku_code IN (SELECT code FROM fg_skus WHERE COALESCE(uses_labels,1)=0)").fetchone()[0]
+        if kept:
+            logger.warning("%d label item(s) of products without labels were kept because they have stock history.", kept)
+        return gone
+    run_once(conn, "remove_labels_of_label_free_skus", remove_unused_labels)
     # Product release: every run finalized before the process existed is
     # grandfathered as released (one SYSTEM audit event each, no review hash),
     # so lots already in stock stay sellable. Runs finalized from now on get a
@@ -6964,7 +6976,7 @@ class Handler(BaseHTTPRequestHandler):
             sku_species.setdefault(r["sku_code"], []).append(r["species_code"])
         skus = [dict(code=r["code"], name=r["name"], species=sku_species.get(r["code"], []),
                     active=bool(r["active"]), tdsTarget=r["tds_target"], phTarget=r["ph_target"],
-                    ksorbateTarget=r["ksorbate_target"], nabenzoateTarget=r["nabenzoate_target"])
+                    ksorbateTarget=r["ksorbate_target"], nabenzoateTarget=r["nabenzoate_target"], usesLabels=bool(r["uses_labels"] is None or r["uses_labels"]))
                 for r in conn.execute("SELECT * FROM fg_skus ORDER BY (active != 1), code")]
         customers = [self._customer_public(r) for r in conn.execute(
             "SELECT * FROM customers WHERE active=1 ORDER BY name")]
@@ -8938,9 +8950,11 @@ class Handler(BaseHTTPRequestHandler):
                     # named automatically, deducted 1 per finished unit at
                     # finalize. Admin-only, like any new container type.
                     self._require_admin(user)
-                    sku_row = conn.execute("SELECT name FROM fg_skus WHERE code=?", (label_sku,)).fetchone()
+                    sku_row = conn.execute("SELECT name, COALESCE(uses_labels,1) u FROM fg_skus WHERE code=?", (label_sku,)).fetchone()
                     if not sku_row:
                         raise ApiError(400, "Choose a product SKU for this label")
+                    if not sku_row["u"]:
+                        raise ApiError(400, "%s uses no finished-good labels" % sku_row["name"])
                     if label_package not in packaging_container_litres_map(conn):
                         raise ApiError(400, "Choose a package type for this label")
                     if conn.execute("SELECT 1 FROM consumables WHERE label_sku_code=? AND label_package=?",
@@ -9281,6 +9295,11 @@ class Handler(BaseHTTPRequestHandler):
                              " VALUES (?,?,?)", (run_id, unit, new_total))
         self._commit_label_stock(conn, run_id, lot, sku, current, user_name)
 
+    @staticmethod
+    def _sku_uses_labels(conn, sku):
+        r = conn.execute("SELECT COALESCE(uses_labels,1) u FROM fg_skus WHERE code=?", (sku,)).fetchone()
+        return not r or bool(r["u"])
+
     def _commit_label_stock(self, conn, run_id, lot, sku, container_totals, user_name=None):
         """One finished-good label per container consumed: nets the labels the
         run should now have used (container totals mapped through the run's SKU
@@ -9288,7 +9307,7 @@ class Handler(BaseHTTPRequestHandler):
         item. No label item for a SKU + container means it simply isn't tracked.
         A shortage never blocks (same as before), it shows as low/negative."""
         want = {}
-        if sku:
+        if sku and self._sku_uses_labels(conn, sku):
             for unit, qty in container_totals.items():
                 row = conn.execute("SELECT id FROM consumables WHERE label_sku_code=? AND label_package=?",
                                    (sku, unit)).fetchone()
@@ -11505,7 +11524,7 @@ class Handler(BaseHTTPRequestHandler):
             conn.execute("INSERT INTO run_packaging_commits (run_id,container_unit,committed_qty) VALUES (?,?,?)",
                          (run_id, unit, qty))
             label = conn.execute("SELECT id FROM consumables WHERE label_sku_code=? AND label_package=?",
-                                 (run["sku_code"], unit)).fetchone() if run else None
+                                 (run["sku_code"], unit)).fetchone() if run and self._sku_uses_labels(conn, run["sku_code"]) else None
             if label and qty and not conn.execute(
                     "SELECT 1 FROM run_label_commits WHERE run_id=? AND consumable_id=?", (run_id, label["id"])).fetchone():
                 conn.execute("INSERT INTO run_label_commits (run_id,consumable_id,committed_qty) VALUES (?,?,?)",
