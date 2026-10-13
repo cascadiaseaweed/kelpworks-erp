@@ -231,6 +231,13 @@ for `main` so a red run blocks the merge.
   hold; Quality Manager or admin, a reason is required and written to the append-only `consumable_lot_log`) and `POST /api/lots/uses/<use id>/move` (correct which lot a use came from). Lots are not part of the
   release snapshot hash. UI: Inventory Items > Receive / Lots / Find / trace a lot; Product Release > "Materials used and their lots". Setting `lot_expiry_warning_days`. The three tables are records
   (`CLEAR` in `tools/make_clean_backup.py`).
+- **Historical run entry** (past runs entered retrospectively; tests in `tests/test_historical_runs.py`; guide `docs/historical-entry.md`). Off until an administrator sets `historical_entry_enabled` = 1 (Calculations
+  page). `POST /api/production/drafts` with a `historical {processingLot, release: review|grandfather, deductInventory}` object (`_create_historical_draft`; admin only, else 403; setting off -> 403 `historical_off`; the lot must
+  match `HISTORICAL_LOT_RE` and be unused, the run date is required and not in the future) creates a draft that keeps the ORIGINAL processing lot and run date (`production_runs.is_historical`, `hist_deduct`, `hist_release`,
+  `hist_note`, `hist_entered_by/at`) and gets NO default sample points. `_finalize_run` for such a run: `finalized_at` and its FG lots' `created_at` = run date 12:00Z (the normal path stamps now); required fields are NOT
+  enforced (what was missing is stored in `hist_note`); `release: review` = the normal pending_review / pending_release path, `grandfather` = `release_state='legacy'` with the lots `on_hand` and no `submitted` event; a hash-chained
+  `historical_entry` event records who entered it. **Inventory**: `_consume` returns at once for a run with `hist_deduct = 0` (no stock, ledger or lots; refunds too), and for a counted one `_lots_allocate` gets `as_of` = the
+  run date (only lots received by then, expiry judged as of then). `_lab_regate` does nothing for a grandfathered historical run. A lot's received date cannot be in the future. Back-dated shipments use the existing Ship date.
 - **Clean backup tool** (`tools/make_clean_backup.py`, tests in `tests/test_clean_backup.py`; guide: the last section of `docs/restore-runbook.md`). Turns a full backup into one with the configuration and NO records
   (the way to wipe live and start fresh: restore the clean zip). `KEEP` / `CLEAR` list every table; **a new table must be added to one of them** or the test (and the tool) fails -- records go in `CLEAR`, configuration
   and its change history in `KEEP`. Customers are records; consumable stock is set to 0; `uploads/` is dropped; the file is rebuilt with `VACUUM INTO` so removed rows do not linger. Never run it against live data directly.
