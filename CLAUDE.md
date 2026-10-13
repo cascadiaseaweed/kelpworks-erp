@@ -87,6 +87,10 @@ for `main` so a red run blocks the merge.
   container, SMP sample container, LBL finished-good label; `item_category` / `next_item_number` / `assign_item_numbers`): auto-assigned
   once (boot backfills existing items in a tidy order; new items get the next number), never reused, never encodes attributes. An admin
   may type another unique value, but an item is never left without one. The FG-label table is grouped under a heading per SKU.
+  **Products without labels** (`fg_skus.uses_labels = 0`: Sugar Kelp Extract `SACC-LKE` and Macrocystis Kelp Extract `MACRO-LKE`, both ordinary active products listed in the SKU table of `migrate()`): no label items are
+  created at start, `_commit_label_stock` / `_ensure_packaging_baseline` deduct nothing for them, a label item cannot be added for them (400) and the "Add finished-good label" picker leaves them out; their old label items are
+  removed once (`run_once("remove_labels_of_label_free_skus")`, keeping any item that has stock history). The SKU list in `migrate()` is reference data re-applied at every start (name, targets, `active`, `uses_labels`):
+  change a product there, not in the database. Tests: `tests/test_sku_labels.py`.
 - **Stock never blocks a run.** Every consumable deduction in a production run (reagents, sample containers, packaging, FG labels,
   and Pre-Processing pack-out via `_adjust_container_stock`) just lets `on_hand` go negative (the item shows LOW); nothing raises "Not
   enough ... on hand". **Sample Point defaults** (`_sample_point_defaults`, applied when the description/type is changed, never over a
@@ -216,6 +220,9 @@ for `main` so a red run blocks the merge.
   `KELP_ERP_RESTORE_FROM=<path>` AND `KELP_ERP_RESTORE_CONFIRM=replace-live-data` are set: it validates everything (`_restore_zip`, the same core as the staging restore), keeps `backups/pre-restore-<utc>.db.gz`,
   does NOT reset passwords, renames the zip to `.restored-<utc>` and a failure stops the start (nothing changed). *Missing disk*: `KELP_ERP_REQUIRE_MOUNT=<path>` makes the server refuse to start when that
   path is not a mounted volume (otherwise a missing Render disk gives a fresh seeded database).
+- **Clean backup tool** (`tools/make_clean_backup.py`, tests in `tests/test_clean_backup.py`; guide: the last section of `docs/restore-runbook.md`). Turns a full backup into one with the configuration and NO records
+  (the way to wipe live and start fresh: restore the clean zip). `KEEP` / `CLEAR` list every table; **a new table must be added to one of them** or the test (and the tool) fails -- records go in `CLEAR`, configuration
+  and its change history in `KEEP`. Customers are records; consumable stock is set to 0; `uploads/` is dropped; the file is rebuilt with `VACUUM INTO` so removed rows do not linger. Never run it against live data directly.
 - **Records archive and nightly backups** (batch 9; tests in `tests/test_records_archive.py`; guide `docs/records-archive.md`). The ERP decides what is archived and how it is named; the stdlib script
   `tools/kelpworks_archive_sync.py` (an office PC, Task Scheduler) copies it into the synced SharePoint library `KelpWorks-Records`. `archive_manifest` (`GET /api/archive/manifest`) is a pure function of the
   database: for every FINALIZED run `archive_run_entries` lists the files with a `version` (generated PDFs: `archive_content_key` = hash of the report data without the generated-at line; documents: the attachment id),
