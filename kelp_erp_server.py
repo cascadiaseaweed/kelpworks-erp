@@ -210,6 +210,8 @@ SETTINGS_DEFAULTS = [
      "A safety data sheet is flagged \"review soon\" when its review date is this many days away or less."),
     ("library_scan_stale_days", 3, "SharePoint folder check: warn after (days)",
      "The Documents page warns administrators when the SOP / safety data sheet folders have not been reported by the sync for longer than this."),
+    ("lot_expiry_warning_days", 30, "Lots: flag stock expiring within (days)",
+     "A lot with stock left whose expiry date is this close (or past) is flagged on the Lots list and in the lot finder."),
     ("upload_user_daily_mb", 300, "Uploads: most one person may upload in 24 hours (MB; 0 = no limit)",
      "Documents and photos together. A person who reaches it is told to try again later; an administrator can raise it."),
     ("release_separate_signers", 0, "Release: reviewer and releaser must be different people (1 = yes)",
@@ -1519,6 +1521,48 @@ CREATE TABLE IF NOT EXISTS user_permission_log (
     changed_at  TEXT NOT NULL
 );
 
+-- Lot traceability for inventory items (reagents, packaging, sample containers, labels, CIP agents). One row per RECEIPT of stock: who supplied it, the supplier's
+-- lot number, when it came in and when it expires. Uses of an item are assigned to lots automatically (earliest expiry first, expired and held lots last / never)
+-- and recorded in lot_uses against the same reference the ledger uses (processing lot, CIP ref, pre-processing batch lot).
+CREATE TABLE IF NOT EXISTS consumable_lots (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    consumable_id INTEGER NOT NULL REFERENCES consumables(id),
+    lot_code      TEXT NOT NULL UNIQUE,      -- KelpWorks lot: <item #>-<YYYYMMDD>-<NN>, e.g. RGT-001-20261014-01
+    supplier      TEXT,
+    supplier_lot  TEXT NOT NULL,             -- the lot number printed on the supplier's package
+    received_date TEXT NOT NULL,
+    expiry_date   TEXT,
+    qty_received  REAL NOT NULL,
+    qty_remaining REAL NOT NULL,
+    po_ref        TEXT,
+    notes         TEXT,
+    on_hold       INTEGER NOT NULL DEFAULT 0,
+    hold_reason   TEXT,
+    created_by    TEXT,
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lots_supplier_lot ON consumable_lots(supplier_lot);
+CREATE TABLE IF NOT EXISTS lot_uses (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    lot_id        INTEGER NOT NULL REFERENCES consumable_lots(id),
+    consumable_id INTEGER NOT NULL REFERENCES consumables(id),
+    ref           TEXT,                      -- what used it: processing lot / CIP ref / pre-processing batch lot (NULL = a manual use or disposal)
+    reason        TEXT,
+    qty           REAL NOT NULL,
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lot_uses_ref ON lot_uses(ref);
+-- Append-only: who changed a lot (a correction, a hold, a use moved to another lot) and why.
+CREATE TABLE IF NOT EXISTS consumable_lot_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    lot_id     INTEGER NOT NULL REFERENCES consumable_lots(id),
+    event      TEXT NOT NULL,
+    detail     TEXT,
+    reason     TEXT,
+    user_name  TEXT,
+    created_at TEXT NOT NULL
+);
+
 -- A record of something deleted on purpose (a tote with no run history): what it was, who removed it and when. Append-only.
 CREATE TABLE IF NOT EXISTS deleted_records (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1544,8 +1588,13 @@ CREATE INDEX IF NOT EXISTS idx_config_log_key ON config_log(area, key);
 """
 
 
+def utcnow():
+    """The current UTC time as a naive datetime (what every stored timestamp and age calculation here uses); datetime.utcnow() is deprecated."""
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+
 def now_iso():
-    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
 def today_iso():
@@ -1773,7 +1822,7 @@ def snapshot_before_migrating(conn, stamp=None, prefix="pre-migrate"):
         if shutil.disk_usage(folder).free < 3 * size + 50 * 1024 * 1024:
             logger.warning("Not enough free disk for a pre-migration snapshot of the database (%.1f MB); continuing without one.", size / 1048576.0)
             return None
-        stamp = stamp or datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        stamp = stamp or utcnow().strftime("%Y%m%d-%H%M%S")
         raw_copy = os.path.join(folder, "snapshot-%s.tmp" % stamp)
         target = os.path.join(folder, "%s-%s.db.gz" % (prefix, stamp))
         dst = sqlite3.connect(raw_copy)
@@ -3908,12 +3957,12 @@ def build_run_summary_pdf(S, logo_path=None):
     if S["materials"]:
         seen_cat = set()
         mrows = []
-        for c, i, q, u in S["materials"]:
-            mrows.append([(c if c not in seen_cat else " ", {"bold": True}), i, _pf(q, 1 if q % 1 else 0), u])
+        for c, i, q, u, lots in S["materials"]:
+            mrows.append([(c if c not in seen_cat else " ", {"bold": True}), i, _pf(q, 1 if q % 1 else 0), u, lots or "-"])
             seen_cat.add(c)
-        pdf.table(["Category", "Item", "Used", "Unit"], mrows,
-                  [100, 250, 80, 60], ["l", "l", "r", "l"], size=7.6)
-        pdf.note("From the inventory ledger for this run (net of refunds).")
+        pdf.table(["Category", "Item", "Used", "Unit", "Supplier lot (KelpWorks lot)"], mrows,
+                  [74, 150, 44, 32, 190], ["l", "l", "r", "l", "l"], size=7.2)
+        pdf.note("From the inventory ledger for this run (net of refunds); lots as assigned when the stock was used.")
     else:
         pdf.note("No inventory usage is recorded against this run.")
     pdf.heading("Finished product")
@@ -5106,7 +5155,7 @@ def _folder_bytes(folder):
 def run_nightly_backup(conn, today=None, keep=None, force=False):
     """Write today's full backup (database + documents) to backups/nightly/kelp_erp_<date>.zip and keep only the newest `keep`.
     Returns {"created": name} or {"skipped": reason}. The caller commits (the result is also noted in app_flags)."""
-    today = today or datetime.datetime.utcnow().date().isoformat()
+    today = today or utcnow().date().isoformat()
     keep = keep or BACKUP_KEEP
     folder = nightly_dir()
     os.makedirs(folder, exist_ok=True)
@@ -5154,7 +5203,7 @@ def run_nightly_backup(conn, today=None, keep=None, force=False):
 
 
 def backup_due(now=None):
-    now = now or datetime.datetime.utcnow()
+    now = now or utcnow()
     return NIGHTLY_BACKUP and now.hour >= BACKUP_HOUR_UTC and not os.path.exists(os.path.join(nightly_dir(), "kelp_erp_%s.zip" % now.date().isoformat()))
 
 
@@ -5466,7 +5515,7 @@ def library_scan_info(conn):
         age = None
         if r and r["scanned_at"]:
             try:
-                age = (datetime.datetime.utcnow() - datetime.datetime.fromisoformat(r["scanned_at"].rstrip("Z"))).total_seconds() / 86400.0
+                age = (utcnow() - datetime.datetime.fromisoformat(r["scanned_at"].rstrip("Z"))).total_seconds() / 86400.0
             except ValueError:
                 age = None
         out[kind] = {"at": r["scanned_at"] if r else None, "files": r["file_count"] if r else None, "by": r["by_who"] if r else None,
@@ -5944,7 +5993,7 @@ class Handler(BaseHTTPRequestHandler):
                 os.close(fd)
                 try:
                     build_full_backup(conn, zip_path)
-                    ts = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+                    ts = utcnow().strftime("%Y%m%d-%H%M%S")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/zip")
                     self.send_header("Content-Length", str(os.path.getsize(zip_path)))
@@ -5973,7 +6022,7 @@ class Handler(BaseHTTPRequestHandler):
                     os.remove(tmp_path)
                 except OSError:
                     pass
-            ts = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+            ts = utcnow().strftime("%Y%m%d-%H%M%S")
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(len(content)))
@@ -6768,6 +6817,8 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     conn.execute("INSERT OR REPLACE INTO sample_label_names (stage,name) VALUES (?,?)", (stage, name))
             return {"ok": True}
+        if seg[:2] == ["api", "lots"]:
+            return self.route_lots(method, seg, query, conn, user)
         if seg[:2] == ["api", "consumables"]:
             return self.route_consumables(method, seg, conn, user)
         if seg[:2] == ["api", "cip"]:
@@ -7600,7 +7651,10 @@ class Handler(BaseHTTPRequestHandler):
             if cat:
                 k = (cat, t["name"], t["unit"])
                 agg[k] = agg.get(k, 0) - (t["delta"] or 0)
-        materials = [(names_c[k[0]], k[1], round(v, 2), k[2]) for k, v in sorted(agg.items(), key=lambda kv: (order[kv[0][0]], kv[0][1])) if abs(v) > 1e-9]
+        lot_text = {}
+        for m in self._run_materials(conn, r):
+            lot_text[(m["item"])] = "; ".join("%s (%s)" % (l["supplierLot"], l["lotCode"]) for l in m["lots"]) + ("; untraced %g" % m["untraced"] if m["untraced"] else "")
+        materials = [(names_c[k[0]], k[1], round(v, 2), k[2], lot_text.get(k[1], "")) for k, v in sorted(agg.items(), key=lambda kv: (order[kv[0][0]], kv[0][1])) if abs(v) > 1e-9]
         prog = run["progress"]
         tot = sum(sec["total"] for sec in prog["sections"])
         fil = sum(sec["filled"] for sec in prog["sections"])
@@ -8930,6 +8984,233 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(409, "Item # %s is already used by another item" % item_number)
         return item_number
 
+    # ---- lots (recall traceability) ---------------------------------------- #
+    def _lot_public(self, conn, r):
+        warn = float(get_setting_value(conn, "lot_expiry_warning_days", 30) or 0)
+        today = datetime.date.today()
+        exp = r["expiry_date"]
+        days = (datetime.date.fromisoformat(exp) - today).days if exp else None
+        c = conn.execute("SELECT name, unit, item_number FROM consumables WHERE id=?", (r["consumable_id"],)).fetchone()
+        uses = conn.execute("SELECT COUNT(DISTINCT COALESCE(ref, 'u'||id)) n FROM lot_uses WHERE lot_id=?", (r["id"],)).fetchone()["n"]
+        return {"id": r["id"], "lotCode": r["lot_code"], "consumableId": r["consumable_id"], "item": c["name"] if c else None, "unit": c["unit"] if c else None,
+                "itemNumber": c["item_number"] if c else None, "supplier": r["supplier"], "supplierLot": r["supplier_lot"], "receivedDate": r["received_date"],
+                "expiryDate": exp, "qtyReceived": r["qty_received"], "qtyRemaining": r["qty_remaining"], "poRef": r["po_ref"], "notes": r["notes"],
+                "onHold": bool(r["on_hold"]), "holdReason": r["hold_reason"], "createdBy": r["created_by"], "createdAt": r["created_at"], "usedBy": uses,
+                "expired": days is not None and days < 0, "expiringSoon": days is not None and 0 <= days <= warn and r["qty_remaining"] > 0, "daysToExpiry": days}
+
+    def _lot_log(self, conn, lot_id, event, detail, reason, user):
+        conn.execute("INSERT INTO consumable_lot_log (lot_id,event,detail,reason,user_name,created_at) VALUES (?,?,?,?,?,?)",
+                     (lot_id, event, detail, reason, user["name"] if user else None, now_iso()))
+
+    @staticmethod
+    def _iso_date(v, label, required=False):
+        v = (v or "").strip()
+        if not v:
+            if required:
+                raise ApiError(400, "Enter the %s" % label)
+            return None
+        try:
+            datetime.date.fromisoformat(v)
+        except ValueError:
+            raise ApiError(400, "%s must be a date" % (label[0].upper() + label[1:]))
+        return v
+
+    def _receive_lot(self, conn, user, cid, d):
+        c = conn.execute("SELECT * FROM consumables WHERE id=?", (cid,)).fetchone()
+        if not c:
+            raise ApiError(404, "Item not found")
+        qty = numn(d.get("qty"))
+        if qty is None or qty <= 0:
+            raise ApiError(400, "Enter a quantity greater than 0")
+        supplier_lot = (d.get("supplierLot") or "").strip()
+        if not supplier_lot:
+            raise ApiError(400, "Enter the supplier's lot number (it is printed on the package)")
+        received = self._iso_date(d.get("receivedDate"), "received date") or today_iso()
+        expiry = self._iso_date(d.get("expiryDate"), "expiry date")
+        if expiry and expiry < received:
+            raise ApiError(400, "The expiry date is before the received date")
+        base = "%s-%s" % (c["item_number"] or "ITEM%d" % c["id"], received.replace("-", ""))
+        n = conn.execute("SELECT COUNT(*) FROM consumable_lots WHERE lot_code LIKE ?", (base + "-%",)).fetchone()[0] + 1
+        while conn.execute("SELECT 1 FROM consumable_lots WHERE lot_code=?", ("%s-%02d" % (base, n),)).fetchone():
+            n += 1
+        code = "%s-%02d" % (base, n)
+        who = user["name"] if user else None
+        cur = conn.execute(
+            "INSERT INTO consumable_lots (consumable_id,lot_code,supplier,supplier_lot,received_date,expiry_date,qty_received,qty_remaining,po_ref,notes,created_by,created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (cid, code, (d.get("supplier") or "").strip() or None, supplier_lot[:80], received, expiry, qty, qty, (d.get("poRef") or "").strip() or None,
+             (d.get("notes") or "").strip() or None, who, now_iso()))
+        self._consume(conn, cid, qty, "Received (lot %s, supplier lot %s)" % (code, supplier_lot[:40]), code, who)
+        self._lot_log(conn, cur.lastrowid, "received", "%s %s" % (qty, c["unit"]), None, user)
+        return {"lot": self._lot_public(conn, conn.execute("SELECT * FROM consumable_lots WHERE id=?", (cur.lastrowid,)).fetchone()),
+                "onHand": conn.execute("SELECT on_hand FROM consumables WHERE id=?", (cid,)).fetchone()["on_hand"]}
+
+    def _run_materials(self, conn, r):
+        """What a run used, item by item, with the lots it came from. `untraced` is the part of the ledger usage that no lot covers (stock received before lots were
+        recorded, or more used than the lots held)."""
+        used, meta = {}, {}
+        for x in conn.execute("SELECT t.delta, t.reason, c.id cid, c.name, c.unit, c.item_number, c.is_container, c.label_sku_code FROM consumable_txns t "
+                              "JOIN consumables c ON c.id=t.consumable_id WHERE t.ref=?", (r["processing_lot"],)):
+            cat = self._yu_category(x["reason"], x["is_container"], x["label_sku_code"])
+            if cat:
+                used[x["cid"]] = used.get(x["cid"], 0) - (x["delta"] or 0)
+                meta[x["cid"]] = (cat, x["name"], x["unit"], x["item_number"])
+        lots = {}
+        for u in conn.execute("SELECT u.id, u.consumable_id, u.qty, l.id lot_id, l.lot_code, l.supplier, l.supplier_lot, l.expiry_date FROM lot_uses u "
+                              "JOIN consumable_lots l ON l.id=u.lot_id WHERE u.ref=? ORDER BY u.id", (r["processing_lot"],)):
+            lots.setdefault(u["consumable_id"], []).append({"useId": u["id"], "lotId": u["lot_id"], "lotCode": u["lot_code"], "supplier": u["supplier"], "supplierLot": u["supplier_lot"],
+                                                            "expiryDate": u["expiry_date"], "qty": u["qty"]})
+            if u["consumable_id"] not in meta:
+                c = conn.execute("SELECT name, unit, item_number FROM consumables WHERE id=?", (u["consumable_id"],)).fetchone()
+                meta[u["consumable_id"]] = ("reagent", c["name"], c["unit"], c["item_number"])
+        order = {"reagent": 0, "packaging": 1, "sample": 2, "label": 3}
+        out = []
+        for cid, (cat, name, unit, number) in sorted(meta.items(), key=lambda kv: (order.get(kv[1][0], 9), kv[1][1])):
+            total = round(used.get(cid, 0), 4)
+            traced = round(sum(l["qty"] for l in lots.get(cid, [])), 4)
+            if abs(total) < 1e-9 and not lots.get(cid):
+                continue
+            out.append({"consumableId": cid, "category": cat, "item": name, "itemNumber": number, "unit": unit, "used": total, "lots": lots.get(cid, []),
+                        "untraced": round(max(0.0, total - traced), 4)})
+        return out
+
+    def _lot_trace(self, conn, lot):
+        """Forward trace of one lot: everything that used it, the production runs that reached, their finished-goods lots and the customers who received them."""
+        uses, runs, seen_runs = {}, [], set()
+        for u in conn.execute("SELECT * FROM lot_uses WHERE lot_id=? ORDER BY id", (lot["id"],)):
+            key = u["ref"] or "(manual) %s" % (u["reason"] or "use")
+            e = uses.setdefault(key, {"ref": u["ref"], "label": key, "qty": 0.0, "kind": "other", "detail": u["reason"], "date": u["created_at"], "useIds": []})
+            e["qty"] = round(e["qty"] + u["qty"], 6)
+            e["useIds"].append(u["id"])
+        run_rows = {}                                                              # run id -> (run row, via)
+        for e in uses.values():
+            ref = e["ref"]
+            if not ref:
+                continue
+            run = conn.execute("SELECT * FROM production_runs WHERE processing_lot=?", (ref,)).fetchone()
+            if run:
+                e.update(kind="run", detail="Production run (%s)" % (run["sku_code"] or ""), runId=run["id"])
+                run_rows.setdefault(run["id"], (run, "used directly"))
+                continue
+            cip = conn.execute("SELECT * FROM cip_events WHERE cip_ref=?", (ref,)).fetchone()
+            if cip:
+                e.update(kind="cip", detail="Clean-in-place: %s" % cip["equipment"], date=cip["started_at"])
+                if cip["run_id"]:
+                    linked = conn.execute("SELECT * FROM production_runs WHERE id=?", (cip["run_id"],)).fetchone()
+                    if linked:
+                        run_rows.setdefault(linked["id"], (linked, "cleaning linked to the run"))
+                continue
+            pre = conn.execute("SELECT * FROM preproc_batches WHERE batch_lot=?", (ref,)).fetchone()
+            if pre:
+                e.update(kind="preproc", detail="Pre-processing batch", date=pre["batch_date"])
+                for tr in conn.execute("SELECT DISTINCT run_id FROM tote_lots WHERE preproc_batch_id=? AND run_id IS NOT NULL", (pre["id"],)):
+                    downstream = conn.execute("SELECT * FROM production_runs WHERE id=?", (tr["run_id"],)).fetchone()
+                    if downstream:
+                        run_rows.setdefault(downstream["id"], (downstream, "through pre-processing batch %s" % ref))
+        customers = {}
+        for run, via in sorted(run_rows.values(), key=lambda x: x[0]["id"]):
+            rep = self._recall_report(conn, run)
+            runs.append({"runId": run["id"], "processingLot": run["processing_lot"], "sku": run["sku_code"], "runDate": run["run_date"], "releaseState": run["release_state"],
+                         "via": via, "lots": rep["lots"]})
+            for c in rep["customers"]:
+                x = customers.setdefault(c["name"], {"name": c["name"], "contact": c["contact"], "email": c["email"], "phone": c["phone"], "units": 0, "lots": []})
+                x["units"] += c["units"]
+                x["lots"] += c["lots"]
+        return {"lot": self._lot_public(conn, lot), "uses": sorted(uses.values(), key=lambda e: e["date"] or ""), "runs": runs,
+                "customers": sorted(customers.values(), key=lambda c: c["name"]),
+                "log": [{"event": g["event"], "detail": g["detail"], "reason": g["reason"], "by": g["user_name"], "at": g["created_at"]}
+                        for g in conn.execute("SELECT * FROM consumable_lot_log WHERE lot_id=? ORDER BY id DESC", (lot["id"],))]}
+
+    def route_lots(self, method, seg, query, conn, user):
+        can_edit = user["role"] == "admin" or self._is_quality_manager(user)
+        if seg == ["api", "lots"] and method == "GET":
+            q = (query.get("q", [""])[0] or "").strip()
+            where, args = [], []
+            if q:
+                like = "%" + q.replace("%", "").replace("_", "") + "%"
+                where.append("(l.lot_code LIKE ? OR l.supplier_lot LIKE ? OR l.supplier LIKE ? OR c.name LIKE ? OR c.item_number LIKE ?)")
+                args += [like] * 5
+            if query.get("expiring", [""])[0] == "1":
+                warn = int(float(get_setting_value(conn, "lot_expiry_warning_days", 30) or 0))
+                where.append("l.qty_remaining>0 AND l.expiry_date IS NOT NULL AND l.expiry_date <= ?")
+                args.append((datetime.date.today() + datetime.timedelta(days=warn)).isoformat())
+            rows = conn.execute("SELECT l.* FROM consumable_lots l JOIN consumables c ON c.id=l.consumable_id" + (" WHERE " + " AND ".join(where) if where else "")
+                                + " ORDER BY l.received_date DESC, l.id DESC LIMIT 200", args).fetchall()
+            return {"lots": [self._lot_public(conn, r) for r in rows]}
+        if len(seg) == 4 and seg[2] == "run" and seg[3].isdigit() and method == "GET":
+            r = conn.execute("SELECT * FROM production_runs WHERE id=?", (int(seg[3]),)).fetchone()
+            if not r:
+                raise ApiError(404, "Production run not found")
+            return {"materials": self._run_materials(conn, r)}
+        if len(seg) == 5 and seg[2] == "uses" and seg[3].isdigit() and seg[4] == "move" and method == "POST":
+            if not can_edit:
+                raise ApiError(403, "Only a Quality Manager or an administrator can move a use to another lot")
+            d = self._body_json()
+            reason = (d.get("reason") or "").strip()
+            if not reason:
+                raise ApiError(400, "Enter the reason for moving this use to another lot")
+            u = conn.execute("SELECT * FROM lot_uses WHERE id=?", (int(seg[3]),)).fetchone()
+            target = conn.execute("SELECT * FROM consumable_lots WHERE id=?", (d.get("lotId"),)).fetchone()
+            if not u or not target:
+                raise ApiError(404, "Use or lot not found")
+            if target["consumable_id"] != u["consumable_id"]:
+                raise ApiError(400, "That lot is a different item")
+            if target["id"] == u["lot_id"]:
+                raise ApiError(400, "It already comes from that lot")
+            if target["qty_remaining"] + 1e-9 < u["qty"]:
+                raise ApiError(409, "Lot %s has only %g left; this use is %g" % (target["lot_code"], target["qty_remaining"], u["qty"]))
+            old = conn.execute("SELECT lot_code FROM consumable_lots WHERE id=?", (u["lot_id"],)).fetchone()
+            conn.execute("UPDATE consumable_lots SET qty_remaining=ROUND(qty_remaining+?,6) WHERE id=?", (u["qty"], u["lot_id"]))
+            conn.execute("UPDATE consumable_lots SET qty_remaining=ROUND(qty_remaining-?,6) WHERE id=?", (u["qty"], target["id"]))
+            conn.execute("UPDATE lot_uses SET lot_id=? WHERE id=?", (target["id"], u["id"]))
+            detail = "%g used by %s moved from %s to %s" % (u["qty"], u["ref"] or u["reason"], old["lot_code"], target["lot_code"])
+            self._lot_log(conn, u["lot_id"], "use_moved_out", detail, reason, user)
+            self._lot_log(conn, target["id"], "use_moved_in", detail, reason, user)
+            return {"ok": True}
+        if len(seg) >= 3 and seg[2].isdigit():
+            lot = conn.execute("SELECT * FROM consumable_lots WHERE id=?", (int(seg[2]),)).fetchone()
+            if not lot:
+                raise ApiError(404, "Lot not found")
+            if len(seg) == 3 and method == "GET":
+                return self._lot_public(conn, lot)
+            if len(seg) == 4 and seg[3] == "trace" and method == "GET":
+                return self._lot_trace(conn, lot)
+            if len(seg) == 3 and method == "PUT":
+                if not can_edit:
+                    raise ApiError(403, "Only a Quality Manager or an administrator can change a lot")
+                d = self._body_json()
+                reason = (d.get("reason") or "").strip()
+                new = {"supplier": lot["supplier"], "supplier_lot": lot["supplier_lot"], "expiry_date": lot["expiry_date"], "po_ref": lot["po_ref"], "notes": lot["notes"],
+                       "on_hold": lot["on_hold"], "hold_reason": lot["hold_reason"]}
+                for key, col in (("supplier", "supplier"), ("poRef", "po_ref"), ("notes", "notes")):
+                    if key in d:
+                        new[col] = (d.get(key) or "").strip() or None
+                if "supplierLot" in d:
+                    new["supplier_lot"] = (d.get("supplierLot") or "").strip()
+                    if not new["supplier_lot"]:
+                        raise ApiError(400, "The supplier lot number cannot be blank")
+                if "expiryDate" in d:
+                    new["expiry_date"] = self._iso_date(d.get("expiryDate"), "expiry date")
+                    if new["expiry_date"] and new["expiry_date"] < lot["received_date"]:
+                        raise ApiError(400, "The expiry date is before the received date")
+                if "onHold" in d:
+                    new["on_hold"] = 1 if d.get("onHold") else 0
+                    new["hold_reason"] = reason if new["on_hold"] else None
+                changes = [(k, lot[k], new[k]) for k in new if (lot[k] if lot[k] is not None else "") != (new[k] if new[k] is not None else "")]
+                if not changes:
+                    return self._lot_public(conn, lot)
+                if not reason:
+                    raise ApiError(400, "Enter the reason for the change")
+                labels = {"supplier": "Supplier", "supplier_lot": "Supplier lot", "expiry_date": "Expiry date", "po_ref": "PO / reference", "notes": "Notes",
+                          "on_hold": "On hold", "hold_reason": "Hold reason"}
+                for k, old, nv in changes:
+                    if k != "hold_reason":
+                        self._lot_log(conn, lot["id"], "edited", "%s: %s -> %s" % (labels[k], old if old not in (None, "") else "-", nv if nv not in (None, "") else "-"), reason, user)
+                conn.execute("UPDATE consumable_lots SET supplier=?, supplier_lot=?, expiry_date=?, po_ref=?, notes=?, on_hold=?, hold_reason=? WHERE id=?",
+                             (new["supplier"], new["supplier_lot"], new["expiry_date"], new["po_ref"], new["notes"], new["on_hold"], new["hold_reason"], lot["id"]))
+                return self._lot_public(conn, conn.execute("SELECT * FROM consumable_lots WHERE id=?", (lot["id"],)).fetchone())
+        raise ApiError(404, "Unknown lots endpoint")
+
     def route_consumables(self, method, seg, conn, user):
         if seg == ["api", "consumables"]:
             if method == "GET":
@@ -8938,7 +9219,10 @@ class Handler(BaseHTTPRequestHandler):
                 for x in conn.execute("SELECT si.consumable_id, d.id, d.chemical, d.supplier FROM sds_items si JOIN sds_documents d ON d.id=si.sds_id "
                                       "WHERE d.status='current' AND d.stored_name IS NOT NULL ORDER BY d.chemical"):
                     sds.setdefault(x["consumable_id"], []).append({"id": x["id"], "chemical": x["chemical"], "supplier": x["supplier"]})
-                return {"consumables": [dict(self._consumable_public(r), sds=sds.get(r["id"], [])) for r in rows]}
+                lots = {x["consumable_id"]: (x["n"], x["rem"]) for x in conn.execute(
+                    "SELECT consumable_id, COUNT(*) n, COALESCE(SUM(qty_remaining),0) rem FROM consumable_lots GROUP BY consumable_id")}
+                return {"consumables": [dict(self._consumable_public(r), sds=sds.get(r["id"], []), lotCount=lots.get(r["id"], (0, 0))[0],
+                                             lotsRemaining=round(lots.get(r["id"], (0, 0))[1], 4)) for r in rows]}
             if method == "POST":
                 d = self._body_json()
                 label_sku = (d.get("labelSku") or "").strip()
@@ -8997,6 +9281,16 @@ class Handler(BaseHTTPRequestHandler):
                 if not item_number:
                     assign_item_numbers(conn)
                 return {"ok": True, "itemNumber": conn.execute("SELECT item_number FROM consumables WHERE id=?", (cur.lastrowid,)).fetchone()["item_number"]}
+        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "lots" and method == "GET":
+            c = conn.execute("SELECT * FROM consumables WHERE id=?", (int(seg[2]),)).fetchone()
+            if not c:
+                raise ApiError(404, "Item not found")
+            rows = conn.execute("SELECT * FROM consumable_lots WHERE consumable_id=? ORDER BY received_date DESC, id DESC", (c["id"],)).fetchall()
+            left = sum(r["qty_remaining"] for r in rows)
+            return {"item": self._consumable_public(c), "lots": [self._lot_public(conn, r) for r in rows],
+                    "untraced": round(max(0.0, c["on_hand"] - left), 4)}
+        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "receive" and method == "POST":
+            return self._receive_lot(conn, user, int(seg[2]), self._body_json())
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "history" and method == "GET":
             cid = int(seg[2])
             if not conn.execute("SELECT 1 FROM consumables WHERE id=?", (cid,)).fetchone():
@@ -9235,6 +9529,38 @@ class Handler(BaseHTTPRequestHandler):
         conn.execute("UPDATE consumables SET on_hand = on_hand + ? WHERE id=?", (delta, consumable_id))
         conn.execute("INSERT INTO consumable_txns (consumable_id,delta,reason,ref,user_name,created_at)"
                      " VALUES (?,?,?,?,?,?)", (consumable_id, delta, reason, ref, user_name, now_iso()))
+        if delta < 0:
+            self._lots_allocate(conn, consumable_id, -delta, ref, reason)       # recall traceability: which lot(s) the stock came from
+        elif delta > 0 and ref:
+            self._lots_refund(conn, consumable_id, delta, ref)                  # a refund of what that reference used goes back to the same lot(s)
+
+    def _lots_allocate(self, conn, cid, qty, ref, reason):
+        """Assign a use of `qty` to lots: not-expired lots first by earliest expiry (no expiry last), then expired ones, never a lot on hold. Whatever the
+        lots cannot cover is simply untraced (stock never blocks a run)."""
+        today = datetime.date.today().isoformat()
+        left = qty
+        for lot in conn.execute(
+                "SELECT id, qty_remaining FROM consumable_lots WHERE consumable_id=? AND qty_remaining>0 AND on_hold=0"
+                " ORDER BY (expiry_date IS NOT NULL AND expiry_date<?), (expiry_date IS NULL), expiry_date, received_date, id", (cid, today)).fetchall():
+            if left <= 1e-9:
+                break
+            take = round(min(lot["qty_remaining"], left), 6)
+            conn.execute("UPDATE consumable_lots SET qty_remaining=ROUND(qty_remaining-?,6) WHERE id=?", (take, lot["id"]))
+            conn.execute("INSERT INTO lot_uses (lot_id,consumable_id,ref,reason,qty,created_at) VALUES (?,?,?,?,?,?)", (lot["id"], cid, ref, reason, take, now_iso()))
+            left = round(left - take, 6)
+
+    def _lots_refund(self, conn, cid, qty, ref):
+        left = qty
+        for u in conn.execute("SELECT id, lot_id, qty FROM lot_uses WHERE consumable_id=? AND ref=? AND qty>0 ORDER BY id DESC", (cid, ref)).fetchall():
+            if left <= 1e-9:
+                break
+            back = round(min(u["qty"], left), 6)
+            conn.execute("UPDATE consumable_lots SET qty_remaining=ROUND(qty_remaining+?,6) WHERE id=?", (back, u["lot_id"]))
+            if back >= u["qty"] - 1e-9:
+                conn.execute("DELETE FROM lot_uses WHERE id=?", (u["id"],))
+            else:
+                conn.execute("UPDATE lot_uses SET qty=ROUND(qty-?,6) WHERE id=?", (back, u["id"]))
+            left = round(left - back, 6)
 
     def _consumable_by_name(self, conn, name):
         return conn.execute("SELECT * FROM consumables WHERE name=?", (name,)).fetchone()
@@ -10188,7 +10514,7 @@ class Handler(BaseHTTPRequestHandler):
             if state == "amending" and not op:
                 add("error", "Amendment", r, "The run is 'Under amendment' but no amendment is open.")
             if op:
-                age = (datetime.datetime.utcnow() - datetime.datetime.strptime(op["opened_at"][:19], "%Y-%m-%dT%H:%M:%S")).days
+                age = (utcnow() - datetime.datetime.strptime(op["opened_at"][:19], "%Y-%m-%dT%H:%M:%S")).days
                 if age >= 7:
                     add("warning", "Amendment", r, "Amendment opened by %s %d days ago is still open - its finished goods are on hold."
                         % (op["opened_by"], age), "Submit or cancel the amendment.")
@@ -10398,7 +10724,8 @@ class Handler(BaseHTTPRequestHandler):
                     customers[x["customer"]]["units"] += x["qty"]
                     customers[x["customer"]]["lots"].add(l["lotNumber"])
         return {"run": {"id": r["id"], "processingLot": r["processing_lot"], "sku": r["sku_code"], "releaseState": r["release_state"]}, "lots": lots,
-                "customers": [dict(c, lots=sorted(c["lots"])) for c in sorted(customers.values(), key=lambda c: c["name"])]}
+                "customers": [dict(c, lots=sorted(c["lots"])) for c in sorted(customers.values(), key=lambda c: c["name"])],
+                "materials": self._run_materials(conn, r)}
 
     def _release_action(self, conn, r, action, d, user):
         rid, state = r["id"], r["release_state"]
@@ -10696,7 +11023,7 @@ class Handler(BaseHTTPRequestHandler):
         limit_mb = float(get_setting_value(conn, "upload_user_daily_mb", 300) or 0)
         if limit_mb <= 0 or not uploaded_by:
             return
-        since = (datetime.datetime.utcnow() - datetime.timedelta(hours=24)).replace(microsecond=0).isoformat() + "Z"
+        since = (utcnow() - datetime.timedelta(hours=24)).replace(microsecond=0).isoformat() + "Z"
         used = sum(conn.execute("SELECT COALESCE(SUM(size),0) FROM %s WHERE uploaded_by=? AND uploaded_at>=?" % t, (uploaded_by, since)).fetchone()[0]
                    for t in ("run_attachments", "tote_attachments"))
         if used + nbytes > limit_mb * 1024 * 1024:
@@ -13615,7 +13942,7 @@ def restore_on_boot():
     except ApiError as e:
         logger.critical("RESTORE FAILED, nothing was replaced: %s", e.message)
         raise SystemExit(1)
-    done = "%s.restored-%s" % (path, datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S"))
+    done = "%s.restored-%s" % (path, utcnow().strftime("%Y%m%d-%H%M%S"))
     os.replace(path, done)
     logger.warning("RESTORED from %s (backup made %s): %d users, files %s. A copy of the previous data is in backups/pre-restore-*.db.gz. "
                    "Remove KELP_ERP_RESTORE_FROM and KELP_ERP_RESTORE_CONFIRM from the environment now.", done, info.get("backupCreatedAt"), info["users"], info["files"])

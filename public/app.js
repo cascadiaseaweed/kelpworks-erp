@@ -4223,6 +4223,10 @@ async function openRecallReport(d) {
     l.shipments.forEach(x => rows.push([x.shipmentNo, x.date, x.customer || '—', num(fmt(x.qty)), x.status, x.reference || '—', x.carrier ? x.carrier + (x.tracking ? ' ' + x.tracking : '') : '—']));
   });
   body.append(table(['Shipment', 'Date', 'Customer', 'Units', 'Status', 'Reference', 'Carrier'], rows, [false, false, false, true, false, false, false]));
+  body.append(el('h4', { style: 'margin:12px 0 4px' }, 'What went into it (supplier lots)'));
+  const mrows = [];
+  r.materials.forEach(x => (x.lots.length ? x.lots : [null]).forEach(l => mrows.push([x.item, num(fmt(l ? l.qty : x.used, 2) + ' ' + x.unit), l ? l.supplierLot : '—', l ? (l.supplier || '—') : '—', l ? (l.expiryDate || '—') : '—'])));
+  body.append(mrows.length ? table(['Item', 'Used', 'Supplier lot', 'Supplier', 'Expiry'], mrows, [false, true, false, false, false]) : el('div', { class: 'help' }, 'No inventory usage is recorded against this run.'));
   modal('Where did ' + d.lot + ' go?', body, async () => {}, 'Close', { wide: true, noCancel: true });
 }
 async function openReleaseRun(id) {
@@ -4239,6 +4243,7 @@ async function openReleaseRun(id) {
       el('button', { type: 'button', class: 'secondary', onclick: () => window.open(coaPdfUrl(id, false), '_blank') }, 'View CoA')),
     d.lab.failed.length ? el('div', { class: 'help', style: 'color:var(--danger);font-weight:600;margin-top:6px' },
       'Outside specification: ' + d.lab.failed.join(', ') + '. A comment is required to release this lot.') : null));
+  body.append(await materialsCard(id));
   const blockedGate = d.gate.filter(g => !g.ok);
   body.append(el('div', { class: 'sign-box' }, el('h4', {}, 'Release gate — must pass before this run can be released'),
     el('div', { class: 'help', style: 'margin-bottom:6px;' + (blockedGate.length ? 'color:var(--danger);font-weight:600' : '') },
@@ -4780,7 +4785,8 @@ async function openCipModal(ev, events) {
 // finished-good labels (labelSku set -- one item per SKU + package type).
 async function pageConsumables(v) {
   const isAdmin = State.user.role === 'admin';
-  v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Inventory Items')));
+  v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Inventory Items'),
+    el('div', { class: 'actions' }, el('button', { class: 'secondary', onclick: () => openLotFinder() }, 'Find / trace a lot'))));
   v.append(el('div', { class: 'help', style: 'margin:-8px 0 10px' },
     'Item # = category + sequence, assigned automatically and never reused: ',
     el('b', {}, 'RGT'), ' reagent · ', el('b', {}, 'CIP'), ' cleaning agent · ', el('b', {}, 'PKG'), ' packaging · ',
@@ -4834,7 +4840,7 @@ async function pageConsumables(v) {
       row.push(c.location || '—', fmt(c.onHand, opts.wholeUnits ? 0 : 1) + ' ' + c.unit, fmt(c.reorderLevel, 1),
         c.costPerUnit != null ? '$' + fmt(c.costPerUnit, 2) : '—',
         badge(c.low ? 'low' : 'ok', c.low ? 'LOW' : 'OK'),
-        rowActions([['Receive', () => adjustC(c, 1)], ['Use', () => adjustC(c, -1)],
+        rowActions([['Receive', () => adjustC(c, 1)], ['Use', () => adjustC(c, -1)], ['Lots' + (c.lotCount ? ' (' + c.lotCount + ')' : ''), () => openItemLots(c)],
           ['Dispose', () => disposeConsumables([c]), 'danger'], ['Edit', () => editC(c)]]));
       return row;
     };
@@ -4897,16 +4903,156 @@ async function pageConsumables(v) {
   draw();
 }
 function adjustC(c, sign) {
+  if (sign > 0) return receiveStock(c);
   const body = el('div', {},
-    field((sign > 0 ? 'Quantity received' : 'Quantity used') + ' (' + c.unit + ')',
-      el('input', { type: 'number', id: 'c_amt', min: '0', step: '0.1', value: '0' })),
-    field('Reason / reference', el('input', { id: 'c_reason', placeholder: sign > 0 ? 'PO / supplier' : 'reason' })));
-  modal((sign > 0 ? 'Receive ' : 'Use ') + c.name, body, async () => {
+    field('Quantity used (' + c.unit + ')', el('input', { type: 'number', id: 'c_amt', min: '0', step: '0.1', value: '0' })),
+    field('Reason / reference', el('input', { id: 'c_reason', placeholder: 'reason' })));
+  modal('Use ' + c.name, body, async () => {
     const amt = +body.querySelector('#c_amt').value || 0;
     if (amt <= 0) throw new Error('Enter a quantity greater than 0.');
-    await api('POST', '/consumables/' + c.id + '/adjust', { delta: sign * amt, reason: body.querySelector('#c_reason').value || (sign > 0 ? 'Received' : 'Used') });
+    await api('POST', '/consumables/' + c.id + '/adjust', { delta: -amt, reason: body.querySelector('#c_reason').value || 'Used' });
     toast('Stock updated'); render();
-  }, sign > 0 ? 'Receive' : 'Use');
+  }, 'Use');
+}
+// Receiving stock records a LOT: who supplied it, the supplier's lot number, when it arrived and when it expires. Every later use of the item is assigned to a lot
+// automatically (earliest expiry first), which is what lets a recall be traced from a lot to the runs, products and customers it reached.
+function receiveStock(c) {
+  const today = new Date().toISOString().slice(0, 10);
+  const q = el('input', { type: 'number', min: '0', step: 'any' }), lot = el('input', { placeholder: 'printed on the package' }), sup = el('input', { placeholder: 'e.g. supplier name' });
+  const rec = el('input', { type: 'date', value: today }), exp = el('input', { type: 'date' }), po = el('input', { placeholder: 'optional' }), nt = el('input', { placeholder: 'optional' });
+  const body = el('div', {},
+    el('div', { class: 'form-row' }, field('Quantity received (' + c.unit + ')', q), field('Supplier lot number *', lot)),
+    el('div', { class: 'form-row' }, field('Supplier', sup), field('PO / reference', po)),
+    el('div', { class: 'form-row' }, field('Received date', rec), field('Expiry date (leave blank if none)', exp)),
+    field('Notes', nt),
+    el('div', { class: 'help' }, 'Each delivery is one lot. Later uses of ' + c.name + ' are assigned to the lot with the earliest expiry first, so a recall can be traced.'));
+  modal('Receive ' + c.name, body, async () => {
+    const r = await api('POST', '/consumables/' + c.id + '/receive', { qty: +q.value, supplierLot: lot.value, supplier: sup.value, receivedDate: rec.value, expiryDate: exp.value || null, poRef: po.value, notes: nt.value });
+    toast('Received as lot ' + r.lot.lotCode); render();
+  }, 'Receive');
+}
+function lotStatusBadge(l) {
+  if (l.onHold) return badge('hold', 'On hold');
+  if (l.expired) return badge('low', 'Expired');
+  if (l.expiringSoon) return badge('low', 'Expires in ' + l.daysToExpiry + ' d');
+  return l.qtyRemaining > 0 ? badge('ok', 'In stock') : badge('sold', 'Used up');
+}
+function lotsTable(items, onTrace) {
+  return table(['Lot', 'Supplier lot', 'Item', 'Supplier', 'Received', 'Expiry', 'Received qty', 'Left', 'Status', ''],
+    items.map(l => [mono(l.lotCode), el('b', {}, l.supplierLot), l.item + (l.itemNumber ? ' (' + l.itemNumber + ')' : ''), l.supplier || '—', l.receivedDate, l.expiryDate || '—',
+      num(fmt(l.qtyReceived, l.qtyReceived % 1 ? 2 : 0) + ' ' + l.unit), num(fmt(l.qtyRemaining, l.qtyRemaining % 1 ? 2 : 0)), lotStatusBadge(l),
+      rowActions([['Trace', () => onTrace(l)]])]), [false, false, false, false, false, false, true, true, false, false]);
+}
+async function openItemLots(c) {
+  const r = await api('GET', '/consumables/' + c.id + '/lots');
+  const body = el('div', {});
+  body.append(el('div', { class: 'summary-line' }, sl('Item', c.name), sl('On hand', fmt(r.item.onHand, 1) + ' ' + c.unit), sl('In lots', fmt(r.item.onHand - r.untraced, 1) + ' ' + c.unit),
+    sl('Not in a lot', fmt(r.untraced, 1) + ' ' + c.unit)));
+  body.append(r.untraced > 0 ? el('div', { class: 'help' }, 'Stock that is on hand but not in a lot was counted or received before lots were recorded; it cannot be traced to a supplier lot. Receive new stock with its lot number to trace it.') : null);
+  body.append(r.lots.length ? lotsTable(r.lots.map(l => l), l => { document.querySelectorAll('.modal-bg').forEach(m => m.remove()); openLotTrace(l.id); })
+    : el('div', { class: 'help' }, 'No lots yet. Use Receive to record a delivery with its supplier lot number.'));
+  modal('Lots of ' + c.name, body, async () => {}, 'Close', { wide: true, noCancel: true });
+}
+async function openLotFinder() {
+  const q = el('input', { placeholder: 'supplier lot, KelpWorks lot, supplier or item', style: 'width:100%' });
+  const host = el('div', {});
+  const draw = async (expiring) => {
+    host.innerHTML = '';
+    const r = await api('GET', '/lots?q=' + encodeURIComponent(q.value.trim()) + (expiring ? '&expiring=1' : ''));
+    host.append(r.lots.length ? lotsTable(r.lots, l => { document.querySelectorAll('.modal-bg').forEach(m => m.remove()); openLotTrace(l.id); })
+      : el('div', { class: 'help' }, expiring ? 'Nothing is expired or expiring soon.' : 'No lot matches.'));
+  };
+  q.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); draw(false); } });
+  const body = el('div', {}, el('div', { class: 'form-row' }, q),
+    el('div', { style: 'margin:6px 0' }, el('button', { type: 'button', onclick: () => draw(false) }, 'Search'), ' ',
+      el('button', { type: 'button', class: 'secondary', onclick: () => draw(true) }, 'Expired / expiring soon')), host);
+  modal('Find a lot', body, async () => {}, 'Close', { wide: true, noCancel: true });
+  draw(false);
+}
+async function openLotTrace(id) {
+  const d = await api('GET', '/lots/' + id + '/trace');
+  const l = d.lot;
+  const canEdit = State.user.role === 'admin' || State.user.isQualityManager;
+  const body = el('div', {});
+  body.append(el('div', { class: 'summary-line' }, sl('Lot', l.lotCode), sl('Supplier lot', l.supplierLot), sl('Item', l.item), sl('Supplier', l.supplier || '—'),
+    sl('Received', l.receivedDate), sl('Expiry', l.expiryDate || '—'), sl('Left', fmt(l.qtyRemaining, 2) + ' / ' + fmt(l.qtyReceived, 2) + ' ' + l.unit), el('span', {}, 'Status: ', lotStatusBadge(l))));
+  if (l.onHold) body.append(el('div', { class: 'help', style: 'color:var(--danger);font-weight:600' }, 'On hold: ' + (l.holdReason || '') + ' — no new use is assigned to this lot.'));
+  body.append(el('h4', { style: 'margin:10px 0 4px' }, 'Used by (' + d.uses.length + ')'));
+  body.append(d.uses.length ? table(['Reference', 'What', 'Quantity', 'Date', canEdit ? '' : null].filter(x => x !== null),
+    d.uses.map(u => [mono(u.label), u.detail || '—', num(fmt(u.qty, 2) + ' ' + l.unit), u.date ? fmtWhen(u.date) : '—',
+      canEdit && u.useIds.length === 1 ? rowActions([['Move to another lot…', () => moveLotUse(l, u)]]) : (canEdit ? '' : null)].filter(x => x !== null)), [false, false, true, false])
+    : el('div', { class: 'help' }, 'Nothing has used this lot yet.'));
+  body.append(el('h4', { style: 'margin:12px 0 4px' }, 'Production runs reached (' + d.runs.length + ')'));
+  body.append(d.runs.length ? table(['Run', 'Product', 'Run date', 'Release', 'Reached through', 'Finished goods'],
+    d.runs.map(r => [mono(r.processingLot), skuName(r.sku), r.runDate || '—', r.releaseState || '—', r.via,
+      r.lots.map(x => x.lotNumber + ' (' + fmt(x.qtyOnHand) + ' here, ' + fmt(x.unitsShipped) + ' shipped)').join('; ') || '—']))
+    : el('div', { class: 'help' }, 'No production run is linked to this lot.'));
+  body.append(el('h4', { style: 'margin:12px 0 4px' }, 'Customers who received product made with this lot (' + d.customers.length + ')'));
+  body.append(d.customers.length ? table(['Customer', 'Contact', 'Email', 'Phone', 'Units', 'Lots'],
+    d.customers.map(c => [c.name, c.contact || '—', c.email || '—', c.phone || '—', num(fmt(c.units)), c.lots.join(', ')]), [false, false, false, false, true, false])
+    : el('div', { class: 'help' }, 'No customer has received product made with this lot.'));
+  if (canEdit) {
+    body.append(el('div', { style: 'margin-top:10px;display:flex;gap:8px;flex-wrap:wrap' },
+      el('button', { type: 'button', class: l.onHold ? '' : 'danger', onclick: () => holdLot(l) }, l.onHold ? 'Release the hold' : 'Put this lot on hold'),
+      el('button', { type: 'button', class: 'secondary', onclick: () => editLot(l) }, 'Correct details…')));
+  }
+  if (d.log.length) body.append(el('details', { class: 'accordion' }, el('summary', {}, 'History (' + d.log.length + ')'), el('div', { class: 'accordion-body' },
+    table(['When', 'By', 'What', 'Reason'], d.log.map(g => [fmtWhen(g.at), g.by || '—', (g.event === 'received' ? 'Received ' : '') + (g.detail || ''), g.reason || '—'])))));
+  body.append(el('div', { style: 'margin-top:8px' }, el('button', { type: 'button', class: 'secondary', onclick: () => printLotTrace(d) }, '🖨 Print this trace')));
+  modal('Trace of lot ' + l.supplierLot + ' (' + l.lotCode + ')', body, async () => {}, 'Close', { wide: true, noCancel: true });
+}
+function lotReload(id) { document.querySelectorAll('.modal-bg').forEach(m => m.remove()); return openLotTrace(id); }
+function holdLot(l) {
+  const reason = el('input', { placeholder: l.onHold ? 'why the hold is lifted' : 'e.g. supplier recall notice' });
+  modal(l.onHold ? 'Release the hold on ' + l.lotCode : 'Put ' + l.lotCode + ' on hold', el('div', {}, field('Reason (required)', reason),
+    el('div', { class: 'help' }, l.onHold ? 'New uses will be assigned to this lot again.' : 'No new use of this item will be assigned to this lot. Use already recorded stays on the record.')),
+    async () => { await api('PUT', '/lots/' + l.id, { onHold: !l.onHold, reason: reason.value }); toast('Saved'); await lotReload(l.id); }, 'Save');
+}
+function editLot(l) {
+  const sl_ = el('input', { value: l.supplierLot }), sup = el('input', { value: l.supplier || '' }), exp = el('input', { type: 'date', value: l.expiryDate || '' }), po = el('input', { value: l.poRef || '' }),
+    nt = el('input', { value: l.notes || '' }), reason = el('input', { placeholder: 'e.g. misread the label' });
+  modal('Correct lot details', el('div', {}, el('div', { class: 'form-row' }, field('Supplier lot number', sl_), field('Supplier', sup)),
+    el('div', { class: 'form-row' }, field('Expiry date', exp), field('PO / reference', po)), field('Notes', nt), field('Reason for the correction (required)', reason)),
+    async () => { await api('PUT', '/lots/' + l.id, { supplierLot: sl_.value, supplier: sup.value, expiryDate: exp.value || null, poRef: po.value, notes: nt.value, reason: reason.value });
+      toast('Saved'); await lotReload(l.id); }, 'Save');
+}
+async function moveLotUse(l, u) {
+  const r = await api('GET', '/consumables/' + l.consumableId + '/lots');
+  const others = r.lots.filter(x => x.id !== l.id && !x.onHold && x.qtyRemaining >= u.qty);
+  if (!others.length) { toast('No other lot of this item has enough left.', true); return; }
+  const sel = selectFrom('', others.map(x => [String(x.id), x.supplierLot + ' (' + x.lotCode + ') — ' + fmt(x.qtyRemaining, 2) + ' left']));
+  const reason = el('input', { placeholder: 'e.g. the operator used the other bag' });
+  modal('Move this use to another lot', el('div', {}, el('div', { class: 'help' }, u.label + ' used ' + fmt(u.qty, 2) + ' ' + l.unit + ' from ' + l.supplierLot + '.'),
+    field('Actually came from', sel), field('Reason (required)', reason)),
+    async () => { await api('POST', '/lots/uses/' + u.useIds[0] + '/move', { lotId: +sel.value, reason: reason.value }); toast('Moved'); await lotReload(l.id); }, 'Move');
+}
+function printLotTrace(d) {
+  const l = d.lot;
+  const rows = (items, cols) => items.map(i => '<tr>' + cols.map(c => '<td>' + escHtml(String(c(i) ?? '')) + '</td>').join('') + '</tr>').join('');
+  const html = '<h2>Lot trace: ' + escHtml(l.supplierLot) + ' (' + escHtml(l.lotCode) + ')</h2><p>' + escHtml(l.item) + ' &middot; supplier ' + escHtml(l.supplier || '-') + ' &middot; received ' + escHtml(l.receivedDate)
+    + ' &middot; expiry ' + escHtml(l.expiryDate || '-') + (l.onHold ? ' &middot; ON HOLD: ' + escHtml(l.holdReason || '') : '') + '</p>'
+    + '<h3>Production runs reached</h3><table><tr><th>Run</th><th>Product</th><th>Reached through</th><th>Finished goods</th></tr>'
+    + rows(d.runs, [r => r.processingLot, r => skuName(r.sku), r => r.via, r => r.lots.map(x => x.lotNumber).join('; ')]) + '</table>'
+    + '<h3>Customers</h3><table><tr><th>Customer</th><th>Contact</th><th>Email</th><th>Phone</th><th>Units</th><th>Lots</th></tr>'
+    + rows(d.customers, [c => c.name, c => c.contact, c => c.email, c => c.phone, c => c.units, c => c.lots.join(', ')]) + '</table>';
+  const w = window.open('', '_blank');
+  if (!w) return;
+  w.document.write('<!doctype html><title>Lot trace</title><style>body{font:13px Arial,sans-serif;margin:24px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #999;padding:4px 6px;text-align:left}</style>' + html);
+  w.document.close();
+  printWhenReady(w);
+}
+async function materialsCard(runId) {
+  const m = (await api('GET', '/lots/run/' + runId)).materials;
+  const rows = [];
+  m.forEach(x => {
+    if (!x.lots.length) rows.push([x.item, num(fmt(x.used, 2) + ' ' + x.unit), '—', '—', '—', x.untraced ? badge('low', 'No lot recorded') : '']);
+    x.lots.forEach((l, i) => rows.push([i ? '' : x.item, num(fmt(l.qty, 2) + ' ' + x.unit), l.supplierLot, l.supplier || '—', l.expiryDate || '—',
+      i === x.lots.length - 1 && x.untraced ? badge('low', fmt(x.untraced, 2) + ' no lot') : '']));
+  });
+  return el('div', { class: 'sign-box' }, el('h4', {}, 'Materials used and their lots'),
+    m.length ? table(['Item', 'Used', 'Supplier lot', 'Supplier', 'Expiry', ''], rows, [false, true, false, false, false, false])
+      : el('div', { class: 'help' }, 'No inventory usage is recorded against this run.'),
+    el('div', { class: 'help' }, 'Lots are assigned when the stock is used (earliest expiry first). “No lot recorded” means stock was used that was received before lots were recorded.'));
 }
 function editC(c) {
   const locs = State.ref.locations.map(l => [l, l]);
@@ -5482,6 +5628,13 @@ function exportYieldCsv(d) {
 // become a new settings row (backend SETTINGS_DEFAULTS) rather than a bare
 // literal in the code, so it shows up in the table below automatically.
 const CALCULATIONS = [
+  {
+    title: 'Inventory lots: stock left in a lot, and stock not in a lot',
+    formula: 'Left in a lot = quantity received − everything assigned to it (assigned when stock is used: not-expired lots first by earliest expiry, no expiry last, expired lots after, never a lot on hold; a refund returns to the lot it came from);  Not in a lot = max(0, item on hand − Σ left in its lots).  Expiring soon = expiry date within the warning period and stock left.',
+    description: 'Lets a recall be traced from a supplier lot to the runs, products and customers it reached. Stock counted or received before lots were recorded is “not in a lot” and cannot be traced to a supplier lot.',
+    location: 'Inventory Items → Lots, Find / trace a lot; Product Release → Materials used and their lots',
+    settings: ['lot_expiry_warning_days'],
+  },
   {
     title: 'Quality Control: control limits and signals (individuals chart)',
     formula: 'Centre = mean of the results;  σ̂ = MR̄ ÷ 1.128, where MR = |difference between consecutive results| and MR̄ is their average;  UCL = Centre + k·σ̂;  LCL = Centre − k·σ̂ (not below 0 for measurements that cannot be negative);  Moving-range UCL = 3.267 × MR̄.  Signals (only once limits are set): a result beyond a limit; N consecutive results on one side of the centre line; M consecutive rising (or falling) results. Results below the detection limit (“<”) are charted but left out of the statistics and signals.',
