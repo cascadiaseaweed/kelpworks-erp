@@ -21,3 +21,4 @@ a2d966f  2026-10-11  SOP register: file name is the source of truth (the release
 be689db  2026-10-12  small hardening batch (download tokens, upload quota, live restore) merged to main and live
 0fbfd69  2026-10-13  clean-backup tool, label-free Sugar Kelp / Macrocystis Kelp Extract merged to main and live
 77cb85f  2026-10-14  recall traceability (inventory lots) merged to main and live
+31d4be9  2026-10-14  historical run entry merged to main and live
