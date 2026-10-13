@@ -220,6 +220,17 @@ for `main` so a red run blocks the merge.
   `KELP_ERP_RESTORE_FROM=<path>` AND `KELP_ERP_RESTORE_CONFIRM=replace-live-data` are set: it validates everything (`_restore_zip`, the same core as the staging restore), keeps `backups/pre-restore-<utc>.db.gz`,
   does NOT reset passwords, renames the zip to `.restored-<utc>` and a failure stops the start (nothing changed). *Missing disk*: `KELP_ERP_REQUIRE_MOUNT=<path>` makes the server refuse to start when that
   path is not a mounted volume (otherwise a missing Render disk gives a fresh seeded database).
+- **Recall traceability: inventory lots** (tests in `tests/test_lot_traceability.py`). Every item in `consumables` (reagents, packaging, sample containers, labels, CIP agents) is received as a LOT:
+  `consumable_lots` (KelpWorks lot `<item #>-<YYYYMMDD>-<NN>`, the supplier, the SUPPLIER'S lot number (required), received / expiry date, quantity received and left, hold flag), created by
+  `POST /api/consumables/<id>/receive` (`_receive_lot`; the Receive button) -- the plain `/adjust` still exists for counts and corrections and creates no lot. **Every use is assigned to lots inside
+  `_consume`** (`_lots_allocate`: not-expired lots first by earliest expiry, no expiry last, expired lots after, never a lot on hold; what the lots cannot cover is simply untraced -- stock still never
+  blocks anything) and recorded in `lot_uses` against the ledger's `ref` (processing lot, `CIP-...` ref, pre-processing batch lot); a refund with the same ref (`_lots_refund`) goes back to the same lots, so the
+  net-change commits stay correct. Do not change stock by writing to `consumables.on_hand` directly: go through `_consume`. `GET /api/lots[?q=&expiring=1]`, `/api/lots/<id>/trace` (`_lot_trace`: the uses, the
+  production runs reached -- directly, through a CIP event linked to a run, or through a pre-processing batch's output totes -- their finished-goods lots and the customers, via `_recall_report`),
+  `/api/lots/run/<run id>` (`_run_materials`: what a run used with its lots and the untraced remainder; also in the recall report and the production summary PDF), `PUT /api/lots/<id>` (supplier lot / expiry /
+  hold; Quality Manager or admin, a reason is required and written to the append-only `consumable_lot_log`) and `POST /api/lots/uses/<use id>/move` (correct which lot a use came from). Lots are not part of the
+  release snapshot hash. UI: Inventory Items > Receive / Lots / Find / trace a lot; Product Release > "Materials used and their lots". Setting `lot_expiry_warning_days`. The three tables are records
+  (`CLEAR` in `tools/make_clean_backup.py`).
 - **Clean backup tool** (`tools/make_clean_backup.py`, tests in `tests/test_clean_backup.py`; guide: the last section of `docs/restore-runbook.md`). Turns a full backup into one with the configuration and NO records
   (the way to wipe live and start fresh: restore the clean zip). `KEEP` / `CLEAR` list every table; **a new table must be added to one of them** or the test (and the tool) fails -- records go in `CLEAR`, configuration
   and its change history in `KEEP`. Customers are records; consumable stock is set to 0; `uploads/` is dropped; the file is rebuilt with `VACUUM INTO` so removed rows do not linger. Never run it against live data directly.

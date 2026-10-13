@@ -157,3 +157,15 @@ def test_the_server_refuses_to_start_when_the_required_volume_is_not_mounted():
 def test_the_server_starts_when_the_required_path_is_a_mount_point():
     with Server(env={"KELP_ERP_REQUIRE_MOUNT": os.path.abspath(os.sep)}) as s:                  # the root of the file system is always a mount point
         assert s.admin_client().get("/api/me").status == 200
+
+
+# ---- no deprecated clock calls (the log showed a DeprecationWarning for datetime.utcnow) ----
+
+def test_the_server_uses_no_deprecated_utcnow():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(root, "kelp_erp_server.py"), encoding="utf-8").read()
+    assert "datetime.datetime.utcnow(" not in src
+    import subprocess, sys
+    r = subprocess.run([sys.executable, "-W", "error::DeprecationWarning", "-c", "import kelp_erp_server as k; print(k.now_iso()[-1], k.utcnow().year > 2000)"],
+                       cwd=root, capture_output=True, env=dict(os.environ, KELP_ERP_DB=os.path.join(root, "tests", "_warn_check.db"), KELP_ERP_SECRET="x" * 32))
+    assert r.returncode == 0 and r.stdout.decode().split() == ["Z", "True"], r.stderr.decode()[-400:]
