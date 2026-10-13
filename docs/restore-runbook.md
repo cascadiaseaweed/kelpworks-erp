@@ -56,3 +56,28 @@ serving anyone, when you ask it to with two environment variables. A copy of the
 If the service ever starts without its disk, it would create a **new empty database**. Set `KELP_ERP_REQUIRE_MOUNT=/var/data` on the service (check first in the
 Render shell that `python -c "import os;print(os.path.ismount('/var/data'))"` prints `True`) and the server refuses to start instead, with a message in the log saying
 the disk is not mounted.
+
+## Wipe everything and start fresh
+
+To clear ALL records from live (totes, runs, finished goods, shipments, customers, samples, lab results, documents, the audit history) and keep only the
+configuration, restore a **clean backup** instead of a normal one. The same steps as above apply; only the file differs, so this doubles as a rehearsal.
+
+**Kept:** users and their roles and passwords, species, sites, products, locations, settings (including the application rate), Certificate of Analysis specifications,
+labs + analyses + requisition templates + contact details, quality-chart limits, the SOP and safety-data-sheet register with its links and files, inventory item
+definitions (stock set to 0), and the history of changes to those. **Cleared:** every record, every uploaded document and photo, and the release / audit history.
+
+1. **Archive the old data.** Download a full backup (Admin > Download full backup) and keep it, named for what it is (for example `pre-wipe-2026-11-01`). The SharePoint
+   archive and its backups stay as they are; do not restore an older nightly backup by mistake afterwards.
+2. **Make the clean file** (on any PC with Python; it only reads and writes files):
+   ```bash
+   py tools/make_clean_backup.py pre-wipe-2026-11-01.zip kelpworks-CLEAN.zip
+   ```
+   It prints what it cleared and what it kept. It refuses a backup with a table it does not recognise (so no record is kept by mistake) and never overwrites a file.
+3. **Rehearse on staging:** Admin > Restore with `kelpworks-CLEAN.zip` (staging resets every password to the staging one). Check it opens empty, the people and settings are
+   there, and a test harvest, run and shipment work.
+4. **Restore on live** with the steps above, using `kelpworks-CLEAN.zip`. Checks afterwards: Product Release lists no runs, Verify audit trail says the chain is intact, the
+   Calculations page still shows your settings, and the first harvest check-in works.
+5. **Tidy up:** delete `kelpworks-CLEAN.zip` and the temporary SharePoint link (both contain every user's password hash), and remove the two restore variables from Render.
+
+Lot and shipment numbers start again from 001 (for example `PR-<date>-001`). The old records remain in `pre-wipe-...zip` and in the SharePoint archive, so reusing a
+number does not overwrite anything there, but keep that in mind when looking things up by number.
