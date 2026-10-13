@@ -19,3 +19,5 @@ f66d03c  2026-10-10  data-integrity cleanup (batch 7) merged to main and live
 a2d966f  2026-10-11  SOP register: file name is the source of truth (the release before batch 6)
 08b4be2  2026-10-11  release gate (batch 6) merged to main and live
 be689db  2026-10-12  small hardening batch (download tokens, upload quota, live restore) merged to main and live
+0fbfd69  2026-10-13  clean-backup tool, label-free Sugar Kelp / Macrocystis Kelp Extract merged to main and live
+77cb85f  2026-10-14  recall traceability (inventory lots) merged to main and live
