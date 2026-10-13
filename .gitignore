@@ -11,3 +11,5 @@ kelp_secret.key
 backups/
 tools/archive-key.txt
 tools/sync.log
+# backups (they hold password hashes and every record): never commit one
+*.zip

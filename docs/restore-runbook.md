@@ -18,15 +18,35 @@ serving anyone, when you ask it to with two environment variables. A copy of the
 
 ## Steps
 
-1. **Put the zip on the disk.** In the Render dashboard open the service > **Shell**.
-   - From a nightly backup already on the disk:
+1. **Put the zip on the disk.** Which way depends on where the file is. (The live service runs on a minimal image: the Render Shell has Python but **no `curl` or `wget`**,
+   and it cannot upload files.)
+   - **From a nightly backup already on the disk** (in the Render dashboard open the service > **Shell**):
      ```bash
      cp /var/data/backups/nightly/kelp_erp_2026-10-11.zip /var/data/restore_me.zip
      ```
-   - From the SharePoint copy: create a temporary download link for the file (OneDrive/SharePoint > Share > a link that works for people with the link,
-     expiring tomorrow), then in the shell `curl -L -o /var/data/restore_me.zip "<the link>"`. Delete the link afterwards.
-2. **Check the file** is a real zip of a sensible size: `ls -l /var/data/restore_me.zip` and `python -c "import zipfile;print(zipfile.ZipFile('/var/data/restore_me.zip').namelist()[:5])"`
-   (it should list `kelp_erp.db` and `manifest.json`).
+   - **From your PC (a downloaded backup, or a clean backup): copy it over SSH.** This is the normal way and needs no sharing link.
+     1. One-time: make an SSH key in PowerShell with `ssh-keygen -t ed25519` (press Enter at each question to accept the defaults; if it says a key already exists, answer `n` and use
+        that one). Show the public key with `Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub`, copy all of it, and add it in Render > Account Settings > **SSH Public Keys**.
+     2. Get the service's address: Render > the **live** service > **Connect** > **SSH**. Copy the part after `ssh `, for example `srv-abc123xyz@ssh.oregon.render.com`
+        (an address to type into a command, not a web page; no `https://`). If the SSH tab is missing, step 1 has not been done.
+     3. Copy the file, from PowerShell, with the full path of the file in quotes:
+        ```powershell
+        scp "C:\Users\nwran\OneDrive - Cascadia Seaweed Corp\Documents\KelpERP\tools\kelpworks-CLEAN.zip" srv-abc123xyz@ssh.oregon.render.com:/var/data/restore_me.zip
+        ```
+        Answer `yes` if it asks about the host's authenticity. It prints a progress line that ends at 100%. `No such file or directory` for the local file means PowerShell is not in the
+        folder you think (`.\` means "this folder"): use the full path.
+   - **A sharing link does not work** if your organisation blocks "anyone with the link" (the server would download Microsoft's sign-in page, about 58 KB, instead of the zip). Use SSH.
+2. **Check the file** arrived whole. The size must equal the file on your PC (`Get-Item <file>` shows `Length`) and it must open as a zip. **Run these on the server, not in PowerShell**
+   (`/var/data` does not exist on Windows, so PowerShell answers `ObjectNotFound`): in the Render **Shell** tab, or from PowerShell through SSH:
+   ```bash
+   ls -l /var/data/restore_me.zip
+   python -c "import zipfile;print(zipfile.ZipFile('/var/data/restore_me.zip').namelist()[:5])"
+   ```
+   ```powershell
+   ssh srv-abc123xyz@ssh.oregon.render.com "ls -l /var/data/restore_me.zip"
+   ```
+   The list should show `kelp_erp.db` and `manifest.json`. `File is not a zip file` means the copy is not your backup: check what it is with `head -c 300 /var/data/restore_me.zip`
+   (`<!DOCTYPE html>` = a web page, see above), delete it with `rm /var/data/restore_me.zip` and copy again.
 3. **Ask for the restore.** Dashboard > the service > **Environment**: add
    - `KELP_ERP_RESTORE_FROM` = `/var/data/restore_me.zip`
    - `KELP_ERP_RESTORE_CONFIRM` = `replace-live-data`
