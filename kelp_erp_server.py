@@ -1793,7 +1793,7 @@ STATUS_RULES = [
     ("fg_lots", ("pending_release", "on_hand", "hold", "sold", "disposed")),
     ("production_runs", ("draft", "completed")),
     ("preproc_batches", ("draft", "completed")),
-    ("sop_documents", ("current", "withdrawn")),
+    ("sop_documents", ("current", "withdrawn", "retired")),
     ("sds_documents", ("current", "withdrawn")),
 ]
 
@@ -1804,6 +1804,9 @@ def ensure_constraints(conn):
     for table, allowed in STATUS_RULES:
         listed = ", ".join("'%s'" % v for v in allowed)
         message = "Not allowed: %s.status must be one of %s" % (table, ", ".join(allowed))
+        # dropped first: a database written before a value was added to STATUS_RULES still holds the old trigger, which would refuse the new value
+        conn.execute("DROP TRIGGER IF EXISTS chk_%s_status_ins" % table)
+        conn.execute("DROP TRIGGER IF EXISTS chk_%s_status_upd" % table)
         conn.execute("CREATE TRIGGER IF NOT EXISTS chk_%s_status_ins BEFORE INSERT ON %s WHEN NEW.status NOT IN (%s) "
                      "BEGIN SELECT RAISE(ABORT, '%s'); END" % (table, table, listed, message))
         conn.execute("CREATE TRIGGER IF NOT EXISTS chk_%s_status_upd BEFORE UPDATE OF status ON %s "
@@ -4447,7 +4450,8 @@ def migrate(conn):
         conn.execute("ALTER TABLE sop_documents ADD COLUMN key TEXT")
     # (batch 10) the SOP register is also fed from the SharePoint folder: document number, revision, status and the file's fingerprint / source
     for col, decl in (("doc_number", "TEXT"), ("revision", "TEXT"), ("status", "TEXT NOT NULL DEFAULT 'current'"), ("file_sha256", "TEXT"),
-                      ("source_path", "TEXT"), ("withdrawn_at", "TEXT")):
+                      ("source_path", "TEXT"), ("withdrawn_at", "TEXT"),
+                      ("retired_at", "TEXT"), ("retired_by", "TEXT"), ("retired_reason", "TEXT"), ("replaced_by", "INTEGER")):     # retired: taken out of use by an administrator
         if col not in {r["name"] for r in conn.execute("PRAGMA table_info(sop_documents)")}:
             conn.execute("ALTER TABLE sop_documents ADD COLUMN %s %s" % (col, decl))
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sop_doc_number ON sop_documents(doc_number) WHERE doc_number IS NOT NULL")
@@ -4457,7 +4461,8 @@ def migrate(conn):
     conn.execute("INSERT OR IGNORE INTO sop_documents (name, key, updated_at) VALUES (?, ?, ?)",
                  ("Determining % Wet Solids SOP", "wet_solids_sop", now_iso()))
     conn.execute("UPDATE sop_documents SET key='wet_solids_sop'"
-                 " WHERE name='Determining % Wet Solids SOP' AND key IS NULL")
+                 " WHERE name='Determining % Wet Solids SOP' AND key IS NULL AND status!='retired'"
+                 " AND NOT EXISTS (SELECT 1 FROM sop_documents WHERE key='wet_solids_sop')")
     # (batch 11) SOP links are chosen per spot now; the one link that used to be coded against a key (the Homogenization solids-loading check) is carried over once
     run_once(conn, "sop_link_wet_solids", lambda: conn.execute(
         "INSERT OR IGNORE INTO sop_links (spot, sop_id, created_by, created_at) "
@@ -5512,6 +5517,21 @@ def parse_sop_filename(filename):
     return {"docNumber": "SOP-%03d" % int(m.group(1)), "title": re.sub(r"[-_]+", " ", rest).strip(), "revision": revision}
 
 
+_SOP_STOP = {"sop", "the", "and", "for", "with", "procedure", "determining", "analysis", "method"}
+
+
+def sop_shared_words(a, b):
+    """The words two SOP titles have in common (case, plurals and punctuation ignored; filler words dropped): used to suggest which existing SOP a new file is."""
+    def words(x):
+        out = set()
+        for w in re.findall(r"[a-z0-9]+", (x or "").lower()):
+            w = w[:-1] if len(w) > 3 and w.endswith("s") else w
+            if len(w) >= 3 and w not in _SOP_STOP:
+                out.add(w)
+        return out
+    return sorted(words(a) & words(b))
+
+
 def sop_name_from_file(conn, parsed, exclude_id=None):
     """The name an SOP shows is the title in its SharePoint file name (SOP-012_Homogenization_rev3.pdf -> "Homogenization"), or its number when the file has no title.
     Names are unique: one that another SOP already shows gets the SOP number added."""
@@ -5638,7 +5658,8 @@ def library_reconcile(conn, kind, files, who):
             if row["source_path"] != s["path"]:
                 renames.append((row, s))
         elif row["file_sha256"] == s["sha"]:
-            desired[("revision", ident, s["sha"])] = dict(base, change="revision", identity=ident, target=row["id"], detail="A withdrawn document is back in the folder.")
+            desired[("revision", ident, s["sha"])] = dict(base, change="revision", identity=ident, target=row["id"],
+                                                          detail="A %s document is back in the folder." % ("retired" if row["status"] == "retired" else "withdrawn"))
         else:
             desired[("revision", ident, s["sha"])] = dict(base, change="revision", identity=ident, target=row["id"], detail=extra)
     present = {library_identity(kind, s["parsed"]) for s in seen if s["parsed"]}
@@ -6431,7 +6452,17 @@ class Handler(BaseHTTPRequestHandler):
                         "renamed": bool(cur and cur["name"] != new_name),
                         "nameNote": ("Another SOP already has the title \"%s\", so the SOP number is added." % parsed.get("title")) if parsed.get("title") and new_name != parsed.get("title") and new_name != parsed.get("docNumber") else None})
         if detail and r["state"] == "pending" and r["kind"] == "sop" and r["change"] == "new":
-            out["candidates"] = [{"id": x["id"], "name": x["name"]} for x in conn.execute("SELECT id, name FROM sop_documents WHERE doc_number IS NULL ORDER BY name")]
+            # the SOPs KelpWorks holds WITHOUT a number (they predate the SharePoint sync): the new file may be one of them. The one whose name shares the most words with the file's title is suggested.
+            cands = [{"id": x["id"], "name": x["name"]} for x in conn.execute("SELECT id, name FROM sop_documents WHERE doc_number IS NULL AND status='current' ORDER BY name")]
+            best = None
+            for c in cands:
+                shared = sop_shared_words((parsed or {}).get("title") or "", c["name"])
+                if shared and (best is None or len(shared) > len(best[1])):
+                    best = (c, shared)
+            for c in cands:
+                c["suggested"] = bool(best and best[0] is c)
+                c["why"] = ("The file's title and this SOP's name share \"%s\"." % " ".join(best[1])) if c["suggested"] else None
+            out["candidates"] = cands
         return out
 
     def _library_inbox(self, conn):
@@ -6500,6 +6531,10 @@ class Handler(BaseHTTPRequestHandler):
             doc = conn.execute("SELECT * FROM %s WHERE id=?" % table, (row["target_id"],)).fetchone()
             if not doc:
                 raise ApiError(404, "That document no longer exists")
+            if doc["status"] == "retired":                               # already taken out of use by an administrator: nothing to withdraw
+                conn.execute("UPDATE library_inbox SET state='accepted', resolved_by=?, resolved_at=?, resolution=?, target_id=?, stored_name=NULL WHERE id=?",
+                             (who, ts, "Already retired", doc["id"], row["id"]))
+                return self._library_inbox(conn)
             conn.execute("UPDATE %s SET status='withdrawn', withdrawn_at=?, updated_at=? WHERE id=?" % table, (ts, ts, doc["id"]))
             library_log_edit(conn, kind, doc["id"], who, "Status", "current", "withdrawn (file removed from the SharePoint folder)")
             summary, doc_id = "Withdrawn", doc["id"]
@@ -6526,6 +6561,9 @@ class Handler(BaseHTTPRequestHandler):
             self._library_archive_current(conn, "sop", doc, user, "Replaced by a new revision from the SharePoint folder")
             name = sop_name_from_file(conn, parsed, doc["id"])
             sets = dict(fileset, revision=revision, name=name)
+            if doc["status"] == "retired":                               # its file is back in the controlled folder: it is in use again (its places must be linked again)
+                sets.update(retired_at=None, retired_by=None, retired_reason=None, replaced_by=None)
+                library_log_edit(conn, "sop", doc["id"], who, "Status", "retired", "current (its file is back in the SharePoint folder)")
             conn.execute("UPDATE sop_documents SET %s WHERE id=?" % ", ".join("%s=?" % c for c in sets), (*sets.values(), doc["id"]))
             library_log_edit(conn, "sop", doc["id"], who, "File", doc["filename"] or "-", row["filename"])
             library_log_edit(conn, "sop", doc["id"], who, "Revision", doc["revision"] or "-", revision or "-")
@@ -6615,7 +6653,7 @@ class Handler(BaseHTTPRequestHandler):
             warn = float(get_setting_value(conn, "sds_review_warning_days", 60) or 60)
             items = self._sds_items_map(conn)
             links = self._sop_spots_by_sop(conn)
-            out = {"sops": [self._sop_public(r, links.get(r["id"])) for r in conn.execute("SELECT * FROM sop_documents ORDER BY doc_number IS NULL, doc_number, name")],
+            out = {"sops": [self._sop_public(r, links.get(r["id"])) for r in conn.execute("SELECT * FROM sop_documents WHERE status!='retired' ORDER BY doc_number IS NULL, doc_number, name")],
                    "sds": [self._sds_public(conn, r, items, years, warn) for r in conn.execute("SELECT * FROM sds_documents ORDER BY chemical, supplier")],
                    "reviewYears": years, "pending": library_pending_count(conn)}
             if user["role"] == "admin":
@@ -7245,7 +7283,7 @@ class Handler(BaseHTTPRequestHandler):
         # everywhere automatically) without a separate round trip. The full
         # admin CRUD view fetches /api/sop-documents itself.
         sops = [dict(id=r["id"], name=r["name"], key=r["key"], hasFile=bool(r["stored_name"]), status=r["status"], revision=r["revision"], docNumber=r["doc_number"])
-                for r in conn.execute("SELECT id, name, key, stored_name, status, revision, doc_number FROM sop_documents ORDER BY name")]
+                for r in conn.execute("SELECT id, name, key, stored_name, status, revision, doc_number FROM sop_documents WHERE status!='retired' ORDER BY name")]
         # Every container type (Packaging output units and Sample Point
         # vessels alike) is just a consumable with is_container=1 -- exposed
         # here (not just via /api/consumables) so the production log's
@@ -7296,7 +7334,8 @@ class Handler(BaseHTTPRequestHandler):
                 "hasFile": bool(r["stored_name"]), "size": r["size"],
                 "uploadedBy": r["uploaded_by"], "uploadedAt": r["uploaded_at"],
                 "updatedAt": r["updated_at"], "docNumber": r["doc_number"], "revision": r["revision"], "status": r["status"],
-                "sourcePath": r["source_path"], "withdrawnAt": r["withdrawn_at"], "spots": spots or []}
+                "sourcePath": r["source_path"], "withdrawnAt": r["withdrawn_at"], "spots": spots or [],
+                "retiredAt": r["retired_at"], "retiredBy": r["retired_by"], "retiredReason": r["retired_reason"], "replacedBy": r["replaced_by"]}
 
     def _sop_edits(self, conn, sid):
         return [dict(field=r["field"], oldValue=r["old_value"], newValue=r["new_value"],
@@ -7314,7 +7353,9 @@ class Handler(BaseHTTPRequestHandler):
         if seg == ["api", "sop-documents"] and method == "GET":
             rows = conn.execute("SELECT * FROM sop_documents ORDER BY doc_number IS NULL, doc_number, name").fetchall()
             links = self._sop_spots_by_sop(conn)
-            return {"sops": [self._sop_public(r, links.get(r["id"])) for r in rows]}
+            names = {r["id"]: (r["doc_number"] + " " if r["doc_number"] else "") + r["name"] for r in rows}
+            return {"sops": [self._sop_public(r, links.get(r["id"])) for r in rows if r["status"] != "retired"],
+                    "retired": [dict(self._sop_public(r, []), replacedByName=names.get(r["replaced_by"])) for r in rows if r["status"] == "retired"]}
         if seg == ["api", "sop-documents"] and method == "POST":
             self._require_admin(user)
             return self._create_sop(conn, user)
@@ -7329,6 +7370,9 @@ class Handler(BaseHTTPRequestHandler):
             if method == "DELETE":
                 raise ApiError(409, "SOPs are removed in SharePoint: take the file out of the Current folder and the next nightly sync offers the document as withdrawn "
                                     "(its files and history are kept).", "controlled_in_sharepoint")
+        if len(seg) == 4 and seg[2].isdigit() and seg[3] in ("retire", "replace", "reinstate") and method == "POST":
+            self._require_admin(user)
+            return self._sop_lifecycle(conn, int(seg[2]), seg[3], self._body_json(), user)
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "edits" and method == "GET":
             sid = int(seg[2])
             if not conn.execute("SELECT 1 FROM sop_documents WHERE id=?", (sid,)).fetchone():
@@ -7342,9 +7386,57 @@ class Handler(BaseHTTPRequestHandler):
     def _sop_links_by_spot(self, conn):
         """{spot: [sop id, ...]} for the production log (SOPs by number, then name)."""
         out = {}
-        for r in conn.execute("SELECT l.spot, l.sop_id FROM sop_links l JOIN sop_documents d ON d.id=l.sop_id ORDER BY d.doc_number IS NULL, d.doc_number, d.name"):
+        for r in conn.execute("SELECT l.spot, l.sop_id FROM sop_links l JOIN sop_documents d ON d.id=l.sop_id WHERE d.status!='retired' ORDER BY d.doc_number IS NULL, d.doc_number, d.name"):
             out.setdefault(r["spot"], []).append(r["sop_id"])
         return out
+
+    def _sop_lifecycle(self, conn, sid, action, d, user):
+        """An administrator takes an SOP out of use. RETIRE: it is no longer relevant (for example its file was removed from the Current folder with no replacement). REPLACE: an SOP that has no
+        number (one that was loaded before the SharePoint sync) is superseded by another SOP -- its links and reference key move to that SOP. REINSTATE undoes a retirement. A retired SOP leaves every
+        list, picker and the production log; its file and history stay on record (nothing is deleted)."""
+        row = conn.execute("SELECT * FROM sop_documents WHERE id=?", (sid,)).fetchone()
+        if not row:
+            raise ApiError(404, "Document not found")
+        who, ts = user["name"], now_iso()
+        label = {k: "%s: %s (%s)" % (v["group"], v["label"], v["kind"]) for k, v in SOP_SPOT_INFO.items()}
+        reason = (d.get("reason") or "").strip()
+        if action == "reinstate":
+            if row["status"] != "retired":
+                raise ApiError(409, "This SOP is not retired")
+            conn.execute("UPDATE sop_documents SET status='current', withdrawn_at=NULL, retired_at=NULL, retired_by=NULL, retired_reason=NULL, replaced_by=NULL, updated_at=? WHERE id=?", (ts, sid))
+            self._log_sop_edit(conn, sid, user, "Status", "retired", "current (reinstated%s)" % (": " + reason if reason else ""))
+            return {"ok": True}
+        if row["status"] == "retired":
+            raise ApiError(409, "This SOP is already retired")
+        if len(reason) < 3:
+            raise ApiError(400, "Enter the reason (it is kept in the SOP's history)")
+        target = None
+        if action == "replace":
+            if row["doc_number"]:
+                raise ApiError(409, "%s has a number, so it is controlled in SharePoint: put the replacement in the Current folder and accept it as a revision, or use Retire." % row["doc_number"], "controlled_in_sharepoint")
+            target = conn.execute("SELECT * FROM sop_documents WHERE id=?", (d.get("replacementId"),)).fetchone()
+            if not target:
+                raise ApiError(400, "Choose the SOP that replaces this one")
+            if target["id"] == sid:
+                raise ApiError(400, "An SOP cannot replace itself")
+            if target["status"] == "retired":
+                raise ApiError(400, "Choose an SOP that is in use: %s is retired" % target["name"])
+        spots = [r["spot"] for r in conn.execute("SELECT spot FROM sop_links WHERE sop_id=? ORDER BY id", (sid,))]
+        if target:
+            for spot in spots:
+                if conn.execute("INSERT OR IGNORE INTO sop_links (spot, sop_id, created_by, created_at) VALUES (?,?,?,?)", (spot, target["id"], who, ts)).rowcount:
+                    self._log_sop_edit(conn, target["id"], user, "Linked at", "-", "%s (taken over from %s)" % (label.get(spot, spot), row["name"]))
+        conn.execute("DELETE FROM sop_links WHERE sop_id=?", (sid,))
+        for spot in spots:
+            self._log_sop_edit(conn, sid, user, "Unlinked from", label.get(spot, spot), "-")
+        if target and row["key"] and not target["key"]:
+            conn.execute("UPDATE sop_documents SET key=NULL WHERE id=?", (sid,))
+            conn.execute("UPDATE sop_documents SET key=?, updated_at=? WHERE id=?", (row["key"], ts, target["id"]))
+            self._log_sop_edit(conn, target["id"], user, "Reference key", "-", "%s (taken over from %s)" % (row["key"], row["name"]))
+        conn.execute("UPDATE sop_documents SET status='retired', retired_at=?, retired_by=?, retired_reason=?, replaced_by=?, updated_at=? WHERE id=?",
+                     (ts, who, reason, target["id"] if target else None, ts, sid))
+        self._log_sop_edit(conn, sid, user, "Status", row["status"], "retired" + (" (replaced by %s)" % ((target["doc_number"] + " " if target["doc_number"] else "") + target["name"]) if target else "") + ": " + reason)
+        return {"ok": True}
 
     def _sop_spots_by_sop(self, conn):
         out = {}

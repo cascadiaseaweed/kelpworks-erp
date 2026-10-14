@@ -230,7 +230,7 @@ def test_a_file_can_be_linked_to_an_sop_that_already_exists(srv, admin, plain):
     data = b"%PDF the controlled copy"
     put(srv, "sop", "SOP002_Solid_Liquid_Ratio_&_Density_Analysis-compressed.pdf", data)
     item = waiting(admin, "sop", identity="SOP-002")[0]
-    assert {"id": wet["id"], "name": wet["name"]} in item["candidates"]
+    assert (wet["id"], wet["name"]) in [(c["id"], c["name"]) for c in item["candidates"]]
     assert accept(admin, item, linkTo=wet["id"]).status == 200
     now = [s for s in docs(plain)["sops"] if s["id"] == wet["id"]][0]
     assert (now["docNumber"], now["key"], now["name"], now["hasFile"]) == ("SOP-002", "wet_solids_sop", "Solid Liquid Ratio & Density Analysis compressed", True)   # the key stays, the name follows the file
@@ -604,3 +604,141 @@ def test_a_new_number_with_a_title_another_sop_has_shows_the_number_added_and_wh
     assert "Another SOP already has the title" in item["nameNote"]
     assert accept(admin, item).status == 200
     assert [s["name"] for s in docs(admin)["sops"] if s["docNumber"] == "SOP-411"] == ["Boiler Startup and Shutdown (SOP-411)"]
+
+
+# ---- retiring an SOP, replacing one that has no number, and the review's safeguards ----
+
+def sop_row(admin, sop_id):
+    for key in ("sops", "retired"):
+        for s in admin.get("/api/sop-documents").json[key]:
+            if s["id"] == sop_id:
+                return s
+    return None
+
+
+def links(admin):
+    return admin.get("/api/refdata").json["sopLinks"]
+
+
+def edits(admin, sop_id):
+    return [(e["field"], e["newValue"]) for e in admin.get("/api/sop-documents/%d/edits" % sop_id).json["edits"]]
+
+
+def test_an_administrator_can_retire_an_sop_and_it_leaves_every_list_and_the_production_log(srv, admin, plain):
+    add_sop(srv, admin, 430, "x", 1, b"%PDF 430", "Old-Steam-Check")
+    sid = [s["id"] for s in docs(admin)["sops"] if s["docNumber"] == "SOP-430"][0]
+    assert admin.put("/api/sop-documents/%d/links" % sid, {"spots": ["production.homogenization"]}).status == 200
+    assert sid in links(admin)["production.homogenization"]
+    assert plain.post("/api/sop-documents/%d/retire" % sid, {"reason": "Not used any more"}).status == 403
+    assert admin.post("/api/sop-documents/%d/retire" % sid, {}).status == 400                      # a reason is needed
+    r = admin.post("/api/sop-documents/%d/retire" % sid, {"reason": "Removed from the Current folder, no replacement"})
+    assert r.status == 200, r.text
+    assert sid not in [s["id"] for s in docs(plain)["sops"]] and sid not in [s["id"] for s in admin.get("/api/refdata").json["sops"]]
+    assert sid not in links(admin).get("production.homogenization", [])                            # gone from the production log
+    gone = sop_row(admin, sid)
+    assert gone["status"] == "retired" and gone["retiredBy"] and "no replacement" in gone["retiredReason"] and gone["spots"] == []
+    assert sid in [s["id"] for s in admin.get("/api/sop-documents").json["retired"]]
+    assert any(f == "Status" and "retired" in v for f, v in edits(admin, sid)) and any(f == "Unlinked from" for f, _ in edits(admin, sid))
+    assert admin.post("/api/sop-documents/%d/retire" % sid, {"reason": "again"}).status == 409
+
+
+def test_a_retired_sop_can_be_reinstated(srv, admin):
+    sid = [s["id"] for s in admin.get("/api/sop-documents").json["retired"] if s["docNumber"] == "SOP-430"][0]
+    assert admin.post("/api/sop-documents/%d/reinstate" % sid, {}).status == 200
+    assert sop_row(admin, sid)["status"] == "current" and sid in [s["id"] for s in docs(admin)["sops"]]
+    assert admin.post("/api/sop-documents/%d/reinstate" % sid, {}).status == 409                   # not retired any more
+
+
+def test_a_retired_documents_file_coming_back_is_offered_for_review_and_accepting_brings_it_back(srv, admin):
+    sid = [s["id"] for s in docs(admin)["sops"] if s["docNumber"] == "SOP-430"][0]
+    assert admin.post("/api/sop-documents/%d/retire" % sid, {"reason": "Wrongly retired"}).status == 200
+    FOLDERS["sop"].pop("SOP-430_Old-Steam-Check_rev1.pdf", None)
+    put(srv, "sop", "SOP-430_Old-Steam-Check_rev1.pdf", b"%PDF 430")                                # the same file is in the folder again
+    item = waiting(admin, "sop", identity="SOP-430")[0]
+    assert item["change"] == "revision" and "retired document is back" in item["detail"]
+    assert accept(admin, item).status == 200
+    row = sop_row(admin, sid)
+    assert row["status"] == "current" and row["retiredAt"] is None
+
+
+def test_retiring_an_sop_whose_file_was_removed_settles_the_pending_removal(srv, admin):
+    add_sop(srv, admin, 431, "x", 1, b"%PDF 431", "Short-Lived")
+    sid = [s["id"] for s in docs(admin)["sops"] if s["docNumber"] == "SOP-431"][0]
+    remove(srv, "sop", "SOP-431_Short-Lived_rev1.pdf")
+    missing = waiting(admin, "sop", identity="SOP-431", change="missing")[0]                       # the file left the Current folder
+    assert admin.post("/api/sop-documents/%d/retire" % sid, {"reason": "No longer relevant"}).status == 200
+    r = accept(admin, missing)                                                                      # "Withdraw" on something already retired is harmless
+    assert r.status == 200 and sop_row(admin, sid)["status"] == "retired"
+
+
+def test_replacing_an_sop_that_has_no_number_moves_its_links_and_key_to_the_one_that_replaces_it(srv, admin, plain):
+    made = admin.post("/api/sop-documents", {"name": "Legacy Boiler Procedure", "key": "legacy_boiler"})
+    assert made.status == 200, made.text
+    old = made.json["sop"]["id"]
+    assert admin.put("/api/sop-documents/%d/links" % old, {"spots": ["production.homogenization", "production.extraction"]}).status == 200
+    add_sop(srv, admin, 432, "x", 1, b"%PDF 432", "Boiler-Procedure")
+    new = [s["id"] for s in docs(admin)["sops"] if s["docNumber"] == "SOP-432"][0]
+    body = {"replacementId": new, "reason": "Entered by mistake as a new SOP"}
+    assert plain.post("/api/sop-documents/%d/replace" % old, body).status == 403
+    assert admin.post("/api/sop-documents/%d/replace" % old, {"replacementId": new}).status == 400  # a reason is needed
+    assert admin.post("/api/sop-documents/%d/replace" % old, {"replacementId": old, "reason": "x y z"}).status == 400
+    assert admin.post("/api/sop-documents/%d/replace" % old, dict(body, replacementId=999999)).status == 400
+    assert admin.post("/api/sop-documents/%d/replace" % old, body).status == 200
+    spots = links(admin)
+    assert new in spots["production.homogenization"] and new in spots["production.extraction"] and old not in spots["production.homogenization"]
+    target, retired = sop_row(admin, new), sop_row(admin, old)
+    assert target["key"] == "legacy_boiler" and retired["key"] is None
+    assert retired["status"] == "retired" and retired["replacedBy"] == new
+    assert [r for r in admin.get("/api/sop-documents").json["retired"] if r["id"] == old][0]["replacedByName"].startswith("SOP-432")
+    assert ("Reference key", "legacy_boiler (taken over from Legacy Boiler Procedure)") in edits(admin, new)
+
+
+def test_an_sop_with_a_number_cannot_be_replaced_and_a_retired_one_cannot_replace_anything(srv, admin):
+    numbered = [s for s in docs(admin)["sops"] if s["docNumber"] == "SOP-432"][0]["id"]
+    made = admin.post("/api/sop-documents", {"name": "Another Legacy Procedure"}).json["sop"]["id"]
+    r = admin.post("/api/sop-documents/%d/replace" % numbered, {"replacementId": made, "reason": "nope"})
+    assert r.status == 409 and r.json["code"] == "controlled_in_sharepoint"
+    admin.post("/api/sop-documents/%d/retire" % made, {"reason": "not needed"}).raise_for_status()
+    other = admin.post("/api/sop-documents", {"name": "Third Legacy Procedure"}).json["sop"]["id"]
+    assert admin.post("/api/sop-documents/%d/replace" % other, {"replacementId": made, "reason": "to a retired one"}).status == 400
+
+
+def test_the_review_suggests_the_number_less_sop_a_new_file_probably_is_and_never_offers_a_retired_one(srv, admin):
+    legacy = admin.post("/api/sop-documents", {"name": "Evaporator Cleaning Procedure"}).json["sop"]["id"]
+    unrelated = admin.post("/api/sop-documents", {"name": "Pallet Wrapping Guide"}).json["sop"]["id"]
+    retired = admin.post("/api/sop-documents", {"name": "Evaporator Cleaning Old"}).json["sop"]["id"]
+    admin.post("/api/sop-documents/%d/retire" % retired, {"reason": "obsolete"}).raise_for_status()
+    put(srv, "sop", "SOP-433_Evaporator-Cleaning_rev1.pdf", b"%PDF 433")
+    item = waiting(admin, "sop", identity="SOP-433")[0]
+    by_id = {c["id"]: c for c in item["candidates"]}
+    assert legacy in by_id and unrelated in by_id and retired not in by_id
+    assert by_id[legacy]["suggested"] is True and "evaporator" in by_id[legacy]["why"] and "cleaning" in by_id[legacy]["why"]
+    assert by_id[unrelated]["suggested"] is False and by_id[unrelated]["why"] is None
+    assert accept(admin, item, linkTo=legacy).status == 200                                        # the suggestion is right: it takes the number
+
+
+def test_a_database_written_before_retired_existed_still_accepts_the_new_status():
+    """The status guard (a database trigger) of an older database lists only current / withdrawn; it must be refreshed at start, or retiring would be refused."""
+    with Server() as s:
+        admin = s.admin_client()
+        made = admin.post("/api/sop-documents", {"name": "Trigger Test Procedure"}).json["sop"]["id"]
+        sql(s, "DROP TRIGGER chk_sop_documents_status_upd")
+        sql(s, "CREATE TRIGGER chk_sop_documents_status_upd BEFORE UPDATE OF status ON sop_documents WHEN NEW.status IS NOT OLD.status AND NEW.status NOT IN ('current','withdrawn') "
+               "BEGIN SELECT RAISE(ABORT, 'old rule'); END")
+        s.restart()
+        admin = s.admin_client()
+        assert admin.post("/api/sop-documents/%d/retire" % made, {"reason": "Check the trigger"}).status == 200
+
+
+def test_the_start_up_seed_cannot_take_the_wet_solids_key_back_from_the_sop_that_replaced_it():
+    with Server() as s:
+        admin = s.admin_client()
+        legacy = [x for x in admin.get("/api/sop-documents").json["sops"] if x["key"] == "wet_solids_sop"][0]
+        sql(s, "INSERT INTO sop_documents (name, doc_number, status, updated_at) VALUES ('Solids Procedure', 'SOP-777', 'current', '2026-10-01T00:00:00Z')")
+        new = sql(s, "SELECT id FROM sop_documents WHERE doc_number='SOP-777'")[0][0]
+        assert admin.post("/api/sop-documents/%d/replace" % legacy["id"], {"replacementId": new, "reason": "Entered as new by mistake"}).status == 200
+        s.restart()                                                                                 # the start-up seed ran again and must not fight over the key
+        admin = s.admin_client()
+        keys = {x["id"]: x["key"] for x in admin.get("/api/sop-documents").json["sops"]}
+        assert keys[new] == "wet_solids_sop" and legacy["id"] not in keys
+        assert [r for r in admin.get("/api/sop-documents").json["retired"] if r["id"] == legacy["id"]][0]["key"] is None

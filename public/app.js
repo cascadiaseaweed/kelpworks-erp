@@ -7745,9 +7745,15 @@ async function adminSopSection(v) {
     'The same list as the Documents tab: every SOP in the SharePoint folder appears here once it is accepted. Here you can give an SOP a reference key and choose where it is linked. '
     + 'Everything else follows SharePoint: an SOP’s name is the title in its file name, and its file, revisions and removal are controlled there (a file taken out of the Current folder shows here as Withdrawn).'));
   v.append(sopTable(sr.sops, { admin: true }));
+  if ((sr.retired || []).length) v.append(el('details', { class: 'accordion', style: 'margin-top:14px' }, el('summary', {}, 'Retired SOPs (' + sr.retired.length + ')'), el('div', { class: 'accordion-body' },
+    el('div', { class: 'help', style: 'margin:0 0 8px' }, 'Retired SOPs are out of use: they are not in the Documents list, the pickers or the production log. Their file and history are kept. Reinstate one to use it again (its places must be linked again).'),
+    table(['SOP no.', 'Name', 'Retired', 'Reason', 'Replaced by', ''], sr.retired.map(s => [s.docNumber ? mono(s.docNumber) : '—', s.name,
+      (s.retiredAt ? fmtWhen(s.retiredAt) : '—') + (s.retiredBy ? ' · ' + s.retiredBy : ''), s.retiredReason || '—', s.replacedByName || '—',
+      rowActions([['History', () => showDocHistory('sop', s.id, s.name)], ['Reinstate', () => reinstateSop(s)]])]), [false, false, false, false, false, false]))));
   // The by-place table is kept minimized: each SOP's own "Link to…" window is the normal way to link it. Open this to link several places at once.
-  let open = false;
-  try { open = localStorage.getItem('kelp.sopPlacesOpen') === '1'; } catch (e) { /* closed */ }
+  // It is always closed when the page loads; it only stays open while you work in it (until the page is reloaded), so a bulk change does not fold it away.
+  try { localStorage.removeItem('kelp.sopPlacesOpen'); } catch (e) { /* nothing saved */ }       // an earlier version remembered the open state in the browser
+  const open = !!State.sopPlacesOpen;
   const placesBody = el('div', { class: 'accordion-body' });
   const places = el('details', { class: 'accordion', style: 'margin-top:22px' }, el('summary', {}, 'Where SOPs are linked (by place)'), placesBody);
   if (open) places.open = true;
@@ -7761,7 +7767,7 @@ async function adminSopSection(v) {
     drawSopSpotsTable(placesBody);
   };
   places.addEventListener('toggle', () => {
-    try { localStorage.setItem('kelp.sopPlacesOpen', places.open ? '1' : '0'); } catch (e) { /* not remembered */ }
+    State.sopPlacesOpen = places.open;
     if (places.open) drawPlaces();
   });
   if (open) drawPlaces();
@@ -7910,6 +7916,30 @@ async function sopChanged(msg) {
   State.ref = await api('GET', '/refdata');
   toast(msg); render();
 }
+// An administrator takes an SOP out of use. Nothing is deleted: the file and the history stay on record.
+function retireSop(s) {
+  const reason = el('input', { placeholder: 'e.g. removed from the Current folder, no replacement' });
+  modal('Retire ' + (s.docNumber ? s.docNumber + ' ' : '') + s.name, el('div', {},
+    el('div', { class: 'help', style: 'margin-top:0' }, 'Retire an SOP that is no longer relevant. It leaves the Documents list, the pickers and every production-log link' + ((s.spots || []).length ? ' (it is linked at ' + s.spots.length + ' place' + (s.spots.length === 1 ? '' : 's') + ')' : '') + '. Its file and history are kept, and you can reinstate it later.'),
+    field('Reason (required)', reason)),
+    async () => { await api('POST', '/sop-documents/' + s.id + '/retire', { reason: reason.value }); await sopChanged('SOP retired'); }, 'Retire');
+}
+// For an SOP that has no number (loaded before the SharePoint sync): another SOP supersedes it, and takes over its places and reference key.
+function replaceSop(s, all) {
+  const others = (all || []).filter(x => x.id !== s.id);
+  if (!others.length) { toast('There is no other SOP to replace it with.', true); return; }
+  const sel = selectFrom('', others.map(x => [String(x.id), (x.docNumber ? x.docNumber + ' ' : '') + x.name]));
+  const reason = el('input', { placeholder: 'e.g. entered as a new SOP by mistake' });
+  modal('Replace ' + s.name, el('div', {},
+    el('div', { class: 'help', style: 'margin-top:0' }, 'Use this when the SOP you want to keep was added as a new SOP instead of replacing this one. ' + ((s.spots || []).length ? 'Its ' + s.spots.length + ' place' + (s.spots.length === 1 ? '' : 's') + ' in the production log' : 'Its links') + (s.key ? ' and its reference key “' + s.key + '”' : '') + ' move to the SOP you choose, and this entry is retired (its file and history are kept).'),
+    field('Replaced by', sel), field('Reason (required)', reason)),
+    async () => { await api('POST', '/sop-documents/' + s.id + '/replace', { replacementId: +sel.value, reason: reason.value }); await sopChanged('SOP replaced'); }, 'Replace');
+}
+async function reinstateSop(s) {
+  if (!confirm('Reinstate ' + s.name + '? It returns to the lists. Its places must be linked again.')) return;
+  await api('POST', '/sop-documents/' + s.id + '/reinstate', {});
+  await sopChanged('SOP reinstated');
+}
 function editSopKey(s) {
   const key = el('input', { value: s.key || '', placeholder: 'e.g. wet_solids_sop' });
   modal('Reference key — ' + s.name, el('div', {},
@@ -8027,7 +8057,7 @@ function sopTable(sops, opts) {
     ...(admin ? [s.key ? mono(s.key) : '—'] : []),
     sopLinkedAt(s),
     rowActions([['History', () => showDocHistory('sop', s.id, s.name)],
-      ...(admin ? [['Key…', () => editSopKey(s)], ['Link to…', () => editSopSpots(s)]] : [])])]);
+      ...(admin ? [['Key…', () => editSopKey(s)], ['Link to…', () => editSopSpots(s)], !s.docNumber ? ['Replace…', () => replaceSop(s, sops)] : null, ['Retire…', () => retireSop(s), 'danger']] : [])])]);
   return table(headers, rows, headers.map(() => false), ri => showDocHistory('sop', sops[ri].id, sops[ri].name));
 }
 
@@ -8122,18 +8152,34 @@ async function reviewLibraryItem(i) {
   if (i.kind === 'sop' && i.change === 'new') {
     const shownName = p.title || p.docNumber || '—';
     const key = el('input', { placeholder: 'optional: a short code' });
-    const link = selectFrom('', [['', '— add as a new SOP —'], ...(i.candidates || []).map(c => [String(c.id), 'This is the existing document: ' + c.name])]);
+    const cands = i.candidates || [];
+    const suggested = cands.find(c => c.suggested);
+    // KelpWorks may hold SOPs that have NO number (loaded before the SharePoint sync). The new file might be one of them, so when there are any the choice is explicit: no default.
+    const link = selectFrom('', cands.map(c => [String(c.id), c.name + (c.suggested ? '  (suggested)' : '')]));
+    const radioExisting = el('input', { type: 'radio', name: 'sop_which' }), radioNew = el('input', { type: 'radio', name: 'sop_which' });
     const keyField = field('Reference key (optional)', key);
-    link.addEventListener('change', () => keyField.classList.toggle('hidden', !!link.value));
+    if (suggested) { link.value = String(suggested.id); radioExisting.checked = true; }
+    const syncChoice = () => { keyField.classList.toggle('hidden', radioExisting.checked); link.disabled = !radioExisting.checked; };
+    [radioExisting, radioNew].forEach(r => r.addEventListener('change', syncChoice));
+    link.addEventListener('focus', () => { radioExisting.checked = true; syncChoice(); });
+    const choice = cands.length ? el('div', { class: 'sign-box', style: 'margin:8px 0' },
+      el('div', { style: 'font-weight:700;margin-bottom:6px' }, 'Is this one of the SOPs KelpWorks already has?'),
+      el('div', { class: 'help', style: 'margin-top:0' }, 'KelpWorks holds ' + cands.length + ' SOP' + (cands.length === 1 ? '' : 's') + ' without a number. If this file is one of them, choose it here: it takes the number and keeps its links. Choosing “new” instead would leave the old one behind as a duplicate.'),
+      el('label', { style: 'display:block;margin:4px 0' }, radioExisting, ' Yes, this is the existing SOP: ', link),
+      suggested && suggested.why ? el('div', { class: 'help', style: 'margin:0 0 4px 22px' }, suggested.why) : null,
+      el('label', { style: 'display:block;margin:4px 0' }, radioNew, ' No, it is a different, new SOP')) : null;
+    syncChoice();
     modal('New SOP ' + (p.docNumber || '') + ': ' + (i.newName || shownName), el('div', {},
       el('div', { class: 'summary-line' }, sl('File', i.filename || '—'), sl('Number', p.docNumber || '—'), sl('Revision', p.revision ? 'rev ' + p.revision : '—'), sl('Name in KelpWorks', i.newName || shownName)),
       el('div', { class: 'help' }, 'KelpWorks has no SOP numbered ' + (p.docNumber || '') + ', so this is added as a ', el('b', {}, 'new SOP'), '. The name comes from the file name in SharePoint (to change it, rename the file there; the next nightly sync updates it).'),
       i.nameNote ? el('div', { class: 'help' }, i.nameNote) : null,
       libraryFileLine(i),
-      field('Is this an SOP KelpWorks already has?', link),
-      el('div', { class: 'help', style: 'margin-top:-6px' }, 'If so, the existing entry keeps its links but takes its name from this file.'),
+      choice,
       keyField), async () => {
-      await acceptLibraryItem(i, { key: key.value.trim() || null, linkTo: link.value ? +link.value : null });
+      if (cands.length && !radioExisting.checked && !radioNew.checked) throw new Error('Choose one: is this file one of the SOPs KelpWorks already has, or a new SOP?');
+      if (cands.length && radioNew.checked && !confirm('KelpWorks has ' + cands.length + ' SOP' + (cands.length === 1 ? '' : 's') + ' without a number: ' + cands.map(c => c.name).join(', ')
+        + '.\n\nIs ' + (p.docNumber || 'this file') + ' really a different document from all of them? (If not, cancel and choose the existing SOP.)')) throw new Error('Not accepted. If this file is one of the existing SOPs, choose it.');
+      await acceptLibraryItem(i, { key: key.value.trim() || null, linkTo: radioExisting.checked && link.value ? +link.value : null });
     }, 'Accept');
     return;
   }
