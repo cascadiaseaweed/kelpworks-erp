@@ -36,7 +36,7 @@ An SOP can be shown as a small **SOP** line, with a link to its current file, at
   - **Group by** *Area and section* (Production log > Homogenization, CIP Log, ...) or *Type* (Sections, Pages, Views, Process Checks, QC Checks, Sample Points, Other boxes, Windows), for example to tick every QC Check at once.
   - A box beside each group ticks the whole group (only the places currently shown); **Only ticked** shows what is already chosen; a counter shows how many places are ticked.
   The same filters and grouping are on the **Where SOPs are linked** table. Your choices are remembered in your browser.
-- **Admin > Where SOPs are linked:** the table of places (with the same filters and grouping): tick several places (or a whole group) and **Add an SOP to these places...** (or **Remove an SOP from these places...**) in one go. **Choose SOPs...** on a row sets all the SOPs for that place.
+- **Admin > Where SOPs are linked** (a minimized section: click it to open): the table of places (with the same filters and grouping): tick several places (or a whole group) and **Add an SOP to these places...** (or **Remove an SOP from these places...**) in one go. **Choose SOPs...** on a row sets all the SOPs for that place.
 - Several SOPs can share a place and one SOP can be at many places.
 
 The places (grouped in the picker by area):
@@ -74,8 +74,8 @@ The earlier link (Homogenization > Process Check to the wet-solids SOP) was carr
 
 | Change | What it means | Review does |
 |---|---|---|
-| **New document** | A number / chemical KelpWorks does not have | SOP: shows the name it will get (from the file name); or say "this is an SOP KelpWorks already has" (links the controlled file to it, keeping its links and reference key; it takes its name from the file). SDS: shows chemical, supplier and issue date (from the file name); tick the inventory items it covers |
-| **New revision** | The same document with different content | Makes the new file current (and the name follows the new file name). The file it replaces stays in the history (**History** button on the row) |
+| **New document** (an SOP: **New SOP**) | A number / chemical KelpWorks does not have. For an SOP the number decides: KelpWorks has no SOP-012, so SOP-012 is a new SOP | SOP: shows the name it will get (from the file name); or say "this is an SOP KelpWorks already has" (links the controlled file to it, keeping its links and reference key; it takes its name from the file). SDS: shows chemical, supplier and issue date (from the file name); tick the inventory items it covers |
+| **New revision** (an SOP: **Revision of SOP-012**) | The same document with different content. For an SOP the number decides: KelpWorks already has SOP-012, so the file is a revision of it, never a second SOP. The Name column shows the current name and, if the new file's title differs, "old -> new"; the revision shows "rev 2 -> rev 3" | Makes the new file current (and the name follows the new file name). The file it replaces stays in the history (**History** button on the row) |
 | **File removed** | A current document's file is no longer in `Current` | Marks the document **Withdrawn**: its last file and history are kept; nothing is deleted. A withdrawn SOP shows "withdrawn" where the production log links to it |
 | **Name not readable** | The file name does not follow the convention | Cannot be accepted: rename it in SharePoint, or **Ignore** |
 

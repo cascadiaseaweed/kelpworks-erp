@@ -204,6 +204,7 @@ const STAB_COLUMNS = [
   { key: 'avgKg', label: 'Avg kg', value: t => t.avgWeightKg, numeric: true, cell: t => fmt(t.avgWeightKg, 1), hidden: true },
   { key: 'ph', label: 'pH', value: t => t.ph, numeric: true, center: true, cell: t => phCell(t) },
   { key: 'orp', label: 'ORP (mV)', value: t => t.orp, numeric: true, center: true, cell: t => orpCell(t) },
+  { key: 'grade', label: 'Grade', value: t => t.grade || '', center: true, options: () => [...new Set((stabCache || []).map(t => t.grade).filter(Boolean))].sort(), cell: t => gradeBadge(t) },
   { key: 'lastUpdated', label: 'Last updated', value: t => t.lastUpdated ? fmtWhen(t.lastUpdated) : '',
     cell: t => t.lastUpdated ? fmtWhen(t.lastUpdated) : '—', hidden: true },
   { key: 'location', label: 'Location', value: t => t.location || '', cell: t => t.location || '—' },
@@ -217,6 +218,26 @@ function loadStabCols() {
   try { const saved = JSON.parse(localStorage.getItem(STAB_COLS_KEY)); if (Array.isArray(saved)) return new Set(saved); } catch (e) { /* default */ }
   return new Set(STAB_COLUMNS.filter(c => !c.hidden).map(c => c.key));
 }
+// A tote's grade, from the administrator's grading rules (Admin > Feedstock grading); hover for the rule that decided it.
+function gradeBadge(t) {
+  const g = t.grade || '—';
+  const kind = /^a/i.test(g) ? 'on_hand' : /^b/i.test(g) ? 'wip' : /^ungraded$/i.test(g) ? 'sold' : 'hold';
+  return el('span', { title: t.gradeWhy || '' }, badge(kind, g));
+}
+// Every change of a tote's grade: when, from, to, what triggered it, the rule that decided and the readings it was based on (from the Feedstock Stability log).
+async function showGradeHistory(t) {
+  const data = await api('GET', '/totes/' + t.id + '/ph');
+  const log = data.stabilityLog.filter(e => e.field === 'Grade');
+  const body = el('div', {}, el('div', { class: 'summary-line' }, sl('Tote', t.lot), sl('Grade now', el('span', {}, gradeBadge(t)))),
+    log.length ? el('div', { class: 'tablewrap stability-log-scroll', style: 'margin-top:6px' }, el('table', {},
+      el('thead', {}, el('tr', {}, ...['When', 'From', 'To', 'Why and readings', 'By'].map(h => el('th', {}, h)))),
+      el('tbody', {}, ...log.map(e => el('tr', {}, el('td', { class: 'muted' }, fmtWhen(e.at)), el('td', { class: 'muted' }, e.oldValue ?? '—'), el('td', {}, el('b', {}, e.newValue ?? '—')),
+        el('td', {}, e.note || '—'), el('td', {}, e.by || '—'))))))
+      : el('div', { class: 'help' }, 'No grade change has been recorded for this tote yet.'),
+    el('div', { class: 'help' }, 'A grade changes when a reading (pH, ORP, odour) changes, when the stabilization period moves on, or when the grading rules change (Admin > Feedstock grading keeps those changes too). '
+      + 'Once a tote is used (consumed or disposed) its grade is fixed.'));
+  modal('Grade history — ' + t.lot, body, async () => {}, 'Close', { wide: true, noCancel: true });
+}
 function showToteDetails(t) {
   const rows = [
     ['Lot number', mono(t.lot)], ['Site', siteName(t.site)], ['Species', speciesName(t.species)],
@@ -228,11 +249,13 @@ function showToteDetails(t) {
     ['Received date', t.receivedDate || '—'],
     ['pH', t.ph != null ? t.ph + (t.phUpdated ? '  (' + t.phUpdated + ')' : '') : '—'],
     ['ORP (mV)', t.orp != null ? t.orp + (t.orpUpdated ? '  (' + t.orpUpdated + ')' : '') : '—'],
+    ['Grade', el('span', {}, gradeBadge(t), t.gradeWhy ? '  ' + t.gradeWhy : '')],
     ['Solids', t.solidsPct != null ? fmt(t.solidsPct, 2) + ' %' : '—'],
     ['Location', t.location || '—'], ['Status', badge(t.status, statusLabel(t.status))],
     ['Last updated', t.lastUpdated ? fmtWhen(t.lastUpdated) : '—'], ['Notes', t.notes || '—']];
   if (t.batchLot) rows.splice(4, 0, ['Pre-processing batch', mono(t.batchLot)]);
   const body = el('div', {}, table(['Field', 'Value'], rows));
+  body.append(el('div', { style: 'margin-top:10px' }, el('button', { class: 'secondary', onclick: () => showGradeHistory(t) }, 'Grade history')));
   if (t.grind === 'Fine' || (t.status === 'consumed' && !t.runId))
     body.append(el('div', { style: 'margin-top:10px' }, el('button', { class: 'secondary', onclick: () => showPreprocTrace(t) }, 'Trace to source totes')));
   modal('Feedstock details — ' + t.lot, body, async () => {}, 'Close', { noCancel: true });
@@ -3565,7 +3588,7 @@ async function openRun(draftSummary, opts) {
     el('option', { value: v }, v || 'All')));
   stabFilterSel.value = 'Citric acid';
   stabFilterSel.addEventListener('change', () => filterTotes());
-  const pickFilters = { site: '', location: '' };
+  const pickFilters = { site: '', location: '', grade: '' };
   const pickHost = el('div', { class: 'tote-pick' });
   const summary = el('div', { class: 'summary-line' });
   let pickFilteredCount = 0;
@@ -3603,13 +3626,18 @@ async function openRun(draftSummary, opts) {
         (!stabFilterSel.value || (t.stabilizationMethod || '') === stabFilterSel.value) &&
         (!q || (t.lot + ' ' + siteName(t.site) + ' ' + (t.location || '')).toLowerCase().includes(q)) &&
         (!pickFilters.site || siteName(t.site) === pickFilters.site) &&
+        (!pickFilters.grade || (t.grade || '') === pickFilters.grade) &&
         (!pickFilters.location || (t.location || '') === pickFilters.location);
     });
     pickFilteredCount = rows.length;
     pickHost.innerHTML = '';
     const headRow = el('tr', {}, el('th', { class: 'checkcol' }, ''), el('th', {}, 'Lot'), el('th', {}, 'Site'),
-      el('th', { class: 'num' }, 'Avg kg'), el('th', {}, 'pH'), el('th', {}, 'Location'));
+      el('th', { class: 'num' }, 'Avg kg'), el('th', {}, 'pH'), el('th', {}, 'Grade'), el('th', {}, 'Location'));
     const siteOpts = (State.ref.sites || []).map(s => s.name);
+    const gradeOpts = [...new Set(totes.map(t => t.grade).filter(Boolean))].sort();
+    const gradeFilterSel = el('select', {}, el('option', { value: '' }, 'All'), ...gradeOpts.map(o => el('option', { value: o }, o)));
+    gradeFilterSel.value = pickFilters.grade;
+    gradeFilterSel.addEventListener('change', () => { pickFilters.grade = gradeFilterSel.value; filterTotes(); });
     const locOpts = State.ref.locations || [];
     const siteFilterSel = el('select', {}, el('option', { value: '' }, 'All'), ...siteOpts.map(o => el('option', { value: o }, o)));
     siteFilterSel.value = pickFilters.site;
@@ -3621,7 +3649,7 @@ async function openRun(draftSummary, opts) {
     // filter input lines up under its own column instead of the one to its right.
     const filterRow = el('tr', { class: 'filter-row' }, el('th', {}, ''),
       el('th', {}, ''), el('th', {}, siteFilterSel),
-      el('th', {}, ''), el('th', {}, ''), el('th', {}, locFilterSel));
+      el('th', {}, ''), el('th', {}, ''), el('th', {}, gradeFilterSel), el('th', {}, locFilterSel));
     const tbl = el('table', {}, el('thead', {}, headRow, filterRow));
     const tb = el('tbody', {});
     for (const t of rows) {
@@ -3650,9 +3678,9 @@ async function openRun(draftSummary, opts) {
         }
       });
       cb.checked = selected.has(t.id);
-      tb.append(el('tr', {}, el('td', { class: 'checkcol' }, cb), el('td', { class: 'mono' }, t.lot), el('td', {}, siteName(t.site)), el('td', { class: 'num' }, fmt(t.avgWeightKg, 1)), el('td', {}, t.ph ?? '—'), el('td', {}, t.location || '—')));
+      tb.append(el('tr', {}, el('td', { class: 'checkcol' }, cb), el('td', { class: 'mono' }, t.lot), el('td', {}, siteName(t.site)), el('td', { class: 'num' }, fmt(t.avgWeightKg, 1)), el('td', {}, t.ph ?? '—'), el('td', {}, gradeBadge(t)), el('td', {}, t.location || '—')));
     }
-    if (!rows.length) tb.append(el('tr', {}, el('td', { colspan: 6, class: 'empty' }, 'No in-stock totes match these filters.')));
+    if (!rows.length) tb.append(el('tr', {}, el('td', { colspan: 7, class: 'empty' }, 'No in-stock totes match these filters.')));
     tbl.append(tb); pickHost.append(tbl); recompute();
   }
   function recompute() {
@@ -5672,6 +5700,13 @@ function exportYieldCsv(d) {
 // literal in the code, so it shows up in the table below automatically.
 const CALCULATIONS = [
   {
+    title: 'Feedstock grade',
+    formula: 'Rules are checked in order; the first rule that is on and holds gives the grade:  IF (condition AND condition …) OR (condition AND …) THEN grade.  A condition compares pH, ORP (mV), stabilization period (weeks), odour or odour intensity with  <  <=  =  >=  >  !=  (odour also: is, is not, contains, does not contain; any: is blank / is not blank).  Odour intensity: Mild < Medium < Strong.  A reading with no value never satisfies a comparison.  No rule holds → the “otherwise” grade.',
+    description: 'Classifies the quality of every tote in Feedstock Inventory automatically from its current readings, using rules an administrator sets. The grade follows the readings as they change and the stabilization period as it grows; every change is recorded on the tote (from, to, why, readings) and a used tote keeps its grade.',
+    location: 'Feedstock Inventory → Grade column and ⓘ details; rules in Admin → Feedstock grading',
+    settings: [],
+  },
+  {
     title: 'Inventory lots: stock left in a lot, and stock not in a lot',
     formula: 'Left in a lot = quantity received − everything assigned to it (assigned when stock is used: not-expired lots first by earliest expiry, no expiry last, expired lots after, never a lot on hold; a refund returns to the lot it came from);  Not in a lot = max(0, item on hand − Σ left in its lots).  Expiring soon = expiry date within the warning period and stock left.',
     description: 'Lets a recall be traced from a supplier lot to the runs, products and customers it reached. Stock counted or received before lots were recorded is “not in a lot” and cannot be traced to a supplier lot.',
@@ -6513,6 +6548,107 @@ async function drawAdminRequisitionContact(v) {
       el('div', { style: 'margin-top:8px;display:flex;gap:10px;align-items:center' }, save, msg))));
 }
 
+/* ---- Admin: feedstock grading rules ---- */
+// "IF (a AND b) OR (c AND d) THEN grade", evaluated top to bottom for every tote: the first rule that holds gives the grade, otherwise the "otherwise" grade.
+// Each change is saved straight away (the whole list) and logged.
+function gradeCondText(c, meta) {
+  const f = meta.fields.find(x => x.key === c.field) || { label: c.field, type: 'number' };
+  const ops = f.type === 'text' ? meta.textOps : meta.numberOps;
+  return f.label + ' ' + (ops[c.op] || c.op) + (c.op === 'blank' || c.op === 'notblank' ? '' : ' ' + c.value);
+}
+function gradeRuleText(rule, meta) {
+  return rule.groups.map(g => { const p = g.map(c => gradeCondText(c, meta)).join(' AND '); return rule.groups.length > 1 && g.length > 1 ? '(' + p + ')' : p; }).join(' OR ');
+}
+async function drawAdminGradeRules(v) {
+  const meta = await api('GET', '/grade-rules');
+  v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Feedstock grading'),
+    el('div', { class: 'actions' }, el('button', { onclick: () => editGradeRule(null) }, '+ Add rule'))));
+  v.append(el('div', { class: 'help', style: 'margin:-6px 0 8px' },
+    'Every tote in Feedstock Inventory gets a grade (A, B, C …) from its current pH, ORP, stabilization period, odour and odour intensity, using these rules. '
+    + 'Rules are checked top to bottom and the first one that holds gives the grade; a tote that matches none gets the “otherwise” grade. A reading with no value never satisfies a comparison. '
+    + 'Within a set of conditions ALL must hold (AND); a rule can have several sets and any one of them is enough (OR). Odour intensity orders Mild < Medium < Strong. '
+    + 'Every change is traceable: each rule change is kept below (before and after), and every tote’s grade change is recorded on that tote (ⓘ details → Grade history) with the reason and the readings; a used tote keeps its grade.'));
+  const persist = async (rules, def, msg) => {
+    const r = await api('PUT', '/grade-rules', { defaultGrade: def, rules: rules.map(x => ({ grade: x.grade, note: x.note, enabled: x.enabled, groups: x.groups })) });
+    toast(msg || 'Grading rules saved'); render();
+    return r;
+  };
+  const rows = meta.rules.map((rule, i) => [String(i + 1), el('span', {}, 'IF ', el('b', {}, rule.note || ''), rule.note ? ' — ' : '', gradeRuleText(rule, meta)),
+    el('b', {}, rule.grade), rule.enabled ? badge('on_hand', 'On') : badge('sold', 'Off'),
+    rowActions([['Edit', () => editGradeRule(rule, i)],
+      i > 0 ? ['↑', () => { const a = meta.rules.slice(); [a[i - 1], a[i]] = [a[i], a[i - 1]]; persist(a, meta.defaultGrade, 'Order saved'); }] : null,
+      i < meta.rules.length - 1 ? ['↓', () => { const a = meta.rules.slice(); [a[i + 1], a[i]] = [a[i], a[i + 1]]; persist(a, meta.defaultGrade, 'Order saved'); }] : null,
+      ['Delete', () => { if (confirm('Delete rule ' + (i + 1) + '?')) persist(meta.rules.filter((_, k) => k !== i), meta.defaultGrade, 'Rule deleted'); }, 'danger']])]);
+  rows.push(['', el('span', { class: 'muted' }, 'Otherwise (no rule above holds)'), el('b', {}, meta.defaultGrade), '',
+    rowActions([['Change…', () => {
+      const g = el('input', { value: meta.defaultGrade, maxlength: '16' });
+      modal('Otherwise grade', el('div', {}, field('Grade for a tote that matches no rule', g)), async () => { await persist(meta.rules, g.value, 'Saved'); }, 'Save');
+    }]])]);
+  v.append(table(['#', 'Rule', 'Grade', 'Status', ''], rows, [false, false, false, false, false]));
+  // try the rules out
+  const ph = el('input', { type: 'number', step: 'any', style: 'width:90px' }), orp = el('input', { type: 'number', step: 'any', style: 'width:90px' }), wk = el('input', { type: 'number', step: 'any', style: 'width:90px' });
+  const od = selectFrom('', [['', '—'], ...REF_ODOURS.filter(o => o !== 'Other').map(o => [o, o])]), it = selectFrom('', ODOUR_INTENSITIES.map(i => [i, i || '—']));
+  const out = el('div', { style: 'margin-top:6px', class: 'help' });
+  const run = async () => { const r = await api('POST', '/grade-rules/test', { ph: ph.value, orp: orp.value, stabWeeks: wk.value, odour: od.value, odourIntensity: it.value }); out.textContent = 'Grade ' + r.grade + ' — ' + r.why; };
+  v.append(el('details', { class: 'accordion' }, el('summary', {}, 'Try the rules'), el('div', { class: 'accordion-body' },
+    el('div', { class: 'form-row' }, field('pH', ph), field('ORP (mV)', orp), field('Stabilization (weeks)', wk)),
+    el('div', { class: 'form-row' }, field('Odour', od), field('Odour intensity', it)),
+    el('button', { type: 'button', class: 'secondary', onclick: run }, 'Grade these values'), out)));
+  v.append(el('details', { class: 'accordion' }, el('summary', {}, 'Change history'), el('div', { class: 'accordion-body', id: 'grade_log' })));
+  v.lastChild.addEventListener('toggle', async function () {
+    if (!this.open || this.dataset.loaded) return;
+    this.dataset.loaded = '1';
+    const h = (await api('GET', '/grade-rules/log')).log;
+    this.querySelector('#grade_log').append(h.length ? table(['When', 'By', 'Rules before', 'Rules after'], h.map(e => [fmtWhen(e.at), e.by || '—', e.old || '—', e.new || '—'])) : el('div', { class: 'help' }, 'No changes yet.'));
+  });
+  function editGradeRule(rule, index) {
+    const draft = rule ? JSON.parse(JSON.stringify(rule)) : { grade: '', note: '', enabled: true, groups: [[{ field: 'ph', op: 'le', value: '' }]] };
+    const grade = el('input', { value: draft.grade, maxlength: '16', placeholder: 'A', style: 'width:90px' }), note = el('input', { value: draft.note || '', placeholder: 'optional name' });
+    const on = el('input', { type: 'checkbox' }); on.checked = draft.enabled;
+    const groupsHost = el('div', {});
+    const valueControl = (c, onChange) => {
+      const f = meta.fields.find(x => x.key === c.field);
+      if (c.op === 'blank' || c.op === 'notblank') return el('span', { class: 'muted' }, '—');
+      if (f.type === 'ordinal') { const s = selectFrom('', f.values.map(x => [x, x])); s.value = f.values.includes(c.value) ? c.value : (c.value = f.values[0]); s.addEventListener('change', () => { c.value = s.value; onChange(); }); return s; }
+      if (f.type === 'text') { const i = editableSelect(REF_ODOURS.filter(o => o !== 'Other').map(o => [o, o]), 'gr_' + Math.random().toString(36).slice(2)); const inp = i.querySelector('input'); inp.value = c.value || ''; inp.addEventListener('input', () => { c.value = inp.value; onChange(); }); return i; }
+      const inp = el('input', { type: 'number', step: 'any', value: c.value ?? '', style: 'width:100px' }); inp.addEventListener('input', () => { c.value = inp.value; onChange(); }); return inp;
+    };
+    function draw() {
+      groupsHost.innerHTML = '';
+      draft.groups.forEach((g, gi) => {
+        if (gi > 0) groupsHost.append(el('div', { style: 'text-align:center;font-weight:700;margin:6px 0' }, 'OR'));
+        const box = el('div', { class: 'perm-box' });
+        g.forEach((c, ci) => {
+          const f = meta.fields.find(x => x.key === c.field);
+          const fSel = selectFrom('', meta.fields.map(x => [x.key, x.label])); fSel.value = c.field;
+          fSel.addEventListener('change', () => { c.field = fSel.value; const nf = meta.fields.find(x => x.key === c.field); c.op = nf.type === 'text' ? 'contains' : 'le'; c.value = ''; draw(); });
+          const ops = f.type === 'text' ? meta.textOps : meta.numberOps;
+          const oSel = selectFrom('', Object.entries(ops).map(([k, label]) => [k, label])); oSel.value = c.op;
+          oSel.addEventListener('change', () => { c.op = oSel.value; draw(); });
+          box.append(el('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:4px 0' },
+            ci > 0 ? el('b', { style: 'width:34px' }, 'AND') : el('span', { style: 'width:34px' }, 'IF'),
+            fSel, oSel, valueControl(c, () => {}),
+            g.length > 1 || draft.groups.length > 1 ? el('button', { type: 'button', class: 'secondary', title: 'Remove this condition', onclick: () => { g.splice(ci, 1); if (!g.length) draft.groups.splice(gi, 1); if (!draft.groups.length) draft.groups.push([{ field: 'ph', op: 'le', value: '' }]); draw(); } }, '✕') : null));
+        });
+        box.append(el('button', { type: 'button', class: 'secondary', onclick: () => { g.push({ field: 'ph', op: 'le', value: '' }); draw(); } }, '+ AND condition'));
+        groupsHost.append(box);
+      });
+      groupsHost.append(el('div', { style: 'margin-top:8px' }, el('button', { type: 'button', class: 'secondary', onclick: () => { draft.groups.push([{ field: 'ph', op: 'le', value: '' }]); draw(); } }, '+ OR another set of conditions')));
+    }
+    draw();
+    modal(rule ? 'Edit grading rule ' + (index + 1) : 'New grading rule', el('div', {},
+      el('div', { class: 'form-row' }, field('Then the grade is', grade), field('Name (optional)', note)),
+      el('label', { class: 'perm-item' + (on.checked ? ' on' : ''), style: 'margin-bottom:8px' }, on, el('span', { class: 'perm-text' }, el('b', {}, 'Rule is on'), el('small', {}, 'A rule that is off is skipped.'))),
+      groupsHost,
+      el('div', { class: 'help' }, 'Within one set every condition must hold (AND); any one set is enough (OR). A reading with no value never satisfies a comparison, except “is blank”.')),
+      async () => {
+        const out = { grade: grade.value, note: note.value, enabled: on.checked, groups: draft.groups };
+        const list = meta.rules.slice();
+        if (rule) list[index] = out; else list.push(out);
+        await persist(list, meta.defaultGrade, rule ? 'Rule saved' : 'Rule added');
+      }, 'Save', { wide: true });
+  }
+}
 /* ---- Admin: Certificate of Analysis specifications ---- */
 async function drawAdminCoaSpecs(v) {
   const { specs, applicationRate, applicationPeriods } = await api('GET', '/coa-specs');
@@ -7409,6 +7545,7 @@ async function pageAdmin(v) {
   await drawAdminLabs(v);
   await drawAdminRequisitionContact(v);
   await drawAdminCoaSpecs(v);
+  await drawAdminGradeRules(v);
 }
 /* ---------------- Certificate of Analysis: lab results ---------------- */
 const COA_BADGE = { pass: ['on_hand', 'PASS'], fail: ['low', 'FAIL'], review: ['pending_release', 'REVIEW'], not_evaluated: ['pending_release', 'N/E'] };
@@ -7608,11 +7745,27 @@ async function adminSopSection(v) {
     'The same list as the Documents tab: every SOP in the SharePoint folder appears here once it is accepted. Here you can give an SOP a reference key and choose where it is linked. '
     + 'Everything else follows SharePoint: an SOP’s name is the title in its file name, and its file, revisions and removal are controlled there (a file taken out of the Current folder shows here as Withdrawn).'));
   v.append(sopTable(sr.sops, { admin: true }));
-  v.append(el('div', { class: 'page-head', style: 'margin-top:22px' }, el('h2', {}, 'Where SOPs are linked')));
-  v.append(el('div', { class: 'help', style: 'margin:-8px 0 10px' },
-    'A link appears as a small “SOP” line at the top of that section, box or page, opening the SOP’s current file. Tick several places (or a whole group) and add an SOP to all of them at once, '
-    + 'or use “Link to…” on an SOP above, or “Choose SOPs…” for one place.'));
-  drawSopSpotsTable(v);
+  // The by-place table is kept minimized: each SOP's own "Link to…" window is the normal way to link it. Open this to link several places at once.
+  let open = false;
+  try { open = localStorage.getItem('kelp.sopPlacesOpen') === '1'; } catch (e) { /* closed */ }
+  const placesBody = el('div', { class: 'accordion-body' });
+  const places = el('details', { class: 'accordion', style: 'margin-top:22px' }, el('summary', {}, 'Where SOPs are linked (by place)'), placesBody);
+  if (open) places.open = true;
+  let drawn = false;
+  const drawPlaces = () => {
+    if (drawn) return;
+    drawn = true;
+    placesBody.append(el('div', { class: 'help', style: 'margin:0 0 10px' },
+      'A link appears as a small “SOP” line at the top of that section, box or page, opening the SOP’s current file. Tick several places (or a whole group) and add an SOP to all of them at once, '
+      + 'or use “Link to…” on an SOP above, or “Choose SOPs…” for one place.'));
+    drawSopSpotsTable(placesBody);
+  };
+  places.addEventListener('toggle', () => {
+    try { localStorage.setItem('kelp.sopPlacesOpen', places.open ? '1' : '0'); } catch (e) { /* not remembered */ }
+    if (places.open) drawPlaces();
+  });
+  if (open) drawPlaces();
+  v.append(places);
 }
 // ---- Places for SOP links: the filters and grouping shared by the "Link to…" window and the "Where SOPs are linked" table ----
 const SOP_KIND_ORDER = ['Section', 'Page', 'View', 'Process Check', 'QC Check', 'Sample Point', 'Other box', 'Window'];
@@ -7843,15 +7996,24 @@ async function pageDocuments(v) {
     'No safety data sheets yet. Put them in the SharePoint folder 04_Safety-Data-Sheets/Current as SDS_Chemical-Name_Supplier_2025-03-14.pdf; they appear here after the next nightly sync and your approval.'));
 }
 
-// Where an SOP is linked, as the areas it appears in (the whole list is in the tooltip): "Homogenization ×3 · Pasteurization · CIP Log".
+// Where an SOP is linked, kept short: the number of places and the first areas ("5 places", "Homogenization, Extraction, CIP Log +1"). Click for the whole list.
 function sopLinkedAt(s) {
   const spots = s.spots || [];
   if (!spots.length) return el('span', { class: 'muted' }, 'nowhere yet');
   const info = new Map((State.ref.sopSpots || []).map(x => [x.key, x]));
-  const counts = new Map();
-  spots.forEach(k => { const x = info.get(k); if (x) counts.set(x.group, (counts.get(x.group) || 0) + 1); });
-  const tip = spots.map(k => { const x = info.get(k); return x ? x.group + ': ' + x.label : k; }).join('\n');
-  return el('span', { title: tip }, [...counts].map(([g, n]) => g.replace('Production log: ', '') + (n > 1 ? ' ×' + n : '')).join(' · '));
+  const areas = [];
+  spots.forEach(k => { const x = info.get(k); const g = x ? x.group.replace('Production log: ', '') : null; if (g && !areas.includes(g)) areas.push(g); });
+  const shown = areas.slice(0, 2).join(', ') + (areas.length > 2 ? ' +' + (areas.length - 2) : '');
+  return el('a', { href: '#', class: 'linked-at', title: 'Show every place', onclick: e => { e.preventDefault(); e.stopPropagation(); showSopPlaces(s); } },
+    el('b', {}, spots.length + (spots.length === 1 ? ' place' : ' places')), el('span', { class: 'muted' }, shown));
+}
+function showSopPlaces(s) {
+  const info = new Map((State.ref.sopSpots || []).map(x => [x.key, x]));
+  const groups = new Map();
+  (s.spots || []).forEach(k => { const x = info.get(k); const g = x ? x.group : 'Other'; if (!groups.has(g)) groups.set(g, []); groups.get(g).push(x ? x.label : k); });
+  const body = el('div', {}, ...[...groups].map(([g, labels]) => el('div', { style: 'margin-bottom:8px' }, el('b', {}, g.replace('Production log: ', 'Production log — ')),
+    el('ul', { style: 'margin:4px 0 0 18px;padding:0' }, ...labels.map(l => el('li', {}, l))))));
+  modal('Where ' + (s.docNumber ? s.docNumber + ' ' : '') + s.name + ' is linked', body, async () => {}, 'Close', { noCancel: true });
 }
 // The SOP list: the same table on the Documents tab and in Admin (which adds the reference key and the actions).
 function sopTable(sops, opts) {
@@ -7869,6 +8031,22 @@ function sopTable(sops, opts) {
   return table(headers, rows, headers.map(() => false), ri => showDocHistory('sop', sops[ri].id, sops[ri].name));
 }
 
+// The SOP NUMBER in the file name decides what a change is: a number KelpWorks does not have is a NEW SOP, a number it has is a REVISION of that SOP.
+function libraryChangeBadge(i) {
+  if (i.kind === 'sop' && i.change === 'new') return badge('wip', 'New SOP');
+  if (i.kind === 'sop' && i.change === 'revision') return badge('pending_release', 'Revision of ' + (i.sopNumber || 'SOP'));
+  return badge(LIBRARY_CHANGE[i.change][1], LIBRARY_CHANGE[i.change][0]);
+}
+// The name the SOP will have once accepted: a new SOP shows its name; a revision shows its current name, and "old → new" when the new file's title differs.
+function libraryReviewName(i) {
+  if (i.kind === 'sop' && i.change === 'new') return el('span', {}, el('b', {}, i.newName || '—'), el('div', { class: 'muted', style: 'font-size:11px' }, 'new' + (i.newRevision ? ' · rev ' + i.newRevision : '')));
+  if (i.kind === 'sop' && i.change === 'revision') {
+    const rev = (i.currentRevision || i.newRevision) ? 'rev ' + (i.currentRevision || '—') + ' → ' + (i.newRevision || '—') : null;
+    return el('span', {}, i.renamed ? el('span', {}, el('span', { class: 'muted' }, i.currentName), ' → ', el('b', {}, i.newName)) : el('b', {}, i.currentName || i.newName || '—'),
+      rev ? el('div', { class: 'muted', style: 'font-size:11px' }, rev) : null);
+  }
+  return i.targetName || '—';
+}
 async function libraryReviewCard(v) {
   let r;
   try { r = await api('GET', '/library/inbox'); } catch (e) { v.append(el('div', { class: 'empty card' }, 'Could not read the SharePoint folder status: ' + e.message)); return; }
@@ -7881,9 +8059,9 @@ async function libraryReviewCard(v) {
     'The ' + stale.map(k => names[k]).join(' and ') + ' folder' + (stale.length > 1 ? 's have' : ' has') + ' not been reported for over ' + r.staleDays
     + ' days: the nightly sync on the office PC may have stopped (see docs/controlled-documents.md).'));
   if (!r.pending.length) card.append(el('div', { class: 'help' }, 'Nothing is waiting: the lists below match the SharePoint folders.'));
-  else card.append(table(['Document type', 'Change', 'File', 'Details', ''],
-    r.pending.map(i => [i.kind === 'sop' ? 'SOP' : 'Safety data sheet', badge(LIBRARY_CHANGE[i.change][1], LIBRARY_CHANGE[i.change][0]),
-      mono(i.filename || '—'), [i.targetName ? 'For ' + i.targetName + '. ' : '', i.detail || ''].join('').trim() || '—',
+  else card.append(table(['Document', 'Change', 'Name', 'File', 'Details', ''],
+    r.pending.map(i => [i.kind === 'sop' ? (i.sopNumber ? mono(i.sopNumber) : 'SOP') : 'Safety data sheet', libraryChangeBadge(i), libraryReviewName(i),
+      mono(i.filename || '—'), [i.kind === 'sop' ? '' : (i.targetName ? 'For ' + i.targetName + '. ' : ''), i.detail || ''].join('').trim() || '—',
       rowActions([['Review', () => reviewLibraryItem(i)], ['Ignore', () => ignoreLibraryItem(i), 'danger']])])));
   if (r.recent.length) card.append(el('details', { style: 'margin-top:10px' }, el('summary', {}, 'Recently dealt with (' + r.recent.length + ')'),
     table(['When', 'File', 'Result', 'By'], r.recent.map(i => [i.resolvedAt ? fmtWhen(i.resolvedAt) : '—', mono(i.filename || '—'),
@@ -7947,9 +8125,10 @@ async function reviewLibraryItem(i) {
     const link = selectFrom('', [['', '— add as a new SOP —'], ...(i.candidates || []).map(c => [String(c.id), 'This is the existing document: ' + c.name])]);
     const keyField = field('Reference key (optional)', key);
     link.addEventListener('change', () => keyField.classList.toggle('hidden', !!link.value));
-    modal('New SOP ' + (p.docNumber || ''), el('div', {},
-      el('div', { class: 'summary-line' }, sl('File', i.filename || '—'), sl('Number', p.docNumber || '—'), sl('Revision', p.revision ? 'rev ' + p.revision : '—'), sl('Name in KelpWorks', shownName)),
-      el('div', { class: 'help' }, 'The name comes from the file name in SharePoint (to change it, rename the file there; the next nightly sync updates it).'),
+    modal('New SOP ' + (p.docNumber || '') + ': ' + (i.newName || shownName), el('div', {},
+      el('div', { class: 'summary-line' }, sl('File', i.filename || '—'), sl('Number', p.docNumber || '—'), sl('Revision', p.revision ? 'rev ' + p.revision : '—'), sl('Name in KelpWorks', i.newName || shownName)),
+      el('div', { class: 'help' }, 'KelpWorks has no SOP numbered ' + (p.docNumber || '') + ', so this is added as a ', el('b', {}, 'new SOP'), '. The name comes from the file name in SharePoint (to change it, rename the file there; the next nightly sync updates it).'),
+      i.nameNote ? el('div', { class: 'help' }, i.nameNote) : null,
       libraryFileLine(i),
       field('Is this an SOP KelpWorks already has?', link),
       el('div', { class: 'help', style: 'margin-top:-6px' }, 'If so, the existing entry keeps its links but takes its name from this file.'),
@@ -7959,9 +8138,12 @@ async function reviewLibraryItem(i) {
     return;
   }
   if (i.kind === 'sop' && i.change === 'revision') {
-    modal('New revision', el('div', {}, el('div', { class: 'summary-line' }, sl('Document', i.targetName || '—'), sl('New file', i.filename || '—'), sl('Revision', p.revision ? 'rev ' + p.revision : '—')),
+    modal('Revision of ' + (i.sopNumber || p.docNumber || 'SOP') + ': ' + (i.currentName || i.targetName || ''), el('div', {}, el('div', { class: 'summary-line' }, sl('Number', i.sopNumber || p.docNumber || '—'), sl('Current name', i.currentName || i.targetName || '—'),
+      i.renamed ? sl('Name after accepting', i.newName) : null, sl('New file', i.filename || '—'), sl('Revision', (i.currentRevision ? 'rev ' + i.currentRevision : '—') + ' → ' + (p.revision ? 'rev ' + p.revision : '—'))),
+      el('div', { class: 'help' }, 'KelpWorks already has ' + (i.sopNumber || p.docNumber || 'this number') + ', so this file is a ', el('b', {}, 'revision of that SOP'), ', not a new one.'),
       libraryFileLine(i), i.detail ? el('div', { class: 'help' }, i.detail) : null,
-      p.title && p.title !== i.targetName ? el('div', { class: 'help' }, 'The name will change from “' + i.targetName + '” to “' + p.title + '”, following the file name.') : null,
+      i.renamed ? el('div', { class: 'help' }, 'The name will change from “' + i.currentName + '” to “' + i.newName + '”, following the file name.') : null,
+      i.nameNote ? el('div', { class: 'help' }, i.nameNote) : null,
       el('div', { class: 'help' }, 'Accepting makes this the current file. The file it replaces stays in the history. Links to this SOP keep working.')),
       () => acceptLibraryItem(i), 'Accept new revision');
     return;

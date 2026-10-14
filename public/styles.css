@@ -629,3 +629,8 @@ th.sortable:hover { color: var(--teal-dark); }
 body.is-staging { padding-top: 26px; }
 .restore-box { border: 1px solid #e0b25c; background: #fff8e8; border-radius: 10px; padding: 12px 14px; margin: 0 0 14px; }
 .restore-box h3 { margin: 0 0 4px; }
+
+/* Admin > SOPs "Linked at": a short summary (count + first areas) instead of the whole list */
+.linked-at { display: block; max-width: 220px; text-decoration: none; color: inherit; }
+.linked-at b { display: block; }
+.linked-at .muted { display: block; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

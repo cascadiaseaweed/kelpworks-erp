@@ -1565,6 +1565,20 @@ CREATE TABLE IF NOT EXISTS consumable_lot_log (
     created_at TEXT NOT NULL
 );
 
+-- Feedstock grade rules: evaluated top to bottom for every tote, the first enabled rule whose conditions hold gives the grade. A rule is "IF (a AND b) OR (c AND d) THEN
+-- grade": groups_json is a list of groups (OR'd), each a list of conditions (AND'd) {field, op, value}. The one row with is_default = 1 is the "otherwise" grade (always last).
+CREATE TABLE IF NOT EXISTS feedstock_grade_rules (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    position    INTEGER NOT NULL,
+    grade       TEXT NOT NULL,
+    note        TEXT,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    groups_json TEXT NOT NULL DEFAULT '[]',
+    is_default  INTEGER NOT NULL DEFAULT 0,
+    updated_by  TEXT,
+    updated_at  TEXT NOT NULL
+);
+
 -- A record of something deleted on purpose (a tote with no run history): what it was, who removed it and when. Append-only.
 CREATE TABLE IF NOT EXISTS deleted_records (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1878,6 +1892,8 @@ def init_db():
             ensure_requisition_contact(conn)
             ensure_sgs_analyses(conn)
             ensure_reagent_types(conn)
+            ensure_grade_rules(conn)
+            soft_step(conn, "feedstock grades", lambda: sync_tote_grades(conn, None, "Start-up check", quiet=True))
             soft_step(conn, "foreign-key indexes", lambda: ensure_indexes(conn))
             soft_step(conn, "status and quantity guards", lambda: ensure_constraints(conn))
             soft_step(conn, "SOP links to places that no longer exist", lambda: conn.execute(
@@ -4104,6 +4120,8 @@ def migrate(conn):
         ("storage_source", "TEXT"), ("orp", "REAL"), ("orp_updated", "TEXT"), ("notes", "TEXT"),
         ("received_date", "TEXT"),
         ("grind", "TEXT DEFAULT 'Coarse'"), ("preproc_batch_id", "INTEGER"), ("solids_pct", "REAL"),
+        ("grade", "TEXT"),                                   # the grade last recorded for this tote (see sync_tote_grades)
+        ("grade_frozen", "INTEGER NOT NULL DEFAULT 0"),      # 1 once the tote is consumed / disposed: its grade is fixed at what it was when it was used
     ]:
         if col not in cols:
             conn.execute("ALTER TABLE tote_lots ADD COLUMN %s %s" % (col, decl))
@@ -4665,6 +4683,171 @@ def read_token(token):
 # --------------------------------------------------------------------------- #
 # Serialization
 # --------------------------------------------------------------------------- #
+GRADE_NUMBER_OPS = {"lt": "<", "le": "<=", "eq": "=", "ge": ">=", "gt": ">", "ne": "!=", "blank": "is blank", "notblank": "is not blank"}
+GRADE_TEXT_OPS = {"eq": "is", "ne": "is not", "contains": "contains", "notcontains": "does not contain", "blank": "is blank", "notblank": "is not blank"}
+GRADE_INTENSITIES = ["Mild", "Medium", "Strong"]                      # in this order: Mild < Medium < Strong
+GRADE_FIELDS = [
+    {"key": "ph", "label": "pH", "type": "number"},
+    {"key": "orp", "label": "ORP (mV)", "type": "number"},
+    {"key": "stab_weeks", "label": "Stabilization period (weeks)", "type": "number"},
+    {"key": "odour", "label": "Odour", "type": "text"},
+    {"key": "odour_intensity", "label": "Odour intensity", "type": "ordinal", "values": GRADE_INTENSITIES},
+]
+GRADE_FIELD = {f["key"]: f for f in GRADE_FIELDS}
+GRADE_DEFAULT = "Ungraded"
+
+
+def grade_ops_for(ftype):
+    return GRADE_TEXT_OPS if ftype == "text" else GRADE_NUMBER_OPS    # ordinal values compare like numbers (by rank)
+
+
+def grade_condition_ok(cond, inputs):
+    """One condition against a tote's current properties. A property with no value never satisfies a comparison (only "is blank" is true for it)."""
+    field, op = GRADE_FIELD[cond["field"]], cond["op"]
+    v = inputs.get(cond["field"])
+    blank = v is None or (isinstance(v, str) and not v.strip())
+    if op == "blank":
+        return blank
+    if op == "notblank":
+        return not blank
+    if blank:
+        return False
+    if field["type"] == "text":
+        a, b = str(v).strip().lower(), str(cond["value"]).strip().lower()
+        return {"eq": a == b, "ne": a != b, "contains": b in a, "notcontains": b not in a}[op]
+    if field["type"] == "ordinal":
+        order = [x.lower() for x in field["values"]]
+        a, b = (order.index(str(v).strip().lower()) if str(v).strip().lower() in order else None), order.index(str(cond["value"]).strip().lower())
+        if a is None:
+            return False
+    else:
+        a, b = float(v), float(cond["value"])
+    return {"lt": a < b, "le": a <= b, "eq": abs(a - b) < 1e-9, "ge": a >= b, "gt": a > b, "ne": abs(a - b) >= 1e-9}[op]
+
+
+def grade_rule_matches(rule, inputs):
+    return any(all(grade_condition_ok(c, inputs) for c in group) for group in rule["groups"])
+
+
+def grade_rule_text(rule):
+    def cond(c):
+        f = GRADE_FIELD[c["field"]]
+        op = grade_ops_for(f["type"])[c["op"]]
+        return "%s %s%s" % (f["label"], op, "" if c["op"] in ("blank", "notblank") else " %s" % (c["value"] if f["type"] != "number" else coa_num(float(c["value"]))))
+    parts = [" AND ".join(cond(c) for c in g) for g in rule["groups"]]
+    return " OR ".join(("(%s)" % p if len(rule["groups"]) > 1 and len(g) > 1 else p) for p, g in zip(parts, rule["groups"]))
+
+
+def grade_for(rules, default_grade, inputs):
+    """-> (grade, why, rule id or None). `rules` are the enabled-or-not rules in order (not the default); the first ENABLED rule that matches wins."""
+    for n, rule in enumerate(rules, 1):
+        if rule["enabled"] and grade_rule_matches(rule, inputs):
+            return rule["grade"], "Rule %d%s: %s" % (n, " (%s)" % rule["note"] if rule["note"] else "", grade_rule_text(rule)), rule["id"]
+    return default_grade, "No rule matched", None
+
+
+def load_grade_rules(conn):
+    """-> (rules in order, default grade)."""
+    rules, default = [], GRADE_DEFAULT
+    for r in conn.execute("SELECT * FROM feedstock_grade_rules ORDER BY is_default, position, id"):
+        if r["is_default"]:
+            default = r["grade"]
+            continue
+        try:
+            groups = json.loads(r["groups_json"])
+        except ValueError:
+            groups = []
+        rules.append({"id": r["id"], "grade": r["grade"], "note": r["note"], "enabled": bool(r["enabled"]), "groups": groups})
+    return rules, default
+
+
+def ensure_grade_rules(conn):
+    """Every database has the "otherwise" grade row, so every tote always has a grade. Insert-only: an administrator's choice is never overwritten."""
+    if not conn.execute("SELECT 1 FROM feedstock_grade_rules WHERE is_default=1").fetchone():
+        conn.execute("INSERT INTO feedstock_grade_rules (position,grade,note,enabled,groups_json,is_default,updated_at) VALUES (999,?,NULL,1,'[]',1,?)", (GRADE_DEFAULT, now_iso()))
+
+
+def tote_stab_weeks(r, batch_date=None, processed_date=None):
+    """Whole weeks (nearest week) a tote stabilized -- the same calculation as the Feedstock Inventory column: from its harvest date (a fine-grind blend: its
+    Pre-Processing batch date) to today while it is in inventory, fixed at the processing date once consumed and at the disposal date once disposed."""
+    start = batch_date if r["preproc_batch_id"] else r["checkin_date"]
+    if not start:
+        return None
+    try:
+        a = datetime.date.fromisoformat(str(start)[:10])
+        if r["status"] == "consumed":
+            end = datetime.date.fromisoformat(str(processed_date)[:10]) if processed_date else None
+        elif r["status"] == "disposed":
+            end = datetime.date.fromisoformat(str(r["disposed_date"])[:10]) if r["disposed_date"] else None
+        else:
+            end = datetime.date.today()
+    except ValueError:
+        return None
+    if end is None:
+        return None
+    days = (end - a).days
+    return None if days < 0 else int(days / 7.0 + 0.5)
+
+
+def sync_tote_grades(conn, actor=None, reason="Readings updated", quiet=False):
+    """Record every change of a tote's grade. A grade is always computed from the rules and the tote's readings; this keeps the LAST RECORDED grade (tote_lots.grade) in step and writes
+    each change to the tote's Feedstock Stability log -- from, to, why (what triggered it, the rule that decided, and the readings it was based on) and who / what caused it. A tote that
+    is consumed or disposed is frozen at the grade it had when it was used. quiet = record the first grade of a tote without a log line (the start-up back-fill of a database that had no
+    grades). Returns the number of grade changes logged."""
+    rules, default = load_grade_rules(conn)
+    odour_now = {}
+    for x in conn.execute("SELECT tote_lot_id, field, new_value FROM tote_stability_log WHERE field IN ('Odour','Odour intensity') ORDER BY id"):
+        odour_now.setdefault(x["tote_lot_id"], {})[x["field"]] = x["new_value"]
+    batch_dates = {x["id"]: x["batch_date"] for x in conn.execute("SELECT id, batch_date FROM preproc_batches")}
+    run_dates = {x["id"]: (x["finalized_at"] or "")[:10] or x["run_date"] for x in conn.execute("SELECT id, run_date, finalized_at FROM production_runs")}
+    pre_dates = {x["tote_lot_id"]: (x["completed_at"] or "")[:10] or x["batch_date"] for x in conn.execute(
+        "SELECT pi.tote_lot_id, b.completed_at, b.batch_date FROM preproc_inputs pi JOIN preproc_batches b ON b.id=pi.batch_id WHERE b.status='completed'")}
+    changed, ts = 0, now_iso()
+    for r in conn.execute("SELECT * FROM tote_lots WHERE grade_frozen=0").fetchall():
+        od = odour_now.get(r["id"], {})
+        weeks = tote_stab_weeks(r, batch_dates.get(r["preproc_batch_id"]), run_dates.get(r["run_id"]) or pre_dates.get(r["id"]))
+        grade, why, _ = grade_for(rules, default, {"ph": r["ph"], "orp": r["orp"], "stab_weeks": weeks, "odour": od.get("Odour"), "odour_intensity": od.get("Odour intensity")})
+        if grade != r["grade"]:
+            if not (quiet and r["grade"] is None):
+                readings = "pH %s, ORP %s, %s wk, odour %s / %s" % ("-" if r["ph"] is None else r["ph"], "-" if r["orp"] is None else r["orp"], "-" if weeks is None else weeks,
+                                                                   od.get("Odour") or "-", od.get("Odour intensity") or "-")
+                conn.execute("INSERT INTO tote_stability_log (tote_lot_id,user_name,field,old_value,new_value,note,created_at) VALUES (?,?,?,?,?,?,?)",
+                             (r["id"], actor or "System", "Grade", r["grade"], grade, ("%s. %s. Readings: %s." % ("First graded" if r["grade"] is None else reason, why, readings))[:500], ts))
+                changed += 1
+            conn.execute("UPDATE tote_lots SET grade=? WHERE id=?", (grade, r["id"]))
+        if r["status"] in ("consumed", "disposed"):
+            conn.execute("UPDATE tote_lots SET grade_frozen=1 WHERE id=?", (r["id"],))
+    return changed
+
+
+def run_grade_daily_check():
+    """Once a day the stabilization period of every tote in inventory moves on, which can change its grade: re-grade and record what changed."""
+    today = datetime.date.today().isoformat()
+    conn = db()
+    try:
+        done = conn.execute("SELECT value FROM app_flags WHERE key='grade_synced_on'").fetchone()
+        if done and done["value"] == today:
+            return 0
+        conn.execute("BEGIN IMMEDIATE")
+        n = sync_tote_grades(conn, None, "Daily check (stabilization period)")
+        conn.execute("INSERT OR REPLACE INTO app_flags (key,value) VALUES ('grade_synced_on', ?)", (today,))
+        conn.commit()
+        return n
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def grade_scheduler(stop, every):
+    while not stop.wait(every):
+        try:
+            run_grade_daily_check()
+        except Exception:
+            logger.error("The daily feedstock grade check failed.", exc_info=True)
+
+
 def tote_public(r):
     return {"id": r["id"], "lot": r["lot_number"], "site": r["site_code"],
             "species": r["species_code"], "harvestYear": r["harvest_year"],
@@ -6238,6 +6421,15 @@ class Handler(BaseHTTPRequestHandler):
         out = {"id": r["id"], "kind": r["kind"], "change": r["change"], "state": r["state"], "identity": r["identity"], "filename": r["filename"], "path": r["source_path"],
                "size": r["size"], "foundAt": r["found_at"], "detail": r["detail"], "parsed": parsed, "targetId": r["target_id"], "targetName": target,
                "hasFile": bool(r["stored_name"]), "resolution": r["resolution"], "resolvedBy": r["resolved_by"], "resolvedAt": r["resolved_at"]}
+        if r["kind"] == "sop" and r["state"] == "pending" and parsed and r["change"] in ("new", "revision"):
+            # The SOP NUMBER in the file name decides what this is: a number KelpWorks does not have is a NEW SOP, a number it has is a REVISION of that SOP. The name shown in the review
+            # is the name the SOP will have once accepted (the title in the file name; the number is added when another SOP already has that name).
+            cur = conn.execute("SELECT name, revision FROM sop_documents WHERE id=?", (r["target_id"],)).fetchone() if r["target_id"] else None
+            new_name = sop_name_from_file(conn, parsed, r["target_id"])
+            out.update({"sopNumber": parsed.get("docNumber"), "currentName": cur["name"] if cur else None, "newName": new_name,
+                        "currentRevision": cur["revision"] if cur else None, "newRevision": parsed.get("revision"),
+                        "renamed": bool(cur and cur["name"] != new_name),
+                        "nameNote": ("Another SOP already has the title \"%s\", so the SOP number is added." % parsed.get("title")) if parsed.get("title") and new_name != parsed.get("title") and new_name != parsed.get("docNumber") else None})
         if detail and r["state"] == "pending" and r["kind"] == "sop" and r["change"] == "new":
             out["candidates"] = [{"id": x["id"], "name": x["name"]} for x in conn.execute("SELECT id, name FROM sop_documents WHERE doc_number IS NULL ORDER BY name")]
         return out
@@ -6737,7 +6929,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if method != "GET" and parsed.path != "/api/auth/login":
                 conn.execute("BEGIN IMMEDIATE")          # take the write lock BEFORE any read the handler bases a write on
+            self._actor = None
             result = self._route(method, parsed.path, query, conn)
+            if method != "GET" and parsed.path.startswith(("/api/totes", "/api/harvest", "/api/production", "/api/preproc")):
+                sync_tote_grades(conn, self._actor, "Readings updated")     # any change to a tote's readings, status or odour: record the grade change, if there is one
             conn.commit()
             self._remove_files(self._files_to_remove)    # files of rows this request deleted (only once the delete is committed)
             self._send_json(result if result is not None else {"ok": True})
@@ -6769,6 +6964,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.login(conn)
 
         user = self._auth(conn)  # everything below requires auth
+        self._actor = user["name"]
         if user["must_change_password"] and seg not in (["api", "me"], ["api", "me", "password"]):
             raise ApiError(403, "You must change your password before continuing.", "password_change_required")
 
@@ -6827,6 +7023,8 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     conn.execute("INSERT OR REPLACE INTO sample_label_names (stage,name) VALUES (?,?)", (stage, name))
             return {"ok": True}
+        if seg[:2] == ["api", "grade-rules"]:
+            return self.route_grade_rules(method, seg, conn, user)
         if seg[:2] == ["api", "lots"]:
             return self.route_lots(method, seg, query, conn, user)
         if seg[:2] == ["api", "consumables"]:
@@ -7342,6 +7540,102 @@ class Handler(BaseHTTPRequestHandler):
             "recentRuns": runs,
         }
 
+    # ---- feedstock grade rules -------------------------------------------- #
+    @staticmethod
+    def _clean_grade_rules(d):
+        """Validate an administrator's rule list; returns ([clean rules], default grade) or raises 400 naming the problem."""
+        def grade_text(v, what):
+            v = (v or "").strip() if isinstance(v, str) else ""
+            if not v or len(v) > 16 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._+-]*", v):
+                raise ApiError(400, "%s: enter a grade of 1 to 16 letters or numbers (for example A, B, C)" % what)
+            return v
+        default = grade_text(d.get("defaultGrade"), "Otherwise grade")
+        raw = d.get("rules")
+        if not isinstance(raw, list) or len(raw) > 30:
+            raise ApiError(400, "Send the rules as a list of at most 30")
+        rules = []
+        for n, r in enumerate(raw, 1):
+            where = "Rule %d" % n
+            grade = grade_text(r.get("grade"), where)
+            groups = r.get("groups")
+            if not isinstance(groups, list) or not groups or len(groups) > 8:
+                raise ApiError(400, "%s needs at least one set of conditions (at most 8)" % where)
+            clean_groups = []
+            for g in groups:
+                if not isinstance(g, list) or not g or len(g) > 10:
+                    raise ApiError(400, "%s: each set needs 1 to 10 conditions" % where)
+                cg = []
+                for c in g:
+                    f = GRADE_FIELD.get((c or {}).get("field"))
+                    if not f:
+                        raise ApiError(400, "%s: choose what to test (pH, ORP, stabilization period, odour or odour intensity)" % where)
+                    op = c.get("op")
+                    if op not in grade_ops_for(f["type"]):
+                        raise ApiError(400, "%s: that comparison does not apply to %s" % (where, f["label"]))
+                    val = c.get("value")
+                    if op in ("blank", "notblank"):
+                        val = None
+                    elif f["type"] == "number":
+                        val = numn(val)
+                        if val is None:
+                            raise ApiError(400, "%s: enter a number for %s" % (where, f["label"]))
+                    elif f["type"] == "ordinal":
+                        if str(val or "").strip().lower() not in [x.lower() for x in f["values"]]:
+                            raise ApiError(400, "%s: choose %s" % (where, " / ".join(f["values"])))
+                        val = [x for x in f["values"] if x.lower() == str(val).strip().lower()][0]
+                    else:
+                        val = (val or "").strip() if isinstance(val, str) else ""
+                        if not val or len(val) > 60:
+                            raise ApiError(400, "%s: enter the odour text to test" % where)
+                    cg.append({"field": c["field"], "op": op, "value": val})
+                clean_groups.append(cg)
+            rules.append({"grade": grade, "note": ((r.get("note") or "").strip()[:120] or None) if isinstance(r.get("note"), str) else None,
+                          "enabled": bool(r.get("enabled", True)), "groups": clean_groups})
+        return rules, default
+
+    def route_grade_rules(self, method, seg, conn, user):
+        if seg == ["api", "grade-rules"] and method == "GET":
+            rules, default = load_grade_rules(conn)
+            return {"rules": [dict(r, text=grade_rule_text(r)) for r in rules], "defaultGrade": default, "fields": GRADE_FIELDS,
+                    "numberOps": GRADE_NUMBER_OPS, "textOps": GRADE_TEXT_OPS}
+        if seg == ["api", "grade-rules"] and method == "PUT":
+            self._require_admin(user)
+            new_rules, new_default = self._clean_grade_rules(self._body_json())
+            old_rules, old_default = load_grade_rules(conn)
+
+            def summary(rules, default):
+                return "; ".join("%d. %s%s -> %s" % (n, grade_rule_text(r), "" if r["enabled"] else " [off]", r["grade"]) for n, r in enumerate(rules, 1)) + ("; otherwise -> %s" % default)
+            before, after = summary(old_rules, old_default), summary(new_rules, new_default)
+            conn.execute("DELETE FROM feedstock_grade_rules")
+            ts, who = now_iso(), user["name"] if user else None
+            for n, r in enumerate(new_rules, 1):
+                conn.execute("INSERT INTO feedstock_grade_rules (position,grade,note,enabled,groups_json,is_default,updated_by,updated_at) VALUES (?,?,?,?,?,0,?,?)",
+                             (n, r["grade"], r["note"], 1 if r["enabled"] else 0, json.dumps(r["groups"]), who, ts))
+            conn.execute("INSERT INTO feedstock_grade_rules (position,grade,note,enabled,groups_json,is_default,updated_by,updated_at) VALUES (999,?,NULL,1,'[]',1,?,?)", (new_default, who, ts))
+            out = None
+            if before != after:
+                cur = conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('grade','feedstock_grade_rules','Feedstock grade rules',?,?,?,?)",
+                                   (before[:4000], after[:4000], who, ts))
+                out = sync_tote_grades(conn, who, "Grading rules changed (change #%d)" % cur.lastrowid)     # every tote is re-graded now; each grade that moved is on its log
+            res = self.route_grade_rules("GET", ["api", "grade-rules"], conn, user)
+            res["regraded"] = out
+            return res
+        if seg == ["api", "grade-rules", "regrade"] and method == "POST":
+            self._require_admin(user)
+            return {"changed": sync_tote_grades(conn, user["name"] if user else None, "Manual re-grade")}
+        if seg == ["api", "grade-rules", "test"] and method == "POST":
+            d = self._body_json()
+            rules, default = load_grade_rules(conn)
+            inputs = {"ph": numn(d.get("ph")), "orp": numn(d.get("orp")), "stab_weeks": numn(d.get("stabWeeks")),
+                      "odour": (d.get("odour") or "").strip() or None, "odour_intensity": (d.get("odourIntensity") or "").strip() or None}
+            grade, why, _ = grade_for(rules, default, inputs)
+            return {"grade": grade, "why": why}
+        if seg == ["api", "grade-rules", "log"] and method == "GET":
+            self._require_admin(user)
+            return {"log": [{"old": r["old_value"], "new": r["new_value"], "by": r["changed_by"], "at": r["changed_at"]}
+                            for r in conn.execute("SELECT * FROM config_log WHERE area='grade' ORDER BY id DESC LIMIT 50")]}
+        raise ApiError(404, "Unknown grade-rules endpoint")
+
     # ---- stabilized totes ------------------------------------------------- #
     def route_totes(self, method, seg, query, conn, user):
         if seg == ["api", "totes"] and method == "GET":
@@ -7380,12 +7674,23 @@ class Handler(BaseHTTPRequestHandler):
                 pre_dates = {x["tote_lot_id"]: (x["completed_at"] or "")[:10] or x["batch_date"] for x in conn.execute(
                     "SELECT pi.tote_lot_id, b.completed_at, b.batch_date FROM preproc_inputs pi "
                     "JOIN preproc_batches b ON b.id=pi.batch_id WHERE b.status='completed'")}
+            grade_rules, grade_default = load_grade_rules(conn)
+            odour_now = {}
+            for x in conn.execute("SELECT tote_lot_id, field, new_value FROM tote_stability_log WHERE field IN ('Odour','Odour intensity') ORDER BY id"):
+                odour_now.setdefault(x["tote_lot_id"], {})[x["field"]] = x["new_value"]
             for r in rows:
                 t = tote_public(r)
                 if r["preproc_batch_id"]:
                     t["batchDate"] = batch_dates.get(r["preproc_batch_id"])
                 if r["status"] == "consumed":
                     t["processedDate"] = run_dates.get(r["run_id"]) or pre_dates.get(r["id"])
+                od = odour_now.get(r["id"], {})
+                if r["grade_frozen"] and r["grade"]:
+                    t["grade"], t["gradeWhy"] = r["grade"], "Fixed when the tote was used (see its Grade history)"
+                else:
+                    t["grade"], t["gradeWhy"], _ = grade_for(grade_rules, grade_default, {
+                        "ph": r["ph"], "orp": r["orp"], "stab_weeks": tote_stab_weeks(r, t.get("batchDate"), t.get("processedDate")),
+                        "odour": od.get("Odour"), "odour_intensity": od.get("Odour intensity")})
                 t["lastUpdated"] = last_map.get(r["id"]) or r["created_at"]
                 if r["preproc_batch_id"] and r["preproc_batch_id"] in sources:
                     t["batchLot"], t["sourceLots"] = sources[r["preproc_batch_id"]]
@@ -7555,7 +7860,30 @@ class Handler(BaseHTTPRequestHandler):
         r = conn.execute("SELECT MAX(created_at) AS last FROM tote_stability_log WHERE tote_lot_id=?",
                          (row["id"],)).fetchone()
         t["lastUpdated"] = (r["last"] if r else None) or row["created_at"]
+        t["grade"], t["gradeWhy"] = self._grade_of_tote(conn, row)
         return t
+
+    def _grade_of_tote(self, conn, row):
+        """The grade and why, for one tote, from the current rules and the tote's current properties (a tote that has been used keeps the grade it had)."""
+        if row["grade_frozen"] and row["grade"]:
+            return row["grade"], "Fixed when the tote was used (see its Grade history)"
+        batch = conn.execute("SELECT batch_date FROM preproc_batches WHERE id=?", (row["preproc_batch_id"],)).fetchone() if row["preproc_batch_id"] else None
+        processed = None
+        if row["status"] == "consumed":
+            run = conn.execute("SELECT run_date, finalized_at FROM production_runs WHERE id=?", (row["run_id"],)).fetchone() if row["run_id"] else None
+            if run:
+                processed = (run["finalized_at"] or "")[:10] or run["run_date"]
+            else:
+                b = conn.execute("SELECT COALESCE(NULLIF(substr(b.completed_at,1,10),''), b.batch_date) d FROM preproc_inputs pi JOIN preproc_batches b ON b.id=pi.batch_id "
+                                 "WHERE pi.tote_lot_id=? AND b.status='completed'", (row["id"],)).fetchone()
+                processed = b["d"] if b else None
+        od = {}
+        for x in conn.execute("SELECT field, new_value FROM tote_stability_log WHERE tote_lot_id=? AND field IN ('Odour','Odour intensity') ORDER BY id", (row["id"],)):
+            od[x["field"]] = x["new_value"]
+        rules, default = load_grade_rules(conn)
+        grade, why, _ = grade_for(rules, default, {"ph": row["ph"], "orp": row["orp"], "stab_weeks": tote_stab_weeks(row, batch["batch_date"] if batch else None, processed),
+                                                  "odour": od.get("Odour"), "odour_intensity": od.get("Odour intensity")})
+        return grade, why
 
     def _stability_log(self, conn, tote_id):
         return [dict(field=r["field"], oldValue=r["old_value"], newValue=r["new_value"],
@@ -14042,6 +14370,7 @@ def main():
         print("NOTE: KELP_ERP_SECRET is not set; using a generated signing key (%s). Set KELP_ERP_SECRET in production." % SECRET_SOURCE)
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     stop_backups = threading.Event()
+    threading.Thread(target=grade_scheduler, args=(stop_backups, float(os.environ.get("KELP_ERP_GRADE_CHECK_SECONDS", "900"))), daemon=True, name="grade-check").start()
     if NIGHTLY_BACKUP:
         threading.Thread(target=backup_scheduler, args=(stop_backups,), daemon=True, name="nightly-backup").start()
         logger.info("Nightly backup is on: after %02d:00 UTC, keeping the newest %d on this disk.", BACKUP_HOUR_UTC, BACKUP_KEEP)

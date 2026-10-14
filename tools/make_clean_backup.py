@@ -24,7 +24,7 @@ import tempfile
 import zipfile
 
 KEEP = {
-    "app_flags", "coa_specs", "config_log", "consumables", "container_units", "document_edits", "document_revisions", "fg_sku_species", "fg_skus",
+    "app_flags", "coa_specs", "config_log", "consumables", "container_units", "document_edits", "document_revisions", "feedstock_grade_rules", "fg_sku_species", "fg_skus",
     "lab_analyses", "labs", "locations", "qc_chart_limit_log", "qc_chart_limits", "requisition_contact", "sample_label_names", "sds_documents",
     "sds_items", "settings", "sites", "sop_document_edits", "sop_documents", "sop_links", "species", "user_permission_log", "users",
 }
