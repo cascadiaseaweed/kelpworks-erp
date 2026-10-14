@@ -566,3 +566,41 @@ def test_the_script_warns_about_a_missing_folder_and_a_wrong_key(srv, tmp_path):
     (root / DIRS["sop"]).mkdir(parents=True)
     code, out = run_tool(srv, root, key="wrong-wrong-wrong-wrong-wrong")
     assert code == 1 and "FAILED" in out and "403" in out
+
+
+# ---- the SOP number decides new vs revision, and the review shows the name ----
+
+def test_a_number_kelpworks_does_not_have_is_a_new_sop_and_the_review_shows_its_name(srv, admin):
+    put(srv, "sop", "SOP-410_Boiler-Startup_rev1.pdf", b"%PDF boiler 1")
+    item = waiting(admin, "sop", identity="SOP-410")[0]
+    assert item["change"] == "new" and item["sopNumber"] == "SOP-410" and item["currentName"] is None
+    assert item["newName"] == "Boiler Startup" and item["newRevision"] == "1" and item["renamed"] is False and item["nameNote"] is None
+    assert accept(admin, item).status == 200
+    assert [s["name"] for s in docs(admin)["sops"] if s["docNumber"] == "SOP-410"] == ["Boiler Startup"]           # accepted with exactly the name the review showed
+
+
+def test_a_number_it_has_is_a_revision_even_when_the_title_changes_and_the_review_shows_old_and_new(srv, admin):
+    FOLDERS["sop"].pop("SOP-410_Boiler-Startup_rev1.pdf", None)
+    put(srv, "sop", "SOP-410_Boiler-Startup-and-Shutdown_rev2.pdf", b"%PDF boiler 2")
+    item = waiting(admin, "sop", identity="SOP-410")[0]
+    assert item["change"] == "revision" and item["currentName"] == "Boiler Startup" and item["newName"] == "Boiler Startup and Shutdown"
+    assert item["renamed"] is True and (item["currentRevision"], item["newRevision"]) == ("1", "2")
+    assert accept(admin, item).status == 200
+    assert [s["name"] for s in docs(admin)["sops"] if s["docNumber"] == "SOP-410"] == ["Boiler Startup and Shutdown"]
+
+
+def test_a_revision_with_the_same_title_does_not_look_renamed(srv, admin):
+    FOLDERS["sop"].pop("SOP-410_Boiler-Startup-and-Shutdown_rev2.pdf", None)
+    put(srv, "sop", "SOP-410_Boiler-Startup-and-Shutdown_rev3.pdf", b"%PDF boiler 3")
+    item = waiting(admin, "sop", identity="SOP-410")[0]
+    assert item["change"] == "revision" and item["renamed"] is False and item["currentName"] == item["newName"]
+    assert accept(admin, item).status == 200
+
+
+def test_a_new_number_with_a_title_another_sop_has_shows_the_number_added_and_why(srv, admin):
+    put(srv, "sop", "SOP-411_Boiler-Startup-and-Shutdown_rev1.pdf", b"%PDF twin title")
+    item = waiting(admin, "sop", identity="SOP-411")[0]
+    assert item["change"] == "new" and item["newName"] == "Boiler Startup and Shutdown (SOP-411)"
+    assert "Another SOP already has the title" in item["nameNote"]
+    assert accept(admin, item).status == 200
+    assert [s["name"] for s in docs(admin)["sops"] if s["docNumber"] == "SOP-411"] == ["Boiler Startup and Shutdown (SOP-411)"]
