@@ -39,6 +39,16 @@ An SOP can be shown as a small **SOP** line, with a link to its current file, at
 - **Admin > Where SOPs are linked** (a minimized section: click it to open): the table of places (with the same filters and grouping): tick several places (or a whole group) and **Add an SOP to these places...** (or **Remove an SOP from these places...**) in one go. **Choose SOPs...** on a row sets all the SOPs for that place.
 - Several SOPs can share a place and one SOP can be at many places.
 
+**Taking an SOP out of use (administrators, Admin > SOPs).** Nothing in KelpWorks is ever deleted, but an SOP can be retired:
+- **Retire...** (any SOP; a reason is required): for an SOP that is no longer relevant, for example its file was removed from the Current folder and nothing replaces it. A retired SOP leaves the Documents list, the pickers and every
+  production-log link; its file and history are kept under **Retired SOPs** at the bottom of the Admin SOP table, where **Reinstate** brings it back (its places must be linked again). If its file reappears in the SharePoint folder it is
+  offered for review as a revision, and accepting reinstates it.
+- **Replace...** (only an SOP **without a number**, one that was loaded before the SharePoint sync): use it when the SOP you want to keep was added as a *new* SOP by mistake. Its places and reference key move to the SOP you choose and this
+  entry is retired, with a line in both histories.
+
+**Is this an SOP KelpWorks already has?** When a new SOP file arrives and KelpWorks still holds SOPs **without a number**, the review asks you to choose: *Yes, this is the existing SOP* (pick which; the closest match by title words is suggested)
+or *No, it is a different, new SOP* (you are asked to confirm). There is no default, so a new SOP cannot be added by accident while an old one is waiting. When no SOP without a number is left, the question disappears.
+
 The places (grouped in the picker by area):
 
 - **Production log**, one group per stage: Initiation, Feedstock, Homogenization, Extraction, Separation, Pasteurization, Dilution & Preservation, Packaging. Each group has *Whole section* and the boxes inside it:
