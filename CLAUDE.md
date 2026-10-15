@@ -527,6 +527,8 @@ Docker web service + a 1 GB persistent disk at `/var/data` holding **both**
 Migrations run on boot, so pushing to `main` auto-deploys safely. Admin + the
 initial staff roster are created on first boot via `ensure_users()`.
 
+**Data integrity:** `docs/data-integrity-statement.md` describes the ALCOA+ controls to auditors and customers; keep it in step when a control it names changes (audit trails, signatures, locks, backups, release gate, tests).
+
 **Process: read `docs/release-guide.md`.** Work on a branch (fixes: `hardening/<name>`), never push to `main`: open a pull request, wait for the green `test`
 check, and the user merges it (Render then auto-deploys live). Staging (a copy of live data, manual deploys) is in `docs/staging.md`. Keep the release guide in
 step with any change to this process, and add the live commit to `tests/legacy_commits.txt` after each release.

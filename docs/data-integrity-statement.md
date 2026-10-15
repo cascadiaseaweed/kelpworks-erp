@@ -1,0 +1,48 @@
+# KelpWorks ERP: Data Integrity Statement
+
+**Cascadia Seaweed Corp** · Version 1.0 · Date: _(set when approved)_ · Owner: _(Quality Manager)_ · Review: yearly, and whenever a control below changes
+
+## 1. Purpose and scope
+
+This statement describes how KelpWorks, Cascadia Seaweed's electronic system for feedstock, production, quality, inventory and shipping records, protects the integrity of the data it holds, in terms of the **ALCOA+** principles
+(Attributable, Legible, Contemporaneous, Original, Accurate, Complete, Consistent, Enduring, Available). It covers the controls built into the software. It does not replace the company's SOPs, training and quality system, which supply the
+procedural controls listed in section 5. It is a description of design and practice, not a certification.
+
+## 2. How each principle is met
+
+| Principle | What it means | Controls in KelpWorks |
+|---|---|---|
+| **Attributable** | Who did it, and when | Every user has an individual account (no shared logins) with a role. Every record and change names the person: production log edits, release signatures, lot and stock changes, grading-rule and setting changes, permission and password changes. Changes the system makes itself (for example the daily feedstock re-grade) are attributed to "System". Release and review signatures require the signer to re-enter their password and record the capacity signed (Production Manager or Quality Manager). Accounts are deactivated, never deleted. |
+| **Legible** | Readable and understandable | Records are structured and time-stamped, with plain-language audit entries (what changed, from, to, why). Reports, the Certificate of Analysis and the production-log summary are generated from the same data, in a fixed layout. |
+| **Contemporaneous** | Recorded at the time | Timestamps come from the server clock (UTC), not from typing. Finalizing a run, signing, receiving stock, grading and every audit entry are stamped when they happen. Retrospective entry is possible only through a separate, administrator-only function that labels the run "Historical" and records who entered it and when (section 4). |
+| **Original** | First capture, or a true copy | A finalized production log is locked; its fingerprint (SHA-256) is stored at review so any later difference is detected. Laboratory results are entered from, and linked to, the original lab report document. A replaced SOP or safety data sheet file is kept in the revision history, never overwritten. Uploaded documents are stored under opaque names and served unchanged. |
+| **Accurate** | Correct, and errors corrected openly | Nothing is edited silently. A wrong lab result is **voided with a reason** and a new one entered. A change to a finalized log is made only through an **amendment** (reason, category, field-by-field old and new values, then re-review). Finished-goods changes need a reason and a manager, and are written to the audit trail. Stock moves only through the ledger, never by overwriting a quantity. Numeric input is validated (impossible or non-numeric values are refused). |
+| **Complete** | All data, including changes | Required production-log fields must be filled before a run can be finalized. Every amendment becomes a numbered revision. The release audit trail, grade and lot histories, and configuration logs are append-only: the application has no function to edit or delete them (the history of a tote that is deleted is first copied to a deletion record). Deleted or retired items (a tote with no run history, an SOP) leave a record of what they were, who removed them and why. |
+| **Consistent** | Same rules, same order | Release always follows review by a Production Manager, then release by a Quality Manager, and cannot be bypassed; a run cannot be released until heavy metals and microbial tests pass and TDS meets its lower limit (no override). Settings and specification limits that these rules depend on are held in one place, and every change is logged (who, what, from, to). Calculations are defined once and shown on the Calculations page. |
+| **Enduring** | Kept for the retention period | A full backup (database and documents) is written every night and copied off the server into the company's SharePoint library on a daily, weekly and monthly schedule; the server disk is also snapshotted. A restore procedure exists and has been rehearsed. The record archive of finalized runs, their documents and certificates only grows. |
+| **Available** | Retrievable when needed | Records can be searched and printed on demand: runs, lots, certificates, audit trails, and a recall report that traces **forward** (a supplier lot to the runs, finished lots and customers it reached) and **backward** (a run to its materials, supplier lots and feedstock). Audit trails can be exported. |
+
+## 3. Technical controls that protect the above
+
+- **Access:** individual accounts; roles and manager flags set by an administrator; sign-in throttling; a password change, reset or deactivation ends all of that person's sessions; short-lived tokens for file downloads.
+- **Tamper evidence:** release and amendment events form a hash chain; **Verify audit trail** (Product Release) recomputes it and reports any break. A data-integrity check compares packaging, finished goods, stock commits, signed-log fingerprints and the audit chain for every finalized run.
+- **Change control of the software:** every change is made on a branch, reviewed through a pull request, and merged only when an automated test suite passes (several hundred tests, including upgrade tests that start the current software on databases created by every released version and confirm no records are lost). A staging environment holds a copy of live data for trial. Each live version is recorded.
+- **Safe upgrades:** a database upgrade runs as a single transaction (a failure leaves the data untouched) and is preceded by a compressed copy of the database.
+- **Protection of stored files:** upload limits, file-type controls and bounded handling of untrusted documents.
+
+## 4. Known limitations (stated openly)
+
+1. The audit chain is tamper-**evident**, not tamper-proof: it is a hash chain without a secret key, so a person with direct access to the database file could in principle recompute it. Direct database access is limited to those with access to the hosting account; adding a keyed signature is planned.
+2. Signatures are authenticated by password re-entry. This is not presented as compliant with 21 CFR Part 11 or equivalent electronic-signature regulations.
+3. Past runs entered after go-live ("historical" runs) are retrospective records. They keep their original lot number and date, are marked as historical, and the entry date and person are in the audit trail. Grandfathered historical runs skip the release gate by administrator decision.
+4. The records of the software's own validation (requirements, test protocol, results, approval) are kept separately from the automated tests; completing that package is a quality-system responsibility.
+5. Paper originals, where any exist, remain the original record; the KelpWorks entry is a transcription.
+
+## 5. Procedural controls (the company's responsibility)
+
+- Written SOPs for production-log entry, review and release, amendments, lab-result entry, and retrospective entry; trained users; no shared logins.
+- Periodic review: user list and roles (at least yearly), audit trails for released runs, and **Verify audit trail** / **Data integrity check** results (at least monthly or before audits).
+- Backups: confirm the nightly backup and SharePoint copy are running, and perform a rehearsed restore at least yearly.
+- Change management: apply the software release process (pull request, green tests, staging where appropriate) and record each live version.
+
+_This statement is controlled with the software (`docs/data-integrity-statement.md`): it is reviewed whenever a control it describes changes._
