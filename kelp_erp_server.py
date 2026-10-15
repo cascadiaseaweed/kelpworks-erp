@@ -11057,6 +11057,36 @@ class Handler(BaseHTTPRequestHandler):
         return {"amendment": self._amendment_public(conn.execute("SELECT * FROM run_amendments WHERE id=?", (a["id"],)).fetchone())}
 
     # ---- data integrity check -------------------------------------------- #
+    def _preproc_stock_expected(self, conn, b):
+        """{consumable id: net change a completed Pre-Processing batch should have made to stock}, from the batch's own records -- the same
+        three movements _preproc_complete makes: the pack-out containers (summed per container), the citric acid and the emptied source IBCs
+        returned to the Used IBC pool."""
+        want = {}
+
+        def add(item, qty):
+            if item and qty:
+                want[item["id"]] = want.get(item["id"], 0) + qty
+        for p in conn.execute("SELECT container, qty FROM preproc_packaging WHERE batch_id=?", (b["id"],)):
+            add(self._consumable_by_name(conn, p["container"]), -(p["qty"] or 0))
+        if b["citric_kg"]:
+            add(self._reagent_item(conn, "Citric Acid", b["citric_item_id"]), -b["citric_kg"])
+        n_in = conn.execute("SELECT COUNT(*) c FROM preproc_inputs WHERE batch_id=?", (b["id"],)).fetchone()["c"]
+        add(self._consumable_by_name(conn, "Used 1,000 L IBC Tote"), n_in)
+        return want
+
+    def _preproc_stock_differences(self, conn, b):
+        """[(consumable row, expected net change, ledger net change)] where a completed batch's ledger (every line carrying the batch lot as
+        its reference) does not match what its records say it used."""
+        want = self._preproc_stock_expected(conn, b)
+        got = {r["consumable_id"]: r["net"] for r in conn.execute(
+            "SELECT consumable_id, SUM(delta) net FROM consumable_txns WHERE ref=? GROUP BY consumable_id", (b["batch_lot"],))}
+        out = []
+        for cid in sorted(set(want) | set(got)):
+            e, g = round(want.get(cid, 0), 6), round(got.get(cid) or 0, 6)
+            if abs(e - g) > 1e-6:
+                out.append((conn.execute("SELECT * FROM consumables WHERE id=?", (cid,)).fetchone(), e, g))
+        return out
+
     def _integrity_actor(self, conn, user, d):
         if not (user["role"] == "admin" or user["is_quality_manager"]):
             raise ApiError(403, "Only an administrator or Quality Manager can run the integrity check")
@@ -11145,6 +11175,14 @@ class Handler(BaseHTTPRequestHandler):
                         % (op["opened_by"], age), "Submit or cancel the amendment.")
             if state != "legacy" and not self._run_progress(conn, r)["complete"]:
                 incomplete.append(r["processing_lot"])
+        for b in conn.execute("SELECT * FROM preproc_batches WHERE status='completed' ORDER BY id").fetchall():
+            diffs = self._preproc_stock_differences(conn, b)
+            for item, e, g in diffs:
+                issues.append({"severity": "error", "area": "Pre-processing stock", "runId": None, "run": b["batch_lot"], "batchId": b["id"],
+                               "message": "Batch %s: %s should have changed by %+g according to the batch (pack-out rows, citric acid, emptied IBCs) but the inventory ledger shows %+g."
+                                          % (b["batch_lot"], item["name"] if item else "(removed item)", e, g),
+                               "action": "Apply the difference (%+g) to the item's stock; the correction is written to the inventory ledger." % (e - g),
+                               "repair": "restock_preproc" if item else None})
         chain = release_verify_chain(conn)
         if not chain["ok"]:
             issues.append({"severity": "error", "area": "Audit trail", "runId": chain["runId"], "run": None,
@@ -11161,7 +11199,7 @@ class Handler(BaseHTTPRequestHandler):
                                       "finished goods can't be cross-checked: %s." % (len(no_entries), ", ".join(no_entries)),
                            "action": None, "repair": None})
         order = {"error": 0, "warning": 1, "info": 2}
-        issues.sort(key=lambda i: (order[i["severity"]], i["runId"] or 0))
+        issues.sort(key=lambda i: (order[i["severity"]], i["runId"] or 0, i.get("batchId") or 0))
         for n, i in enumerate(issues, 1):
             i["id"] = n
         return {"checkedAt": now_iso(), "chain": chain,
@@ -11173,6 +11211,20 @@ class Handler(BaseHTTPRequestHandler):
         if not verify_password(d.get("password") or "", user["password_hash"]):
             raise ApiError(400, "Password is incorrect - the repair was not applied")
         kind = d.get("kind")
+        if kind == "restock_preproc":
+            # Pre-Processing stock: the batch's records are the source of truth; the difference goes through _consume, so it is one more line of the
+            # append-only inventory ledger (reference = the batch lot, reason says it is an integrity repair, with the person) and is assigned to lots.
+            b = conn.execute("SELECT * FROM preproc_batches WHERE id=? AND status='completed'", (d.get("batchId"),)).fetchone()
+            if not b:
+                raise ApiError(404, "Pre-processing batch not found")
+            diffs = [x for x in self._preproc_stock_differences(conn, b) if x[0]]
+            if not diffs:
+                raise ApiError(409, "Nothing to repair - the inventory ledger already matches the batch")
+            for item, e, g in diffs:
+                self._consume(conn, item["id"], round(e - g, 6), "Integrity repair (pre-processing stock)", b["batch_lot"], user["name"])
+                conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('integrity',?,?,?,?,?,?)",
+                             (b["batch_lot"], "Pre-processing stock: " + item["name"], "%+g" % g, "%+g" % e, user["name"], now_iso()))
+            return self._integrity_check(conn)
         r = conn.execute("SELECT * FROM production_runs WHERE id=? AND status='completed'", (d.get("runId"),)).fetchone()
         if not r:
             raise ApiError(404, "Production run not found")

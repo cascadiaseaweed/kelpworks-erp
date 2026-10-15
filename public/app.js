@@ -1077,16 +1077,16 @@ async function openIntegrityCheck() {
       sl('Errors', r.summary.error), sl('Warnings', r.summary.warning), sl('Info', r.summary.info),
       el('span', {}, 'Audit chain: ', badge(r.chain.ok ? 'on_hand' : 'low', r.chain.ok ? 'intact (' + r.chain.events + ' events)' : 'BROKEN'))));
     if (!r.issues.length) { host.append(el('div', { class: 'empty card' }, '✓ No inconsistencies found.')); return; }
-    host.append(table(['', 'Area', 'Run', 'Finding', ''], r.issues.map(i => [
+    host.append(table(['', 'Area', 'Run / batch', 'Finding', ''], r.issues.map(i => [
       el('span', { class: 'int-sev' }, badge(sev[i.severity], i.severity)), i.area, i.run ? mono(i.run) : '—',
       el('div', {}, i.message, i.action ? el('div', { class: 'help' }, '→ ' + i.action) : null),
       i.repair ? el('button', { class: 'secondary', onclick: async () => {
         const pwd = await askPassword('Repair — ' + i.area, 'Applies the fix and records it in the audit trail. Enter your password to confirm.');
-        try { draw(await api('POST', '/integrity/repair', { kind: i.repair, runId: i.runId, password: pwd })); toast('Repair applied'); }
+        try { draw(await api('POST', '/integrity/repair', { kind: i.repair, runId: i.runId, batchId: i.batchId, password: pwd })); toast('Repair applied'); }
         catch (e) { toast(e.message, true); }
       } }, 'Repair') : null]), [false, false, false, false, false]));
   }
-  const body = el('div', {}, el('div', { class: 'help' }, 'Cross-checks each finalized run against the records derived from it: finished-goods lots vs packaging entries, output litres, container/label stock commits, release status vs lot status, the signed log vs the current log, open amendments and the audit chain. Documents are not part of the check.'),
+  const body = el('div', {}, el('div', { class: 'help' }, 'Cross-checks each finalized run against the records derived from it (and each completed pre-processing batch against the inventory ledger): finished-goods lots vs packaging entries, output litres, container/label stock commits, release status vs lot status, the signed log vs the current log, open amendments and the audit chain. Documents are not part of the check.'),
     host);
   modal('Data integrity check', body, async () => {}, 'Close', { wide: true, noCancel: true });
   host.append(el('div', { class: 'help' }, 'Checking…'));

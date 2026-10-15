@@ -489,7 +489,7 @@ for `main` so a red run blocks the merge.
   log hash vs current log, open amendments, required fields (info), and the audit chain. Safe
   derived-data repairs (`POST /api/integrity/repair`: resync_lots, recompute_output,
   recommit_stock, fix_lot_status) need the actor's password and are logged to `release_events`.
-  Legacy runs without packaging entries can't be cross-checked and are reported as info only.
+  Legacy runs without packaging entries can't be cross-checked and are reported as info only. **Pre-Processing stock** (tests in `tests/test_preproc_packaging.py`): every COMPLETED batch is also checked against the inventory ledger -- `_preproc_stock_expected` (pack-out containers summed per container, citric acid, emptied source IBCs returned to Used IBC) vs the net of every `consumable_txns` line carrying the batch lot as `ref` (`_preproc_stock_differences`); a difference is an error (area "Pre-processing stock", `batchId`) with the repair `restock_preproc` (`POST /api/integrity/repair {kind, batchId, password}`): the difference goes through `_consume` as one more ledger line (reason "Integrity repair (pre-processing stock)") plus a `config_log` row (area `integrity`); it does not use `release_events` (those rows need a run).
 - **Env vars:** `PORT` (8002), `KELP_ERP_DB`, `KELP_ERP_UPLOADS`,
   `KELP_ERP_SECRET` (when unset or equal to the old public default, a random key is generated once into `kelp_secret.key` next to the database), `KELP_ERP_ADMIN_EMAIL/PASSWORD`,
   `KELP_ERP_INITIAL_PASSWORD`, `KELP_ERP_REQUIRE_MOUNT` (refuse to start unless this path is a mounted volume), `KELP_ERP_RESTORE_FROM` + `KELP_ERP_RESTORE_CONFIRM=replace-live-data` (one-time live restore at start;
