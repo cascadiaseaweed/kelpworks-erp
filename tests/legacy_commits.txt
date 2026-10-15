@@ -24,3 +24,5 @@ be689db  2026-10-12  small hardening batch (download tokens, upload quota, live 
 31d4be9  2026-10-14  historical run entry merged to main and live
 5350402  2026-10-14  feedstock grading (traceable), SOP review names merged to main and live
 5ce3ed7  2026-10-14  SOP retire / replace, explicit review choice merged to main and live
+e6ae246  2026-10-15  feedstock optional TDS, full CSV import, bulk set merged to main and live
+f5fd678  2026-10-15  integrity check covers Pre-Processing batches merged to main and live
