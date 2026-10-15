@@ -204,6 +204,7 @@ const STAB_COLUMNS = [
   { key: 'avgKg', label: 'Avg kg', value: t => t.avgWeightKg, numeric: true, cell: t => fmt(t.avgWeightKg, 1), hidden: true },
   { key: 'ph', label: 'pH', value: t => t.ph, numeric: true, center: true, cell: t => phCell(t) },
   { key: 'orp', label: 'ORP (mV)', value: t => t.orp, numeric: true, center: true, cell: t => orpCell(t) },
+  { key: 'tds', label: 'Feedstock TDS (%)', value: t => t.tdsPct, numeric: true, center: true, wrapHead: true, hidden: true, cell: t => t.tdsPct == null ? el('span', { class: 'muted' }, '—') : String(t.tdsPct) },
   { key: 'grade', label: 'Grade', value: t => t.grade || '', center: true, options: () => [...new Set((stabCache || []).map(t => t.grade).filter(Boolean))].sort(), cell: t => gradeBadge(t) },
   { key: 'lastUpdated', label: 'Last updated', value: t => t.lastUpdated ? fmtWhen(t.lastUpdated) : '',
     cell: t => t.lastUpdated ? fmtWhen(t.lastUpdated) : '—', hidden: true },
@@ -249,6 +250,7 @@ function showToteDetails(t) {
     ['Received date', t.receivedDate || '—'],
     ['pH', t.ph != null ? t.ph + (t.phUpdated ? '  (' + t.phUpdated + ')' : '') : '—'],
     ['ORP (mV)', t.orp != null ? t.orp + (t.orpUpdated ? '  (' + t.orpUpdated + ')' : '') : '—'],
+    ['Feedstock TDS (%)', t.tdsPct != null ? t.tdsPct + (t.tdsUpdated ? '  (' + t.tdsUpdated + ')' : '') : '—'],
     ['Grade', el('span', {}, gradeBadge(t), t.gradeWhy ? '  ' + t.gradeWhy : '')],
     ['Solids', t.solidsPct != null ? fmt(t.solidsPct, 2) + ' %' : '—'],
     ['Location', t.location || '—'], ['Status', badge(t.status, statusLabel(t.status))],
@@ -561,6 +563,7 @@ async function updateCondition(t) {
       sl('Current pH', d.ph == null ? '—' : d.ph),
       sl('Current ORP', d.orp == null ? '—' : d.orp + ' mV'),
       sl('ORP meter range', d.orp == null ? '—' : (classifyOrp(d.orp) || '—')),
+      sl('Feedstock TDS', d.tdsPct == null ? '—' : d.tdsPct + ' %' + (d.tdsUpdated ? '  (' + d.tdsUpdated + ')' : '')),
       sl('Last updated', d.lastUpdated ? fmtWhen(d.lastUpdated) : 'never')];
   }
   const summary = el('div', { class: 'summary-line' }, ...summaryLines(data));
@@ -576,6 +579,7 @@ async function updateCondition(t) {
     // pH/ORP live in the summary + quick-update fields above instead of
     // here, so the same reading isn't captured twice in this modal.
     omit: ['ph', 'orp', 'orpRange'],
+    showTds: true,
     // Pre-fills from whatever was captured most recently (this tote's own
     // reading for pH/ORP, its latest Feedstock Stability log entry for
     // everything else) rather than starting blank every time.
@@ -603,6 +607,7 @@ async function updateCondition(t) {
     const orp = body.querySelector('#p_orp').value;
     let rejected = false;
     if (detailVals) {
+      if (detailVals.tdsPct != null) detailVals.tdsDate = body.querySelector('#p_date').value;      // the TDS reading carries the window's reading date, like pH and ORP
       const r = await api('POST', '/totes/' + t.id + '/characterize', detailVals);
       rejected = r.rejected;
     }
@@ -2793,9 +2798,13 @@ function buildFeedstockCard(opts) {
   const reasonField = field('Rejection reason', reasonInp);
   reasonField.classList.toggle('hidden', decisionSel.value !== 'rejected');
   const notesInp = el('textarea', { rows: '2', placeholder: 'Notes' }, v.notes || '');
+  // Feedstock % TDS: optional, kept on the tote and tracked in its Feedstock Stability log like pH and ORP. Only Feedstock Inventory's update window shows it (opts.showTds);
+  // a production run's characterization does not, so signed run logs are unaffected.
+  const tdsInp = el('input', { type: 'number', step: 'any', min: '0', max: '100', placeholder: 'optional, e.g. 12.5', value: v.tdsPct ?? '' });
 
   function currentValues() {
     return {
+      ...(opts.showTds ? { tdsPct: tdsInp.value.trim() === '' ? null : qcParseValue(tdsInp.value) } : {}),
       loadedAt: loadedAt.value || null,
       ph: phInp.value.trim() === '' ? null : qcParseValue(phInp.value),
       phMeasuredAt: v.phMeasuredAt,
@@ -2828,7 +2837,7 @@ function buildFeedstockCard(opts) {
   }));
   odourMultiSelect.el.addEventListener('change', notifyChange);
   decisionSel.addEventListener('change', () => { reasonField.classList.toggle('hidden', decisionSel.value !== 'rejected'); notifyChange(); });
-  [loadedAt, weightInp, volumeInp, intensitySel, notesInp]
+  [loadedAt, weightInp, volumeInp, intensitySel, notesInp, tdsInp]
     .forEach(inp => inp.addEventListener('change', notifyChange));
 
   function photoSlot(slotKey, label) {
@@ -2881,6 +2890,7 @@ function buildFeedstockCard(opts) {
     ['densityKgL', field('Density (calculated)', densityNote)],
     ['odour', fl('odour', 'Odour', odourMultiSelect.el)],
     ['odourIntensity', fl('odourIntensity', 'Odour intensity', intensitySel)],
+    ...(opts.showTds ? [['tdsPct', field('Feedstock TDS (%) — optional', tdsInp)]] : []),
     ['decision', fl('decision', 'Decision', decisionSel)],
   ];
   const fieldsRow = el('div', { class: 'form-row' },

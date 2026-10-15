@@ -4123,6 +4123,8 @@ def migrate(conn):
         ("storage_source", "TEXT"), ("orp", "REAL"), ("orp_updated", "TEXT"), ("notes", "TEXT"),
         ("received_date", "TEXT"),
         ("grind", "TEXT DEFAULT 'Coarse'"), ("preproc_batch_id", "INTEGER"), ("solids_pct", "REAL"),
+        ("tds_pct", "REAL"),                                 # optional: feedstock % TDS, tracked in the Feedstock Stability log like pH / ORP
+        ("tds_updated", "TEXT"),
         ("grade", "TEXT"),                                   # the grade last recorded for this tote (see sync_tote_grades)
         ("grade_frozen", "INTEGER NOT NULL DEFAULT 0"),      # 1 once the tote is consumed / disposed: its grade is fixed at what it was when it was used
     ]:
@@ -4865,7 +4867,7 @@ def tote_public(r):
             "stabilizationMethod": r["stabilization_method"], "storageUnit": r["storage_unit"],
             "storageSource": r["storage_source"], "orp": r["orp"], "orpUpdated": r["orp_updated"],
             "notes": r["notes"], "grind": r["grind"] or "Coarse", "preprocBatchId": r["preproc_batch_id"],
-            "solidsPct": r["solids_pct"]}
+            "solidsPct": r["solids_pct"], "tdsPct": r["tds_pct"], "tdsUpdated": r["tds_updated"]}
 
 
 def _canon(v):
@@ -7845,7 +7847,7 @@ class Handler(BaseHTTPRequestHandler):
                 if method == "GET":
                     return {"stabilityLog": self._stability_log(conn, tid),
                             "ph": it["ph"], "phUpdated": it["ph_updated"],
-                            "orp": it["orp"], "orpUpdated": it["orp_updated"],
+                            "orp": it["orp"], "orpUpdated": it["orp_updated"], "tdsPct": it["tds_pct"], "tdsUpdated": it["tds_updated"],
                             "lastUpdated": self._tote_with_last_updated(conn, it)["lastUpdated"],
                             "latestCharacterization": self._latest_characterization(conn, tid, it)}
                 if method == "POST":
@@ -11620,7 +11622,7 @@ class Handler(BaseHTTPRequestHandler):
         ("volumeL", "Volume (L)"), ("densityKgL", "Density (kg/L)"),
         ("odour", "Odour"), ("odourOther", "Odour (other)"),
         ("odourIntensity", "Odour intensity"), ("rejectionReason", "Rejection reason"),
-        ("notes", "Notes"),
+        ("notes", "Notes"), ("tdsPct", "Feedstock TDS (%)"),
     ]
 
     def _latest_characterization(self, conn, tote_lot_id, tote):
@@ -11632,7 +11634,7 @@ class Handler(BaseHTTPRequestHandler):
         left out: a new characterization always starts as a fresh accepted
         inspection, never a carry-over of a past rejection."""
         kind_for = {key: kind for _, key, kind in self.INPUT_FIELDS}
-        out = {"ph": tote["ph"], "orp": tote["orp"]}
+        out = {"ph": tote["ph"], "orp": tote["orp"], "tdsPct": tote["tds_pct"]}
         for key, label in self.CHARACTERIZATION_LABELS:
             if key in out or key == "rejectionReason":
                 continue
@@ -11657,8 +11659,8 @@ class Handler(BaseHTTPRequestHandler):
         as new/changed if there isn't one yet). A photo is diffed the same
         way, by attachment id, so re-submitting an already-logged photo on an
         unrelated field change doesn't create a duplicate row either."""
-        tote = conn.execute("SELECT ph, orp FROM tote_lots WHERE id=?", (tote_lot_id,)).fetchone()
-        current_for = {"ph": tote["ph"], "orp": tote["orp"]}
+        tote = conn.execute("SELECT ph, orp, tds_pct FROM tote_lots WHERE id=?", (tote_lot_id,)).fetchone()
+        current_for = {"ph": tote["ph"], "orp": tote["orp"], "tdsPct": tote["tds_pct"]}
         for key, label in self.CHARACTERIZATION_LABELS:
             val = fd.get(key)
             if val in (None, ""):
@@ -11879,9 +11881,17 @@ class Handler(BaseHTTPRequestHandler):
         decision = d.get("decision") or "accepted"
         if decision not in ("accepted", "rejected"):
             raise ApiError(400, "Invalid decision")
+        tds = None
+        if d.get("tdsPct") not in (None, ""):
+            tds = numn(d.get("tdsPct"))
+            if tds is None or tds < 0 or tds > 100:
+                raise ApiError(400, "Feedstock TDS is a percentage between 0 and 100")
         note = ("Rejected via Feedstock Inventory" if decision == "rejected"
                 else "Characterized via Feedstock Inventory")
         self._log_characterization_fields(conn, tote_id, user, d, note)
+        if tds is not None and tds != tote["tds_pct"]:
+            tds_date = (d.get("tdsDate") or "").strip() or today_iso()
+            conn.execute("UPDATE tote_lots SET tds_pct=?, tds_updated=? WHERE id=?", (tds, tds_date, tote_id))
         ph, ph_updated, orp, orp_updated = self._apply_ph_orp_override(conn, tote, d)
         if decision == "rejected":
             self._log_stability(conn, tote_id, user, "Decision", None, "rejected", note)
