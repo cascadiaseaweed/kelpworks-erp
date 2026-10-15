@@ -22,3 +22,5 @@ be689db  2026-10-12  small hardening batch (download tokens, upload quota, live 
 0fbfd69  2026-10-13  clean-backup tool, label-free Sugar Kelp / Macrocystis Kelp Extract merged to main and live
 77cb85f  2026-10-14  recall traceability (inventory lots) merged to main and live
 31d4be9  2026-10-14  historical run entry merged to main and live
+5350402  2026-10-14  feedstock grading (traceable), SOP review names merged to main and live
+5ce3ed7  2026-10-14  SOP retire / replace, explicit review choice merged to main and live
