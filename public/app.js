@@ -13,7 +13,7 @@ async function api(method, path, body) {
   let data = {};
   try { data = await res.json(); } catch (e) {}
   if (res.status === 401) { logout(); throw new Error(data.error || 'Session expired'); }
-  if (!res.ok) { const err = new Error(data.error || ('HTTP ' + res.status)); err.code = data.code; throw err; }
+  if (!res.ok) { const err = new Error(data.error || ('HTTP ' + res.status)); err.code = data.code; if (data.problems) { err.problems = data.problems; err.problemCount = data.problemCount; } throw err; }
   return data;
 }
 
@@ -306,6 +306,7 @@ async function pageStabilized(v) {
     bulkBar.append(
       el('span', {}, el('b', {}, n), ' tote' + (n === 1 ? '' : 's') + ' selected'),
       el('button', { onclick: () => bulkMoveTotes([...selected]) }, 'Move selected'),
+      el('button', { onclick: () => bulkSetTotes([...selected]) }, 'Set values for selected'),
       el('button', { class: 'danger', onclick: () => disposeSimple('tote', [...selected], 'tote') }, 'Dispose / write off'),
       el('button', { class: 'secondary', onclick: () => { selected.clear(); drawStab(); } }, 'Clear'));
   }
@@ -512,6 +513,26 @@ function bulkMoveTotes(ids) {
     State.ref = await api('GET', '/refdata');
     toast('Moved ' + r.moved + ' tote' + (r.moved === 1 ? '' : 's') + ' to ' + to); render();
   }, 'Move');
+}
+function bulkSetTotes(ids) {
+  const keep = '';
+  const body = el('div', {},
+    el('div', { class: 'summary-line' }, sl('Totes', ids.length + ' selected')),
+    el('div', { class: 'help' }, 'Fill in only what you want to set — anything left blank is not changed.'),
+    field('Average weight per tote (kg)', el('input', { type: 'number', id: 'bs_kg', step: 'any', min: '0', max: '5000', placeholder: 'e.g. 180.5' })),
+    el('div', { class: 'form-row' },
+      field('Grind', el('select', { id: 'bs_grind' }, el('option', { value: keep }, '— no change —'), el('option', {}, 'Coarse'), el('option', {}, 'Fine'))),
+      field('Stabilization method', el('select', { id: 'bs_stab' }, el('option', { value: keep }, '— no change —'), el('option', {}, 'Citric acid'), el('option', {}, 'Fresh')))),
+    field('Note (optional)', el('input', { id: 'bs_note', placeholder: 'e.g. batch weighed 2026-10-16' })),
+    el('div', { class: 'help' }, 'Each change is written to every tote’s Feedstock Stability log (old → new). Totes that are in a run or already consumed cannot be changed — '
+      + 'if any are selected, nothing is changed. A blend made by Pre-Processing stays Fine.'));
+  modal('Set values for ' + ids.length + ' tote' + (ids.length === 1 ? '' : 's'), body, async () => {
+    const kg = body.querySelector('#bs_kg').value.trim(), grind = body.querySelector('#bs_grind').value, stab = body.querySelector('#bs_stab').value;
+    if (kg === '' && !grind && !stab) throw new Error('Enter a weight, or choose a grind or stabilization method.');
+    if (kg !== '' && !(+kg > 0)) throw new Error('The average weight must be above 0.');
+    const r = await api('POST', '/totes/set-bulk', { ids, avgWeightKg: kg === '' ? null : +kg, grind: grind || null, stabilizationMethod: stab || null, note: body.querySelector('#bs_note').value || null });
+    toast('Updated ' + r.updated + ' tote' + (r.updated === 1 ? '' : 's') + (r.unchanged ? ' (' + r.unchanged + ' already had these values)' : '')); render();
+  }, 'Set values');
 }
 async function delTote(t) {
   if (!confirm('Delete tote ' + t.lot + '?')) return;
@@ -740,38 +761,65 @@ async function openFeedstockImport() {
   let csvText = '';
   const fileInput = el('input', { type: 'file', accept: '.csv,text/csv' });
   const status = el('div', { class: 'help' });
+  const report = el('div', {});
   fileInput.addEventListener('change', () => {
-    csvText = ''; status.textContent = '';
+    csvText = ''; status.textContent = ''; report.innerHTML = '';
     const f = fileInput.files[0];
     if (!f) return;
     const reader = new FileReader();
     reader.onload = () => {
       csvText = String(reader.result || '');
       const rows = csvText.split(/\r\n|\r|\n/).filter(l => l.trim() !== '').length - 1;
-      status.textContent = f.name + ' — ' + Math.max(rows, 0) + ' row(s) ready to import.';
+      status.textContent = f.name + ' — ' + Math.max(rows, 0) + ' row(s). Use “Check file” to see any problems before importing.';
     };
     reader.onerror = () => { status.textContent = 'Could not read ' + f.name; };
     reader.readAsText(f);
   });
+  // Shows what the server found: every problem with its row and column, or what will be created.
+  function show(r, ok) {
+    report.innerHTML = '';
+    if (ok) {
+      report.append(el('div', { class: 'sign-box' }, el('b', {}, '✔ ' + r.count + ' tote(s) can be imported.'),
+        el('div', { class: 'help' }, 'Lot numbers: ' + r.lots.slice(0, 6).join(', ') + (r.lots.length > 6 ? ' … and ' + (r.lots.length - 6) + ' more' : '')),
+        ...(r.warnings || []).map(w => el('div', { class: 'help', style: 'color:#8a5a00' }, '⚠ ' + w))));
+      return;
+    }
+    const shown = r.problems || [];
+    report.append(el('div', { class: 'sign-box', style: 'border-color:var(--danger,#b00020)' },
+      el('b', { style: 'color:var(--danger,#b00020)' }, '✘ ' + (r.problemCount || shown.length) + ' problem' + ((r.problemCount || shown.length) === 1 ? '' : 's') + ' — nothing was imported'),
+      el('div', { class: 'help' }, 'Row numbers match your spreadsheet (row 1 is the header). Fix these in the file and import it again.'),
+      el('div', { class: 'tablewrap', style: 'max-height:260px;overflow:auto;margin-top:6px' }, table(['Row', 'Column', 'Problem'], shown.map(p => [String(p.row), p.column || '—', p.message]), [false, false, false])),
+      (r.problemCount || 0) > shown.length ? el('div', { class: 'help' }, 'Showing the first ' + shown.length + '. Fix these and check the file again to see the rest.') : null));
+  }
+  const checkBtn = el('button', { type: 'button', class: 'secondary', onclick: async () => {
+    if (!csvText.trim()) { status.textContent = 'Choose a CSV file first.'; return; }
+    try { show(await api('POST', '/harvest/bulk', { csvText, dryRun: true }), true); }
+    catch (e) { if (e.problems) show(e, false); else report.replaceChildren(el('div', { class: 'error' }, e.message)); }
+  } }, 'Check file');
   const body = el('div', {},
-    el('div', { class: 'help' },
-      'Add many feedstock totes at once — one row per tote. Download the template, fill it in, then upload it here.'),
+    el('div', { class: 'help' }, 'Add many feedstock totes at once — one row per tote. Download the template, fill it in, check it, then import it.'),
     el('div', { style: 'margin:10px 0' },
-      el('a', { href: 'templates/feedstock_bulk_import_template.csv', download: 'feedstock_bulk_import_template.csv' },
-        '⬇ Download CSV template')),
+      el('a', { href: 'templates/feedstock_bulk_import_template.csv', download: 'feedstock_bulk_import_template.csv' }, '⬇ Download CSV template')),
     field('CSV file', fileInput),
-    status,
-    el('div', { class: 'help' },
-      'Required columns: site, species, harvestDate (YYYY-MM-DD), avgWeightKg. ' +
-      'Optional: receivedDate, stabilizationMethod, storageUnit, grind (Coarse or Fine, default Coarse), location, ph, orp, storageSource, notes. ' +
-      'Rows for the same site/species/harvest date are numbered in the order they appear in the file.'));
+    el('div', { style: 'display:flex;gap:10px;align-items:center;margin:6px 0' }, checkBtn, status),
+    report,
+    el('div', { class: 'help' }, el('b', {}, 'Required: '), 'site, species, harvestDate (YYYY-MM-DD).'),
+    el('div', { class: 'help' }, el('b', {}, 'Optional: '), 'avgWeightKg (leave blank if the batch is not weighed yet — use “Set values for selected” later), toteNumber, receivedDate, grind (Coarse or Fine, default Coarse), stabilizationMethod (Citric acid or Fresh), storageUnit (Tote or Bag), storageSource, location, ph, orp, tdsPct, status (in_stock or hold), notes.'),
+    el('div', { class: 'help' }, el('b', {}, 'Tote numbers: '), 'the lot number is SITE-SPECIES-YYYYMMDD-NNN, where NNN is the tote number. Leave toteNumber blank to number the totes automatically. If you type one, it must be a whole number from 1 to 999 and unique: '
+      + 'it cannot repeat in the file, match a tote already in Feedstock Inventory, or match a tote that was deleted (those numbers are never reused). '
+      + 'Calculated columns (lot number, stabilization period, grade, last updated) are not imported. One problem anywhere blocks the whole file, so nothing is half-imported.'));
   modal('Bulk import feedstock (CSV)', body, async () => {
     if (!csvText.trim()) throw new Error('Choose a CSV file to import.');
-    const r = await api('POST', '/harvest/bulk', { csvText });
-    State.ref = await api('GET', '/refdata');
-    toast('Imported ' + r.count + ' tote(s).');
-    render();
-  }, 'Import');
+    try {
+      const r = await api('POST', '/harvest/bulk', { csvText });
+      State.ref = await api('GET', '/refdata');
+      toast('Imported ' + r.count + ' tote(s).');
+      render();
+    } catch (e) {
+      if (e.problems) { show(e, false); throw new Error(e.message); }
+      throw e;
+    }
+  }, 'Import', { wide: true });
 }
 
 /* ---------------- Production ---------------- */

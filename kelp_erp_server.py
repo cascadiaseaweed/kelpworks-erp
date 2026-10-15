@@ -1898,6 +1898,9 @@ def init_db():
             ensure_grade_rules(conn)
             soft_step(conn, "feedstock grades", lambda: sync_tote_grades(conn, None, "Start-up check", quiet=True))
             soft_step(conn, "foreign-key indexes", lambda: ensure_indexes(conn))
+            # one tote number per site / species / harvest date (the lot number is unique already; this guards the parts it is built from). Not for pre-processing blends, which are numbered per batch.
+            soft_step(conn, "unique tote numbers", lambda: conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_tote_unique_number ON tote_lots(site_code, species_code, checkin_date, tote_number) WHERE preproc_batch_id IS NULL AND tote_number IS NOT NULL"))
             soft_step(conn, "status and quantity guards", lambda: ensure_constraints(conn))
             soft_step(conn, "SOP links to places that no longer exist", lambda: conn.execute(
                 "DELETE FROM sop_links WHERE spot NOT IN (%s)" % ",".join("?" * len(SOP_SPOT_KEYS)), tuple(SOP_SPOT_KEYS)))
@@ -4855,6 +4858,20 @@ def grade_scheduler(stop, every):
             logger.error("The daily feedstock grade check failed.", exc_info=True)
 
 
+def tote_numbers_used(conn, site, species, date):
+    """(numbers of totes that exist, numbers of totes that were DELETED) for one site / species / harvest date. A deleted tote's number is never handed out again: its lot number may
+    still be on a label or in a customer's paperwork."""
+    exist = {r["tote_number"] for r in conn.execute(
+        "SELECT tote_number FROM tote_lots WHERE site_code=? AND species_code=? AND checkin_date=? AND tote_number IS NOT NULL", (site, species, date))}
+    prefix = "%s-%s-%s-" % (site, species, date.replace("-", ""))
+    gone = set()
+    for r in conn.execute("SELECT ref FROM deleted_records WHERE entity_type='tote' AND substr(ref,1,?)=?", (len(prefix), prefix)):
+        tail = r["ref"][len(prefix):]
+        if tail.isdigit():
+            gone.add(int(tail))
+    return exist, gone
+
+
 def tote_public(r):
     return {"id": r["id"], "lot": r["lot_number"], "site": r["site_code"],
             "species": r["species_code"], "harvestYear": r["harvest_year"],
@@ -5752,10 +5769,11 @@ def sds_review(issue_date, years, warn_days, today=None):
 
 
 class ApiError(Exception):
-    def __init__(self, status, message, code=None):
+    def __init__(self, status, message, code=None, extra=None):
         self.status = status
         self.message = message
         self.code = code
+        self.extra = extra                          # more fields for the JSON answer (for example the row-by-row problems of an import)
 
 
 # Served inline (the browser shows them): only types that cannot run script. Everything else is a download with a server-chosen type.
@@ -6979,7 +6997,7 @@ class Handler(BaseHTTPRequestHandler):
         except ApiError as e:
             conn.rollback()
             self._remove_files(self._created_files)      # files this request wrote for rows that were rolled back
-            self._send_json({"error": e.message, **({"code": e.code} if e.code else {})}, status=e.status)
+            self._send_json({"error": e.message, **({"code": e.code} if e.code else {}), **(e.extra or {})}, status=e.status)
         except sqlite3.IntegrityError as e:
             conn.rollback()                              # a rule the database enforces (unique number, row still referenced): the request is refused as a whole
             self._remove_files(self._created_files)
@@ -7027,7 +7045,7 @@ class Handler(BaseHTTPRequestHandler):
         if seg[:2] == ["api", "totes"]:
             return self.route_totes(method, seg, query, conn, user)
         if seg[:2] == ["api", "harvest"]:
-            return self.route_harvest(method, seg, conn)
+            return self.route_harvest(method, seg, conn, user)
         if method == "GET" and seg == ["api", "reagents"]:
             return self.route_reagents(query, conn)
         if seg[:2] == ["api", "preproc"]:
@@ -7790,6 +7808,62 @@ class Handler(BaseHTTPRequestHandler):
                     t["batchLot"], t["sourceLots"] = sources[r["preproc_batch_id"]]
                 totes.append(t)
             return {"totes": totes}
+        if seg == ["api", "totes", "set-bulk"] and method == "POST":
+            # One value applied to many totes: average weight, grind and / or stabilization method (a field that is left out is not touched).
+            # All or nothing; every change is a line in each tote's Feedstock Stability log. A tote that is in a run / consumed / disposed keeps its
+            # values (as in PUT /api/totes/:id), and a blend made by Pre-Processing stays Fine.
+            d = self._body_json()
+            try:
+                ids = list(dict.fromkeys(int(x) for x in (d.get("ids") or [])))
+            except (TypeError, ValueError):
+                raise ApiError(400, "Select at least one tote")
+            if not ids:
+                raise ApiError(400, "Select at least one tote")
+            new = {}
+            if d.get("avgWeightKg") not in (None, ""):
+                w = numn(d.get("avgWeightKg"))
+                if w is None or w <= 0 or w > 5000:
+                    raise ApiError(400, "Average weight must be a number above 0 and up to 5000 kg")
+                new["avg_weight_kg"] = w
+            if (d.get("grind") or "").strip():
+                g = d["grind"].strip().capitalize()
+                if g not in ("Coarse", "Fine"):
+                    raise ApiError(400, "Grind must be Coarse or Fine")
+                new["grind"] = g
+            if (d.get("stabilizationMethod") or "").strip():
+                sm = {"citric acid": "Citric acid", "fresh": "Fresh"}.get(d["stabilizationMethod"].strip().lower())
+                if not sm:
+                    raise ApiError(400, "Stabilization method must be Citric acid or Fresh")
+                new["stabilization_method"] = sm
+            if not new:
+                raise ApiError(400, "Enter a weight, a grind or a stabilization method to set")
+            labels = {"avg_weight_kg": "Weight (kg)", "grind": "Grind", "stabilization_method": "Stabilization method"}
+            note = (d.get("note") or "").strip() or None
+            rows = [conn.execute("SELECT * FROM tote_lots WHERE id=?", (i,)).fetchone() for i in ids]
+            if any(r is None for r in rows):
+                raise ApiError(404, "One of the selected totes no longer exists")
+
+            def current(r, col):
+                return (r[col] or "Coarse") if col == "grind" else r[col]
+            locked = [r["lot_number"] for r in rows if r["status"] in ("wip", "consumed", "disposed") and any(current(r, c) != v for c, v in new.items())]
+            if locked:
+                raise ApiError(400, "A tote that is in a run or already consumed cannot be changed: %s%s" % (
+                    ", ".join(locked[:5]), " and %d more" % (len(locked) - 5) if len(locked) > 5 else ""))
+            blends = [r["lot_number"] for r in rows if "grind" in new and r["preproc_batch_id"] and current(r, "grind") != new["grind"]]
+            if blends:
+                raise ApiError(400, "A blend made by Pre-Processing stays Fine: %s%s" % (
+                    ", ".join(blends[:5]), " and %d more" % (len(blends) - 5) if len(blends) > 5 else ""))
+            changed = 0
+            for r in rows:
+                diff = {c: v for c, v in new.items() if current(r, c) != v}
+                if not diff:
+                    continue
+                for c, v in diff.items():
+                    self._log_stability(conn, r["id"], user, labels[c], current(r, c), v,
+                                        ("Set for %d totes at once%s" % (len(ids), (": " + note) if note else ""))[:300])
+                conn.execute("UPDATE tote_lots SET " + ", ".join(c + "=?" for c in diff) + " WHERE id=?", (*diff.values(), r["id"]))
+                changed += 1
+            return {"updated": changed, "unchanged": len(ids) - changed, "set": {labels[c]: v for c, v in new.items()}}
         if seg == ["api", "totes", "move-bulk"] and method == "POST":
             d = self._body_json()
             ids = [int(x) for x in (d.get("ids") or [])]
@@ -9235,7 +9309,7 @@ class Handler(BaseHTTPRequestHandler):
         return {"role": role, "batch": self._preproc_public(conn, b)}
 
     # ---- harvest check-in (creates a batch of totes) ---------------------- #
-    def route_harvest(self, method, seg, conn):
+    def route_harvest(self, method, seg, conn, user=None):
         if seg == ["api", "harvest"] and method == "POST":
             d = self._body_json()
             site = (d.get("site") or "").strip().upper()
@@ -9279,11 +9353,9 @@ class Handler(BaseHTTPRequestHandler):
             datestr = date.replace("-", "")
             sp = conn.execute("SELECT common FROM species WHERE code=?", (species,)).fetchone()
             common = sp["common"] if sp else species
-            # continue tote numbering after any existing totes for this batch key
-            existing = conn.execute(
-                "SELECT COALESCE(MAX(tote_number),0) n FROM tote_lots "
-                "WHERE site_code=? AND species_code=? AND checkin_date=?",
-                (site, species, date)).fetchone()["n"]
+            # continue tote numbering after every number ever used for this batch key (including totes since deleted)
+            used_now, used_deleted = tote_numbers_used(conn, site, species, date)
+            existing = max(used_now | used_deleted | {0})
             ts = now_iso()
             created = []
             for i in range(1, count + 1):
@@ -9304,98 +9376,208 @@ class Handler(BaseHTTPRequestHandler):
             return {"created": created, "avgWeightKg": avg, "count": len(created),
                     "storageSource": storage_source}
         if seg == ["api", "harvest", "bulk"] and method == "POST":
-            return self._harvest_bulk(conn)
+            return self._harvest_bulk(conn, user)
         raise ApiError(404, "Unknown harvest endpoint")
 
-    # One row per tote -- unlike the batch check-in above (one average weight
-    # shared across a count of totes), each CSV row is its own tote with its
-    # own weight, so rows sharing a site/species/harvest-date still need the
-    # same tote-number continuation logic, tracked in-memory across the file
-    # rather than in one COALESCE(MAX(...)) query per batch.
-    def _harvest_bulk(self, conn):
+    # ---- bulk import of feedstock totes (CSV) -------------------------------- #
+    # One row per tote. The whole file is checked FIRST and every problem is reported with its row and column; if there is any, nothing is imported (all or nothing). With
+    # dryRun the file is only checked. A lot number is SITE-SPECIES-YYYYMMDD-NNN: toteNumber (NNN) may be given, and then it must be unique; left blank it is assigned automatically.
+    BULK_COLUMNS = ["site", "species", "harvestDate", "avgWeightKg", "toteNumber", "receivedDate", "grind", "stabilizationMethod", "storageUnit", "storageSource",
+                    "location", "ph", "orp", "tdsPct", "status", "notes"]
+    BULK_REQUIRED = ("site", "species", "harvestDate")
+
+    def _harvest_bulk(self, conn, user):
         d = self._body_json()
-        csv_text = d.get("csvText") or ""
+        csv_text = (d.get("csvText") or "").lstrip("\ufeff")
         if not csv_text.strip():
             raise ApiError(400, "No CSV data received")
         try:
-            reader = csv.DictReader(io.StringIO(csv_text))
-            rows = list(reader)
+            reader = csv.reader(io.StringIO(csv_text))
+            table = [r for r in reader]
         except Exception:
             raise ApiError(400, "Could not parse the CSV file")
-        if not rows:
+        problems = []
+
+        def problem(row, column, message):
+            problems.append({"row": row, "column": column, "message": message})
+
+        header = [(h or "").strip() for h in (table[0] if table else [])]
+        canon = {c.lower(): c for c in self.BULK_COLUMNS}
+        cols, seen = [], set()
+        for h in header:
+            c = canon.get(h.lower())
+            if c is None:
+                problem(1, h or "(blank)", "Unknown column. The columns are: %s." % ", ".join(self.BULK_COLUMNS))
+            elif c in seen:
+                problem(1, c, "This column appears twice.")
+            seen.add(c)
+            cols.append(c)
+        for c in self.BULK_REQUIRED:
+            if c not in seen:
+                problem(1, c, "Required column is missing.")
+        absent = set(self.BULK_REQUIRED) - seen                      # a missing column is reported once on row 1, not again on every row
+        data_rows = [(i, r) for i, r in enumerate(table[1:], start=2) if any((x or "").strip() for x in r)]
+        if not data_rows:
             raise ApiError(400, "The CSV has no data rows")
-        if len(rows) > 500:
-            raise ApiError(400, "Too many rows in one import (max 500)")
-        required = {"site", "species", "harvestDate", "avgWeightKg"}
-        have = {(h or "").strip() for h in (reader.fieldnames or [])}
-        missing = required - have
-        if missing:
-            raise ApiError(400, "CSV is missing required column(s): %s" % ", ".join(sorted(missing)))
+        if len(data_rows) > 500:
+            raise ApiError(400, "Too many rows in one import (max 500): split the file")
         species_codes = {r["code"] for r in conn.execute("SELECT code FROM species")}
-        counters = {}  # (site,species,date) -> next tote_number
-        ts = now_iso()
-        created = []
-        for i, row in enumerate(rows, start=2):  # row 1 is the header
-            def cell(key):
-                return ((row.get(key) or "").strip())
-            site = cell("site").upper()
-            species = cell("species").upper()
-            date = cell("harvestDate")
-            if not site or not species or not date:
-                raise ApiError(400, "Row %d: site, species and harvestDate are required" % i)
-            try:
-                datetime.date.fromisoformat(date)
-            except ValueError:
-                raise ApiError(400, "Row %d: harvestDate '%s' must be YYYY-MM-DD" % (i, date))
-            received_date = cell("receivedDate") or None
-            if received_date:
+        known_sites = {r["code"] for r in conn.execute("SELECT code FROM sites")}
+        known_locations = {r["name"] for r in conn.execute("SELECT name FROM locations")}
+        today = today_iso()
+        warnings, new_sites, new_locs = [], set(), set()
+        parsed = []
+        for rn, raw in data_rows:
+            if len(raw) > len(cols):
+                problem(rn, "", "This row has more cells than the header has columns (a comma inside a value needs quotes).")
+                continue
+            row = {c: (raw[k].strip() if k < len(raw) and raw[k] is not None else "") for k, c in enumerate(cols) if c}
+            bad = len(problems)
+            site, species, date = row.get("site", "").upper(), row.get("species", "").upper(), row.get("harvestDate", "")
+            if not site:
+                if "site" not in absent:
+                    problem(rn, "site", "Required.")
+            elif not re.fullmatch(r"[A-Z0-9]{2,8}", site):
+                problem(rn, "site", "Site code '%s' should be letters and numbers only (2-8 characters)." % site)
+            elif site not in known_sites:
+                new_sites.add(site)
+            if not species:
+                if "species" not in absent:
+                    problem(rn, "species", "Required.")
+            elif species not in species_codes:
+                problem(rn, "species", "Unknown species code '%s'. Known: %s." % (species, ", ".join(sorted(species_codes))))
+            hd = None
+            if not date:
+                if "harvestDate" not in absent:
+                    problem(rn, "harvestDate", "Required.")
+            else:
                 try:
-                    datetime.date.fromisoformat(received_date)
+                    hd = datetime.date.fromisoformat(date)
+                    if date > today:
+                        problem(rn, "harvestDate", "The harvest date %s is in the future." % date)
                 except ValueError:
-                    raise ApiError(400, "Row %d: receivedDate '%s' must be YYYY-MM-DD" % (i, received_date))
-            if species not in species_codes:
-                raise ApiError(400, "Row %d: unknown species code '%s'" % (i, species))
-            try:
-                avg = float(cell("avgWeightKg"))
-            except ValueError:
-                avg = 0
-            if avg <= 0:
-                raise ApiError(400, "Row %d: avgWeightKg must be a number greater than 0" % i)
-            ph = numn(cell("ph"))
-            orp = numn(cell("orp"))
-            location = cell("location") or None
-            stabilization_method = cell("stabilizationMethod") or "Citric acid"
-            storage_unit = cell("storageUnit") or "Tote"
-            storage_source = cell("storageSource") or None
-            grind = cell("grind").capitalize() or "Coarse"
+                    problem(rn, "harvestDate", "'%s' is not a date (use YYYY-MM-DD)." % date)
+            rec = row.get("receivedDate") or None
+            if rec:
+                try:
+                    rd = datetime.date.fromisoformat(rec)
+                    if hd and rd < hd:
+                        problem(rn, "receivedDate", "Received %s is before the harvest date %s." % (rec, date))
+                    elif rec > today:
+                        problem(rn, "receivedDate", "The received date %s is in the future." % rec)
+                except ValueError:
+                    problem(rn, "receivedDate", "'%s' is not a date (use YYYY-MM-DD)." % rec)
+
+            def number(col, lo, hi, what):
+                v = row.get(col, "")
+                if v == "":
+                    return None
+                n = numn(v)
+                if n is None or not (lo <= n <= hi):
+                    problem(rn, col, "%s must be a number between %g and %g (got '%s')." % (what, lo, hi, v))
+                    return None
+                return n
+            avg_raw = row.get("avgWeightKg", "")
+            avg = numn(avg_raw) if avg_raw else None
+            if avg_raw and (avg is None or avg <= 0 or avg > 5000):       # optional: blank = weight not known yet (set later with "Set weight for selected")
+                problem(rn, "avgWeightKg", "Weight must be a number above 0 and up to 5000 kg (got '%s')." % avg_raw)
+            ph, orp, tds = number("ph", 0, 14, "pH"), number("orp", -1000, 1000, "ORP (mV)"), number("tdsPct", 0, 100, "Feedstock TDS (%)")
+            tote_raw = row.get("toteNumber", "")
+            tote_no = None
+            if tote_raw:
+                if not re.fullmatch(r"\d{1,3}", tote_raw) or int(tote_raw) < 1:
+                    problem(rn, "toteNumber", "Must be a whole number from 1 to 999 (got '%s')." % tote_raw)
+                else:
+                    tote_no = int(tote_raw)
+            grind_raw = row.get("grind", "")
+            grind = grind_raw.capitalize() if grind_raw else "Coarse"
             if grind not in ("Coarse", "Fine"):
-                raise ApiError(400, "Row %d: grind '%s' must be Coarse or Fine" % (i, cell("grind")))
-            notes = cell("notes") or None
-            if not conn.execute("SELECT 1 FROM sites WHERE code=?", (site,)).fetchone():
-                conn.execute("INSERT INTO sites (code,name) VALUES (?,?)", (site, site))
-            if location:
-                conn.execute("INSERT OR IGNORE INTO locations (name) VALUES (?)", (location,))
-            key = (site, species, date)
-            if key not in counters:
-                counters[key] = conn.execute(
-                    "SELECT COALESCE(MAX(tote_number),0) n FROM tote_lots "
-                    "WHERE site_code=? AND species_code=? AND checkin_date=?", key).fetchone()["n"]
-            counters[key] += 1
-            n = counters[key]
-            datestr = date.replace("-", "")
-            lot = "%s-%s-%s-%03d" % (site, species, datestr, n)
-            sp = conn.execute("SELECT common FROM species WHERE code=?", (species,)).fetchone()
-            common = sp["common"] if sp else species
-            conn.execute(
-                "INSERT INTO tote_lots (lot_number,site_code,species_code,harvest_year,"
-                "checkin_date,received_date,tote_number,volume_l,ph,orp,avg_weight_kg,location,"
-                "description,status,stabilization_method,storage_unit,storage_source,notes,created_at,grind)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'in_stock',?,?,?,?,?,?)",
-                (lot, site, species, int(date[:4]), date, received_date, n, 1000, ph, orp, avg, location,
-                 "Fresh Stabilized Ground %s" % common, stabilization_method, storage_unit,
-                 storage_source, notes, ts, grind))
-            created.append(lot)
-        return {"created": created, "count": len(created)}
+                problem(rn, "grind", "Must be Coarse or Fine (got '%s')." % grind_raw)
+            stab = row.get("stabilizationMethod", "")
+            stab = {"citric acid": "Citric acid", "fresh": "Fresh"}.get(stab.lower(), stab) if stab else "Citric acid"
+            if stab not in ("Citric acid", "Fresh"):
+                problem(rn, "stabilizationMethod", "Must be Citric acid or Fresh (got '%s')." % row.get("stabilizationMethod"))
+            unit = row.get("storageUnit", "")
+            unit = {"tote": "Tote", "bag": "Bag"}.get(unit.lower(), unit) if unit else "Tote"
+            if unit not in ("Tote", "Bag"):
+                problem(rn, "storageUnit", "Must be Tote or Bag (got '%s')." % row.get("storageUnit"))
+            location = row.get("location") or None
+            status = (row.get("status") or "").strip().lower().replace(" ", "_")
+            if status and status not in ("in_stock", "hold"):
+                problem(rn, "status", "Only in_stock or hold can be imported (got '%s'). Consumed and disposed totes come from runs and write-offs." % row.get("status"))
+                status = ""
+            if status == "hold":
+                if location and location != QAQC_HOLD_LOCATION:
+                    problem(rn, "location", "A tote on hold sits at '%s': leave the location blank or use that name." % QAQC_HOLD_LOCATION)
+                location = QAQC_HOLD_LOCATION
+            elif location == QAQC_HOLD_LOCATION:
+                status = "hold"
+            status = status or "in_stock"
+            if location and location not in known_locations:
+                new_locs.add(location)
+            parsed.append({"rn": rn, "ok": len(problems) == bad, "site": site, "species": species, "date": date, "received": rec, "avg": avg, "tote": tote_no, "grind": grind,
+                           "stab": stab, "unit": unit, "source": row.get("storageSource") or None, "location": location, "ph": ph, "orp": orp, "tds": tds, "status": status,
+                           "notes": row.get("notes") or None})
+        # tote numbers: explicit ones must be unique (in the file, among totes that exist, among totes that were deleted); the rest are numbered after the highest number in use
+        groups = {}
+        for p in parsed:
+            if p["ok"]:
+                groups.setdefault((p["site"], p["species"], p["date"]), []).append(p)
+        planned = []
+        for key, items in groups.items():
+            exist, gone = tote_numbers_used(conn, *key)
+            first_row = {}
+            for p in items:
+                if p["tote"] is None:
+                    continue
+                n, lot = p["tote"], "%s-%s-%s-%03d" % (key[0], key[1], key[2].replace("-", ""), p["tote"])
+                if n in exist:
+                    problem(p["rn"], "toteNumber", "%s already exists in Feedstock Inventory." % lot)
+                elif n in gone:
+                    problem(p["rn"], "toteNumber", "%s was the lot number of a tote that has since been deleted; deleted tote numbers are never reused." % lot)
+                elif n in first_row:
+                    problem(p["rn"], "toteNumber", "%s repeats row %d of this file." % (lot, first_row[n]))
+                else:
+                    first_row[n] = p["rn"]
+            top = max(exist | gone | set(first_row) | {0})
+            for p in items:
+                if p["tote"] is None:
+                    top += 1
+                    p["tote"] = top
+                if p["tote"] > 999:
+                    problem(p["rn"], "toteNumber", "More than 999 totes for %s-%s on %s." % key)
+            planned += items
+        if problems:
+            problems.sort(key=lambda x: (x["row"], x["column"]))
+            raise ApiError(400, "%d problem%s found in the file. Nothing was imported: fix them and import the file again." % (len(problems), "" if len(problems) == 1 else "s"),
+                           "import_errors", {"problems": problems[:200], "problemCount": len(problems)})
+        planned.sort(key=lambda p: p["rn"])
+        lots = ["%s-%s-%s-%03d" % (p["site"], p["species"], p["date"].replace("-", ""), p["tote"]) for p in planned]
+        for sc in sorted(new_sites):
+            warnings.append("Site code %s is new and will be added." % sc)
+        for lc in sorted(new_locs):
+            warnings.append("Location '%s' is new and will be added." % lc)
+        if d.get("dryRun"):
+            return {"ok": True, "dryRun": True, "count": len(lots), "lots": lots, "warnings": warnings}
+        ts, who = now_iso(), user["name"] if user else None
+        common = {r["code"]: (r["common"] or r["code"]) for r in conn.execute("SELECT code, common FROM species")}
+        for sc in sorted(new_sites):
+            conn.execute("INSERT OR IGNORE INTO sites (code,name) VALUES (?,?)", (sc, sc))
+        for lc in sorted(new_locs):
+            conn.execute("INSERT OR IGNORE INTO locations (name) VALUES (?)", (lc,))
+        for p, lot in zip(planned, lots):
+            cur = conn.execute(
+                "INSERT INTO tote_lots (lot_number,site_code,species_code,harvest_year,checkin_date,received_date,tote_number,volume_l,ph,ph_updated,orp,orp_updated,tds_pct,tds_updated,"
+                "avg_weight_kg,location,description,status,stabilization_method,storage_unit,storage_source,notes,created_at,grind)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (lot, p["site"], p["species"], int(p["date"][:4]), p["date"], p["received"], p["tote"], 1000, p["ph"], today_iso() if p["ph"] is not None else None,
+                 p["orp"], today_iso() if p["orp"] is not None else None, p["tds"], today_iso() if p["tds"] is not None else None, p["avg"], p["location"],
+                 "Fresh Stabilized Ground %s" % common.get(p["species"], p["species"]), p["status"], p["stab"], p["unit"], p["source"], p["notes"], ts, p["grind"]))
+            readings = ", ".join(x for x in ("pH %s" % p["ph"] if p["ph"] is not None else "", "ORP %s" % p["orp"] if p["orp"] is not None else "",
+                                              "TDS %s %%" % p["tds"] if p["tds"] is not None else "") if x)
+            conn.execute("INSERT INTO tote_stability_log (tote_lot_id,user_name,field,old_value,new_value,note,created_at) VALUES (?,?,?,?,?,?,?)",
+                         (cur.lastrowid, who, "Imported", "", "CSV import", ("Row %d of the bulk import%s" % (p["rn"], (": " + readings) if readings else ""))[:300], ts))
+        return {"created": lots, "count": len(lots), "warnings": warnings}
 
     # ---- consumables ------------------------------------------------------ #
     def _consumable_public(self, r):
