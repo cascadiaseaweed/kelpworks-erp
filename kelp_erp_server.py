@@ -4204,7 +4204,7 @@ def migrate(conn):
         if col not in cols:
             conn.execute("ALTER TABLE tote_lots ADD COLUMN %s %s" % (col, decl))
     tscols = {r["name"] for r in conn.execute("PRAGMA table_info(tote_stability_log)")}
-    for col, decl in [("run_id", "INTEGER"), ("attachment_id", "INTEGER")]:
+    for col, decl in [("run_id", "INTEGER"), ("attachment_id", "INTEGER"), ("reading_date", "TEXT")]:     # reading_date: the day a reading was taken (NULL = the day it was logged)
         if col not in tscols:
             conn.execute("ALTER TABLE tote_stability_log ADD COLUMN %s %s" % (col, decl))
     ccols = {r["name"] for r in conn.execute("PRAGMA table_info(consumables)")}
@@ -4926,7 +4926,7 @@ def sync_tote_grades(conn, actor=None, reason="Readings updated", quiet=False):
     grades). Returns the number of grade changes logged."""
     rules, default = load_grade_rules(conn)
     odour_now = {}
-    for x in conn.execute("SELECT tote_lot_id, field, new_value FROM tote_stability_log WHERE field IN ('Odour','Odour intensity') ORDER BY id"):
+    for x in conn.execute("SELECT tote_lot_id, field, new_value FROM tote_stability_log WHERE field IN ('Odour','Odour intensity') ORDER BY COALESCE(reading_date, substr(created_at,1,10)), id"):
         odour_now.setdefault(x["tote_lot_id"], {})[x["field"]] = x["new_value"]
     batch_dates = {x["id"]: x["batch_date"] for x in conn.execute("SELECT id, batch_date FROM preproc_batches")}
     run_dates = {x["id"]: (x["finalized_at"] or "")[:10] or x["run_date"] for x in conn.execute("SELECT id, run_date, finalized_at FROM production_runs")}
@@ -7988,7 +7988,7 @@ class Handler(BaseHTTPRequestHandler):
                     "JOIN preproc_batches b ON b.id=pi.batch_id WHERE b.status='completed'")}
             grade_rules, grade_default = load_grade_rules(conn)
             odour_now = {}
-            for x in conn.execute("SELECT tote_lot_id, field, new_value FROM tote_stability_log WHERE field IN ('Odour','Odour intensity') ORDER BY id"):
+            for x in conn.execute("SELECT tote_lot_id, field, new_value FROM tote_stability_log WHERE field IN ('Odour','Odour intensity') ORDER BY COALESCE(reading_date, substr(created_at,1,10)), id"):
                 odour_now.setdefault(x["tote_lot_id"], {})[x["field"]] = x["new_value"]
             for r in rows:
                 t = tote_public(r)
@@ -8117,11 +8117,28 @@ class Handler(BaseHTTPRequestHandler):
 
             # /api/totes/:id/ph  — log a new pH and/or ORP reading, or read the
             # Feedstock Stability history (every field edit, not just pH/ORP).
+            # /api/totes/:id/received-date -- correct or fill in when the tote was received (Update feedstock conditions). Changing a date that is already filled in needs a reason;
+            # every change is a "Received date" line in the Feedstock Stability log.
+            if len(seg) == 4 and seg[3] == "received-date" and method == "POST":
+                d = self._body_json()
+                new = self._iso_date(d.get("receivedDate"), "received date", required=True)
+                if new > today_iso():
+                    raise ApiError(400, "The received date cannot be in the future")
+                if it["checkin_date"] and new < it["checkin_date"]:
+                    raise ApiError(400, "The received date cannot be before the harvest date (%s)" % it["checkin_date"])
+                reason = (d.get("reason") or "").strip()
+                if new != it["received_date"]:
+                    if it["received_date"] and not reason:
+                        raise ApiError(400, "Enter the reason for changing the received date")
+                    self._log_stability(conn, tid, user, "Received date", it["received_date"], new, reason or "Received date filled in")
+                    conn.execute("UPDATE tote_lots SET received_date=? WHERE id=?", (new, tid))
+                return {"receivedDate": new, "stabilityLog": self._stability_log(conn, tid)}
             if len(seg) == 4 and seg[3] == "ph":
                 if method == "GET":
                     return {"stabilityLog": self._stability_log(conn, tid),
                             "ph": it["ph"], "phUpdated": it["ph_updated"],
                             "orp": it["orp"], "orpUpdated": it["orp_updated"], "tdsPct": it["tds_pct"], "tdsUpdated": it["tds_updated"],
+                            "receivedDate": it["received_date"], "harvestDate": it["checkin_date"],
                             "lastUpdated": self._tote_with_last_updated(conn, it)["lastUpdated"],
                             "latestCharacterization": self._latest_characterization(conn, tid, it)}
                 if method == "POST":
@@ -8130,22 +8147,24 @@ class Handler(BaseHTTPRequestHandler):
                     orp = numn(d.get("orp")) if d.get("orp") not in (None, "") else None
                     if ph is None and orp is None:
                         raise ApiError(400, "Enter a pH and/or ORP value")
-                    date = (d.get("date") or today_iso()).strip()
+                    date = self._reading_date(d, "date") or today_iso()
                     note = d.get("note")
-                    updates = {}
-                    if ph is not None:
-                        self._log_stability(conn, tid, user, "pH", it["ph"], ph, note)
-                        updates["ph"] = ph
-                        updates["ph_updated"] = date
-                    if orp is not None:
-                        self._log_stability(conn, tid, user, "ORP (mV)", it["orp"], orp, note)
-                        updates["orp"] = orp
-                        updates["orp_updated"] = date
-                    sets = ", ".join("%s=?" % c for c in updates)
-                    conn.execute("UPDATE tote_lots SET %s WHERE id=?" % sets, (*updates.values(), tid))
+                    updates, historical = {}, []
+                    for val, label, col, dcol in ((ph, "pH", "ph", "ph_updated"), (orp, "ORP (mV)", "orp", "orp_updated")):
+                        if val is None:
+                            continue
+                        if it[dcol] and date < it[dcol]:                     # an earlier reading than the one on file: kept in the history, the current value stays
+                            self._log_stability(conn, tid, user, label, None, val, "Historical reading (the current value stays %s, taken %s)%s" % (it[col], it[dcol], (" - " + note) if note else ""), reading_date=date)
+                            historical.append(label)
+                        else:
+                            self._log_stability(conn, tid, user, label, it[col], val, note, reading_date=date)
+                            updates[col] = val
+                            updates[dcol] = date
+                    if updates:
+                        conn.execute("UPDATE tote_lots SET %s WHERE id=?" % ", ".join("%s=?" % c for c in updates), (*updates.values(), tid))
                     return {"tote": self._tote_with_last_updated(conn, conn.execute(
                         "SELECT * FROM tote_lots WHERE id=?", (tid,)).fetchone()),
-                        "stabilityLog": self._stability_log(conn, tid)}
+                        "stabilityLog": self._stability_log(conn, tid), "historical": historical}
                 raise ApiError(405, "Method not allowed")
 
             # /api/totes/:id/photo  — upload a Detail-card photo (no run involved)
@@ -8246,7 +8265,7 @@ class Handler(BaseHTTPRequestHandler):
                                  "WHERE pi.tote_lot_id=? AND b.status='completed'", (row["id"],)).fetchone()
                 processed = b["d"] if b else None
         od = {}
-        for x in conn.execute("SELECT field, new_value FROM tote_stability_log WHERE tote_lot_id=? AND field IN ('Odour','Odour intensity') ORDER BY id", (row["id"],)):
+        for x in conn.execute("SELECT field, new_value FROM tote_stability_log WHERE tote_lot_id=? AND field IN ('Odour','Odour intensity') ORDER BY COALESCE(reading_date, substr(created_at,1,10)), id", (row["id"],)):
             od[x["field"]] = x["new_value"]
         rules, default = load_grade_rules(conn)
         grade, why, _ = grade_for(rules, default, {"ph": row["ph"], "orp": row["orp"], "stab_weeks": tote_stab_weeks(row, batch["batch_date"] if batch else None, processed),
@@ -8255,18 +8274,33 @@ class Handler(BaseHTTPRequestHandler):
 
     def _stability_log(self, conn, tote_id):
         return [dict(field=r["field"], oldValue=r["old_value"], newValue=r["new_value"],
-                     note=r["note"], by=r["user_name"], at=r["created_at"],
+                     note=r["note"], by=r["user_name"], at=r["created_at"], readingDate=r["reading_date"],
                      runId=r["run_id"], attachmentId=r["attachment_id"])
                 for r in conn.execute(
                     "SELECT * FROM tote_stability_log WHERE tote_lot_id=? ORDER BY id DESC",
                     (tote_id,))]
 
-    def _log_stability(self, conn, tote_id, user, field, old, new, note=None, run_id=None, attachment_id=None):
+    def _log_stability(self, conn, tote_id, user, field, old, new, note=None, run_id=None, attachment_id=None, reading_date=None):
         conn.execute(
             "INSERT INTO tote_stability_log (tote_lot_id,user_name,field,old_value,new_value,note,"
-            "created_at,run_id,attachment_id) VALUES (?,?,?,?,?,?,?,?,?)",
+            "created_at,run_id,attachment_id,reading_date) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (tote_id, user["name"] if user else None, field, _fmtval(old), _fmtval(new), note, now_iso(),
-             run_id, attachment_id))
+             run_id, attachment_id, reading_date))
+
+    @staticmethod
+    def _reading_date(d, *keys):
+        """The day a reading was taken, from the first of these request fields that is filled in: a date (not in the future), or None = today."""
+        for k in keys:
+            v = (str(d.get(k)) if d.get(k) not in (None, "") else "").strip()
+            if v:
+                try:
+                    day = datetime.date.fromisoformat(v)
+                except ValueError:
+                    raise ApiError(400, "The reading date must be a date")
+                if v > today_iso():
+                    raise ApiError(400, "The reading date cannot be in the future")
+                return v
+        return None
 
     # ---- locations & moves ------------------------------------------------ #
     def _ensure_location(self, conn, name):
@@ -12323,14 +12357,14 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             last = conn.execute(
                 "SELECT new_value FROM tote_stability_log WHERE tote_lot_id=? AND field=?"
-                " ORDER BY id DESC LIMIT 1", (tote_lot_id, label)).fetchone()
+                " ORDER BY COALESCE(reading_date, substr(created_at,1,10)) DESC, id DESC LIMIT 1", (tote_lot_id, label)).fetchone()
             val = last["new_value"] if last else None
             if val is not None and kind_for.get(key) == "num":
                 val = numn(val)
             out[key] = val
         return out
 
-    def _log_characterization_fields(self, conn, tote_lot_id, user, fd, note, run_id=None):
+    def _log_characterization_fields(self, conn, tote_lot_id, user, fd, note, run_id=None, reading_date=None):
         """Write a Feedstock Stability log row only for fields that actually
         changed since they were last captured -- re-saving a card with the
         same values (e.g. touching just one field) shouldn't spam the log
@@ -12342,22 +12376,31 @@ class Handler(BaseHTTPRequestHandler):
         as new/changed if there isn't one yet). A photo is diffed the same
         way, by attachment id, so re-submitting an already-logged photo on an
         unrelated field change doesn't create a duplicate row either."""
-        tote = conn.execute("SELECT ph, orp, tds_pct FROM tote_lots WHERE id=?", (tote_lot_id,)).fetchone()
+        tote = conn.execute("SELECT ph, orp, tds_pct, ph_updated, orp_updated, tds_updated FROM tote_lots WHERE id=?", (tote_lot_id,)).fetchone()
         current_for = {"ph": tote["ph"], "orp": tote["orp"], "tdsPct": tote["tds_pct"]}
+        date_for = {"ph": tote["ph_updated"], "orp": tote["orp_updated"], "tdsPct": tote["tds_updated"]}
+        historical = []
         for key, label in self.CHARACTERIZATION_LABELS:
             val = fd.get(key)
             if val in (None, ""):
                 continue
+            cur_date = None
             if key in current_for:
-                old = current_for[key]
+                old, cur_date = current_for[key], date_for[key]
             else:
                 last = conn.execute(
-                    "SELECT new_value FROM tote_stability_log WHERE tote_lot_id=? AND field=?"
-                    " ORDER BY id DESC LIMIT 1", (tote_lot_id, label)).fetchone()
-                old = last["new_value"] if last else None
+                    "SELECT new_value, COALESCE(reading_date, substr(created_at,1,10)) d FROM tote_stability_log WHERE tote_lot_id=? AND field=?"
+                    " ORDER BY COALESCE(reading_date, substr(created_at,1,10)) DESC, id DESC LIMIT 1", (tote_lot_id, label)).fetchone()
+                old, cur_date = (last["new_value"], last["d"]) if last else (None, None)
+            entry_note = note
             if _fmtval(old) == _fmtval(val):
-                continue
-            self._log_stability(conn, tote_lot_id, user, label, old, val, note, run_id=run_id)
+                continue                                          # the same value as the current one (e.g. a field the window pre-filled): nothing to log, whatever the date
+            if reading_date and cur_date and reading_date < cur_date:
+                # an earlier reading than the one on file, with a different value: kept in the history, the current value stays
+                entry_note = "Historical reading (the current value stays %s, taken %s)%s" % (_fmtval(old), cur_date, (" - " + note) if note else "")
+                old = None
+                historical.append(label)
+            self._log_stability(conn, tote_lot_id, user, label, old, val, entry_note, run_id=run_id, reading_date=reading_date)
         for slot_key, label in (("surfacePhotoId", "Surface photo"),
                                  ("striationPhotoId", "Settling/striation photo")):
             att_id = fd.get(slot_key)
@@ -12377,6 +12420,7 @@ class Handler(BaseHTTPRequestHandler):
             self._log_stability(conn, tote_lot_id, user, label, None,
                                att["filename"] if att else "Photo", note,
                                run_id=run_id, attachment_id=att_id)
+        return historical
 
     def _apply_ph_orp_override(self, conn, tote, fd):
         """pH/ORP captured on a characterization save become the tote's
@@ -12571,10 +12615,10 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(400, "Feedstock TDS is a percentage between 0 and 100")
         note = ("Rejected via Feedstock Inventory" if decision == "rejected"
                 else "Characterized via Feedstock Inventory")
-        self._log_characterization_fields(conn, tote_id, user, d, note)
-        if tds is not None and tds != tote["tds_pct"]:
-            tds_date = (d.get("tdsDate") or "").strip() or today_iso()
-            conn.execute("UPDATE tote_lots SET tds_pct=?, tds_updated=? WHERE id=?", (tds, tds_date, tote_id))
+        reading_date = self._reading_date(d, "readingDate", "tdsDate")
+        historical = self._log_characterization_fields(conn, tote_id, user, d, note, reading_date=reading_date)
+        if tds is not None and tds != tote["tds_pct"] and not (reading_date and tote["tds_updated"] and reading_date < tote["tds_updated"]):
+            conn.execute("UPDATE tote_lots SET tds_pct=?, tds_updated=? WHERE id=?", (tds, reading_date or today_iso(), tote_id))
         ph, ph_updated, orp, orp_updated = self._apply_ph_orp_override(conn, tote, d)
         if decision == "rejected":
             self._log_stability(conn, tote_id, user, "Decision", None, "rejected", note)
@@ -12587,7 +12631,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             conn.execute("UPDATE tote_lots SET ph=?, ph_updated=?, orp=?, orp_updated=? WHERE id=?",
                          (ph, ph_updated, orp, orp_updated, tote_id))
-        return {"rejected": decision == "rejected",
+        return {"rejected": decision == "rejected", "historical": historical,
                 "tote": self._tote_with_last_updated(conn, conn.execute(
                     "SELECT * FROM tote_lots WHERE id=?", (tote_id,)).fetchone())}
 
