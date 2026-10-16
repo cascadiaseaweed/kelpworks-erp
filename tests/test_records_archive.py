@@ -109,7 +109,7 @@ def test_the_manifest_lists_the_agreed_tree_for_finalized_runs_only(srv, people)
     m = manifest(srv)
     assert m["skeleton"] == ["01_System-Backups/daily", "01_System-Backups/weekly", "01_System-Backups/monthly", "01_System-Backups/pre-migrate",
                              "02_Production-Runs/_Index", "03_SOPs/Current", "03_SOPs/Superseded", "04_Safety-Data-Sheets/Current",
-                             "04_Safety-Data-Sheets/Superseded", "05_Fulfillment"]
+                             "04_Safety-Data-Sheets/Superseded", "05_Fulfillment", "06_Receiving/_Index"]
     assert entry(m, "README_Naming-Convention.txt")["kind"] == "readme" and entry(m, "_Index/runs_index.csv")["kind"] == "index"
     folder = "02_Production-Runs/2026/2026-05/%s_KELPIVEX_2026-05-04" % lot
     assert entry(m, "%s_Production-Summary_rev1.pdf" % lot)["path"] == folder + "/01_Report-and-CoA/%s_Production-Summary_rev1.pdf" % lot

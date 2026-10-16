@@ -223,3 +223,69 @@ def test_containers_are_counted_in_whole_units(srv, people):
     cid = [c["id"] for c in a.get("/api/consumables").json["consumables"] if c["name"] == "New 1,000 L IBC Tote"][0]
     assert a.post("/api/consumables/%d/count" % cid, {"counted": 12.5, "reason": "Damaged"}).status == 400
     assert a.post("/api/consumables/%d/count" % cid, {"counted": 12, "reason": "Stocktake correction"}).status == 200
+
+
+# ---- the nightly records archive -------------------------------------------------------------------------------------------------
+
+def manifest(admin):
+    r = admin.get("/api/archive/manifest")
+    assert r.status == 200, r.text
+    return r.json
+
+
+def receipts_in(m):
+    return [f for f in m["files"] if f["path"].startswith("06_Receiving/") and f["kind"] != "index"]
+
+
+def test_documents_of_a_delivery_are_archived_in_a_fixed_folder_with_stable_names(srv, people):
+    a = people["admin"]
+    cid = new_item(a, "Recv Archive")
+    rid = a.post("/api/consumables/%d/receive" % cid, {"qty": 3, "supplierLot": "AR-1", "supplier": "DuBois Chemicals Canada Inc.", "invoiceNo": "IN-60133189", "receivedDate": "2026-08-21",
+                                                       "poNumber": "1092"}).json["receiptId"]
+    nodoc = a.post("/api/consumables/%d/receive" % cid, {"qty": 1, "supplierLot": "AR-NODOC", "supplier": "Acme", "invoiceNo": "NO-DOCS"}).json["receiptId"]
+    a.post("/api/receipts/%d/attachments" % rid, {"filename": "DuBois IN-60133189.pdf", "dataB64": PDF, "kind": "invoice"}).raise_for_status()
+    a.post("/api/receipts/%d/attachments" % rid, {"filename": "DuBois IN-60133189.pdf", "dataB64": PDF, "kind": "invoice"}).raise_for_status()     # the same name twice
+    a.post("/api/receipts/%d/attachments" % rid, {"filename": "bol.pdf", "dataB64": PDF, "kind": "delivery"}).raise_for_status()
+    m = manifest(a)
+    mine = [f for f in receipts_in(m) if "IN-60133189" in f["path"]]
+    folder = "06_Receiving/2026/2026-08/2026-08-21_DuBois-Chemicals-Canada_IN-60133189/"
+    names = sorted(f["path"][len(folder):] for f in mine)
+    assert all(f["path"].startswith(folder) for f in mine) and len(mine) == 3
+    assert "IN-60133189_Delivery-Doc_bol.pdf" in names and "IN-60133189_Invoice_DuBois-IN-60133189.pdf" in names
+    assert any(n.startswith("IN-60133189_Invoice_DuBois-IN-60133189_") for n in names)                                  # the second copy gets its id so it cannot clash
+    assert not [f for f in receipts_in(m) if "NO-DOCS" in f["path"]]                                                    # a delivery with no document has no folder
+    assert "06_Receiving/_Index" in m["skeleton"] and m["deliveries"] >= 1
+    for f in m["files"]:
+        assert len(f["path"]) <= 200 and " " not in f["path"], f["path"]
+    # the folder never moves when the delivery's details are corrected, and a new document joins it
+    a.put("/api/receipts/%d" % rid, {"supplier": "DuBois", "invoiceNo": "IN-CORRECTED", "reason": "typo"}).raise_for_status()
+    a.post("/api/receipts/%d/attachments" % rid, {"filename": "coa.pdf", "dataB64": PDF, "kind": "coa"}).raise_for_status()
+    again = [f for f in receipts_in(manifest(a)) if f["path"].startswith(folder)]
+    assert len(again) == 4 and {f["path"] for f in mine} <= {f["path"] for f in again}
+    assert any(f["path"].endswith("IN-60133189_CoA_coa.pdf") for f in again)
+
+
+def test_an_archived_document_is_served_by_its_path_and_the_index_lists_the_delivery(srv, people):
+    a = people["admin"]
+    cid = new_item(a, "Recv Archive Serve")
+    rid = a.post("/api/consumables/%d/receive" % cid, {"qty": 2, "supplierLot": "AS-1", "supplier": "Univar Solutions", "invoiceNo": "53959279", "poNumber": "DANIEL 05/29/2026",
+                                                       "orderNo": "16317914", "deliveryDoc": "6503210704", "carrier": "Day & Ross", "receivedDate": "2026-06-17"}).json["receiptId"]
+    a.post("/api/receipts/%d/attachments" % rid, {"filename": "Univar 53959279.pdf", "dataB64": PDF, "kind": "invoice"}).raise_for_status()
+    f = [x for x in receipts_in(manifest(a)) if "53959279" in x["path"]][0]
+    assert f["runId"] is None and f["version"].startswith("att")
+    got = a.get("/api/archive/file?path=" + f["path"])
+    assert got.status == 200 and got.body.startswith(b"%PDF") and got.headers.get("X-Archive-Sha256")
+    assert a.get("/api/archive/file?path=06_Receiving/2026/nothing.pdf").status == 404
+    idx = a.get("/api/archive/file?path=06_Receiving/_Index/receiving_index.csv")
+    assert idx.status == 200
+    text = idx.body.decode("utf-8-sig")
+    assert "53959279" in text and "DANIEL 05/29/2026" in text and "16317914" in text and "6503210704" in text and "Day & Ross" in text
+    assert f["path"].rsplit("/", 1)[0] in text
+    assert any(x["path"] == "06_Receiving/_Index/receiving_index.csv" for x in manifest(a)["files"])
+
+
+def test_the_archive_is_readable_with_the_archive_key_only(srv, people):
+    a = people["admin"]
+    paths = [f["path"] for f in receipts_in(manifest(a))]
+    assert paths
+    assert a.get("/api/archive/file?path=" + paths[0], token="").status == 401

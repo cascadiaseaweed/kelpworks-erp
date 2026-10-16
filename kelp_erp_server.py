@@ -1482,6 +1482,13 @@ CREATE TABLE IF NOT EXISTS archive_runs (
     folder     TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+-- The folder (and file-name key) a delivery's documents were given the first time they were archived: a later correction of its supplier, date or invoice number never moves them.
+CREATE TABLE IF NOT EXISTS archive_receipts (
+    receipt_id INTEGER PRIMARY KEY REFERENCES inventory_receipts(id),
+    folder     TEXT NOT NULL,
+    file_key   TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 
 -- A finalized run's production log is locked; changing it requires an
 -- amendment (reason + category). While open the run is 'amending' and its
@@ -5161,9 +5168,12 @@ ARCHIVE_SKELETON = [
     "03_SOPs/Current", "03_SOPs/Superseded",
     "04_Safety-Data-Sheets/Current", "04_Safety-Data-Sheets/Superseded",
     "05_Fulfillment",
+    "06_Receiving/_Index",
 ]
 ARCHIVE_README_PATH = "README_Naming-Convention.txt"
 ARCHIVE_INDEX_PATH = "02_Production-Runs/_Index/runs_index.csv"
+RECEIVING_INDEX_PATH = "06_Receiving/_Index/receiving_index.csv"
+RECEIPT_KIND_NAMES = {"invoice": "Invoice", "delivery": "Delivery-Doc", "coa": "CoA", "freight": "Freight-Invoice", "other": "Document"}
 ARCHIVE_README = """KelpWorks-Records: folders and file names
 ==========================================
 
@@ -5181,6 +5191,10 @@ ARCHIVE_README = """KelpWorks-Records: folders and file names
                     Current/ every night (the sync lists the files); new or changed files wait for an administrator to accept them.
 04_Safety-Data-Sheets  Controlled safety data sheets, same Current / Superseded layout and the same nightly check.
 05_Fulfillment      Shipping and sales documents (bill of lading, commercial invoice ...), one folder per shipment.
+06_Receiving        Documents that came with deliveries of reagents, packaging and other inventory (supplier invoice, bill of lading, certificate of analysis, freight
+                    invoice), one folder per delivery that has a document, written automatically by KelpWorks. Do not edit or rename (it is not read back).
+                    <year>/<year-month>/<received date>_<supplier>_<invoice number>/   (RCPT-<n> when the invoice number was not known)
+                    receiving_index.csv (in _Index) lists every delivery with its invoice, PO, order and delivery numbers.
 
 File names
   Letters, numbers, hyphens and underscores only (no spaces). Fields are separated by an underscore, dates are 2026-10-10 style,
@@ -5189,6 +5203,7 @@ File names
   SDS         SDS_<Chemical-Name>_<Supplier>_<issue date>.pdf             e.g. SDS_Citric-Acid_Univar_2025-03-14.pdf
   Run files   <processing lot>_<document type>_<detail>.<extension>       e.g. PR-20261006-053_CoA_RELEASED.pdf
   Shipments   <shipment number>_<document type>_<detail>.pdf              e.g. SH-20261010-001_BOL.pdf
+  Deliveries  <invoice number>_<document type>_<detail>.<extension>       e.g. IN-60133189_Invoice_DuBois-IN-60133189.pdf
 """
 
 IMAGE_EXTS = {"jpg", "jpeg", "png", "gif", "webp", "heic", "bmp", "tif", "tiff"}
@@ -5335,6 +5350,55 @@ def archive_index_csv(rows):
     return buf.getvalue().encode("utf-8-sig")                 # the BOM makes Excel read the accents correctly
 
 
+def archive_receipt_folder(conn, rc):
+    """(folder, file key) of a delivery in the records library. Fixed the first time one of its documents is archived."""
+    row = conn.execute("SELECT folder, file_key FROM archive_receipts WHERE receipt_id=?", (rc["id"],)).fetchone()
+    if row:
+        return row["folder"], row["file_key"]
+    day = (rc["received_date"] or "")[:10]
+    year, month = (day[:4], day[:7]) if re.match(r"^\d{4}-\d{2}-\d{2}$", day) else ("undated", "undated")
+    key = archive_slug(rc["invoice_no"], 30, "") or "RCPT-%d" % rc["id"]
+    folder = "06_Receiving/%s/%s/%s_%s_%s" % (year, month, day or "undated", archive_slug(rc["supplier"], 24, "Supplier"), key)
+    if conn.execute("SELECT 1 FROM archive_receipts WHERE folder=?", (folder,)).fetchone():
+        folder += "-%d" % rc["id"]
+    conn.execute("INSERT OR IGNORE INTO archive_receipts (receipt_id, folder, file_key, created_at) VALUES (?,?,?,?)", (rc["id"], folder, key, now_iso()))
+    return folder, key
+
+
+def archive_receipt_entries(conn):
+    """(entries, problems, index rows) for the deliveries that have documents. A document's file never changes (a new document is a new file), so its version is its id."""
+    entries, problems, rows = [], [], []
+    for rc in conn.execute("SELECT * FROM inventory_receipts WHERE id IN (SELECT receipt_id FROM receipt_attachments) ORDER BY id").fetchall():
+        folder, key = archive_receipt_folder(conn, rc)
+        used, n = set(), 0
+        for a in conn.execute("SELECT * FROM receipt_attachments WHERE receipt_id=? ORDER BY id", (rc["id"],)).fetchall():
+            if not os.path.isfile(os.path.join(UPLOAD_DIR, a["stored_name"])):
+                problems.append({"run": "delivery %d" % rc["id"], "what": a["filename"], "error": "the stored file is missing on the server"})
+                continue
+            stem = archive_slug(os.path.splitext(a["filename"])[0], 40, "file")
+            kind = RECEIPT_KIND_NAMES.get(a["kind"], "Document")
+            name = "%s_%s_%s.%s" % (key, kind, stem, archive_ext(a["filename"]))
+            if name in used:
+                name = "%s_%s_%s_%d.%s" % (key, kind, stem, a["id"], archive_ext(a["filename"]))
+            used.add(name)
+            entries.append({"path": "%s/%s" % (folder, name), "kind": "receipt-" + a["kind"], "version": "att%d" % a["id"], "size": a["size"], "runId": None,
+                            "src": "rcpt:%d" % a["id"], "supersedes": []})
+            n += 1
+        lots = conn.execute("SELECT COUNT(*) c FROM consumable_lots WHERE receipt_id=?", (rc["id"],)).fetchone()["c"]
+        rows.append({"received": rc["received_date"], "supplier": rc["supplier"], "invoiceNo": rc["invoice_no"], "invoiceDate": rc["invoice_date"], "poNumber": rc["po_number"],
+                     "orderNo": rc["order_no"], "deliveryDoc": rc["delivery_doc"], "carrier": rc["carrier"], "lots": lots, "files": n, "folder": folder})
+    return entries, problems, rows
+
+
+def receiving_index_csv(rows):
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\r\n")
+    w.writerow(["received_date", "supplier", "invoice_no", "invoice_date", "po_number", "order_no", "delivery_document", "carrier", "lots", "files", "folder"])
+    for r in rows:
+        w.writerow([r["received"], r["supplier"] or "", r["invoiceNo"] or "", r["invoiceDate"] or "", r["poNumber"] or "", r["orderNo"] or "", r["deliveryDoc"] or "", r["carrier"] or "", r["lots"], r["files"], r["folder"]])
+    return buf.getvalue().encode("utf-8-sig")
+
+
 def archive_manifest(conn, only_run=None, handler=None):
     """Everything the records library should hold right now. `only_run` limits it to one run's files (used to serve a single file)."""
     return _archive_build(conn, only_run, handler)[0]
@@ -5356,14 +5420,21 @@ def _archive_build(conn, only_run=None, handler=None):
                      "finalizedAt": run["finalized_at"], "release": RELEASE_LABELS.get(run["release_state"], run["release_state"] or ""),
                      "rev": rev, "files": len(entries), "folder": folder})
     index = archive_index_csv(rows)
+    deliveries = 0
     if not only_run:
+        r_entries, r_problems, r_rows = archive_receipt_entries(conn)
+        files += r_entries
+        problems += r_problems
+        deliveries = len(r_rows)
+        ridx = receiving_index_csv(r_rows)
+        files.append({"path": RECEIVING_INDEX_PATH, "kind": "index", "version": hashlib.sha256(ridx).hexdigest()[:16], "size": len(ridx), "runId": None, "src": "receiving-index", "supersedes": []})
         readme = ARCHIVE_README.encode("utf-8")
         files.insert(0, {"path": ARCHIVE_README_PATH, "kind": "readme", "version": hashlib.sha256(readme).hexdigest()[:16], "size": len(readme),
                          "runId": None, "src": "readme", "supersedes": []})
         files.insert(1, {"path": ARCHIVE_INDEX_PATH, "kind": "index", "version": hashlib.sha256(index).hexdigest()[:16], "size": len(index),
                          "runId": None, "src": "index", "supersedes": []})
     return ({"format": "kelpworks-records-manifest", "version": 1, "generatedAt": now_iso(), "root": ARCHIVE_ROOT_NAME, "env": ENV_NAME,
-             "skeleton": ARCHIVE_SKELETON, "runs": len(rows), "files": files, "problems": problems}, index)
+             "skeleton": ARCHIVE_SKELETON, "runs": len(rows), "deliveries": deliveries, "files": files, "problems": problems}, index)
 
 
 def archive_file_bytes(conn, run_id, path, handler=None):
@@ -5376,6 +5447,17 @@ def archive_file_bytes(conn, run_id, path, handler=None):
         if path == ARCHIVE_INDEX_PATH:
             data = _archive_build(conn, None, handler)[1]
             return data, hashlib.sha256(data).hexdigest()[:16], "text/csv; charset=utf-8"
+        if path == RECEIVING_INDEX_PATH:
+            data = receiving_index_csv(archive_receipt_entries(conn)[2])
+            return data, hashlib.sha256(data).hexdigest()[:16], "text/csv; charset=utf-8"
+        if path.startswith("06_Receiving/"):                      # a delivery's document: found by its path (the sync script sends no run number)
+            ent = next((e for e in archive_receipt_entries(conn)[0] if e["path"] == path), None)
+            row = conn.execute("SELECT * FROM receipt_attachments WHERE id=?", (int(ent["src"].split(":")[1]),)).fetchone() if ent else None
+            full = os.path.join(UPLOAD_DIR, row["stored_name"]) if row else None
+            if not row or not os.path.isfile(full):
+                return None
+            with open(full, "rb") as f:
+                return f.read(), ent["version"], served_type(row["filename"])[0]
         return None
     run = conn.execute("SELECT * FROM production_runs WHERE id=? AND status='completed'", (run_id,)).fetchone()
     if not run:
@@ -5516,7 +5598,8 @@ def archive_status(conn):
     return {"nightlyBackup": NIGHTLY_BACKUP, "backupHourUtc": BACKUP_HOUR_UTC, "backupKeep": BACKUP_KEEP,
             "archiveKeyConfigured": len(ARCHIVE_KEY) >= ARCHIVE_KEY_MIN, "archiveKeyTooShort": 0 < len(ARCHIVE_KEY) < ARCHIVE_KEY_MIN,
             "lastBackup": flag("last_backup"), "lastBackupError": flag("last_backup_error"), "backups": backups,
-            "runsToArchive": conn.execute("SELECT COUNT(*) c FROM production_runs WHERE status='completed'").fetchone()["c"]}
+            "runsToArchive": conn.execute("SELECT COUNT(*) c FROM production_runs WHERE status='completed'").fetchone()["c"],
+            "deliveriesToArchive": conn.execute("SELECT COUNT(DISTINCT receipt_id) c FROM receipt_attachments").fetchone()["c"]}
 
 
 # ---------------------------------------------------------------------------------------
