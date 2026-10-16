@@ -26,3 +26,7 @@ be689db  2026-10-12  small hardening batch (download tokens, upload quota, live 
 5ce3ed7  2026-10-14  SOP retire / replace, explicit review choice merged to main and live
 e6ae246  2026-10-15  feedstock optional TDS, full CSV import, bulk set merged to main and live
 f5fd678  2026-10-15  integrity check covers Pre-Processing batches merged to main and live
+770c0f0  2026-10-16  site list (Cordova, Cormorant, Diplock, James Island, Kodiak, Seagrove) merged to main and live
+0bdfb25  2026-10-16  receiving deliveries, documents, pack sizes, Adjust > Count, receiving archive merged to main and live
+8624345  2026-10-16  Whole grind merged to main and live
+e0416b9  2026-10-16  historical readings and editable received date merged to main and live
