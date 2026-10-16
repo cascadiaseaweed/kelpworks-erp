@@ -441,7 +441,7 @@ CREATE TABLE IF NOT EXISTS species (
 );
 
 CREATE TABLE IF NOT EXISTS sites (
-    code TEXT PRIMARY KEY,       -- JAM, DIP, COR ...
+    code TEXT PRIMARY KEY,       -- JAM, DIP, CDV ... (the site part of a tote lot number)
     name TEXT NOT NULL
 );
 
@@ -1964,6 +1964,7 @@ def init_db():
             ensure_requisition_contact(conn)
             ensure_sgs_analyses(conn)
             ensure_reagent_types(conn)
+            ensure_site_list(conn)
             ensure_grade_rules(conn)
             soft_step(conn, "feedstock grades", lambda: sync_tote_grades(conn, None, "Start-up check", quiet=True))
             soft_step(conn, "foreign-key indexes", lambda: ensure_indexes(conn))
@@ -4331,6 +4332,8 @@ def migrate(conn):
     for col, decl in (("receipt_id", "INTEGER REFERENCES inventory_receipts(id)"), ("supplier_item_code", "TEXT"), ("unit_price", "REAL"), ("received_as", "TEXT")):
         if col not in clcols:
             conn.execute("ALTER TABLE consumable_lots ADD COLUMN %s %s" % (col, decl))
+    if "active" not in {r["name"] for r in conn.execute("PRAGMA table_info(sites)")}:        # a site that is not active is not offered for a new tote; its old totes keep it
+        conn.execute("ALTER TABLE sites ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
     spcols = {r["name"] for r in conn.execute("PRAGMA table_info(run_sample_points)")}
     if "stage" not in spcols:
         conn.execute("ALTER TABLE run_sample_points ADD COLUMN stage TEXT")
@@ -4845,6 +4848,39 @@ def load_grade_rules(conn):
             groups = []
         rules.append({"id": r["id"], "grade": r["grade"], "note": r["note"], "enabled": bool(r["enabled"]), "groups": groups})
     return rules, default
+
+
+# The sites a tote can come from (code = the site part of its lot number). Everything else stays in the table, inactive, so the totes that already carry it still show its name.
+SITE_LIST = [("CDV", "Cordova"), ("COR", "Cormorant"), ("DIP", "Diplock Island"), ("JAM", "James Island"), ("KOD", "Kodiak"), ("SGR", "Seagrove")]
+
+
+def ensure_site_list(conn):
+    """Once: only the six sites in SITE_LIST are offered. Cordova used to be COR (now Cormorant) and Seagrove used to be ASG: their existing totes keep their lot numbers (the labels on
+    the totes) but move to the new site code (CDV, SGR). Every other old site stays, inactive. Recorded in the configuration log; later edits are never overwritten."""
+    def apply():
+        was = conn.execute("SELECT name FROM sites WHERE code='COR'").fetchone()
+        moves = []
+        if was and was["name"] != "Cormorant":
+            moves.append(("COR", "CDV", "Cordova"))
+        if conn.execute("SELECT 1 FROM sites WHERE code='ASG'").fetchone():
+            moves.append(("ASG", "SGR", "Seagrove"))
+        moved = []
+        for old, new, name in moves:
+            conn.execute("INSERT OR IGNORE INTO sites (code,name,active) VALUES (?,?,1)", (new, name))
+            n = conn.execute("UPDATE tote_lots SET site_code=? WHERE site_code=?", (new, old)).rowcount
+            if n:
+                moved.append("%d totes moved from %s to %s" % (n, old, new))
+        for code, name in SITE_LIST:
+            conn.execute("INSERT INTO sites (code,name,active) VALUES (?,?,1) ON CONFLICT(code) DO UPDATE SET name=excluded.name, active=1", (code, name))
+        codes = [c for c, _n in SITE_LIST]
+        conn.execute("UPDATE sites SET active=0 WHERE code NOT IN (%s) AND code<>'MIX'" % ",".join("?" * len(codes)), codes)
+        conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('site','sites','Sites offered for feedstock',?,?,?,?)",
+                     (None, "; ".join("%s = %s" % (c, n) for c, n in SITE_LIST) + (" (%s; lot numbers unchanged)" % ", ".join(moved) if moved else ""), "System", now_iso()))
+    run_once(conn, "site_list_2026_10", apply)
+
+
+def active_site_codes(conn):
+    return [r["code"] for r in conn.execute("SELECT code FROM sites WHERE active=1 AND code<>'MIX' ORDER BY name")]
 
 
 def ensure_grade_rules(conn):
@@ -7441,8 +7477,8 @@ class Handler(BaseHTTPRequestHandler):
     def refdata(self, conn):
         species = [dict(code=r["code"], name=r["name"], common=r["common"])
                    for r in conn.execute("SELECT * FROM species ORDER BY code")]
-        sites = [dict(code=r["code"], name=r["name"])
-                 for r in conn.execute("SELECT * FROM sites ORDER BY code")]
+        sites = [dict(code=r["code"], name=r["name"], active=bool(r["active"]))
+                 for r in conn.execute("SELECT * FROM sites ORDER BY name")]
         locations = [r["name"] for r in conn.execute("SELECT name FROM locations ORDER BY name")]
         sku_species = {}
         for r in conn.execute("SELECT sku_code, species_code FROM fg_sku_species"):
@@ -9499,8 +9535,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(400, "Not enough %s on hand (%g < %d)"
                                    % (ibc_row["name"], ibc_row["on_hand"], count))
                 storage_source = storage_source or ibc_row["name"]
-            if not conn.execute("SELECT 1 FROM sites WHERE code=?", (site,)).fetchone():
-                conn.execute("INSERT INTO sites (code,name) VALUES (?,?)", (site, site))
+            if site not in active_site_codes(conn):
+                raise ApiError(400, "Unknown site code '%s'. Choose one of: %s" % (site, ", ".join(active_site_codes(conn))))
             if not conn.execute("SELECT 1 FROM species WHERE code=?", (species,)).fetchone():
                 raise ApiError(400, "Unknown species code: %s" % species)
             if location:
@@ -9578,7 +9614,7 @@ class Handler(BaseHTTPRequestHandler):
         if len(data_rows) > 500:
             raise ApiError(400, "Too many rows in one import (max 500): split the file")
         species_codes = {r["code"] for r in conn.execute("SELECT code FROM species")}
-        known_sites = {r["code"] for r in conn.execute("SELECT code FROM sites")}
+        known_sites = set(active_site_codes(conn))
         known_locations = {r["name"] for r in conn.execute("SELECT name FROM locations")}
         today = today_iso()
         warnings, new_sites, new_locs = [], set(), set()
@@ -9596,7 +9632,7 @@ class Handler(BaseHTTPRequestHandler):
             elif not re.fullmatch(r"[A-Z0-9]{2,8}", site):
                 problem(rn, "site", "Site code '%s' should be letters and numbers only (2-8 characters)." % site)
             elif site not in known_sites:
-                new_sites.add(site)
+                problem(rn, "site", "'%s' is not one of the sites: %s." % (site, ", ".join(sorted(known_sites))))
             if not species:
                 if "species" not in absent:
                     problem(rn, "species", "Required.")
@@ -9709,16 +9745,12 @@ class Handler(BaseHTTPRequestHandler):
                            "import_errors", {"problems": problems[:200], "problemCount": len(problems)})
         planned.sort(key=lambda p: p["rn"])
         lots = ["%s-%s-%s-%03d" % (p["site"], p["species"], p["date"].replace("-", ""), p["tote"]) for p in planned]
-        for sc in sorted(new_sites):
-            warnings.append("Site code %s is new and will be added." % sc)
         for lc in sorted(new_locs):
             warnings.append("Location '%s' is new and will be added." % lc)
         if d.get("dryRun"):
             return {"ok": True, "dryRun": True, "count": len(lots), "lots": lots, "warnings": warnings}
         ts, who = now_iso(), user["name"] if user else None
         common = {r["code"]: (r["common"] or r["code"]) for r in conn.execute("SELECT code, common FROM species")}
-        for sc in sorted(new_sites):
-            conn.execute("INSERT OR IGNORE INTO sites (code,name) VALUES (?,?)", (sc, sc))
         for lc in sorted(new_locs):
             conn.execute("INSERT OR IGNORE INTO locations (name) VALUES (?)", (lc,))
         for p, lot in zip(planned, lots):
