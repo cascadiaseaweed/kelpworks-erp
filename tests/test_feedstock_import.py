@@ -299,9 +299,30 @@ def test_whole_is_accepted_by_the_csv_import_and_the_bulk_set(srv, admin):
     assert tote_row(srv, lots[2])[0] == "Whole"
 
 
-def test_only_coarse_totes_can_be_pulled_for_pre_processing(srv, admin):
-    whole = admin.post("/api/harvest", {"site": "JAM", "species": "SL", "harvestDate": "2026-09-07", "toteCount": 1, "totalKg": 900, "location": "Cold", "grind": "Whole"}).json["created"][0]
-    tid = sql(srv, "SELECT id FROM tote_lots WHERE lot_number=?", (whole,))[0][0]
+def whole_tote(srv, admin, date):
+    lot = admin.post("/api/harvest", {"site": "JAM", "species": "SL", "harvestDate": date, "toteCount": 1, "totalKg": 900, "location": "Cold", "grind": "Whole"}).json["created"][0]
+    return lot, sql(srv, "SELECT id FROM tote_lots WHERE lot_number=?", (lot,))[0][0]
+
+
+def test_whole_and_coarse_totes_can_be_pulled_for_pre_processing_but_not_fine(srv, admin):
+    _lot, whole = whole_tote(srv, admin, "2026-09-07")
+    fine = harvest_totes(admin, n=1, date="2026-09-08")[0]
+    admin.post("/api/totes/set-bulk", {"ids": [fine], "grind": "Fine"}).raise_for_status()
     bid = admin.post("/api/preproc", {}).json["id"]
-    r = admin.post("/api/preproc/%d/inputs" % bid, {"toteIds": [tid]})
-    assert r.status == 400 and "only Coarse totes" in r.json["error"]
+    r = admin.post("/api/preproc/%d/inputs" % bid, {"toteIds": [fine]})
+    assert r.status == 400 and "only Coarse or Whole totes" in r.json["error"]
+    assert admin.post("/api/preproc/%d/inputs" % bid, {"toteIds": [whole]}).status == 200
+    assert sql(srv, "SELECT status FROM tote_lots WHERE id=?", (whole,))[0][0] == "wip"
+
+
+def test_a_whole_tote_is_shredded_into_a_fine_blend(srv, admin):
+    lot, tid = whole_tote(srv, admin, "2026-09-09")
+    bid = admin.post("/api/preproc", {}).json["id"]
+    assert admin.post("/api/preproc/%d/inputs" % bid, {"toteIds": [tid]}).status == 200
+    admin.put("/api/preproc/%d" % bid, {"batchDate": "2026-09-09", "operators": "QA", "location": "Cold", "measuredPh": 3.7, "targetPh": 3.7, "citricKg": 0}).raise_for_status()
+    admin.put("/api/preproc/%d/packaging" % bid, {"rows": [{"container": "New 1,000 L IBC Tote", "qty": 1, "litresEach": 1000}]}).raise_for_status()
+    done = admin.post("/api/preproc/%d/complete" % bid, {})
+    assert done.status == 200, done.text
+    assert sql(srv, "SELECT status FROM tote_lots WHERE id=?", (tid,))[0][0] == "consumed"
+    out = sql(srv, "SELECT grind, lot_number FROM tote_lots WHERE preproc_batch_id=?", (bid,))
+    assert len(out) == 1 and out[0][0] == "Fine"

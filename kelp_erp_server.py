@@ -9215,8 +9215,8 @@ class Handler(BaseHTTPRequestHandler):
                 t = conn.execute("SELECT * FROM tote_lots WHERE id=?", (tid,)).fetchone()
                 if not t or t["status"] != "in_stock":
                     raise ApiError(400, "Tote %s is not in stock" % (t["lot_number"] if t else tid))
-                if (t["grind"] or "Coarse") != "Coarse":
-                    raise ApiError(400, "Tote %s is %s: only Coarse totes can be pulled for pre-processing" % (t["lot_number"], t["grind"]))
+                if (t["grind"] or "Coarse") not in ("Coarse", "Whole"):
+                    raise ApiError(400, "Tote %s is %s grind: only Coarse or Whole totes can be pulled for pre-processing" % (t["lot_number"], t["grind"]))
                 self._log_stability(conn, tid, user, "Status", "in_stock", "wip",
                                     "Pulled for pre-processing batch %s" % b["batch_lot"])
                 conn.execute("UPDATE tote_lots SET status='wip' WHERE id=?", (tid,))

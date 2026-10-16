@@ -7001,7 +7001,7 @@ async function pagePreproc(v) {
   const { batches } = await api('GET', '/preproc');
   const drafts = batches.filter(b => b.status === 'draft'), done = batches.filter(b => b.status === 'completed');
   if (!batches.length) {
-    v.append(el('div', { class: 'empty card' }, 'No pre-processing batches yet. Click “New batch” to pull coarse-ground totes, shred and blend them, and pack the blend into IBCs that go back into Feedstock Inventory as fine-grind lots (traceable to the original totes).'));
+    v.append(el('div', { class: 'empty card' }, 'No pre-processing batches yet. Click “New batch” to pull coarse or whole totes, shred and blend them, and pack the blend into IBCs that go back into Feedstock Inventory as fine-grind lots (traceable to the original totes).'));
     return;
   }
   if (drafts.length) {
@@ -7096,7 +7096,7 @@ async function openPreprocBatch(id, section) {
   const picks = new Set();
   async function loadPickTotes() {
     const r = await api('GET', '/totes?status=in_stock');
-    pickTotes = r.totes.filter(t => (t.grind || 'Coarse') === 'Coarse' && t.location !== 'QAQC Hold');
+    pickTotes = r.totes.filter(t => ['Coarse', 'Whole'].includes(t.grind || 'Coarse') && t.location !== 'QAQC Hold');
     drawPick();
   }
   function drawPick() {
@@ -7106,7 +7106,7 @@ async function openPreprocBatch(id, section) {
     [...picks].forEach(i => { if (!pickTotes.some(t => t.id === i)) picks.delete(i); });
     pickHost.innerHTML = '';
     const tb = el('tbody', {});
-    if (!rows.length) tb.append(el('tr', {}, el('td', { colspan: 8, class: 'empty' }, 'No coarse-grind totes in stock match.')));
+    if (!rows.length) tb.append(el('tr', {}, el('td', { colspan: 8, class: 'empty' }, 'No coarse or whole totes in stock match.')));
     rows.forEach(t => {
       const cb = el('input', { type: 'checkbox', onchange: () => { cb.checked ? picks.add(t.id) : picks.delete(t.id); addBtn.textContent = 'Add selected (' + picks.size + ')'; } });
       cb.checked = picks.has(t.id);
@@ -7173,7 +7173,7 @@ async function openPreprocBatch(id, section) {
     pickSummary.innerHTML = ''; pickSummary.append(sl('Totes', B.inputs.length), sl('Input', fmt(kg, 1) + ' kg'), sl('Volume', fmt(vol, 0) + ' L'));
   };
   const sPick = preSection('Feedstock pick list', [
-    el('div', { class: 'help', style: 'margin-bottom:6px' }, 'Only coarse-grind totes in stock (not on QAQC Hold) are offered. Pulled totes are locked to this batch until it is completed or discarded.'),
+    el('div', { class: 'help', style: 'margin-bottom:6px' }, 'Only coarse or whole totes in stock (not on QAQC Hold) are offered. Pulled totes are locked to this batch until it is completed or discarded.'),
     el('div', { class: 'form-row' }, field('Search', qInp), field('Species', spSel), field('Site', siteSel)),
     pickHost, el('div', { style: 'margin:8px 0' }, addBtn),
     pickSummary, pickedHost],
@@ -7269,7 +7269,7 @@ async function openPreprocBatch(id, section) {
   }
   (B.packaging.length ? B.packaging : [null]).forEach(addPackRow);
   const sPack = preSection('Pack-out into IBCs', [
-    el('div', { class: 'help', style: 'margin-bottom:6px' }, 'Pulled coarse totes are shredded to a fine grind, and each output IBC becomes its own fine-grind lot (' + B.batchLot + '-01, -02 …) in Feedstock Inventory. Empty IBCs are deducted from Inventory Items when the batch is completed; the source totes’ emptied IBCs return to the Used IBC pool.'),
+    el('div', { class: 'help', style: 'margin-bottom:6px' }, 'Pulled coarse or whole totes are shredded to a fine grind, and each output IBC becomes its own fine-grind lot (' + B.batchLot + '-01, -02 …) in Feedstock Inventory. Empty IBCs are deducted from Inventory Items when the batch is completed; the source totes’ emptied IBCs return to the Used IBC pool.'),
     field(reqLabel('Output location'), locSel),
     el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {}, el('th', {}, 'Empty IBC used'), el('th', {}, 'Qty'), el('th', {}, 'Fill each (L)'), el('th', {}, ''))), packRows)),
     el('div', { style: 'margin:6px 0' }, el('button', { type: 'button', class: 'secondary', onclick: () => addPackRow() }, '+ Add row')),
@@ -7305,7 +7305,7 @@ function drawPreprocCompleted(v, B) {
   v.append(el('div', { class: 'summary-line' }, sl('Estimated weight', opt(B.shreddedKg, 1, ' kg')), sl('Start solids', opt(B.startSolidsPct, 2, ' %')),
     sl('Target solids', opt(B.targetSolidsPct, 2, ' %')), sl('Water added', opt(B.waterAddedL, 0, ' L')), sl('Blend volume', opt(B.blendVolumeL, 0, ' L')),
     sl('Final solids (calc.)', opt(B.finalSolidsPct, 2, ' %')), sl('pH', fmt(B.measuredPh, 1) + ' (target ' + fmt(B.targetPh, 1) + ')'), sl('Citric acid', fmt(B.citricKg, 2) + ' kg')));
-  v.append(el('h3', {}, 'Source totes (coarse grind)'),
+  v.append(el('h3', {}, 'Source totes (coarse or whole)'),
     table(['Lot', 'Site', 'Species', 'Harvest date', 'Weight tote (kg)', 'Volume tote (L)'],
       B.inputs.map(i => [mono(i.lot), siteName(i.site), speciesName(i.species), i.harvestDate || '—', fmt(i.weightKg, 1), i.volumeL != null ? fmt(i.volumeL, 0) : '—']), [false, false, false, false, true, true]));
   v.append(el('div', { class: 'page-head', style: 'margin-top:14px' }, el('h3', {}, 'Fine-grind output IBCs'),
@@ -7323,7 +7323,7 @@ async function showPreprocTrace(t) {
   const body = el('div', {},
     el('div', { class: 'summary-line' }, sl('Lot', t.lot), sl('Batch', b.batchLot), sl('Batch date', b.batchDate || '—'), sl('Status', b.status)),
     el('div', { class: 'help', style: 'margin:6px 0' }, r.role === 'output'
-      ? t.lot + ' is a fine-grind blend made in batch ' + b.batchLot + ' from these coarse-grind totes:'
+      ? t.lot + ' is a fine-grind blend made in batch ' + b.batchLot + ' from these source totes:'
       : t.lot + ' was shredded in batch ' + b.batchLot + ' and now lives in these fine-grind lots:'),
     el('div', {}, el('b', {}, 'Source totes')),
     table(['Lot', 'Site', 'Species', 'Harvest date', 'Weight (kg)'], b.inputs.map(i => [mono(i.lot), siteName(i.site), speciesName(i.species), i.harvestDate || '—', fmt(i.weightKg, 1)]), [false, false, false, false, true]),
