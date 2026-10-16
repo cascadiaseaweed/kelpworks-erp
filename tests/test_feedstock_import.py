@@ -269,3 +269,60 @@ def test_bulk_set_never_touches_a_tote_in_a_run(srv, admin):
     r = admin.post("/api/totes/set-bulk", {"ids": [free, used], "grind": "Fine"})
     assert r.status == 400 and "cannot be changed" in r.json["error"]
     assert sql(srv, "SELECT grind FROM tote_lots WHERE id=?", (free,))[0][0] in ("Coarse", None)
+
+
+# ---- the Whole grind ---------------------------------------------------------------------------------------------------------------
+
+def tote_row(srv, lot):
+    return sql(srv, "SELECT grind, description FROM tote_lots WHERE lot_number=?", (lot,))[0]
+
+
+def test_a_tote_can_be_checked_in_as_whole(srv, admin):
+    r = admin.post("/api/harvest", {"site": "JAM", "species": "SL", "harvestDate": "2026-09-05", "toteCount": 1, "totalKg": 900, "location": "Cold", "grind": "whole"})
+    assert r.status == 200, r.text
+    assert tote_row(srv, r.json["created"][0]) == ("Whole", "Fresh Stabilized Whole Sugar Kelp")
+    assert [t["grind"] for t in admin.get("/api/totes").json["totes"] if t["lot"] == r.json["created"][0]] == ["Whole"]
+    bad = admin.post("/api/harvest", {"site": "JAM", "species": "SL", "harvestDate": "2026-09-05", "toteCount": 1, "totalKg": 900, "location": "Cold", "grind": "Chunky"})
+    assert bad.status == 400 and "Coarse, Fine or Whole" in bad.json["error"]
+
+
+def test_whole_is_accepted_by_the_csv_import_and_the_bulk_set(srv, admin):
+    r = load(admin, csv(row(date="2026-09-06", grind="Whole"), row(date="2026-09-06", grind="WHOLE"), row(date="2026-09-06")))
+    assert r.status == 200, r.text
+    lots = r.json["created"]
+    assert [tote_row(srv, l)[0] for l in lots] == ["Whole", "Whole", "Coarse"]
+    assert tote_row(srv, lots[0])[1].startswith("Fresh Stabilized Whole") and tote_row(srv, lots[2])[1].startswith("Fresh Stabilized Ground")
+    where, details = problems(check(admin, csv(row(date="2026-09-06", grind="Chunky"))))
+    assert where == [(2, "grind")] and "Whole" in details[0]["message"]
+    ids = [sql(srv, "SELECT id FROM tote_lots WHERE lot_number=?", (l,))[0][0] for l in lots]
+    assert admin.post("/api/totes/set-bulk", {"ids": [ids[2]], "grind": "Whole"}).json["updated"] == 1
+    assert tote_row(srv, lots[2])[0] == "Whole"
+
+
+def whole_tote(srv, admin, date):
+    lot = admin.post("/api/harvest", {"site": "JAM", "species": "SL", "harvestDate": date, "toteCount": 1, "totalKg": 900, "location": "Cold", "grind": "Whole"}).json["created"][0]
+    return lot, sql(srv, "SELECT id FROM tote_lots WHERE lot_number=?", (lot,))[0][0]
+
+
+def test_whole_and_coarse_totes_can_be_pulled_for_pre_processing_but_not_fine(srv, admin):
+    _lot, whole = whole_tote(srv, admin, "2026-09-07")
+    fine = harvest_totes(admin, n=1, date="2026-09-08")[0]
+    admin.post("/api/totes/set-bulk", {"ids": [fine], "grind": "Fine"}).raise_for_status()
+    bid = admin.post("/api/preproc", {}).json["id"]
+    r = admin.post("/api/preproc/%d/inputs" % bid, {"toteIds": [fine]})
+    assert r.status == 400 and "only Coarse or Whole totes" in r.json["error"]
+    assert admin.post("/api/preproc/%d/inputs" % bid, {"toteIds": [whole]}).status == 200
+    assert sql(srv, "SELECT status FROM tote_lots WHERE id=?", (whole,))[0][0] == "wip"
+
+
+def test_a_whole_tote_is_shredded_into_a_fine_blend(srv, admin):
+    lot, tid = whole_tote(srv, admin, "2026-09-09")
+    bid = admin.post("/api/preproc", {}).json["id"]
+    assert admin.post("/api/preproc/%d/inputs" % bid, {"toteIds": [tid]}).status == 200
+    admin.put("/api/preproc/%d" % bid, {"batchDate": "2026-09-09", "operators": "QA", "location": "Cold", "measuredPh": 3.7, "targetPh": 3.7, "citricKg": 0}).raise_for_status()
+    admin.put("/api/preproc/%d/packaging" % bid, {"rows": [{"container": "New 1,000 L IBC Tote", "qty": 1, "litresEach": 1000}]}).raise_for_status()
+    done = admin.post("/api/preproc/%d/complete" % bid, {})
+    assert done.status == 200, done.text
+    assert sql(srv, "SELECT status FROM tote_lots WHERE id=?", (tid,))[0][0] == "consumed"
+    out = sql(srv, "SELECT grind, lot_number FROM tote_lots WHERE preproc_batch_id=?", (bid,))
+    assert len(out) == 1 and out[0][0] == "Fine"

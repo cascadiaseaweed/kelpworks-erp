@@ -351,7 +351,7 @@ for `main` so a red run blocks the merge.
   required-field items in the Dilution & Preservation section, and `dilutionPasses` is part of the signed-log snapshot.
 - **Pre-Processing (shred + blend)** (`preproc_batches` / `preproc_inputs` / `preproc_packaging`, `route_preproc`,
   `/api/preproc`, the "Pre-Processing" tab: batches are cards like production runs -- `pagePreproc` / `preprocDraftCard` (section chips from `_preproc_progress`, the same `stageProgress` component) / `preprocDoneCard` -- and `openPreprocBatch` opens the editor / batch record in a wide window) turns coarse-grind feedstock into
-  fine-grind feedstock (harvest check-in / CSV import set `grind`, default Coarse; check-in no longer has a storage-unit source or deducts empty-IBC stock). A draft batch pulls coarse totes (`tote_lots.grind='Coarse'`, in stock, not on QAQC Hold) from a
+  fine-grind feedstock (harvest check-in / CSV import set `grind`, default Coarse; check-in no longer has a storage-unit source or deducts empty-IBC stock). A draft batch pulls coarse or whole totes (`tote_lots.grind` Coarse or Whole, in stock, not on QAQC Hold) from a
   pick list (status -> `wip`, same lock as a run), each characterized with the shared `buildFeedstockCard`
   (`/api/totes/:id/characterize` + `/photo`, so it lands in the tote's own stability log; the shredded mass is simply the sum
   of the pulled totes' weights -- there is no separate shredding section), then blend solids loading (all optional;
@@ -532,7 +532,7 @@ for `main` so a red run blocks the merge.
 ## Domain model (key tables)
 
 `species`, `sites`, `tote_lots` (stabilized totes; status in_stock/wip/hold/consumed/
-disposed; `grind` Coarse|Fine), `preproc_batches` / `preproc_inputs` / `preproc_packaging`, `samples` / `sample_events` / `sample_cart` / `labs` / `lab_analyses` / `lab_requisitions`, `production_runs` + `run_inputs`, `fg_lots`, `consumables` +
+disposed; `grind` Coarse|Fine|Whole), `preproc_batches` / `preproc_inputs` / `preproc_packaging`, `samples` / `sample_events` / `sample_cart` / `labs` / `lab_analyses` / `lab_requisitions`, `production_runs` + `run_inputs`, `fg_lots`, `consumables` +
 `consumable_txns`, `run_reagent_commits`, `release_events`, `cip_events` / `cip_event_chemicals`,
 `coa_specs` / `lab_results`, `customers` / `shipments` /
 `shipment_lines`, `disposals`, `run_attachments`, `run_edits`, `location_moves`,

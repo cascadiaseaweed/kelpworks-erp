@@ -4879,6 +4879,14 @@ def ensure_site_list(conn):
     run_once(conn, "site_list_2026_10", apply)
 
 
+# How a tote's material was reduced when it was checked in: Coarse (the usual check-in) or Whole (not ground at all); Fine is made only by a Pre-Processing batch (or set by hand).
+GRINDS = ("Coarse", "Fine", "Whole")
+
+
+def tote_description(grind, species_name):
+    return "Fresh Stabilized %s %s" % ("Whole" if grind == "Whole" else "Ground", species_name)
+
+
 def active_site_codes(conn):
     return [r["code"] for r in conn.execute("SELECT code FROM sites WHERE active=1 AND code<>'MIX' ORDER BY name")]
 
@@ -8019,8 +8027,8 @@ class Handler(BaseHTTPRequestHandler):
                 new["avg_weight_kg"] = w
             if (d.get("grind") or "").strip():
                 g = d["grind"].strip().capitalize()
-                if g not in ("Coarse", "Fine"):
-                    raise ApiError(400, "Grind must be Coarse or Fine")
+                if g not in GRINDS:
+                    raise ApiError(400, "Grind must be Coarse, Fine or Whole")
                 new["grind"] = g
             if (d.get("stabilizationMethod") or "").strip():
                 sm = {"citric acid": "Citric acid", "fresh": "Fresh"}.get(d["stabilizationMethod"].strip().lower())
@@ -9363,8 +9371,8 @@ class Handler(BaseHTTPRequestHandler):
                 t = conn.execute("SELECT * FROM tote_lots WHERE id=?", (tid,)).fetchone()
                 if not t or t["status"] != "in_stock":
                     raise ApiError(400, "Tote %s is not in stock" % (t["lot_number"] if t else tid))
-                if (t["grind"] or "Coarse") != "Coarse":
-                    raise ApiError(400, "Tote %s is already fine grind" % t["lot_number"])
+                if (t["grind"] or "Coarse") not in ("Coarse", "Whole"):
+                    raise ApiError(400, "Tote %s is %s grind: only Coarse or Whole totes can be pulled for pre-processing" % (t["lot_number"], t["grind"]))
                 self._log_stability(conn, tid, user, "Status", "in_stock", "wip",
                                     "Pulled for pre-processing batch %s" % b["batch_lot"])
                 conn.execute("UPDATE tote_lots SET status='wip' WHERE id=?", (tid,))
@@ -9516,8 +9524,8 @@ class Handler(BaseHTTPRequestHandler):
             stabilization_method = (d.get("stabilizationMethod") or "").strip() or "Citric acid"
             storage_unit = (d.get("storageUnit") or "").strip() or "Tote"
             grind = (d.get("grind") or "").strip().capitalize() or "Coarse"
-            if grind not in ("Coarse", "Fine"):
-                raise ApiError(400, "Grind must be Coarse or Fine")
+            if grind not in GRINDS:
+                raise ApiError(400, "Grind must be Coarse, Fine or Whole")
             notes = (d.get("notes") or "").strip() or None
             if not site or not species or count <= 0:
                 raise ApiError(400, "Site, species and a storage unit count > 0 are required")
@@ -9559,7 +9567,7 @@ class Handler(BaseHTTPRequestHandler):
                     "description,status,stabilization_method,storage_unit,storage_source,notes,created_at,grind)"
                     " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'in_stock',?,?,?,?,?,?)",
                     (lot, site, species, int(date[:4]), date, received_date, n, 1000, ph, orp, avg, location,
-                     "Fresh Stabilized Ground %s" % common, stabilization_method, storage_unit,
+                     tote_description(grind, common), stabilization_method, storage_unit,
                      storage_source, notes, ts, grind))
                 created.append(lot)
             if ibc_row:
@@ -9683,8 +9691,8 @@ class Handler(BaseHTTPRequestHandler):
                     tote_no = int(tote_raw)
             grind_raw = row.get("grind", "")
             grind = grind_raw.capitalize() if grind_raw else "Coarse"
-            if grind not in ("Coarse", "Fine"):
-                problem(rn, "grind", "Must be Coarse or Fine (got '%s')." % grind_raw)
+            if grind not in GRINDS:
+                problem(rn, "grind", "Must be Coarse, Fine or Whole (got '%s')." % grind_raw)
             stab = row.get("stabilizationMethod", "")
             stab = {"citric acid": "Citric acid", "fresh": "Fresh"}.get(stab.lower(), stab) if stab else "Citric acid"
             if stab not in ("Citric acid", "Fresh"):
@@ -9760,7 +9768,7 @@ class Handler(BaseHTTPRequestHandler):
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (lot, p["site"], p["species"], int(p["date"][:4]), p["date"], p["received"], p["tote"], 1000, p["ph"], today_iso() if p["ph"] is not None else None,
                  p["orp"], today_iso() if p["orp"] is not None else None, p["tds"], today_iso() if p["tds"] is not None else None, p["avg"], p["location"],
-                 "Fresh Stabilized Ground %s" % common.get(p["species"], p["species"]), p["status"], p["stab"], p["unit"], p["source"], p["notes"], ts, p["grind"]))
+                 tote_description(p["grind"], common.get(p["species"], p["species"])), p["status"], p["stab"], p["unit"], p["source"], p["notes"], ts, p["grind"]))
             readings = ", ".join(x for x in ("pH %s" % p["ph"] if p["ph"] is not None else "", "ORP %s" % p["orp"] if p["orp"] is not None else "",
                                               "TDS %s %%" % p["tds"] if p["tds"] is not None else "") if x)
             conn.execute("INSERT INTO tote_stability_log (tote_lot_id,user_name,field,old_value,new_value,note,created_at) VALUES (?,?,?,?,?,?,?)",

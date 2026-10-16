@@ -200,8 +200,8 @@ const STAB_COLUMNS = [
     cell: t => siteName(t.site) },
   { key: 'species', label: 'Species', value: t => speciesName(t.species),
     options: () => [...new Set((State.ref.species || []).map(s => s.common || s.name))], cell: t => speciesName(t.species) },
-  { key: 'grind', label: 'Grind', value: t => t.grind || 'Coarse', options: () => ['Coarse', 'Fine'],
-    cell: t => t.grind === 'Fine' ? badge('ok', 'Fine') : 'Coarse' },
+  { key: 'grind', label: 'Grind', value: t => t.grind || 'Coarse', options: () => ['Coarse', 'Fine', 'Whole'],
+    cell: t => t.grind === 'Fine' ? badge('ok', 'Fine') : t.grind === 'Whole' ? badge('wip', 'Whole') : 'Coarse' },
   { key: 'stabMethod', label: 'Stabilization method', value: t => t.stabilizationMethod || '',
     options: () => ['Citric acid', 'Fresh'], cell: t => t.stabilizationMethod || '—', hidden: true },
   { key: 'harvestDate', label: 'Harvest date', value: t => t.harvestDate || '', cell: t => t.harvestDate || '—' },
@@ -528,7 +528,7 @@ function bulkSetTotes(ids) {
     el('div', { class: 'help' }, 'Fill in only what you want to set — anything left blank is not changed.'),
     field('Average weight per tote (kg)', el('input', { type: 'number', id: 'bs_kg', step: 'any', min: '0', max: '5000', placeholder: 'e.g. 180.5' })),
     el('div', { class: 'form-row' },
-      field('Grind', el('select', { id: 'bs_grind' }, el('option', { value: keep }, '— no change —'), el('option', {}, 'Coarse'), el('option', {}, 'Fine'))),
+      field('Grind', el('select', { id: 'bs_grind' }, el('option', { value: keep }, '— no change —'), el('option', {}, 'Coarse'), el('option', {}, 'Fine'), el('option', {}, 'Whole'))),
       field('Stabilization method', el('select', { id: 'bs_stab' }, el('option', { value: keep }, '— no change —'), el('option', {}, 'Citric acid'), el('option', {}, 'Fresh')))),
     field('Note (optional)', el('input', { id: 'bs_note', placeholder: 'e.g. batch weighed 2026-10-16' })),
     el('div', { class: 'help' }, 'Each change is written to every tote’s Feedstock Stability log (old → new). Totes that are in a run or already consumed cannot be changed — '
@@ -729,7 +729,7 @@ async function openHarvest() {
       field('Total harvest (kg)', el('input', { type: 'number', id: 'h_kg', min: '0', step: '0.01', placeholder: 'averaged across storage units' })),
       field('Storage unit', selectFrom('', [['Tote', 'Tote'], ['Bag', 'Bag']], null, 'h_unit'))),
     el('div', { class: 'form-row' },
-      field('Grind', selectFrom('', [['Coarse', 'Coarse'], ['Fine', 'Fine']], null, 'h_grind')),
+      field('Grind', selectFrom('', [['Coarse', 'Coarse'], ['Fine', 'Fine'], ['Whole', 'Whole']], null, 'h_grind')),
       field('pH', el('input', { type: 'number', id: 'h_ph', step: '0.1', placeholder: 'e.g. 3.7' }))),
     field('ORP (mV) — optional', el('input', { type: 'number', id: 'h_orp', step: '1', placeholder: 'e.g. -150' })),
     field('Notes', el('textarea', { id: 'h_notes', rows: '2', placeholder: 'Optional' })),
@@ -811,7 +811,7 @@ async function openFeedstockImport() {
     el('div', { style: 'display:flex;gap:10px;align-items:center;margin:6px 0' }, checkBtn, status),
     report,
     el('div', { class: 'help' }, el('b', {}, 'Required: '), 'site, species, harvestDate (YYYY-MM-DD).'),
-    el('div', { class: 'help' }, el('b', {}, 'Optional: '), 'avgWeightKg (leave blank if the batch is not weighed yet — use “Set values for selected” later), toteNumber, receivedDate, grind (Coarse or Fine, default Coarse), stabilizationMethod (Citric acid or Fresh), storageUnit (Tote or Bag), storageSource, location, ph, orp, tdsPct, status (in_stock or hold), notes.'),
+    el('div', { class: 'help' }, el('b', {}, 'Optional: '), 'avgWeightKg (leave blank if the batch is not weighed yet — use “Set values for selected” later), toteNumber, receivedDate, grind (Coarse, Fine or Whole, default Coarse), stabilizationMethod (Citric acid or Fresh), storageUnit (Tote or Bag), storageSource, location, ph, orp, tdsPct, status (in_stock or hold), notes.'),
     el('div', { class: 'help' }, el('b', {}, 'Tote numbers: '), 'the lot number is SITE-SPECIES-YYYYMMDD-NNN, where NNN is the tote number. Leave toteNumber blank to number the totes automatically. If you type one, it must be a whole number from 1 to 999 and unique: '
       + 'it cannot repeat in the file, match a tote already in Feedstock Inventory, or match a tote that was deleted (those numbers are never reused). '
       + 'Calculated columns (lot number, stabilization period, grade, last updated) are not imported. One problem anywhere blocks the whole file, so nothing is half-imported.'));
@@ -7172,7 +7172,7 @@ async function pagePreproc(v) {
   const { batches } = await api('GET', '/preproc');
   const drafts = batches.filter(b => b.status === 'draft'), done = batches.filter(b => b.status === 'completed');
   if (!batches.length) {
-    v.append(el('div', { class: 'empty card' }, 'No pre-processing batches yet. Click “New batch” to pull coarse-ground totes, shred and blend them, and pack the blend into IBCs that go back into Feedstock Inventory as fine-grind lots (traceable to the original totes).'));
+    v.append(el('div', { class: 'empty card' }, 'No pre-processing batches yet. Click “New batch” to pull coarse or whole totes, shred and blend them, and pack the blend into IBCs that go back into Feedstock Inventory as fine-grind lots (traceable to the original totes).'));
     return;
   }
   if (drafts.length) {
@@ -7267,7 +7267,7 @@ async function openPreprocBatch(id, section) {
   const picks = new Set();
   async function loadPickTotes() {
     const r = await api('GET', '/totes?status=in_stock');
-    pickTotes = r.totes.filter(t => (t.grind || 'Coarse') === 'Coarse' && t.location !== 'QAQC Hold');
+    pickTotes = r.totes.filter(t => ['Coarse', 'Whole'].includes(t.grind || 'Coarse') && t.location !== 'QAQC Hold');
     drawPick();
   }
   function drawPick() {
@@ -7277,7 +7277,7 @@ async function openPreprocBatch(id, section) {
     [...picks].forEach(i => { if (!pickTotes.some(t => t.id === i)) picks.delete(i); });
     pickHost.innerHTML = '';
     const tb = el('tbody', {});
-    if (!rows.length) tb.append(el('tr', {}, el('td', { colspan: 8, class: 'empty' }, 'No coarse-grind totes in stock match.')));
+    if (!rows.length) tb.append(el('tr', {}, el('td', { colspan: 8, class: 'empty' }, 'No coarse or whole totes in stock match.')));
     rows.forEach(t => {
       const cb = el('input', { type: 'checkbox', onchange: () => { cb.checked ? picks.add(t.id) : picks.delete(t.id); addBtn.textContent = 'Add selected (' + picks.size + ')'; } });
       cb.checked = picks.has(t.id);
@@ -7344,7 +7344,7 @@ async function openPreprocBatch(id, section) {
     pickSummary.innerHTML = ''; pickSummary.append(sl('Totes', B.inputs.length), sl('Input', fmt(kg, 1) + ' kg'), sl('Volume', fmt(vol, 0) + ' L'));
   };
   const sPick = preSection('Feedstock pick list', [
-    el('div', { class: 'help', style: 'margin-bottom:6px' }, 'Only coarse-grind totes in stock (not on QAQC Hold) are offered. Pulled totes are locked to this batch until it is completed or discarded.'),
+    el('div', { class: 'help', style: 'margin-bottom:6px' }, 'Only coarse or whole totes in stock (not on QAQC Hold) are offered. Pulled totes are locked to this batch until it is completed or discarded.'),
     el('div', { class: 'form-row' }, field('Search', qInp), field('Species', spSel), field('Site', siteSel)),
     pickHost, el('div', { style: 'margin:8px 0' }, addBtn),
     pickSummary, pickedHost],
@@ -7440,7 +7440,7 @@ async function openPreprocBatch(id, section) {
   }
   (B.packaging.length ? B.packaging : [null]).forEach(addPackRow);
   const sPack = preSection('Pack-out into IBCs', [
-    el('div', { class: 'help', style: 'margin-bottom:6px' }, 'Pulled coarse totes are shredded to a fine grind, and each output IBC becomes its own fine-grind lot (' + B.batchLot + '-01, -02 …) in Feedstock Inventory. Empty IBCs are deducted from Inventory Items when the batch is completed; the source totes’ emptied IBCs return to the Used IBC pool.'),
+    el('div', { class: 'help', style: 'margin-bottom:6px' }, 'Pulled coarse or whole totes are shredded to a fine grind, and each output IBC becomes its own fine-grind lot (' + B.batchLot + '-01, -02 …) in Feedstock Inventory. Empty IBCs are deducted from Inventory Items when the batch is completed; the source totes’ emptied IBCs return to the Used IBC pool.'),
     field(reqLabel('Output location'), locSel),
     el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {}, el('th', {}, 'Empty IBC used'), el('th', {}, 'Qty'), el('th', {}, 'Fill each (L)'), el('th', {}, ''))), packRows)),
     el('div', { style: 'margin:6px 0' }, el('button', { type: 'button', class: 'secondary', onclick: () => addPackRow() }, '+ Add row')),
@@ -7476,7 +7476,7 @@ function drawPreprocCompleted(v, B) {
   v.append(el('div', { class: 'summary-line' }, sl('Estimated weight', opt(B.shreddedKg, 1, ' kg')), sl('Start solids', opt(B.startSolidsPct, 2, ' %')),
     sl('Target solids', opt(B.targetSolidsPct, 2, ' %')), sl('Water added', opt(B.waterAddedL, 0, ' L')), sl('Blend volume', opt(B.blendVolumeL, 0, ' L')),
     sl('Final solids (calc.)', opt(B.finalSolidsPct, 2, ' %')), sl('pH', fmt(B.measuredPh, 1) + ' (target ' + fmt(B.targetPh, 1) + ')'), sl('Citric acid', fmt(B.citricKg, 2) + ' kg')));
-  v.append(el('h3', {}, 'Source totes (coarse grind)'),
+  v.append(el('h3', {}, 'Source totes (coarse or whole)'),
     table(['Lot', 'Site', 'Species', 'Harvest date', 'Weight tote (kg)', 'Volume tote (L)'],
       B.inputs.map(i => [mono(i.lot), siteName(i.site), speciesName(i.species), i.harvestDate || '—', fmt(i.weightKg, 1), i.volumeL != null ? fmt(i.volumeL, 0) : '—']), [false, false, false, false, true, true]));
   v.append(el('div', { class: 'page-head', style: 'margin-top:14px' }, el('h3', {}, 'Fine-grind output IBCs'),
@@ -7494,7 +7494,7 @@ async function showPreprocTrace(t) {
   const body = el('div', {},
     el('div', { class: 'summary-line' }, sl('Lot', t.lot), sl('Batch', b.batchLot), sl('Batch date', b.batchDate || '—'), sl('Status', b.status)),
     el('div', { class: 'help', style: 'margin:6px 0' }, r.role === 'output'
-      ? t.lot + ' is a fine-grind blend made in batch ' + b.batchLot + ' from these coarse-grind totes:'
+      ? t.lot + ' is a fine-grind blend made in batch ' + b.batchLot + ' from these source totes:'
       : t.lot + ' was shredded in batch ' + b.batchLot + ' and now lives in these fine-grind lots:'),
     el('div', {}, el('b', {}, 'Source totes')),
     table(['Lot', 'Site', 'Species', 'Harvest date', 'Weight (kg)'], b.inputs.map(i => [mono(i.lot), siteName(i.site), speciesName(i.species), i.harvestDate || '—', fmt(i.weightKg, 1)]), [false, false, false, false, true]),
