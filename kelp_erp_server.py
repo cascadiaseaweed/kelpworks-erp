@@ -1482,6 +1482,13 @@ CREATE TABLE IF NOT EXISTS archive_runs (
     folder     TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+-- The folder (and file-name key) a delivery's documents were given the first time they were archived: a later correction of its supplier, date or invoice number never moves them.
+CREATE TABLE IF NOT EXISTS archive_receipts (
+    receipt_id INTEGER PRIMARY KEY REFERENCES inventory_receipts(id),
+    folder     TEXT NOT NULL,
+    file_key   TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 
 -- A finalized run's production log is locked; changing it requires an
 -- amendment (reason + category). While open the run is 'amending' and its
@@ -1563,6 +1570,68 @@ CREATE TABLE IF NOT EXISTS consumable_lot_log (
     reason     TEXT,
     user_name  TEXT,
     created_at TEXT NOT NULL
+);
+-- A delivery: the supplier's invoice, PO and order numbers, the carrier and delivery document, and the documents (invoice, bill of lading, certificate of analysis, freight invoice).
+-- Every lot received from it points here (consumable_lots.receipt_id); lots received with the same supplier + invoice number share one delivery.
+CREATE TABLE IF NOT EXISTS inventory_receipts (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    supplier          TEXT,
+    invoice_no        TEXT,
+    invoice_date      TEXT,
+    po_number         TEXT,
+    order_no          TEXT,                  -- the supplier's order / sales-order number
+    delivery_doc      TEXT,                  -- bill of lading / packing slip / PRO number
+    carrier           TEXT,
+    ship_date         TEXT,
+    received_date     TEXT NOT NULL,
+    arrival_condition TEXT,                  -- ok | issue
+    condition_note    TEXT,
+    notes             TEXT,
+    created_by        TEXT,
+    created_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_receipts_invoice ON inventory_receipts(invoice_no);
+CREATE TABLE IF NOT EXISTS receipt_attachments (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    receipt_id   INTEGER NOT NULL REFERENCES inventory_receipts(id),
+    kind         TEXT NOT NULL DEFAULT 'other',   -- invoice | delivery | coa | freight | other
+    filename     TEXT NOT NULL,
+    content_type TEXT,
+    size         INTEGER,
+    stored_name  TEXT NOT NULL,
+    uploaded_by  TEXT,
+    uploaded_at  TEXT NOT NULL
+);
+-- Append-only: a delivery's details filled in or corrected after the receipt (who, when, old -> new, and why when an existing value was changed).
+CREATE TABLE IF NOT EXISTS receipt_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    receipt_id INTEGER NOT NULL REFERENCES inventory_receipts(id),
+    field      TEXT NOT NULL,
+    old_value  TEXT,
+    new_value  TEXT,
+    reason     TEXT,
+    user_name  TEXT,
+    created_at TEXT NOT NULL
+);
+-- Purchase pack sizes of an item (a 50 lb box, a 208 L drum): how much of the item's stock unit one pack holds. Stock, lots and the ledger are always in the stock unit.
+CREATE TABLE IF NOT EXISTS consumable_packs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    consumable_id INTEGER NOT NULL REFERENCES consumables(id),
+    name          TEXT NOT NULL,
+    qty_per_pack  REAL NOT NULL,
+    active        INTEGER NOT NULL DEFAULT 1,
+    created_by    TEXT,
+    created_at    TEXT NOT NULL,
+    UNIQUE (consumable_id, name)
+);
+CREATE TABLE IF NOT EXISTS consumable_pack_log (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    consumable_id INTEGER NOT NULL REFERENCES consumables(id),
+    pack_id       INTEGER,
+    event         TEXT NOT NULL,
+    detail        TEXT,
+    user_name     TEXT,
+    created_at    TEXT NOT NULL
 );
 
 -- Feedstock grade rules: evaluated top to bottom for every tote, the first enabled rule whose conditions hold gives the grade. A rule is "IF (a AND b) OR (c AND d) THEN
@@ -4256,6 +4325,13 @@ def migrate(conn):
     ctcols = {r["name"] for r in conn.execute("PRAGMA table_info(consumable_txns)")}
     if "user_name" not in ctcols:
         conn.execute("ALTER TABLE consumable_txns ADD COLUMN user_name TEXT")
+    for col, decl in (("last_counted_at", "TEXT"), ("last_counted_by", "TEXT")):         # Adjust > Count: when an item was last counted, and by whom
+        if col not in {r["name"] for r in conn.execute("PRAGMA table_info(consumables)")}:
+            conn.execute("ALTER TABLE consumables ADD COLUMN %s %s" % (col, decl))
+    clcols = {r["name"] for r in conn.execute("PRAGMA table_info(consumable_lots)")}
+    for col, decl in (("receipt_id", "INTEGER REFERENCES inventory_receipts(id)"), ("supplier_item_code", "TEXT"), ("unit_price", "REAL"), ("received_as", "TEXT")):
+        if col not in clcols:
+            conn.execute("ALTER TABLE consumable_lots ADD COLUMN %s %s" % (col, decl))
     if "active" not in {r["name"] for r in conn.execute("PRAGMA table_info(sites)")}:        # a site that is not active is not offered for a new tote; its old totes keep it
         conn.execute("ALTER TABLE sites ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
     spcols = {r["name"] for r in conn.execute("PRAGMA table_info(run_sample_points)")}
@@ -5128,9 +5204,12 @@ ARCHIVE_SKELETON = [
     "03_SOPs/Current", "03_SOPs/Superseded",
     "04_Safety-Data-Sheets/Current", "04_Safety-Data-Sheets/Superseded",
     "05_Fulfillment",
+    "06_Receiving/_Index",
 ]
 ARCHIVE_README_PATH = "README_Naming-Convention.txt"
 ARCHIVE_INDEX_PATH = "02_Production-Runs/_Index/runs_index.csv"
+RECEIVING_INDEX_PATH = "06_Receiving/_Index/receiving_index.csv"
+RECEIPT_KIND_NAMES = {"invoice": "Invoice", "delivery": "Delivery-Doc", "coa": "CoA", "freight": "Freight-Invoice", "other": "Document"}
 ARCHIVE_README = """KelpWorks-Records: folders and file names
 ==========================================
 
@@ -5148,6 +5227,10 @@ ARCHIVE_README = """KelpWorks-Records: folders and file names
                     Current/ every night (the sync lists the files); new or changed files wait for an administrator to accept them.
 04_Safety-Data-Sheets  Controlled safety data sheets, same Current / Superseded layout and the same nightly check.
 05_Fulfillment      Shipping and sales documents (bill of lading, commercial invoice ...), one folder per shipment.
+06_Receiving        Documents that came with deliveries of reagents, packaging and other inventory (supplier invoice, bill of lading, certificate of analysis, freight
+                    invoice), one folder per delivery that has a document, written automatically by KelpWorks. Do not edit or rename (it is not read back).
+                    <year>/<year-month>/<received date>_<supplier>_<invoice number>/   (RCPT-<n> when the invoice number was not known)
+                    receiving_index.csv (in _Index) lists every delivery with its invoice, PO, order and delivery numbers.
 
 File names
   Letters, numbers, hyphens and underscores only (no spaces). Fields are separated by an underscore, dates are 2026-10-10 style,
@@ -5156,6 +5239,7 @@ File names
   SDS         SDS_<Chemical-Name>_<Supplier>_<issue date>.pdf             e.g. SDS_Citric-Acid_Univar_2025-03-14.pdf
   Run files   <processing lot>_<document type>_<detail>.<extension>       e.g. PR-20261006-053_CoA_RELEASED.pdf
   Shipments   <shipment number>_<document type>_<detail>.pdf              e.g. SH-20261010-001_BOL.pdf
+  Deliveries  <invoice number>_<document type>_<detail>.<extension>       e.g. IN-60133189_Invoice_DuBois-IN-60133189.pdf
 """
 
 IMAGE_EXTS = {"jpg", "jpeg", "png", "gif", "webp", "heic", "bmp", "tif", "tiff"}
@@ -5302,6 +5386,55 @@ def archive_index_csv(rows):
     return buf.getvalue().encode("utf-8-sig")                 # the BOM makes Excel read the accents correctly
 
 
+def archive_receipt_folder(conn, rc):
+    """(folder, file key) of a delivery in the records library. Fixed the first time one of its documents is archived."""
+    row = conn.execute("SELECT folder, file_key FROM archive_receipts WHERE receipt_id=?", (rc["id"],)).fetchone()
+    if row:
+        return row["folder"], row["file_key"]
+    day = (rc["received_date"] or "")[:10]
+    year, month = (day[:4], day[:7]) if re.match(r"^\d{4}-\d{2}-\d{2}$", day) else ("undated", "undated")
+    key = archive_slug(rc["invoice_no"], 30, "") or "RCPT-%d" % rc["id"]
+    folder = "06_Receiving/%s/%s/%s_%s_%s" % (year, month, day or "undated", archive_slug(rc["supplier"], 24, "Supplier"), key)
+    if conn.execute("SELECT 1 FROM archive_receipts WHERE folder=?", (folder,)).fetchone():
+        folder += "-%d" % rc["id"]
+    conn.execute("INSERT OR IGNORE INTO archive_receipts (receipt_id, folder, file_key, created_at) VALUES (?,?,?,?)", (rc["id"], folder, key, now_iso()))
+    return folder, key
+
+
+def archive_receipt_entries(conn):
+    """(entries, problems, index rows) for the deliveries that have documents. A document's file never changes (a new document is a new file), so its version is its id."""
+    entries, problems, rows = [], [], []
+    for rc in conn.execute("SELECT * FROM inventory_receipts WHERE id IN (SELECT receipt_id FROM receipt_attachments) ORDER BY id").fetchall():
+        folder, key = archive_receipt_folder(conn, rc)
+        used, n = set(), 0
+        for a in conn.execute("SELECT * FROM receipt_attachments WHERE receipt_id=? ORDER BY id", (rc["id"],)).fetchall():
+            if not os.path.isfile(os.path.join(UPLOAD_DIR, a["stored_name"])):
+                problems.append({"run": "delivery %d" % rc["id"], "what": a["filename"], "error": "the stored file is missing on the server"})
+                continue
+            stem = archive_slug(os.path.splitext(a["filename"])[0], 40, "file")
+            kind = RECEIPT_KIND_NAMES.get(a["kind"], "Document")
+            name = "%s_%s_%s.%s" % (key, kind, stem, archive_ext(a["filename"]))
+            if name in used:
+                name = "%s_%s_%s_%d.%s" % (key, kind, stem, a["id"], archive_ext(a["filename"]))
+            used.add(name)
+            entries.append({"path": "%s/%s" % (folder, name), "kind": "receipt-" + a["kind"], "version": "att%d" % a["id"], "size": a["size"], "runId": None,
+                            "src": "rcpt:%d" % a["id"], "supersedes": []})
+            n += 1
+        lots = conn.execute("SELECT COUNT(*) c FROM consumable_lots WHERE receipt_id=?", (rc["id"],)).fetchone()["c"]
+        rows.append({"received": rc["received_date"], "supplier": rc["supplier"], "invoiceNo": rc["invoice_no"], "invoiceDate": rc["invoice_date"], "poNumber": rc["po_number"],
+                     "orderNo": rc["order_no"], "deliveryDoc": rc["delivery_doc"], "carrier": rc["carrier"], "lots": lots, "files": n, "folder": folder})
+    return entries, problems, rows
+
+
+def receiving_index_csv(rows):
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\r\n")
+    w.writerow(["received_date", "supplier", "invoice_no", "invoice_date", "po_number", "order_no", "delivery_document", "carrier", "lots", "files", "folder"])
+    for r in rows:
+        w.writerow([r["received"], r["supplier"] or "", r["invoiceNo"] or "", r["invoiceDate"] or "", r["poNumber"] or "", r["orderNo"] or "", r["deliveryDoc"] or "", r["carrier"] or "", r["lots"], r["files"], r["folder"]])
+    return buf.getvalue().encode("utf-8-sig")
+
+
 def archive_manifest(conn, only_run=None, handler=None):
     """Everything the records library should hold right now. `only_run` limits it to one run's files (used to serve a single file)."""
     return _archive_build(conn, only_run, handler)[0]
@@ -5323,14 +5456,21 @@ def _archive_build(conn, only_run=None, handler=None):
                      "finalizedAt": run["finalized_at"], "release": RELEASE_LABELS.get(run["release_state"], run["release_state"] or ""),
                      "rev": rev, "files": len(entries), "folder": folder})
     index = archive_index_csv(rows)
+    deliveries = 0
     if not only_run:
+        r_entries, r_problems, r_rows = archive_receipt_entries(conn)
+        files += r_entries
+        problems += r_problems
+        deliveries = len(r_rows)
+        ridx = receiving_index_csv(r_rows)
+        files.append({"path": RECEIVING_INDEX_PATH, "kind": "index", "version": hashlib.sha256(ridx).hexdigest()[:16], "size": len(ridx), "runId": None, "src": "receiving-index", "supersedes": []})
         readme = ARCHIVE_README.encode("utf-8")
         files.insert(0, {"path": ARCHIVE_README_PATH, "kind": "readme", "version": hashlib.sha256(readme).hexdigest()[:16], "size": len(readme),
                          "runId": None, "src": "readme", "supersedes": []})
         files.insert(1, {"path": ARCHIVE_INDEX_PATH, "kind": "index", "version": hashlib.sha256(index).hexdigest()[:16], "size": len(index),
                          "runId": None, "src": "index", "supersedes": []})
     return ({"format": "kelpworks-records-manifest", "version": 1, "generatedAt": now_iso(), "root": ARCHIVE_ROOT_NAME, "env": ENV_NAME,
-             "skeleton": ARCHIVE_SKELETON, "runs": len(rows), "files": files, "problems": problems}, index)
+             "skeleton": ARCHIVE_SKELETON, "runs": len(rows), "deliveries": deliveries, "files": files, "problems": problems}, index)
 
 
 def archive_file_bytes(conn, run_id, path, handler=None):
@@ -5343,6 +5483,17 @@ def archive_file_bytes(conn, run_id, path, handler=None):
         if path == ARCHIVE_INDEX_PATH:
             data = _archive_build(conn, None, handler)[1]
             return data, hashlib.sha256(data).hexdigest()[:16], "text/csv; charset=utf-8"
+        if path == RECEIVING_INDEX_PATH:
+            data = receiving_index_csv(archive_receipt_entries(conn)[2])
+            return data, hashlib.sha256(data).hexdigest()[:16], "text/csv; charset=utf-8"
+        if path.startswith("06_Receiving/"):                      # a delivery's document: found by its path (the sync script sends no run number)
+            ent = next((e for e in archive_receipt_entries(conn)[0] if e["path"] == path), None)
+            row = conn.execute("SELECT * FROM receipt_attachments WHERE id=?", (int(ent["src"].split(":")[1]),)).fetchone() if ent else None
+            full = os.path.join(UPLOAD_DIR, row["stored_name"]) if row else None
+            if not row or not os.path.isfile(full):
+                return None
+            with open(full, "rb") as f:
+                return f.read(), ent["version"], served_type(row["filename"])[0]
         return None
     run = conn.execute("SELECT * FROM production_runs WHERE id=? AND status='completed'", (run_id,)).fetchone()
     if not run:
@@ -5483,7 +5634,8 @@ def archive_status(conn):
     return {"nightlyBackup": NIGHTLY_BACKUP, "backupHourUtc": BACKUP_HOUR_UTC, "backupKeep": BACKUP_KEEP,
             "archiveKeyConfigured": len(ARCHIVE_KEY) >= ARCHIVE_KEY_MIN, "archiveKeyTooShort": 0 < len(ARCHIVE_KEY) < ARCHIVE_KEY_MIN,
             "lastBackup": flag("last_backup"), "lastBackupError": flag("last_backup_error"), "backups": backups,
-            "runsToArchive": conn.execute("SELECT COUNT(*) c FROM production_runs WHERE status='completed'").fetchone()["c"]}
+            "runsToArchive": conn.execute("SELECT COUNT(*) c FROM production_runs WHERE status='completed'").fetchone()["c"],
+            "deliveriesToArchive": conn.execute("SELECT COUNT(DISTINCT receipt_id) c FROM receipt_attachments").fetchone()["c"]}
 
 
 # ---------------------------------------------------------------------------------------
@@ -6317,7 +6469,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": e.message}, e.status)
             seg = [s for s in path.split("/") if s]   # api production|totes :id attachments :aid download
             kind, rid, aid = seg[1], int(seg[2]), int(seg[4])
-            if kind == "totes":
+            if kind == "receipts":
+                r = conn.execute("SELECT * FROM receipt_attachments WHERE id=? AND receipt_id=?", (aid, rid)).fetchone()
+            elif kind == "totes":
                 r = conn.execute("SELECT * FROM tote_attachments WHERE id=? AND tote_lot_id=?",
                                  (aid, rid)).fetchone()
             else:
@@ -7121,6 +7275,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.route_grade_rules(method, seg, conn, user)
         if seg[:2] == ["api", "lots"]:
             return self.route_lots(method, seg, query, conn, user)
+        if seg[:2] == ["api", "receipts"]:
+            return self.route_receipts(method, seg, query, conn, user)
         if seg[:2] == ["api", "consumables"]:
             return self.route_consumables(method, seg, conn, user)
         if seg[:2] == ["api", "cip"]:
@@ -9619,7 +9775,8 @@ class Handler(BaseHTTPRequestHandler):
                     litresEach=r["litres_each"], isSampleContainer=bool(r["is_sample_container"]),
                     itemNumber=r["item_number"], labelSku=r["label_sku_code"],
                     labelPackage=r["label_package"], isCipAgent=bool(r["is_cip_agent"]),
-                    reagentType=r["reagent_type"], low=(r["on_hand"] <= r["reorder_level"]))
+                    reagentType=r["reagent_type"], low=(r["on_hand"] <= r["reorder_level"]),
+                    lastCountedAt=r["last_counted_at"], lastCountedBy=r["last_counted_by"])
 
     def _clean_item_number(self, conn, raw, exclude_id=None):
         """Item # is normally auto-assigned (CAT-NNN, see assign_item_numbers); an admin may type their own. A typed value
@@ -9640,7 +9797,12 @@ class Handler(BaseHTTPRequestHandler):
         days = (datetime.date.fromisoformat(exp) - today).days if exp else None
         c = conn.execute("SELECT name, unit, item_number FROM consumables WHERE id=?", (r["consumable_id"],)).fetchone()
         uses = conn.execute("SELECT COUNT(DISTINCT COALESCE(ref, 'u'||id)) n FROM lot_uses WHERE lot_id=?", (r["id"],)).fetchone()["n"]
-        return {"id": r["id"], "lotCode": r["lot_code"], "consumableId": r["consumable_id"], "item": c["name"] if c else None, "unit": c["unit"] if c else None,
+        rc = conn.execute("SELECT * FROM inventory_receipts WHERE id=?", (r["receipt_id"],)).fetchone() if r["receipt_id"] else None
+        docs = conn.execute("SELECT COUNT(*) n FROM receipt_attachments WHERE receipt_id=?", (rc["id"],)).fetchone()["n"] if rc else 0
+        return {"receiptId": rc["id"] if rc else None, "invoiceNo": rc["invoice_no"] if rc else None, "invoiceDate": rc["invoice_date"] if rc else None,
+                "poNumber": (rc["po_number"] if rc else None) or r["po_ref"], "orderNo": rc["order_no"] if rc else None, "deliveryDoc": rc["delivery_doc"] if rc else None,
+                "carrier": rc["carrier"] if rc else None, "docCount": docs, "unitPrice": r["unit_price"], "supplierItemCode": r["supplier_item_code"], "receivedAs": r["received_as"],
+                "id": r["id"], "lotCode": r["lot_code"], "consumableId": r["consumable_id"], "item": c["name"] if c else None, "unit": c["unit"] if c else None,
                 "itemNumber": c["item_number"] if c else None, "supplier": r["supplier"], "supplierLot": r["supplier_lot"], "receivedDate": r["received_date"],
                 "expiryDate": exp, "qtyReceived": r["qty_received"], "qtyRemaining": r["qty_remaining"], "poRef": r["po_ref"], "notes": r["notes"],
                 "onHold": bool(r["on_hold"]), "holdReason": r["hold_reason"], "createdBy": r["created_by"], "createdAt": r["created_at"], "usedBy": uses,
@@ -9663,37 +9825,237 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "%s must be a date" % (label[0].upper() + label[1:]))
         return v
 
+    # ---- deliveries (invoice, PO, order, carrier, documents) and pack sizes ------------------------------------------------ #
+    RECEIVE_UNITS = ("kg", "g", "L", "mL", "ea")                 # the stock units a new item can have
+    ARRIVAL_CONDITIONS = ("ok", "issue")
+    RECEIPT_DOC_KINDS = ("invoice", "delivery", "coa", "freight", "other")
+    RECEIPT_FIELDS = (("supplier", "supplier", "Supplier"), ("invoiceNo", "invoice_no", "Invoice number"), ("invoiceDate", "invoice_date", "Invoice date"),
+                      ("poNumber", "po_number", "PO number"), ("orderNo", "order_no", "Supplier order number"), ("deliveryDoc", "delivery_doc", "Delivery document number"),
+                      ("carrier", "carrier", "Carrier"), ("shipDate", "ship_date", "Ship date"), ("arrivalCondition", "arrival_condition", "Condition on arrival"),
+                      ("conditionNote", "condition_note", "Condition note"), ("notes", "notes", "Notes"))
+    COUNT_REASONS = ("Stocktake correction", "Damaged", "Expired", "Spill or loss", "Found or returned", "Other")
+
+    @classmethod
+    def normalize_unit(cls, raw):
+        v = (raw or "").strip()
+        for u in cls.RECEIVE_UNITS:
+            if v.lower() == u.lower():
+                return u
+        raise ApiError(400, "The unit must be one of: %s" % ", ".join(cls.RECEIVE_UNITS))
+
+    def _receipt_clean(self, d):
+        """The delivery fields present in a request body, cleaned ({column: value or None}); a field that is left out is not touched."""
+        out = {}
+        for key, col, label in self.RECEIPT_FIELDS:
+            if key in d or (key == "poNumber" and "poRef" in d):
+                raw = d[key] if key in d else d.get("poRef")
+                v = ("" if raw is None else str(raw)).strip()
+                if col in ("invoice_date", "ship_date"):
+                    v = self._iso_date(v, label.lower()) or ""
+                elif col == "arrival_condition" and v and v not in self.ARRIVAL_CONDITIONS:
+                    raise ApiError(400, "Condition on arrival must be ok or issue")
+                else:
+                    v = v[:300]
+                out[col] = v or None
+        return out
+
+    def _receipt_log(self, conn, rid, field, old, new, reason, user):
+        conn.execute("INSERT INTO receipt_log (receipt_id,field,old_value,new_value,reason,user_name,created_at) VALUES (?,?,?,?,?,?,?)",
+                     (rid, field, old, new, reason, user["name"] if user else None, now_iso()))
+
+    def _receipt_for(self, conn, user, d, received):
+        """The delivery a receive belongs to: the existing one with the same supplier and invoice number (blank details are filled in), else a new one."""
+        vals = self._receipt_clean(d)
+        if vals.get("arrival_condition") == "issue" and not vals.get("condition_note"):
+            raise ApiError(400, "Describe what was wrong on arrival")
+        supplier, inv = vals.get("supplier"), vals.get("invoice_no")
+        if inv and supplier:
+            row = conn.execute("SELECT * FROM inventory_receipts WHERE LOWER(invoice_no)=LOWER(?) AND LOWER(COALESCE(supplier,''))=LOWER(?) ORDER BY id LIMIT 1", (inv, supplier)).fetchone()
+            if row:
+                for col, v in vals.items():
+                    if v and not row[col]:
+                        conn.execute("UPDATE inventory_receipts SET %s=? WHERE id=?" % col, (v, row["id"]))
+                        self._receipt_log(conn, row["id"], col, None, v, None, user)
+                return row["id"]
+        cur = conn.execute(
+            "INSERT INTO inventory_receipts (supplier,invoice_no,invoice_date,po_number,order_no,delivery_doc,carrier,ship_date,received_date,arrival_condition,condition_note,notes,created_by,created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (supplier, inv, vals.get("invoice_date"), vals.get("po_number"), vals.get("order_no"), vals.get("delivery_doc"), vals.get("carrier"), vals.get("ship_date"), received,
+             vals.get("arrival_condition"), vals.get("condition_note"), vals.get("notes"), user["name"] if user else None, now_iso()))
+        return cur.lastrowid
+
+    def _receipt_public(self, conn, r):
+        atts = [{"id": a["id"], "kind": a["kind"], "filename": a["filename"], "size": a["size"], "uploadedBy": a["uploaded_by"], "uploadedAt": a["uploaded_at"]}
+                for a in conn.execute("SELECT * FROM receipt_attachments WHERE receipt_id=? ORDER BY id", (r["id"],))]
+        lots = [self._lot_public(conn, l) for l in conn.execute("SELECT * FROM consumable_lots WHERE receipt_id=? ORDER BY id", (r["id"],))]
+        log = [{"field": g["field"], "oldValue": g["old_value"], "newValue": g["new_value"], "reason": g["reason"], "by": g["user_name"], "at": g["created_at"]}
+               for g in conn.execute("SELECT * FROM receipt_log WHERE receipt_id=? ORDER BY id DESC", (r["id"],))]
+        return {"id": r["id"], "supplier": r["supplier"], "invoiceNo": r["invoice_no"], "invoiceDate": r["invoice_date"], "poNumber": r["po_number"], "orderNo": r["order_no"],
+                "deliveryDoc": r["delivery_doc"], "carrier": r["carrier"], "shipDate": r["ship_date"], "receivedDate": r["received_date"], "arrivalCondition": r["arrival_condition"],
+                "conditionNote": r["condition_note"], "notes": r["notes"], "createdBy": r["created_by"], "createdAt": r["created_at"], "attachments": atts, "lots": lots, "log": log}
+
+    def _pack_public(self, p):
+        return {"id": p["id"], "name": p["name"], "qtyPerPack": p["qty_per_pack"]}
+
+    def _pack_create(self, conn, user, cid, name, qty):
+        """A purchase pack size for an item. Anyone may add one; it is written to the pack log. A pack only converts what is typed at receiving: stock stays in the item's unit."""
+        name = (name or "").strip()[:60]
+        qty = numn(qty)
+        if not name:
+            raise ApiError(400, "Name the pack size (for example 'Box, 50 lb')")
+        if qty is None or qty <= 0:
+            raise ApiError(400, "Enter how much one pack holds (above 0)")
+        dup = conn.execute("SELECT * FROM consumable_packs WHERE consumable_id=? AND LOWER(name)=LOWER(?)", (cid, name)).fetchone()
+        if dup:
+            if abs(dup["qty_per_pack"] - qty) > 1e-9:
+                raise ApiError(409, "A pack size called '%s' already holds %g; choose that one or give the new size another name" % (dup["name"], dup["qty_per_pack"]))
+            if not dup["active"]:
+                conn.execute("UPDATE consumable_packs SET active=1 WHERE id=?", (dup["id"],))
+            return dup
+        cur = conn.execute("INSERT INTO consumable_packs (consumable_id,name,qty_per_pack,created_by,created_at) VALUES (?,?,?,?,?)", (cid, name, qty, user["name"] if user else None, now_iso()))
+        c = conn.execute("SELECT unit FROM consumables WHERE id=?", (cid,)).fetchone()
+        conn.execute("INSERT INTO consumable_pack_log (consumable_id,pack_id,event,detail,user_name,created_at) VALUES (?,?,?,?,?,?)",
+                     (cid, cur.lastrowid, "added", "%s = %g %s" % (name, qty, c["unit"] if c else ""), user["name"] if user else None, now_iso()))
+        return conn.execute("SELECT * FROM consumable_packs WHERE id=?", (cur.lastrowid,)).fetchone()
+
     def _receive_lot(self, conn, user, cid, d):
+        """Receive stock as one or more lots of one delivery. `lines` = [{qty | packs + packId | packs + newPack{name, qtyPerPack}, supplierLot, expiryDate, unitPrice, priceBasis, supplierItemCode}];
+        without `lines` the top-level qty / supplierLot / expiryDate are the single line. The delivery fields (invoiceNo, poNumber, orderNo, ...) are shared by every line."""
         c = conn.execute("SELECT * FROM consumables WHERE id=?", (cid,)).fetchone()
         if not c:
             raise ApiError(404, "Item not found")
-        qty = numn(d.get("qty"))
-        if qty is None or qty <= 0:
-            raise ApiError(400, "Enter a quantity greater than 0")
-        supplier_lot = (d.get("supplierLot") or "").strip()
-        if not supplier_lot:
-            raise ApiError(400, "Enter the supplier's lot number (it is printed on the package)")
+        lines = d.get("lines")
+        if not lines:
+            lines = [{k: d.get(k) for k in ("qty", "packs", "packId", "newPack", "supplierLot", "expiryDate", "unitPrice", "priceBasis", "supplierItemCode")}]
+        if not isinstance(lines, list) or len(lines) > 50:
+            raise ApiError(400, "Send between 1 and 50 lots")
         received = self._iso_date(d.get("receivedDate"), "received date") or today_iso()
         if received > today_iso():
             raise ApiError(400, "The received date cannot be in the future")
-        expiry = self._iso_date(d.get("expiryDate"), "expiry date")
-        if expiry and expiry < received:
-            raise ApiError(400, "The expiry date is before the received date")
-        base = "%s-%s" % (c["item_number"] or "ITEM%d" % c["id"], received.replace("-", ""))
-        n = conn.execute("SELECT COUNT(*) FROM consumable_lots WHERE lot_code LIKE ?", (base + "-%",)).fetchone()[0] + 1
-        while conn.execute("SELECT 1 FROM consumable_lots WHERE lot_code=?", ("%s-%02d" % (base, n),)).fetchone():
-            n += 1
-        code = "%s-%02d" % (base, n)
+        packaging = bool(c["is_container"])                    # packaging has no supplier lot on its invoice: the invoice number stands in
+        inv = (str(d.get("invoiceNo") or "")).strip()
         who = user["name"] if user else None
-        cur = conn.execute(
-            "INSERT INTO consumable_lots (consumable_id,lot_code,supplier,supplier_lot,received_date,expiry_date,qty_received,qty_remaining,po_ref,notes,created_by,created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (cid, code, (d.get("supplier") or "").strip() or None, supplier_lot[:80], received, expiry, qty, qty, (d.get("poRef") or "").strip() or None,
-             (d.get("notes") or "").strip() or None, who, now_iso()))
-        self._consume(conn, cid, qty, "Received (lot %s, supplier lot %s)" % (code, supplier_lot[:40]), code, who)
-        self._lot_log(conn, cur.lastrowid, "received", "%s %s" % (qty, c["unit"]), None, user)
-        return {"lot": self._lot_public(conn, conn.execute("SELECT * FROM consumable_lots WHERE id=?", (cur.lastrowid,)).fetchone()),
-                "onHand": conn.execute("SELECT on_hand FROM consumables WHERE id=?", (cid,)).fetchone()["on_hand"]}
+        prepared = []
+        for i, ln in enumerate(lines, 1):
+            where = (" (lot %d)" % i) if len(lines) > 1 else ""
+            pack, packs, qty = None, None, None
+            if ln.get("newPack"):
+                np = ln["newPack"]
+                pack = self._pack_create(conn, user, cid, np.get("name"), np.get("qtyPerPack"))
+            elif ln.get("packId"):
+                pack = conn.execute("SELECT * FROM consumable_packs WHERE id=? AND consumable_id=?", (ln.get("packId"), cid)).fetchone()
+                if not pack:
+                    raise ApiError(400, "That pack size does not belong to this item" + where)
+            if pack:
+                packs = numn(ln.get("packs"))
+                if packs is None or packs <= 0:
+                    raise ApiError(400, "Enter how many packs were received" + where)
+                qty = round(packs * pack["qty_per_pack"], 6)
+            else:
+                qty = numn(ln.get("qty"))
+            if qty is None or qty <= 0:
+                raise ApiError(400, "Enter a quantity greater than 0" + where)
+            supplier_lot = (str(ln.get("supplierLot") or "")).strip()
+            if not supplier_lot:
+                if not packaging:
+                    raise ApiError(400, "Enter the supplier's lot number (it is printed on the package)" + where)
+                supplier_lot = ("INV " + inv) if inv else "(none)"
+            expiry = self._iso_date(ln.get("expiryDate"), "expiry date")
+            if expiry and expiry < received:
+                raise ApiError(400, "The expiry date is before the received date" + where)
+            price = numn(ln.get("unitPrice"))
+            if price is not None and price < 0:
+                raise ApiError(400, "The price cannot be negative" + where)
+            unit_price = None
+            if price is not None:
+                unit_price = round(price / pack["qty_per_pack"], 6) if (pack and ln.get("priceBasis") == "pack") else price
+            as_text = ("%g x %s" % (packs, pack["name"])) if pack else None
+            prepared.append((qty, supplier_lot[:80], expiry, unit_price, (str(ln.get("supplierItemCode") or "")).strip()[:60] or None, as_text))
+        rid = self._receipt_for(conn, user, dict(d, receivedDate=received), received)
+        po = (str(d.get("poNumber") if d.get("poNumber") is not None else (d.get("poRef") or ""))).strip() or None
+        made = []
+        for qty, supplier_lot, expiry, unit_price, item_code, as_text in prepared:
+            base = "%s-%s" % (c["item_number"] or "ITEM%d" % c["id"], received.replace("-", ""))
+            n = conn.execute("SELECT COUNT(*) FROM consumable_lots WHERE lot_code LIKE ?", (base + "-%",)).fetchone()[0] + 1
+            while conn.execute("SELECT 1 FROM consumable_lots WHERE lot_code=?", ("%s-%02d" % (base, n),)).fetchone():
+                n += 1
+            code = "%s-%02d" % (base, n)
+            cur = conn.execute(
+                "INSERT INTO consumable_lots (consumable_id,lot_code,supplier,supplier_lot,received_date,expiry_date,qty_received,qty_remaining,po_ref,notes,created_by,created_at,receipt_id,supplier_item_code,unit_price,received_as)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (cid, code, (d.get("supplier") or "").strip() or None, supplier_lot, received, expiry, qty, qty, po, (d.get("notes") or "").strip() or None, who, now_iso(),
+                 rid, item_code, unit_price, as_text))
+            self._consume(conn, cid, qty, "Received (lot %s, supplier lot %s)" % (code, supplier_lot[:40]), code, who)
+            self._lot_log(conn, cur.lastrowid, "received", "%s %s%s" % (qty, c["unit"], (" (" + as_text + ")") if as_text else ""), None, user)
+            made.append(cur.lastrowid)
+        lots_out = [self._lot_public(conn, conn.execute("SELECT * FROM consumable_lots WHERE id=?", (i,)).fetchone()) for i in made]
+        return {"lot": lots_out[0], "lots": lots_out, "receiptId": rid, "onHand": conn.execute("SELECT on_hand FROM consumables WHERE id=?", (cid,)).fetchone()["on_hand"]}
+
+    def _store_receipt_attachment(self, conn, rid, kind, filename, data_b64, uploaded_by):
+        """One document (invoice, bill of lading, certificate of analysis, freight invoice ...) on a delivery: same file rules and quotas as every other upload."""
+        filename = (filename or "document").strip().replace("\\", "/").split("/")[-1] or "document"
+        data_b64 = data_b64 or ""
+        if data_b64.startswith("data:") and "," in data_b64:
+            data_b64 = data_b64.split(",", 1)[1]
+        try:
+            raw = base64.b64decode(data_b64)
+        except Exception:
+            raise ApiError(400, "Could not decode file data")
+        if not raw:
+            raise ApiError(400, "The file is empty")
+        if len(raw) > MAX_UPLOAD_BYTES:
+            raise ApiError(400, "File exceeds the %d MB limit" % (MAX_UPLOAD_BYTES // (1024 * 1024)))
+        check_upload_filename(filename)
+        self._check_storage_room(conn, len(raw))
+        self._check_user_quota(conn, uploaded_by, len(raw))
+        kind = kind if kind in self.RECEIPT_DOC_KINDS else "other"
+        stored = self._write_upload(UPLOAD_DIR, raw, os.path.splitext(filename)[1][:12])
+        cur = conn.execute("INSERT INTO receipt_attachments (receipt_id,kind,filename,content_type,size,stored_name,uploaded_by,uploaded_at) VALUES (?,?,?,?,?,?,?,?)",
+                           (rid, kind, filename, served_type(filename)[0], len(raw), stored, uploaded_by, now_iso()))
+        self._receipt_log(conn, rid, "document", None, "%s (%s)" % (filename, kind), None, {"name": uploaded_by})
+        return cur.lastrowid
+
+    def route_receipts(self, method, seg, query, conn, user):
+        if seg == ["api", "receipts"] and method == "GET":
+            q = (query.get("q", [""])[0] or "").strip()
+            where, args = [], []
+            if q:
+                like = "%" + q.replace("%", "").replace("_", "") + "%"
+                where.append("(supplier LIKE ? OR invoice_no LIKE ? OR po_number LIKE ? OR order_no LIKE ? OR delivery_doc LIKE ?)")
+                args += [like] * 5
+            rows = conn.execute("SELECT * FROM inventory_receipts" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY received_date DESC, id DESC LIMIT 200", args).fetchall()
+            out = []
+            for r in rows:
+                p = self._receipt_public(conn, r)
+                p["lotCount"], p["docCount"] = len(p.pop("lots")), len(p["attachments"])
+                p.pop("attachments"), p.pop("log")
+                out.append(p)
+            return {"receipts": out}
+        if len(seg) >= 3 and seg[2].isdigit():
+            r = conn.execute("SELECT * FROM inventory_receipts WHERE id=?", (int(seg[2]),)).fetchone()
+            if not r:
+                raise ApiError(404, "Delivery not found")
+            if len(seg) == 3 and method == "GET":
+                return self._receipt_public(conn, r)
+            if len(seg) == 3 and method == "PUT":
+                d = self._body_json()
+                reason = (d.get("reason") or "").strip()
+                vals = self._receipt_clean(d)
+                changes = [(col, r[col], v) for col, v in vals.items() if (r[col] or None) != (v or None)]
+                if any(old for _c, old, _n in changes) and not reason:
+                    raise ApiError(400, "Enter the reason for the correction")
+                merged = {col: (vals[col] if col in vals else r[col]) for _k, col, _l in self.RECEIPT_FIELDS}
+                if merged.get("arrival_condition") == "issue" and not merged.get("condition_note"):
+                    raise ApiError(400, "Describe what was wrong on arrival")
+                for col, old, new in changes:
+                    conn.execute("UPDATE inventory_receipts SET %s=? WHERE id=?" % col, (new, r["id"]))
+                    self._receipt_log(conn, r["id"], col, old, new, reason if old else None, user)
+                return self._receipt_public(conn, conn.execute("SELECT * FROM inventory_receipts WHERE id=?", (r["id"],)).fetchone())
+            if len(seg) == 4 and seg[3] == "attachments" and method == "POST":
+                d = self._body_json()
+                self._store_receipt_attachment(conn, r["id"], d.get("kind"), d.get("filename"), d.get("dataB64") or "", user["name"] if user else None)
+                return self._receipt_public(conn, r)
+        raise ApiError(404, "Unknown delivery endpoint")
 
     def _run_materials(self, conn, r):
         """What a run used, item by item, with the lots it came from. `untraced` is the part of the ledger usage that no lot covers (stock received before lots were
@@ -9778,8 +10140,9 @@ class Handler(BaseHTTPRequestHandler):
             where, args = [], []
             if q:
                 like = "%" + q.replace("%", "").replace("_", "") + "%"
-                where.append("(l.lot_code LIKE ? OR l.supplier_lot LIKE ? OR l.supplier LIKE ? OR c.name LIKE ? OR c.item_number LIKE ?)")
-                args += [like] * 5
+                where.append("(l.lot_code LIKE ? OR l.supplier_lot LIKE ? OR l.supplier LIKE ? OR c.name LIKE ? OR c.item_number LIKE ? OR l.po_ref LIKE ?"
+                             " OR l.receipt_id IN (SELECT id FROM inventory_receipts WHERE invoice_no LIKE ? OR po_number LIKE ? OR order_no LIKE ? OR delivery_doc LIKE ?))")
+                args += [like] * 10
             if query.get("expiring", [""])[0] == "1":
                 warn = int(float(get_setting_value(conn, "lot_expiry_warning_days", 30) or 0))
                 where.append("l.qty_remaining>0 AND l.expiry_date IS NOT NULL AND l.expiry_date <= ?")
@@ -9825,6 +10188,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._lot_public(conn, lot)
             if len(seg) == 4 and seg[3] == "trace" and method == "GET":
                 return self._lot_trace(conn, lot)
+            if len(seg) == 4 and seg[3] == "receipt" and method == "POST":
+                # a lot received before deliveries existed gets one now (from what the lot already records), so its invoice can be attached
+                if not lot["receipt_id"]:
+                    cur = conn.execute("INSERT INTO inventory_receipts (supplier,po_number,received_date,notes,created_by,created_at) VALUES (?,?,?,?,?,?)",
+                                       (lot["supplier"], lot["po_ref"], lot["received_date"], "Created from lot %s so documents can be attached" % lot["lot_code"],
+                                        user["name"] if user else None, now_iso()))
+                    conn.execute("UPDATE consumable_lots SET receipt_id=? WHERE id=?", (cur.lastrowid, lot["id"]))
+                    lot = conn.execute("SELECT * FROM consumable_lots WHERE id=?", (lot["id"],)).fetchone()
+                return self._receipt_public(conn, conn.execute("SELECT * FROM inventory_receipts WHERE id=?", (lot["receipt_id"],)).fetchone())
             if len(seg) == 3 and method == "PUT":
                 if not can_edit:
                     raise ApiError(403, "Only a Quality Manager or an administrator can change a lot")
@@ -9871,8 +10243,11 @@ class Handler(BaseHTTPRequestHandler):
                     sds.setdefault(x["consumable_id"], []).append({"id": x["id"], "chemical": x["chemical"], "supplier": x["supplier"]})
                 lots = {x["consumable_id"]: (x["n"], x["rem"]) for x in conn.execute(
                     "SELECT consumable_id, COUNT(*) n, COALESCE(SUM(qty_remaining),0) rem FROM consumable_lots GROUP BY consumable_id")}
+                packs = {}
+                for p in conn.execute("SELECT * FROM consumable_packs WHERE active=1 ORDER BY name"):
+                    packs.setdefault(p["consumable_id"], []).append(self._pack_public(p))
                 return {"consumables": [dict(self._consumable_public(r), sds=sds.get(r["id"], []), lotCount=lots.get(r["id"], (0, 0))[0],
-                                             lotsRemaining=round(lots.get(r["id"], (0, 0))[1], 4)) for r in rows]}
+                                             lotsRemaining=round(lots.get(r["id"], (0, 0))[1], 4), packs=packs.get(r["id"], [])) for r in rows]}
             if method == "POST":
                 d = self._body_json()
                 label_sku = (d.get("labelSku") or "").strip()
@@ -9907,6 +10282,7 @@ class Handler(BaseHTTPRequestHandler):
                 if conn.execute("SELECT 1 FROM consumables WHERE name=?", (name,)).fetchone():
                     raise ApiError(409, "That item already exists")
                 item_number = self._clean_item_number(conn, d.get("itemNumber"))
+                unit = "ea" if is_label else self.normalize_unit(d.get("unit") or "ea")
                 location = self._ensure_location(conn, d.get("location"))
                 litres_each = numn(d.get("litresEach")) if is_container else None
                 is_sample = 1 if (is_container and d.get("isSampleContainer")) else 0
@@ -9922,7 +10298,7 @@ class Handler(BaseHTTPRequestHandler):
                     "INSERT INTO consumables (name,unit,on_hand,reorder_level,cost_per_unit,location,"
                     "is_container,litres_each,is_sample_container,item_number,label_sku_code,label_package,"
                     "is_cip_agent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (name, "ea" if is_label else (d.get("unit") or "unit").strip(), num(d.get("onHand")),
+                    (name, unit, num(d.get("onHand")),
                      num(d.get("reorderLevel")), numn(d.get("costPerUnit")), location,
                      1 if is_container else 0, litres_each, is_sample, item_number,
                      label_sku if is_label else None, label_package if is_label else None, is_cip))
@@ -9941,6 +10317,39 @@ class Handler(BaseHTTPRequestHandler):
                     "untraced": round(max(0.0, c["on_hand"] - left), 4)}
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "receive" and method == "POST":
             return self._receive_lot(conn, user, int(seg[2]), self._body_json())
+        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "packs":
+            cid = int(seg[2])
+            if not conn.execute("SELECT 1 FROM consumables WHERE id=?", (cid,)).fetchone():
+                raise ApiError(404, "Item not found")
+            if method == "GET":
+                return {"packs": [self._pack_public(p) for p in conn.execute("SELECT * FROM consumable_packs WHERE consumable_id=? AND active=1 ORDER BY name", (cid,))]}
+            if method == "POST":
+                d = self._body_json()
+                return {"pack": self._pack_public(self._pack_create(conn, user, cid, d.get("name"), d.get("qtyPerPack")))}
+        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "count" and method == "POST":
+            # Adjust > Count: the person says what is on the shelf; the difference is written to the ledger (who, when, why) and a shortage comes out of the lots like any use.
+            cid = int(seg[2])
+            c = conn.execute("SELECT * FROM consumables WHERE id=?", (cid,)).fetchone()
+            if not c:
+                raise ApiError(404, "Item not found")
+            d = self._body_json()
+            counted = numn(d.get("counted"))
+            if counted is None or counted < 0:
+                raise ApiError(400, "Enter the quantity counted (zero or more)")
+            if (c["is_container"] or c["label_sku_code"]) and abs(counted - round(counted)) > 1e-9:
+                raise ApiError(400, "%s is counted in whole units" % c["name"])
+            reason = (d.get("reason") or "").strip()
+            if reason not in self.COUNT_REASONS:
+                raise ApiError(400, "Choose a reason: %s" % ", ".join(self.COUNT_REASONS))
+            note = (d.get("note") or "").strip()[:200]
+            if reason == "Other" and not note:
+                raise ApiError(400, "Describe the reason")
+            before = c["on_hand"]
+            delta = round(counted - before, 6)
+            label = "Stocktake count: %s%s" % (reason, (" - " + note) if note else "")
+            self._consume(conn, cid, delta, label, None, user["name"] if user else None)
+            conn.execute("UPDATE consumables SET last_counted_at=?, last_counted_by=? WHERE id=?", (now_iso(), user["name"] if user else None, cid))
+            return {"previous": before, "counted": counted, "delta": delta, "onHand": conn.execute("SELECT on_hand FROM consumables WHERE id=?", (cid,)).fetchone()["on_hand"]}
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "history" and method == "GET":
             cid = int(seg[2])
             if not conn.execute("SELECT 1 FROM consumables WHERE id=?", (cid,)).fetchone():
@@ -11716,7 +12125,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _check_storage_room(self, conn, nbytes):
         """Refuse an upload that would fill the document store or the disk (every user can upload, and the disk is shared with the database)."""
-        used = sum(conn.execute("SELECT COALESCE(SUM(size),0) FROM %s" % t).fetchone()[0] for t in ("run_attachments", "tote_attachments", "sop_documents", "sds_documents", "document_revisions", "library_inbox"))
+        used = sum(conn.execute("SELECT COALESCE(SUM(size),0) FROM %s" % t).fetchone()[0] for t in ("run_attachments", "tote_attachments", "receipt_attachments", "sop_documents", "sds_documents", "document_revisions", "library_inbox"))
         if used + nbytes > MAX_UPLOAD_TOTAL_BYTES:
             raise ApiError(507, "The document store is full (%d MB used of %d MB). Ask an administrator to remove old documents."
                            % (used // (1024 * 1024), MAX_UPLOAD_TOTAL_BYTES // (1024 * 1024)))
@@ -11734,7 +12143,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         since = (utcnow() - datetime.timedelta(hours=24)).replace(microsecond=0).isoformat() + "Z"
         used = sum(conn.execute("SELECT COALESCE(SUM(size),0) FROM %s WHERE uploaded_by=? AND uploaded_at>=?" % t, (uploaded_by, since)).fetchone()[0]
-                   for t in ("run_attachments", "tote_attachments"))
+                   for t in ("run_attachments", "tote_attachments", "receipt_attachments"))
         if used + nbytes > limit_mb * 1024 * 1024:
             raise ApiError(429, "You have reached the upload limit for today (%d MB in 24 hours). Try again later, or ask an administrator to raise it." % limit_mb, "upload_quota")
 

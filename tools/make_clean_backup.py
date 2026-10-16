@@ -24,14 +24,14 @@ import tempfile
 import zipfile
 
 KEEP = {
-    "app_flags", "coa_specs", "config_log", "consumables", "container_units", "document_edits", "document_revisions", "feedstock_grade_rules", "fg_sku_species", "fg_skus",
+    "app_flags", "coa_specs", "config_log", "consumable_pack_log", "consumable_packs", "consumables", "container_units", "document_edits", "document_revisions", "feedstock_grade_rules", "fg_sku_species", "fg_skus",
     "lab_analyses", "labs", "locations", "qc_chart_limit_log", "qc_chart_limits", "requisition_contact", "sample_label_names", "sds_documents",
     "sds_items", "settings", "sites", "sop_document_edits", "sop_documents", "sop_links", "species", "user_permission_log", "users",
 }
 CLEAR = {
-    "archive_runs", "cip_event_chemicals", "cip_events", "consumable_lot_log", "consumable_lots", "consumable_txns", "customers", "deleted_records", "disposals", "fg_lots", "lab_requisitions",
+    "archive_receipts", "archive_runs", "cip_event_chemicals", "cip_events", "consumable_lot_log", "consumable_lots", "consumable_txns", "customers", "deleted_records", "disposals", "fg_lots", "inventory_receipts", "lab_requisitions",
     "lab_results", "library_inbox", "library_scans", "location_moves", "lot_uses", "preproc_batches", "preproc_inputs", "preproc_packaging", "production_runs",
-    "qc_field_log", "qc_logs", "release_events", "requisition_samples", "run_amendments", "run_attachments", "run_dilution_passes", "run_dilutions",
+    "qc_field_log", "qc_logs", "receipt_attachments", "receipt_log", "release_events", "requisition_samples", "run_amendments", "run_attachments", "run_dilution_passes", "run_dilutions",
     "run_edits", "run_inputs", "run_label_commits", "run_packaging_commits", "run_packaging_entries", "run_reagent_commits", "run_revisions",
     "run_sample_points", "run_separation_solids", "sample_cart", "sample_events", "samples", "shipment_lines", "shipments", "tote_attachments", "tote_lots",
     "tote_ph_log", "tote_stability_log",

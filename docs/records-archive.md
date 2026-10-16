@@ -31,11 +31,19 @@ KelpWorks-Records/
 │     └─ 04_Other/            ..._Document_<original-name>.<ext>
 ├─ 03_SOPs/  (Current / Superseded)            kept by Quality; not written by KelpWorks yet
 ├─ 04_Safety-Data-Sheets/  (Current / Superseded)
-└─ 05_Fulfillment/                              later
+├─ 05_Fulfillment/                              later
+└─ 06_Receiving/
+   ├─ _Index/receiving_index.csv                   one row per delivery that has a document (invoice, PO, order and delivery numbers, carrier)
+   └─ 2026/2026-08/2026-08-21_DuBois-Chemicals-Canada-Inc_IN-60133189/
+      └─ IN-60133189_Invoice_<original-name>.pdf   IN-60133189_Delivery-Doc_...   IN-60133189_CoA_...   IN-60133189_Freight-Invoice_...
 ```
 
 - **Which runs:** every *finalized* run (a draft is still changing). A run's folder is named from its lot, product and run date **the first time it is archived and
   never changes afterwards**, even if the run's date or product is amended.
+- **Receiving documents:** every delivery that has at least one attached document (Inventory Items > Lots > Documents) gets a folder `06_Receiving/<year>/<year-month>/<received date>_<supplier>_<invoice number>/`
+  (`RCPT-<n>` in place of the invoice number when it was not known when the first document was archived). The folder and the file-name key are fixed the first time a document of the delivery is
+  archived, so correcting the invoice number or supplier later does not move anything; the corrected details appear in `receiving_index.csv`. A document is archived as uploaded and never changes,
+  and a new document is simply a new file. The sync script needs no change to carry these files.
 - **File names:** `<processing lot>_<document type>_<detail>.<extension>`: letters, numbers, hyphens and underscores only, the lot first so a search for it finds everything.
   The full convention (also covering SOPs, SDS and shipments) is in `README_Naming-Convention.txt`, which the sync writes into the library.
 - **Revisions:** the production summary is named for the production-log revision (`_rev1`, and `_rev2` after an amendment); an earlier revision's file stays. The Certificate of

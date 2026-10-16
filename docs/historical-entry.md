@@ -34,7 +34,7 @@ A **+ Historical run** button appears on the Production page. **Set it back to `
      **Finalize run**. Required fields are not enforced; what was missing is recorded on the run (the **Historical** badge shows it).
 4. **Lab results** for the runs sent to normal release: Production > Lab results (attach the lab report), then Product Release for the review and release.
 5. **Shipments.** Shipping > New shipment, with the **real ship date**, for lots that are on hand (grandfathered runs, or released ones).
-6. **Check.** Compare each item's on-hand quantity with a physical count; correct any difference with a stocktake (Use / Receive, reason "Stocktake").
+6. **Check.** Compare each item's on-hand quantity with a physical count; correct any difference with Adjust > Count on the item (the count, the reason and your name go to the item's history).
    Run Admin > **Data integrity check**.
 
 ## What a historical run looks like afterwards

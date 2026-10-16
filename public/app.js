@@ -4973,10 +4973,11 @@ async function pageConsumables(v) {
       // Packaging items and labels are counted in whole units (totes,
       // bottles, labels ...), so their on-hand quantity displays with no
       // decimals; reagents (kg of Citric Acid, etc.) keep their fractional display.
-      row.push(c.location || '—', fmt(c.onHand, opts.wholeUnits ? 0 : 1) + ' ' + c.unit, fmt(c.reorderLevel, 1),
+      const onHandText = fmt(c.onHand, opts.wholeUnits ? 0 : 1) + ' ' + c.unit;
+      row.push(c.location || '—', c.lastCountedAt ? el('span', { title: 'Last counted ' + fmtWhen(c.lastCountedAt) + (c.lastCountedBy ? ' by ' + c.lastCountedBy : '') }, onHandText) : onHandText, fmt(c.reorderLevel, 1),
         c.costPerUnit != null ? '$' + fmt(c.costPerUnit, 2) : '—',
         badge(c.low ? 'low' : 'ok', c.low ? 'LOW' : 'OK'),
-        rowActions([['Receive', () => adjustC(c, 1)], ['Use', () => adjustC(c, -1)], ['Lots' + (c.lotCount ? ' (' + c.lotCount + ')' : ''), () => openItemLots(c)],
+        rowActions([['Receive', () => adjustC(c, 1)], ['Adjust', () => adjustStock(c)], ['Lots' + (c.lotCount ? ' (' + c.lotCount + ')' : ''), () => openItemLots(c)],
           ['Dispose', () => disposeConsumables([c]), 'danger'], ['Edit', () => editC(c)]]));
       return row;
     };
@@ -5017,7 +5018,7 @@ async function pageConsumables(v) {
         isAdmin ? el('button', { onclick: addContainerType }, '+ Add container type') : null)));
     host.append(el('div', { class: 'help', style: 'margin-bottom:10px' },
       'Every container Production uses -- Packaging table output units and Sample Point vessels alike -- with its own on-hand inventory. '
-      + (isAdmin ? 'Only an admin can bulk-upload counts or add a new container type; anyone can receive/use/edit an existing one.'
+      + (isAdmin ? 'Only an admin can bulk-upload counts or add a new container type; anyone can receive, adjust or edit an existing one.'
         : 'Ask an admin to bulk-upload counts or add a new container type.')));
     host.append(itemsTable(containers, { showVolume: true, wholeUnits: true, history: true }));
     // Finished-good labels are the physical labels stuck on each finished
@@ -5038,34 +5039,201 @@ async function pageConsumables(v) {
   }
   draw();
 }
-function adjustC(c, sign) {
-  if (sign > 0) return receiveStock(c);
-  const body = el('div', {},
-    field('Quantity used (' + c.unit + ')', el('input', { type: 'number', id: 'c_amt', min: '0', step: '0.1', value: '0' })),
-    field('Reason / reference', el('input', { id: 'c_reason', placeholder: 'reason' })));
-  modal('Use ' + c.name, body, async () => {
-    const amt = +body.querySelector('#c_amt').value || 0;
-    if (amt <= 0) throw new Error('Enter a quantity greater than 0.');
-    await api('POST', '/consumables/' + c.id + '/adjust', { delta: -amt, reason: body.querySelector('#c_reason').value || 'Used' });
-    toast('Stock updated'); render();
-  }, 'Use');
+const STOCK_UNITS = ['kg', 'g', 'L', 'mL', 'ea'];
+const COUNT_REASONS = ['Stocktake correction', 'Damaged', 'Expired', 'Spill or loss', 'Found or returned', 'Other'];
+const DOC_KINDS = [['invoice', 'Invoice'], ['delivery', 'Delivery document (BOL / packing slip)'], ['coa', 'Certificate of analysis'], ['freight', 'Freight invoice'], ['other', 'Other']];
+const docKindName = k => (DOC_KINDS.find(x => x[0] === k) || [k, k])[1];
+function adjustC(c, sign) { return sign > 0 ? receiveStock(c) : adjustStock(c); }
+function receiptDocUrl(rid, aid) { return '/api/receipts/' + rid + '/attachments/' + aid + '/download?token=' + encodeURIComponent(dlToken()); }
+function fileB64(file) {
+  return new Promise((resolve, reject) => { const r = new FileReader(); r.onload = () => resolve(String(r.result).split(',')[1]); r.onerror = () => reject(new Error('Could not read ' + file.name)); r.readAsDataURL(file); });
 }
-// Receiving stock records a LOT: who supplied it, the supplier's lot number, when it arrived and when it expires. Every later use of the item is assigned to a lot
-// automatically (earliest expiry first), which is what lets a recall be traced from a lot to the runs, products and customers it reached.
-function receiveStock(c) {
+async function uploadReceiptDocs(rid, files, kind) {
+  for (const f of files) await api('POST', '/receipts/' + rid + '/attachments', { filename: f.name, contentType: f.type || 'application/octet-stream', dataB64: await fileB64(f), kind });
+}
+// Adjust: one button for everything that changes stock outside a delivery or a production run. COUNT sets the stock to what is on the shelf (the difference is logged with who, when and why;
+// a shortage comes out of the earliest-expiry lot); USED records stock that left without being counted (a spill, lab or R&D use, a discard).
+function adjustStock(c) {
+  const whole = c.isContainer || !!c.labelSku;
+  const modeSel = selectFrom('', [['count', 'Count: set the stock to what is on the shelf'], ['used', 'Used outside production, lost or discarded']]);
+  const hold = el('div', {});
+  const packSel = c.packs && c.packs.length ? selectFrom('', [['', '— none, type the total —'], ...c.packs.map(p => [String(p.id), p.name + ' (' + fmt(p.qtyPerPack, 2) + ' ' + c.unit + ')'])]) : null;
+  const packN = el('input', { type: 'number', min: '0', step: '1', placeholder: 'number of full packs' });
+  const packNField = field('Full packs', packN);
+  const syncPack = () => { packNField.style.display = packSel && packSel.value ? '' : 'none'; };
+  const looseInp = el('input', { type: 'number', min: '0', step: whole ? '1' : 'any', placeholder: packSel ? 'loose ' + c.unit : 'counted (' + c.unit + ')' });
+  const reasonSel = selectFrom('', COUNT_REASONS.map(x => [x, x]));
+  const note = el('input', { placeholder: 'required for “Other”, otherwise optional' });
+  const diff = el('div', { class: 'help', style: 'font-weight:600' });
+  const amt = el('input', { type: 'number', min: '0', step: whole ? '1' : 'any', value: '0' });
+  const why = el('input', { placeholder: 'reason' });
+  const counted = () => {
+    const pack = packSel && packSel.value ? c.packs.find(p => String(p.id) === packSel.value) : null;
+    const loose = looseInp.value.trim() === '' ? null : +looseInp.value;
+    if (pack) return (packN.value.trim() === '' ? 0 : +packN.value) * pack.qtyPerPack + (loose || 0);
+    return loose;
+  };
+  function showDiff() {
+    const n = counted();
+    if (n == null || Number.isNaN(n)) { diff.textContent = 'On hand in KelpWorks: ' + fmt(c.onHand, whole ? 0 : 2) + ' ' + c.unit; return; }
+    const d = Math.round((n - c.onHand) * 1e6) / 1e6;
+    diff.textContent = 'On hand in KelpWorks: ' + fmt(c.onHand, whole ? 0 : 2) + ' ' + c.unit + '  ·  counted ' + fmt(n, 2) + '  ·  ' + (d === 0 ? 'no difference' : (d > 0 ? 'surplus +' : 'shortage ') + fmt(d, 2) + ' ' + c.unit);
+  }
+  [packSel, packN, looseInp].forEach(x => x && x.addEventListener('input', showDiff));
+  if (packSel) packSel.addEventListener('change', () => { syncPack(); showDiff(); });
+  function draw() {
+    hold.innerHTML = '';
+    if (modeSel.value === 'count') {
+      hold.append(diff,
+        packSel ? el('div', { class: 'form-row' }, field('Pack size (optional)', packSel), packNField) : null,
+        field(packSel ? 'Loose, or the total if no pack size (' + c.unit + ')' : 'Counted (' + c.unit + ')', looseInp),
+        el('div', { class: 'form-row' }, field('Reason for the difference', reasonSel), field('Note', note)),
+        el('div', { class: 'help' }, 'The difference is written to the item’s history with your name and the date. A shortage is taken from the lot that expires first; a surplus is stock that is not in a lot.'));
+      syncPack(); showDiff();
+    } else {
+      hold.append(field('Quantity used (' + c.unit + ')', amt), field('Reason / reference', why),
+        el('div', { class: 'help' }, 'For stock that leaves without a production run: a spill, lab or R&D use, a discard. To correct the stock to a physical count, choose Count instead.'));
+    }
+  }
+  modeSel.addEventListener('change', draw);
+  const body = el('div', {}, el('div', { class: 'summary-line' }, sl('Item', c.name), sl('On hand', fmt(c.onHand, whole ? 0 : 2) + ' ' + c.unit),
+    sl('Last counted', c.lastCountedAt ? fmtWhen(c.lastCountedAt) + (c.lastCountedBy ? ' by ' + c.lastCountedBy : '') : 'never')), field('What are you recording?', modeSel), hold);
+  draw();
+  modal('Adjust ' + c.name, body, async () => {
+    if (modeSel.value === 'count') {
+      const n = counted();
+      if (n == null || Number.isNaN(n)) throw new Error('Enter the quantity you counted.');
+      const r = await api('POST', '/consumables/' + c.id + '/count', { counted: n, reason: reasonSel.value, note: note.value });
+      toast(r.delta === 0 ? 'Counted: no difference' : 'Stock corrected by ' + (r.delta > 0 ? '+' : '') + fmt(r.delta, 2) + ' ' + c.unit);
+    } else {
+      const q = +amt.value || 0;
+      if (q <= 0) throw new Error('Enter a quantity greater than 0.');
+      await api('POST', '/consumables/' + c.id + '/adjust', { delta: -q, reason: why.value || 'Used' });
+      toast('Stock updated');
+    }
+    render();
+  }, 'Save');
+}
+// Receiving stock records a LOT per supplier lot: who supplied it, the supplier's lot number, when it arrived and when it expires, and ONE delivery (invoice, PO, order, carrier, documents)
+// that all the lots of the invoice share. Every later use of the item is assigned to a lot automatically (earliest expiry first), which is what lets a recall be traced.
+async function receiveStock(c) {
   const today = new Date().toISOString().slice(0, 10);
-  const q = el('input', { type: 'number', min: '0', step: 'any' }), lot = el('input', { placeholder: 'printed on the package' }), sup = el('input', { placeholder: 'e.g. supplier name' });
-  const rec = el('input', { type: 'date', value: today }), exp = el('input', { type: 'date' }), po = el('input', { placeholder: 'optional' }), nt = el('input', { placeholder: 'optional' });
+  let last = null;
+  try { last = ((await api('GET', '/consumables/' + c.id + '/lots')).lots || [])[0] || null; } catch (e) { /* no earlier lot */ }
+  const packaging = c.isContainer;
+  const inp = (attrs, v) => el('input', Object.assign({}, attrs || {}, v != null ? { value: v } : {}));
+  const sup = inp({ placeholder: 'e.g. supplier name' }, last && last.supplier || ''), rec = inp({ type: 'date' }, today);
+  const inv = inp({ placeholder: 'supplier invoice number' }), invDate = inp({ type: 'date' }), po = inp({ placeholder: 'your PO number' }), ord = inp({ placeholder: 'supplier order / sales order' });
+  const doc = inp({ placeholder: 'bill of lading / packing slip / PRO' }), car = inp({ placeholder: 'carrier' }), ship = inp({ type: 'date' });
+  const code = inp({ placeholder: 'supplier product code (optional)' }, last && last.supplierItemCode || '');
+  const cond = selectFrom('', [['', '—'], ['ok', 'OK'], ['issue', 'Problem found']]), condNote = inp({ placeholder: 'what was wrong' });
+  const nt = inp({ placeholder: 'optional' });
+  const kind = selectFrom('', DOC_KINDS), files = el('input', { type: 'file', multiple: true });
+  const packOpts = () => [['', '— type the quantity in ' + c.unit + ' —'], ...(c.packs || []).map(p => [String(p.id), p.name + ' (' + fmt(p.qtyPerPack, 2) + ' ' + c.unit + ')']), ['new', '+ New pack size…']];
+  const rows = [], tbody = el('tbody', {});
+  function addRow() {
+    const r = {};
+    r.pack = selectFrom('', packOpts());
+    r.qty = inp({ type: 'number', min: '0', step: 'any', placeholder: 'quantity (' + c.unit + ')' });
+    r.newName = inp({ placeholder: 'pack name, e.g. Box, 50 lb', style: 'display:none;margin-top:4px' });
+    r.newQty = inp({ type: 'number', min: '0', step: 'any', placeholder: c.unit + ' per pack', style: 'display:none;margin-top:4px' });
+    r.lot = inp({ placeholder: packaging ? 'optional (invoice no. is used)' : 'printed on the package' });
+    r.exp = inp({ type: 'date' });
+    r.price = inp({ type: 'number', min: '0', step: 'any', placeholder: 'price' });
+    r.total = el('div', { class: 'help', style: 'margin:2px 0 0' });
+    const upd = () => {
+      const isNew = r.pack.value === 'new', p = (c.packs || []).find(x => String(x.id) === r.pack.value);
+      r.newName.style.display = r.newQty.style.display = isNew ? '' : 'none';
+      r.qty.placeholder = (p || isNew) ? 'number of packs' : 'quantity (' + c.unit + ')';
+      r.price.placeholder = p || isNew ? 'price per pack' : 'price per ' + c.unit;
+      const per = isNew ? +r.newQty.value : (p ? p.qtyPerPack : null);
+      r.total.textContent = per && +r.qty.value ? '= ' + fmt(per * +r.qty.value, 3) + ' ' + c.unit : '';
+    };
+    [r.pack, r.qty, r.newQty].forEach(x => { x.addEventListener('input', upd); x.addEventListener('change', upd); });
+    r.tr = el('tr', {}, el('td', {}, r.pack, r.newName, r.newQty), el('td', {}, r.qty, r.total), el('td', {}, r.lot), el('td', {}, r.exp), el('td', {}, r.price),
+      el('td', {}, el('button', { type: 'button', class: 'secondary', onclick: () => { if (rows.length > 1) { rows.splice(rows.indexOf(r), 1); r.tr.remove(); } } }, '✕')));
+    rows.push(r); tbody.append(r.tr);
+    upd();
+  }
+  addRow();
   const body = el('div', {},
-    el('div', { class: 'form-row' }, field('Quantity received (' + c.unit + ')', q), field('Supplier lot number *', lot)),
-    el('div', { class: 'form-row' }, field('Supplier', sup), field('PO / reference', po)),
-    el('div', { class: 'form-row' }, field('Received date', rec), field('Expiry date (leave blank if none)', exp)),
-    field('Notes', nt),
-    el('div', { class: 'help' }, 'Each delivery is one lot. Later uses of ' + c.name + ' are assigned to the lot with the earliest expiry first, so a recall can be traced.'));
+    el('h4', { style: 'margin:0 0 4px' }, 'Delivery'),
+    el('div', { class: 'form-row' }, field('Supplier', sup), field('Received date', rec)),
+    el('div', { class: 'form-row' }, field('Invoice number', inv), field('Invoice date', invDate)),
+    el('div', { class: 'form-row' }, field('PO number', po), field('Supplier order number', ord)),
+    el('div', { class: 'form-row' }, field('Delivery document no.', doc), field('Carrier', car), field('Ship date', ship)),
+    el('div', { class: 'form-row' }, field('Condition on arrival', cond), field('If a problem, what', condNote)),
+    el('h4', { style: 'margin:10px 0 4px' }, 'Lots received (' + c.unit + ')'),
+    el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {}, el('th', {}, 'Pack'), el('th', {}, 'Quantity'), el('th', {}, packaging ? 'Supplier lot' : 'Supplier lot *'), el('th', {}, 'Expiry'), el('th', {}, 'Price (excl. tax)'), el('th', {}, ''))), tbody)),
+    el('div', { style: 'margin:6px 0' }, el('button', { type: 'button', class: 'secondary', onclick: addRow }, '+ Another supplier lot')),
+    field('Supplier product code', code), field('Notes', nt),
+    el('h4', { style: 'margin:10px 0 4px' }, 'Documents (optional)'),
+    el('div', { class: 'form-row' }, field('Type', kind), field('Files — invoice, bill of lading, certificate of analysis', files)),
+    el('div', { class: 'help' }, 'One delivery can hold several supplier lots (an invoice can list two lots for two totes). Lots received with the same supplier and invoice number share one delivery, so the invoice is attached once. '
+      + (packaging ? 'Packaging has no supplier lot on its invoice: leave it blank and the invoice number is used. ' : '')
+      + 'You can add documents or fill in missing details later from the lot’s Documents button. Stock is always counted in ' + c.unit + '; a pack size only converts what you type.'));
   modal('Receive ' + c.name, body, async () => {
-    const r = await api('POST', '/consumables/' + c.id + '/receive', { qty: +q.value, supplierLot: lot.value, supplier: sup.value, receivedDate: rec.value, expiryDate: exp.value || null, poRef: po.value, notes: nt.value });
-    toast('Received as lot ' + r.lot.lotCode); render();
-  }, 'Receive');
+    const lines = rows.map(r => {
+      const isNew = r.pack.value === 'new', p = (c.packs || []).find(x => String(x.id) === r.pack.value);
+      const base = { supplierLot: r.lot.value, expiryDate: r.exp.value || null, unitPrice: r.price.value === '' ? null : +r.price.value, supplierItemCode: code.value };
+      if (isNew) return Object.assign(base, { packs: +r.qty.value, newPack: { name: r.newName.value, qtyPerPack: +r.newQty.value }, priceBasis: 'pack' });
+      if (p) return Object.assign(base, { packs: +r.qty.value, packId: p.id, priceBasis: 'pack' });
+      return Object.assign(base, { qty: +r.qty.value, priceBasis: 'unit' });
+    });
+    const r = await api('POST', '/consumables/' + c.id + '/receive', { supplier: sup.value, receivedDate: rec.value, invoiceNo: inv.value, invoiceDate: invDate.value, poNumber: po.value, orderNo: ord.value,
+      deliveryDoc: doc.value, carrier: car.value, shipDate: ship.value, arrivalCondition: cond.value, conditionNote: condNote.value, notes: nt.value, lines });
+    let msg = 'Received as ' + (r.lots.length > 1 ? r.lots.length + ' lots' : 'lot ' + r.lot.lotCode);
+    if (files.files.length) {
+      try { await uploadReceiptDocs(r.receiptId, [...files.files], kind.value); msg += ' with ' + files.files.length + ' document' + (files.files.length === 1 ? '' : 's'); }
+      catch (e) { toast('Received, but a document could not be attached (' + e.message + '). Attach it from the lot’s Documents button.', true); }
+    }
+    State.ref = await api('GET', '/refdata');
+    toast(msg); render();
+  }, 'Receive', { wide: true });
+}
+// A delivery's window: its details (fill in or correct), its documents (attach more at any time), and the lots that came with it.
+async function openDelivery(lot) {
+  let rid = lot.receiptId;
+  if (!rid) rid = (await api('POST', '/lots/' + lot.id + '/receipt')).id;
+  const d = await api('GET', '/receipts/' + rid);
+  const f = {};
+  const mk = (key, label, attrs) => { f[key] = el('input', Object.assign({ value: d[key] || '' }, attrs || {})); return field(label, f[key]); };
+  const cond = selectFrom('', [['', '—'], ['ok', 'OK'], ['issue', 'Problem found']]); cond.value = d.arrivalCondition || '';
+  const reason = el('input', { placeholder: 'required only when you change a value that was already filled in' });
+  const kind = selectFrom('', DOC_KINDS), files = el('input', { type: 'file', multiple: true });
+  const docsHost = el('div', {});
+  const drawDocs = x => {
+    docsHost.innerHTML = '';
+    docsHost.append(x.attachments.length ? table(['Type', 'File', 'Size', 'Added by', 'When'], x.attachments.map(a => [docKindName(a.kind),
+      el('a', { href: receiptDocUrl(x.id, a.id), target: '_blank', rel: 'noopener' }, a.filename), fmt(a.size / 1024, 0) + ' KB', a.uploadedBy || '—', fmtWhen(a.uploadedAt)]))
+      : el('div', { class: 'help' }, 'No documents yet.'));
+  };
+  drawDocs(d);
+  const upload = el('button', { type: 'button', onclick: async () => {
+    if (!files.files.length) { toast('Choose a file first.', true); return; }
+    try { await uploadReceiptDocs(d.id, [...files.files], kind.value); const x = await api('GET', '/receipts/' + d.id); drawDocs(x); files.value = ''; toast('Attached'); }
+    catch (e) { toast(e.message, true); }
+  } }, 'Attach');
+  const body = el('div', {},
+    el('div', { class: 'summary-line' }, sl('Received', d.receivedDate), sl('Entered by', d.createdBy || '—'), sl('Lots', d.lots.length)),
+    el('div', { class: 'form-row' }, mk('supplier', 'Supplier'), mk('invoiceNo', 'Invoice number'), mk('invoiceDate', 'Invoice date', { type: 'date' })),
+    el('div', { class: 'form-row' }, mk('poNumber', 'PO number'), mk('orderNo', 'Supplier order number'), mk('deliveryDoc', 'Delivery document no.')),
+    el('div', { class: 'form-row' }, mk('carrier', 'Carrier'), mk('shipDate', 'Ship date', { type: 'date' }), field('Condition on arrival', cond)),
+    el('div', { class: 'form-row' }, mk('conditionNote', 'If a problem, what'), mk('notes', 'Notes')),
+    field('Reason for a correction', reason),
+    el('h4', { style: 'margin:12px 0 4px' }, 'Documents'), docsHost,
+    el('div', { class: 'form-row' }, field('Type', kind), field('Add files', files), el('div', { class: 'field' }, el('label', {}, ' '), upload)),
+    el('h4', { style: 'margin:12px 0 4px' }, 'Lots in this delivery'),
+    table(['Lot', 'Item', 'Supplier lot', 'Received', 'Price / unit', 'Received as'], d.lots.map(l => [mono(l.lotCode), l.item, l.supplierLot, num(fmt(l.qtyReceived, 2) + ' ' + l.unit),
+      l.unitPrice != null ? '$' + fmt(l.unitPrice, 4) : '—', l.receivedAs || '—']), [false, false, false, true, true, false]),
+    d.log.length ? el('details', { class: 'accordion' }, el('summary', {}, 'History (' + d.log.length + ')'), el('div', { class: 'accordion-body' },
+      table(['When', 'By', 'What', 'From', 'To', 'Reason'], d.log.map(g => [fmtWhen(g.at), g.by || '—', g.field, g.oldValue || '—', g.newValue || '—', g.reason || '—'])))) : null);
+  modal('Delivery' + (d.invoiceNo ? ' — invoice ' + d.invoiceNo : ''), body, async () => {
+    const payload = { reason: reason.value, arrivalCondition: cond.value };
+    ['supplier', 'invoiceNo', 'invoiceDate', 'poNumber', 'orderNo', 'deliveryDoc', 'carrier', 'shipDate', 'conditionNote', 'notes'].forEach(k => { payload[k] = f[k].value; });
+    await api('PUT', '/receipts/' + d.id, payload);
+    toast('Saved');
+  }, 'Save details', { wide: true });
 }
 function lotStatusBadge(l) {
   if (l.onHold) return badge('hold', 'On hold');
@@ -5074,10 +5242,11 @@ function lotStatusBadge(l) {
   return l.qtyRemaining > 0 ? badge('ok', 'In stock') : badge('sold', 'Used up');
 }
 function lotsTable(items, onTrace) {
-  return table(['Lot', 'Supplier lot', 'Item', 'Supplier', 'Received', 'Expiry', 'Received qty', 'Left', 'Status', ''],
-    items.map(l => [mono(l.lotCode), el('b', {}, l.supplierLot), l.item + (l.itemNumber ? ' (' + l.itemNumber + ')' : ''), l.supplier || '—', l.receivedDate, l.expiryDate || '—',
+  return table(['Lot', 'Supplier lot', 'Item', 'Supplier', 'Delivery', 'Received', 'Expiry', 'Received qty', 'Left', 'Status', ''],
+    items.map(l => [mono(l.lotCode), el('b', {}, l.supplierLot), l.item + (l.itemNumber ? ' (' + l.itemNumber + ')' : ''), l.supplier || '—',
+      [l.invoiceNo ? 'Inv ' + l.invoiceNo : '', l.poNumber ? 'PO ' + l.poNumber : ''].filter(Boolean).join(' · ') || '—', l.receivedDate, l.expiryDate || '—',
       num(fmt(l.qtyReceived, l.qtyReceived % 1 ? 2 : 0) + ' ' + l.unit), num(fmt(l.qtyRemaining, l.qtyRemaining % 1 ? 2 : 0)), lotStatusBadge(l),
-      rowActions([['Trace', () => onTrace(l)]])]), [false, false, false, false, false, false, true, true, false, false]);
+      rowActions([['Trace', () => onTrace(l)], ['Documents' + (l.docCount ? ' (' + l.docCount + ')' : ''), () => openDelivery(l)]])]), [false, false, false, false, false, false, false, true, true, false, false]);
 }
 async function openItemLots(c) {
   const r = await api('GET', '/consumables/' + c.id + '/lots');
@@ -5111,7 +5280,9 @@ async function openLotTrace(id) {
   const canEdit = State.user.role === 'admin' || State.user.isQualityManager;
   const body = el('div', {});
   body.append(el('div', { class: 'summary-line' }, sl('Lot', l.lotCode), sl('Supplier lot', l.supplierLot), sl('Item', l.item), sl('Supplier', l.supplier || '—'),
-    sl('Received', l.receivedDate), sl('Expiry', l.expiryDate || '—'), sl('Left', fmt(l.qtyRemaining, 2) + ' / ' + fmt(l.qtyReceived, 2) + ' ' + l.unit), el('span', {}, 'Status: ', lotStatusBadge(l))));
+    sl('Received', l.receivedDate), sl('Expiry', l.expiryDate || '—'), sl('Left', fmt(l.qtyRemaining, 2) + ' / ' + fmt(l.qtyReceived, 2) + ' ' + l.unit), el('span', {}, 'Status: ', lotStatusBadge(l)),
+    sl('Invoice', l.invoiceNo || '—'), sl('PO', l.poNumber || '—'), sl('Order', l.orderNo || '—'), sl('Documents', l.docCount || 0)));
+  body.append(el('div', { style: 'margin:4px 0' }, el('button', { type: 'button', class: 'secondary', onclick: () => openDelivery(l) }, 'Delivery & documents')));
   if (l.onHold) body.append(el('div', { class: 'help', style: 'color:var(--danger);font-weight:600' }, 'On hold: ' + (l.holdReason || '') + ' — no new use is assigned to this lot.'));
   body.append(el('h4', { style: 'margin:10px 0 4px' }, 'Used by (' + d.uses.length + ')'));
   body.append(d.uses.length ? table(['Reference', 'What', 'Quantity', 'Date', canEdit ? '' : null].filter(x => x !== null),
@@ -5256,7 +5427,7 @@ function addConsumable() {
   const cipCb = State.user.role === 'admin' ? el('input', { type: 'checkbox' }) : null;
   const typeSel = selectFrom('', [['', '— none —'], ...REAGENT_TYPES.map(t => [t, t])]);
   const body = el('div', {},
-    el('div', { class: 'form-row' }, field('Name', el('input', { id: 'n_name' })), field('Unit', el('input', { id: 'n_unit', value: 'kg' }))),
+    el('div', { class: 'form-row' }, field('Name', el('input', { id: 'n_name' })), field('Stock unit', selectFrom('', STOCK_UNITS.map(u => [u, u]), null, 'n_unit'))),
     field('Reagent type (items of one type are offered together in the production log)', typeSel),
     field('Item #', el('input', { id: 'n_itemno', placeholder: 'Auto-assigned (e.g. RGT-008) — leave blank' })),
     el('div', { class: 'form-row' }, field('On hand', el('input', { type: 'number', id: 'n_oh', value: '0' })),
@@ -5273,14 +5444,14 @@ function addConsumable() {
 }
 // Admin-only: introduces a brand-new container type (Packaging output unit
 // and/or Sample Point vessel) -- editing/receiving/using an existing one is
-// open to everyone via editC/adjustC above.
+// open to everyone via editC / receiveStock / adjustStock below.
 function addContainerType() {
   const locs = State.ref.locations.map(l => [l, l]);
   const litresInp = el('input', { type: 'number', min: '0', step: 'any', placeholder: 'e.g. 1000 for IBC -- blank if not an FG package' });
   const sampleCb = el('input', { type: 'checkbox' });
   const body = el('div', {},
     el('div', { class: 'form-row' }, field('Name', el('input', { id: 'n_name', placeholder: 'e.g. 4 L' })),
-      field('Unit', el('input', { id: 'n_unit', value: 'ea' }))),
+      field('Stock unit', (() => { const s = selectFrom('', STOCK_UNITS.map(u => [u, u]), null, 'n_unit'); s.value = 'ea'; return s; })())),
     field('Item #', el('input', { id: 'n_itemno', placeholder: 'Auto-assigned (e.g. RGT-008) — leave blank' })),
     el('div', { class: 'form-row' }, field('On hand', el('input', { type: 'number', id: 'n_oh', value: '0' })),
       field('Reorder level', el('input', { type: 'number', id: 'n_re', value: '0' }))),
