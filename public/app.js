@@ -561,7 +561,7 @@ function stabilityLogTable(log, toteId) {
   // table -- a tote's log can grow long over its lifetime.
   return el('div', { class: 'tablewrap stability-log-scroll', style: 'margin-top:6px' },
     el('table', {},
-      el('thead', {}, el('tr', {}, el('th', {}, 'When'), el('th', {}, 'Field'), el('th', {}, 'From'), el('th', {}, 'To'), el('th', {}, 'Note'), el('th', {}, 'By'))),
+      el('thead', {}, el('tr', {}, el('th', {}, 'When'), el('th', {}, 'Reading date'), el('th', {}, 'Field'), el('th', {}, 'From'), el('th', {}, 'To'), el('th', {}, 'Note'), el('th', {}, 'By'))),
       el('tbody', {}, ...log.map(r => {
         // A row logged with a photo attachment -- from a tote rejected during
         // a production run (runId set) or from Feedstock Inventory's own
@@ -572,7 +572,7 @@ function stabilityLogTable(log, toteId) {
         else if (r.attachmentId && toteId) toCell = el('a', { href: toteAttDownloadUrl(toteId, r.attachmentId, false), target: '_blank', rel: 'noopener' }, r.newValue || 'View photo');
         else toCell = el('b', {}, r.newValue ?? '—');
         return el('tr', {},
-          el('td', { class: 'muted' }, fmtWhen(r.at)), el('td', {}, r.field),
+          el('td', { class: 'muted' }, fmtWhen(r.at)), el('td', { class: 'muted' }, r.readingDate || '—'), el('td', {}, r.field),
           el('td', { class: 'muted' }, r.oldValue ?? '—'), el('td', {}, toCell),
           el('td', { class: 'muted' }, r.note || '—'), el('td', {}, r.by || '—'));
       }))));
@@ -588,10 +588,11 @@ async function updateCondition(t) {
   const data = await api('GET', '/totes/' + t.id + '/ph');
   function summaryLines(d) {
     return [sl('Tote', t.lot),
-      sl('Current pH', d.ph == null ? '—' : d.ph),
-      sl('Current ORP', d.orp == null ? '—' : d.orp + ' mV'),
+      sl('Current pH', d.ph == null ? '—' : d.ph + (d.phUpdated ? '  (' + d.phUpdated + ')' : '')),
+      sl('Current ORP', d.orp == null ? '—' : d.orp + ' mV' + (d.orpUpdated ? '  (' + d.orpUpdated + ')' : '')),
       sl('ORP meter range', d.orp == null ? '—' : (classifyOrp(d.orp) || '—')),
       sl('Feedstock TDS', d.tdsPct == null ? '—' : d.tdsPct + ' %' + (d.tdsUpdated ? '  (' + d.tdsUpdated + ')' : '')),
+      sl('Received', d.receivedDate || '—'),
       sl('Last updated', d.lastUpdated ? fmtWhen(d.lastUpdated) : 'never')];
   }
   const summary = el('div', { class: 'summary-line' }, ...summaryLines(data));
@@ -626,26 +627,40 @@ async function updateCondition(t) {
     el('div', { class: 'form-row' },
       field('New pH reading', el('input', { type: 'number', step: '0.1', id: 'p_ph', placeholder: 'e.g. 3.7' })),
       field('New ORP reading', el('input', { type: 'number', step: '1', id: 'p_orp', placeholder: 'e.g. -150' }))),
-    field('Reading date', el('input', { type: 'date', id: 'p_date', value: new Date().toISOString().slice(0, 10) })),
+    field('Reading date', el('input', { type: 'date', id: 'p_date', value: new Date().toISOString().slice(0, 10), max: new Date().toISOString().slice(0, 10) })),
+    el('div', { class: 'help', style: 'margin:-6px 0 8px' }, 'Today by default. Choose an earlier date to add a historical reading: the reading with the newest date is the value shown (and used for grading); an older one is kept in the history only.'),
     field('Note (optional)', el('input', { id: 'p_note', placeholder: 'who / instrument / observation' })),
     detailCard,
+    el('h4', { style: 'margin:12px 0 4px' }, 'Received date'),
+    el('div', { class: 'form-row' },
+      field('Received date', el('input', { type: 'date', id: 'p_received', value: data.receivedDate || '', max: new Date().toISOString().slice(0, 10), min: data.harvestDate || '' })),
+      field('Reason for changing it', el('input', { id: 'p_received_why', placeholder: 'required only when you change a date that is already filled in' }))),
     el('label', {}, 'Feedstock Stability log'), history);
   modal('Update feedstock conditions — ' + t.lot, body, async () => {
     const ph = body.querySelector('#p_ph').value;
     const orp = body.querySelector('#p_orp').value;
     let rejected = false;
+    const historical = [];
+    const received = body.querySelector('#p_received').value;
+    if (received && received !== (data.receivedDate || '')) {
+      await api('POST', '/totes/' + t.id + '/received-date', { receivedDate: received, reason: body.querySelector('#p_received_why').value });
+    }
     if (detailVals) {
-      if (detailVals.tdsPct != null) detailVals.tdsDate = body.querySelector('#p_date').value;      // the TDS reading carries the window's reading date, like pH and ORP
+      detailVals.readingDate = body.querySelector('#p_date').value;      // every reading in this window carries the reading date (TDS, odour, intensity, ...), like pH and ORP
       const r = await api('POST', '/totes/' + t.id + '/characterize', detailVals);
       rejected = r.rejected;
+      historical.push(...(r.historical || []));
     }
     if (ph !== '' || orp !== '') {
-      await api('POST', '/totes/' + t.id + '/ph', {
+      const r = await api('POST', '/totes/' + t.id + '/ph', {
         ph: ph === '' ? null : +ph, orp: orp === '' ? null : +orp,
         date: body.querySelector('#p_date').value, note: body.querySelector('#p_note').value || null
       });
+      historical.push(...(r.historical || []));
     }
-    toast(rejected ? t.lot + ' rejected — moved to QAQC Hold.' : 'Feedstock conditions saved for ' + t.lot);
+    const kept = [...new Set(historical)];
+    toast(rejected ? t.lot + ' rejected — moved to QAQC Hold.'
+      : kept.length ? 'Saved. ' + kept.join(', ') + ' kept as a historical reading: a newer reading is on file, so the current value stays.' : 'Feedstock conditions saved for ' + t.lot);
     render();
   }, 'Save & close', { wide: true });
 }
