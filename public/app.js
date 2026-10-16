@@ -51,6 +51,13 @@ const el = (tag, attrs = {}, ...kids) => {
 const fmt = (n, d = 0) => (n == null ? '—' : Number(n).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d }));
 const speciesName = c => { const s = (State.ref?.species || []).find(x => x.code === c); return s ? (s.common || s.name) : (c || '—'); };
 const skuName = c => { const s = (State.ref?.skus || []).find(x => x.code === c); return s ? s.name : (c || '—'); };
+// The sites a tote can be checked in from (active, by name); an inactive site stays in State.ref.sites so old totes still show its name.
+const activeSites = () => (State.ref?.sites || []).filter(s => s.active !== false && s.code !== 'MIX').sort((a, b) => a.name.localeCompare(b.name));
+// Names for a site FILTER: the active sites plus any old site a tote in the list still carries.
+const siteFilterNames = codesInUse => {
+  const inUse = new Set(codesInUse || []);
+  return (State.ref?.sites || []).filter(s => s.code !== 'MIX' && (s.active !== false || inUse.has(s.code))).sort((a, b) => a.name.localeCompare(b.name)).map(s => s.name);
+};
 const siteName = c => { const s = (State.ref?.sites || []).find(x => x.code === c); return s ? s.name : (c || '—'); };
 function toast(msg, isErr) {
   const t = el('div', { class: 'summary-line', style: 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:99;box-shadow:var(--shadow);' + (isErr ? 'background:#fbe3df;color:#c0392b' : 'background:#e2f3ef;color:#15564F') }, msg);
@@ -189,7 +196,7 @@ const STAB_COLUMNS = [
   { key: 'lot', label: 'Lot number', value: t => t.lot,
     cell: t => el('span', {}, t.lot, el('button', { type: 'button', class: 'stab-info-btn', title: 'Feedstock details',
       onclick: e => { e.stopPropagation(); showToteDetails(t); } }, 'ⓘ')) },
-  { key: 'site', label: 'Site', value: t => siteName(t.site), options: () => (State.ref.sites || []).map(s => s.name),
+  { key: 'site', label: 'Site', value: t => siteName(t.site), options: () => siteFilterNames(stabCache.map(t => t.site)),
     cell: t => siteName(t.site) },
   { key: 'species', label: 'Species', value: t => speciesName(t.species),
     options: () => [...new Set((State.ref.species || []).map(s => s.common || s.name))], cell: t => speciesName(t.species) },
@@ -699,7 +706,7 @@ async function moveFG(f) {
   }, 'Move');
 }
 async function openHarvest() {
-  const sites = State.ref.sites.filter(s => s.code !== 'MIX').map(s => [s.code, s.code + ' — ' + s.name]);
+  const sites = activeSites().map(s => [s.code, s.code + ' — ' + s.name]);
   const species = State.ref.species.filter(s => s.code !== 'MIX').map(s => [s.code, s.common || s.name]);
   const locs = State.ref.locations.map(l => [l, l]);
   // Stabilization method drives a sensible default for the storage unit:
@@ -3691,7 +3698,7 @@ async function openRun(draftSummary, opts) {
     pickHost.innerHTML = '';
     const headRow = el('tr', {}, el('th', { class: 'checkcol' }, ''), el('th', {}, 'Lot'), el('th', {}, 'Site'),
       el('th', { class: 'num' }, 'Avg kg'), el('th', {}, 'pH'), el('th', {}, 'Grade'), el('th', {}, 'Location'));
-    const siteOpts = (State.ref.sites || []).map(s => s.name);
+    const siteOpts = siteFilterNames(totes.map(t => t.site));
     const gradeOpts = [...new Set(totes.map(t => t.grade).filter(Boolean))].sort();
     const gradeFilterSel = el('select', {}, el('option', { value: '' }, 'All'), ...gradeOpts.map(o => el('option', { value: o }, o)));
     gradeFilterSel.value = pickFilters.grade;
@@ -7085,7 +7092,7 @@ async function openPreprocBatch(id, section) {
   const spSel = el('select', {}, el('option', { value: '' }, 'All species'),
     ...(State.ref.species || []).filter(s => s.code !== 'MIX').map(s => el('option', { value: s.code }, s.common || s.name)));
   const siteSel = el('select', {}, el('option', { value: '' }, 'All sites'),
-    ...(State.ref.sites || []).filter(s => s.code !== 'MIX').map(s => el('option', { value: s.code }, s.name)));
+    ...activeSites().map(s => el('option', { value: s.code }, s.name)));
   const picks = new Set();
   async function loadPickTotes() {
     const r = await api('GET', '/totes?status=in_stock');
