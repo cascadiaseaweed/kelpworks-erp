@@ -200,8 +200,8 @@ const STAB_COLUMNS = [
     cell: t => siteName(t.site) },
   { key: 'species', label: 'Species', value: t => speciesName(t.species),
     options: () => [...new Set((State.ref.species || []).map(s => s.common || s.name))], cell: t => speciesName(t.species) },
-  { key: 'grind', label: 'Grind', value: t => t.grind || 'Coarse', options: () => ['Coarse', 'Fine'],
-    cell: t => t.grind === 'Fine' ? badge('ok', 'Fine') : 'Coarse' },
+  { key: 'grind', label: 'Grind', value: t => t.grind || 'Coarse', options: () => ['Coarse', 'Fine', 'Whole'],
+    cell: t => t.grind === 'Fine' ? badge('ok', 'Fine') : t.grind === 'Whole' ? badge('wip', 'Whole') : 'Coarse' },
   { key: 'stabMethod', label: 'Stabilization method', value: t => t.stabilizationMethod || '',
     options: () => ['Citric acid', 'Fresh'], cell: t => t.stabilizationMethod || '—', hidden: true },
   { key: 'harvestDate', label: 'Harvest date', value: t => t.harvestDate || '', cell: t => t.harvestDate || '—' },
@@ -528,7 +528,7 @@ function bulkSetTotes(ids) {
     el('div', { class: 'help' }, 'Fill in only what you want to set — anything left blank is not changed.'),
     field('Average weight per tote (kg)', el('input', { type: 'number', id: 'bs_kg', step: 'any', min: '0', max: '5000', placeholder: 'e.g. 180.5' })),
     el('div', { class: 'form-row' },
-      field('Grind', el('select', { id: 'bs_grind' }, el('option', { value: keep }, '— no change —'), el('option', {}, 'Coarse'), el('option', {}, 'Fine'))),
+      field('Grind', el('select', { id: 'bs_grind' }, el('option', { value: keep }, '— no change —'), el('option', {}, 'Coarse'), el('option', {}, 'Fine'), el('option', {}, 'Whole'))),
       field('Stabilization method', el('select', { id: 'bs_stab' }, el('option', { value: keep }, '— no change —'), el('option', {}, 'Citric acid'), el('option', {}, 'Fresh')))),
     field('Note (optional)', el('input', { id: 'bs_note', placeholder: 'e.g. batch weighed 2026-10-16' })),
     el('div', { class: 'help' }, 'Each change is written to every tote’s Feedstock Stability log (old → new). Totes that are in a run or already consumed cannot be changed — '
@@ -729,7 +729,7 @@ async function openHarvest() {
       field('Total harvest (kg)', el('input', { type: 'number', id: 'h_kg', min: '0', step: '0.01', placeholder: 'averaged across storage units' })),
       field('Storage unit', selectFrom('', [['Tote', 'Tote'], ['Bag', 'Bag']], null, 'h_unit'))),
     el('div', { class: 'form-row' },
-      field('Grind', selectFrom('', [['Coarse', 'Coarse'], ['Fine', 'Fine']], null, 'h_grind')),
+      field('Grind', selectFrom('', [['Coarse', 'Coarse'], ['Fine', 'Fine'], ['Whole', 'Whole']], null, 'h_grind')),
       field('pH', el('input', { type: 'number', id: 'h_ph', step: '0.1', placeholder: 'e.g. 3.7' }))),
     field('ORP (mV) — optional', el('input', { type: 'number', id: 'h_orp', step: '1', placeholder: 'e.g. -150' })),
     field('Notes', el('textarea', { id: 'h_notes', rows: '2', placeholder: 'Optional' })),
@@ -811,7 +811,7 @@ async function openFeedstockImport() {
     el('div', { style: 'display:flex;gap:10px;align-items:center;margin:6px 0' }, checkBtn, status),
     report,
     el('div', { class: 'help' }, el('b', {}, 'Required: '), 'site, species, harvestDate (YYYY-MM-DD).'),
-    el('div', { class: 'help' }, el('b', {}, 'Optional: '), 'avgWeightKg (leave blank if the batch is not weighed yet — use “Set values for selected” later), toteNumber, receivedDate, grind (Coarse or Fine, default Coarse), stabilizationMethod (Citric acid or Fresh), storageUnit (Tote or Bag), storageSource, location, ph, orp, tdsPct, status (in_stock or hold), notes.'),
+    el('div', { class: 'help' }, el('b', {}, 'Optional: '), 'avgWeightKg (leave blank if the batch is not weighed yet — use “Set values for selected” later), toteNumber, receivedDate, grind (Coarse, Fine or Whole, default Coarse), stabilizationMethod (Citric acid or Fresh), storageUnit (Tote or Bag), storageSource, location, ph, orp, tdsPct, status (in_stock or hold), notes.'),
     el('div', { class: 'help' }, el('b', {}, 'Tote numbers: '), 'the lot number is SITE-SPECIES-YYYYMMDD-NNN, where NNN is the tote number. Leave toteNumber blank to number the totes automatically. If you type one, it must be a whole number from 1 to 999 and unique: '
       + 'it cannot repeat in the file, match a tote already in Feedstock Inventory, or match a tote that was deleted (those numbers are never reused). '
       + 'Calculated columns (lot number, stabilization period, grade, last updated) are not imported. One problem anywhere blocks the whole file, so nothing is half-imported.'));

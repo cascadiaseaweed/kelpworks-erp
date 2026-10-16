@@ -269,3 +269,39 @@ def test_bulk_set_never_touches_a_tote_in_a_run(srv, admin):
     r = admin.post("/api/totes/set-bulk", {"ids": [free, used], "grind": "Fine"})
     assert r.status == 400 and "cannot be changed" in r.json["error"]
     assert sql(srv, "SELECT grind FROM tote_lots WHERE id=?", (free,))[0][0] in ("Coarse", None)
+
+
+# ---- the Whole grind ---------------------------------------------------------------------------------------------------------------
+
+def tote_row(srv, lot):
+    return sql(srv, "SELECT grind, description FROM tote_lots WHERE lot_number=?", (lot,))[0]
+
+
+def test_a_tote_can_be_checked_in_as_whole(srv, admin):
+    r = admin.post("/api/harvest", {"site": "JAM", "species": "SL", "harvestDate": "2026-09-05", "toteCount": 1, "totalKg": 900, "location": "Cold", "grind": "whole"})
+    assert r.status == 200, r.text
+    assert tote_row(srv, r.json["created"][0]) == ("Whole", "Fresh Stabilized Whole Sugar Kelp")
+    assert [t["grind"] for t in admin.get("/api/totes").json["totes"] if t["lot"] == r.json["created"][0]] == ["Whole"]
+    bad = admin.post("/api/harvest", {"site": "JAM", "species": "SL", "harvestDate": "2026-09-05", "toteCount": 1, "totalKg": 900, "location": "Cold", "grind": "Chunky"})
+    assert bad.status == 400 and "Coarse, Fine or Whole" in bad.json["error"]
+
+
+def test_whole_is_accepted_by_the_csv_import_and_the_bulk_set(srv, admin):
+    r = load(admin, csv(row(date="2026-09-06", grind="Whole"), row(date="2026-09-06", grind="WHOLE"), row(date="2026-09-06")))
+    assert r.status == 200, r.text
+    lots = r.json["created"]
+    assert [tote_row(srv, l)[0] for l in lots] == ["Whole", "Whole", "Coarse"]
+    assert tote_row(srv, lots[0])[1].startswith("Fresh Stabilized Whole") and tote_row(srv, lots[2])[1].startswith("Fresh Stabilized Ground")
+    where, details = problems(check(admin, csv(row(date="2026-09-06", grind="Chunky"))))
+    assert where == [(2, "grind")] and "Whole" in details[0]["message"]
+    ids = [sql(srv, "SELECT id FROM tote_lots WHERE lot_number=?", (l,))[0][0] for l in lots]
+    assert admin.post("/api/totes/set-bulk", {"ids": [ids[2]], "grind": "Whole"}).json["updated"] == 1
+    assert tote_row(srv, lots[2])[0] == "Whole"
+
+
+def test_only_coarse_totes_can_be_pulled_for_pre_processing(srv, admin):
+    whole = admin.post("/api/harvest", {"site": "JAM", "species": "SL", "harvestDate": "2026-09-07", "toteCount": 1, "totalKg": 900, "location": "Cold", "grind": "Whole"}).json["created"][0]
+    tid = sql(srv, "SELECT id FROM tote_lots WHERE lot_number=?", (whole,))[0][0]
+    bid = admin.post("/api/preproc", {}).json["id"]
+    r = admin.post("/api/preproc/%d/inputs" % bid, {"toteIds": [tid]})
+    assert r.status == 400 and "only Coarse totes" in r.json["error"]
