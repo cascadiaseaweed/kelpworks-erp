@@ -94,7 +94,7 @@ def test_a_repeated_number_in_the_file_is_reported_on_the_second_row(srv, admin)
 
 
 def test_the_same_number_on_another_date_or_site_is_a_different_lot(srv, admin):
-    assert check(admin, csv(row(date="2026-08-07", tote="7"), row(date="2026-08-08", tote="7"), row(site="CORD", date="2026-08-07", tote="7"))).status == 200
+    assert check(admin, csv(row(date="2026-08-07", tote="7"), row(date="2026-08-08", tote="7"), row(site="DIP", date="2026-08-07", tote="7"))).status == 200
 
 
 def test_a_number_already_in_inventory_is_refused(srv, admin):
@@ -163,11 +163,11 @@ def test_a_row_with_too_many_cells_is_a_problem_not_a_silent_shift(srv, admin):
     assert where == [(2, "")] and "more cells" in details[0]["message"]
 
 
-def test_a_check_changes_nothing_and_reports_the_lots_and_new_codes(srv, admin):
+def test_a_check_changes_nothing_and_reports_the_lots_and_new_locations(srv, admin):
     before = count_totes(srv)
-    r = check(admin, csv(row(site="NEWSITE", date="2026-08-17", tote="5")))
-    assert r.status == 200 and r.json["lots"] == ["NEWSITE-SL-20260817-005"] and any("NEWSITE" in w for w in r.json["warnings"])
-    assert count_totes(srv) == before and not sql(srv, "SELECT 1 FROM sites WHERE code='NEWSITE'")
+    r = check(admin, csv(row(date="2026-08-17", tote="5", loc="Brand New Dock")))
+    assert r.status == 200 and r.json["lots"] == ["JAM-SL-20260817-005"] and any("Brand New Dock" in w for w in r.json["warnings"])
+    assert count_totes(srv) == before and not sql(srv, "SELECT 1 FROM locations WHERE name='Brand New Dock'")
 
 
 def test_header_names_are_case_insensitive_and_a_leading_bom_is_ignored(srv, admin):
