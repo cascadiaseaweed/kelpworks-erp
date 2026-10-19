@@ -180,6 +180,11 @@ for `main` so a red run blocks the merge.
   `_auth` / `_user_from_token` refuse a `dl` token as a Bearer token, and a password change / reset / deactivation ends it like any session. The SPA keeps one fresh (`dlToken()`, refreshed every 5 minutes
   and on return to the tab; a capture-phase click handler swaps the current token into any `a[href*="token="]` at click time), so build every file URL with `encodeURIComponent(dlToken())`, never `State.token`.
   Tests that follow a link must send NO Authorization header (`client.get(path, token="")`); `ApiClient.download_token()` mints one.
+- **Idle timeout** (KW-08; tests in `tests/test_idle_timeout.py`). Setting `idle_timeout_minutes` (default 30, 0 = off, on the Calculations page, effective within a minute, no deploy): the browser (`Idle`, app.js) watches input,
+  shows a one-minute "Still there?" countdown (any input cancels it), then presses every open `button.section-save` (`pressSectionSaves`: run drafts, amended runs, pre-processing batches -- the same as "Save & close"), closes the
+  windows and signs out with a message listing what was saved. The server enforces the limit too (`idle_check` in `_user_from_token`, session tokens only; grace = a fifth of the limit, 2 s - 120 s, so the browser can save first):
+  an idle session answers 401 `idle_timeout`, so a dead tablet cannot hold a session for the 12 hours of the token. Activity = any request except `/api/auth/download-token` (the background refresh), plus `POST /api/activity`
+  (a ping every ~30 s while the person is using the screen; no write transaction, 200s not logged). In memory (`IDLE_LAST`): a restart restarts every idle clock. Windows that are not section-based (small edit forms) cannot be auto-saved.
 - **Uploads, downloads and browser headers** (risk review batch 3; tests in `tests/test_uploads_xss.py`). What a stored file is served as comes from its FILE NAME only
   (`served_type`): PDFs and images may open inline, everything else is a download with a server-chosen type (`SAFE_INLINE_TYPES` / `DOWNLOAD_TYPES`); the type a client
   sends is ignored, including for rows stored before this rule. Script-capable extensions (`BLOCKED_UPLOAD_EXTENSIONS`: html, svg, js, xml, exe ...) are refused at upload

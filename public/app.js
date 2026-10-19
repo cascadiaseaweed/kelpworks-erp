@@ -12,7 +12,7 @@ async function api(method, path, body) {
   const res = await fetch('/api' + path, opts);
   let data = {};
   try { data = await res.json(); } catch (e) {}
-  if (res.status === 401) { logout(); throw new Error(data.error || 'Session expired'); }
+  if (res.status === 401) { if (State.token) logout(data.code === 'idle_timeout' ? data.error : null); throw new Error(data.error || 'Session expired'); }     // (already signed out: a late request must not wipe the sign-in message)
   if (!res.ok) { const err = new Error(data.error || ('HTTP ' + res.status)); err.code = data.code; if (data.problems) { err.problems = data.problems; err.problemCount = data.problemCount; } throw err; }
   return data;
 }
@@ -84,8 +84,67 @@ function code128SVG(data, opts = {}) {
   return `<svg viewBox="0 0 ${totalW.toFixed(0)} ${h}" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg"><g fill="#000">${rects}</g></svg>`;
 }
 
+/* ---------------- Idle timeout (KW-08) ---------------- */
+// After `idle_timeout_minutes` (Calculations page, 0 = off) without input the person is signed out -- but first every open run / batch section is saved (the same
+// Save as "Save & close"), so a tablet dropped in a tank or left on the bench loses nothing. A one-minute countdown comes first; any input cancels it. The server
+// enforces the same limit (plus a short grace), so a browser that died cannot keep the session for hours; a small ping while the person is active keeps it alive.
+const Idle = { last: Date.now(), timer: null, warn: null, firing: false, minutes: null, pinged: 0 };
+const idleMinutes = () => Number(Idle.minutes != null ? Idle.minutes : settingValue('idle_timeout_minutes', 30)) || 0;
+function idleMark() { Idle.last = Date.now(); if (Idle.warn && !Idle.firing) idleHideWarning(); }
+['mousemove', 'mousedown', 'keydown', 'touchstart', 'wheel', 'scroll', 'input'].forEach(ev => window.addEventListener(ev, idleMark, { passive: true, capture: true }));
+function idleHideWarning() { if (Idle.warn) { Idle.warn.bg.remove(); Idle.warn = null; } }
+function idleShowWarning(seconds) {
+  if (!Idle.warn) {
+    const text = el('b', {});
+    const bg = el('div', { class: 'modal-bg' }, el('div', { class: 'modal' }, el('h3', {}, 'Still there?'),
+      el('div', {}, 'You will be signed out in ', text, ' because nothing has been touched for a while. The run and batch sections you have open are saved first.'),
+      el('div', { class: 'modal-actions' }, el('button', { onclick: idleMark }, 'Stay signed in'))));
+    $('#modalRoot').append(bg);
+    Idle.warn = { bg, text };
+  }
+  Idle.warn.text.textContent = Math.max(0, Math.round(seconds)) + ' s';
+}
+async function idleSignOut(minutes) {
+  Idle.firing = true;
+  const saved = [], problems = [];
+  try {
+    for (const bg of document.querySelectorAll('#modalRoot .modal-bg')) {
+      if (Idle.warn && bg === Idle.warn.bg) continue;
+      if (!bg.querySelector('button.section-save')) continue;
+      const failed = await pressSectionSaves(bg);
+      const title = (bg.querySelector('h3') || {}).textContent || 'a window';
+      (failed.length ? problems : saved).push(title);
+    }
+  } catch (e) { /* sign out anyway: the server drops the session shortly after */ }
+  idleHideWarning(); closeAllModals();
+  logout('You were signed out after ' + minutes + ' minutes without activity.'
+    + (saved.length ? ' Saved first: ' + saved.join('; ') + '.' : '')
+    + (problems.length ? ' Could not save everything in: ' + problems.join('; ') + '.' : ''));
+  Idle.firing = false; Idle.last = Date.now();
+}
+function idleTick() {
+  if (!State.token || !State.user || Idle.firing) return;
+  const minutes = idleMinutes();
+  if (!(minutes > 0)) { idleHideWarning(); return; }
+  const limit = minutes * 60000, left = limit - (Date.now() - Idle.last), warnAt = Math.min(60000, limit / 2);
+  if (left <= 0) idleSignOut(minutes);
+  else if (left <= warnAt) idleShowWarning(left / 1000);
+  else idleHideWarning();
+}
+async function idlePing() {         // tells the server the person is using the screen (it keeps the session alive) and learns the current limit
+  if (!State.token || !State.user || Date.now() - Idle.last > 35000 || Date.now() - Idle.pinged < 25000) return;
+  Idle.pinged = Date.now();
+  try { const r = await api('POST', '/activity', {}); Idle.minutes = r.idleTimeoutMinutes; } catch (e) { /* offline: the next ping tries again */ }
+}
+function idleStart() { Idle.last = Date.now(); Idle.pinged = 0; clearInterval(Idle.timer); Idle.timer = setInterval(() => { idleTick(); idlePing(); }, 1000); idlePing(); }
+function idleStop() { clearInterval(Idle.timer); Idle.timer = null; idleHideWarning(); }
+
 /* ---------------- Auth / shell ---------------- */
-function logout() { State.token = null; State.user = null; localStorage.removeItem(TOKEN_KEY); show('login'); }
+function logout(message) {
+  idleStop();
+  State.token = null; State.user = null; localStorage.removeItem(TOKEN_KEY); show('login');
+  $('#loginError').textContent = message || '';        // e.g. "You were signed out after 30 minutes without activity ..."
+}
 function show(which) {
   $('#login').classList.toggle('hidden', which !== 'login');
   $('#app').classList.toggle('hidden', which === 'login');
@@ -122,6 +181,7 @@ async function boot() {
     $('#tabs [data-tab=admin]').closest('.tab-group').classList.toggle('hidden', State.user.role !== 'admin');
     if (State.tab === 'admin' && State.user.role !== 'admin') State.tab = 'dashboard';
     show('app'); selectTab(State.tab);
+    idleStart();
   } catch (err) { logout(); }
 }
 

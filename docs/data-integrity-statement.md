@@ -24,7 +24,7 @@ procedural controls listed in section 5. It is a description of design and pract
 
 ## 3. Technical controls that protect the above
 
-- **Access:** individual accounts; roles and manager flags set by an administrator; sign-in throttling; a password change, reset or deactivation ends all of that person's sessions; short-lived tokens for file downloads.
+- **Access:** individual accounts; roles and manager flags set by an administrator; sign-in throttling; an idle timeout (30 minutes by default, set by an administrator) signs out an unattended session after saving the production-log sections left open; a password change, reset or deactivation ends all of that person's sessions; short-lived tokens for file downloads.
 - **Tamper evidence:** release and amendment events form a hash chain; **Verify audit trail** (Product Release) recomputes it and reports any break. A data-integrity check compares packaging, finished goods, stock commits, signed-log fingerprints and the audit chain for every finalized run.
 - **Change control of the software:** every change is made on a branch, reviewed through a pull request, and merged only when an automated test suite passes (several hundred tests, including upgrade tests that start the current software on databases created by every released version and confirm no records are lost). A staging environment holds a copy of live data for trial. Each live version is recorded.
 - **Safe upgrades:** a database upgrade runs as a single transaction (a failure leaves the data untouched) and is preceded by a compressed copy of the database.
