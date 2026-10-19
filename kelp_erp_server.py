@@ -164,6 +164,8 @@ SETTINGS_DEFAULTS = [
      "Maximum working volume of EACH of Tank 6A and Tank 6B (6A + 6B connected = double) -- used by the Dilution plan's available space / maximum product transfer."),
     ("homog_tank_capacity_each_l", 5000, "Homogenization Tank 2A / 2B capacity, each (L)",
      "Maximum working volume of EACH of Tank 2A and Tank 2B (2A + 2B = double): a Post-Dilution Tank Level above it is flagged in the production log. A warning only -- it never blocks saving."),
+    ("presence_timeout_seconds", 90, "Presence timeout (seconds)",
+     "How long someone who has closed their browser (or lost power) still shows as having a run, batch or tote open. Browsers announce themselves about every third of this time; it only drives the 'someone else has this open' warning."),
     ("idle_timeout_minutes", 30, "Idle timeout (minutes)",
      "A signed-in person who has not used the screen for this long is signed out; the run and batch sections they have open are saved first. 0 turns it off. Takes effect for everyone within a minute, no deploy needed."),
     ("sample_retention_months", 12, "Retention sample shelf life (months)",
@@ -294,10 +296,15 @@ _QC_ALL = [
     ("mannitolPct", "QC Check: Mannitol (%)"), ("tsLiquidPct", "QC Check: TSliquid (%)"),
     ("rhoLiquidGMl", "QC Check: \u03c1liquid (g/mL)"),
 ]
-# A field entry may carry a 4th element: a predicate over the run's stages dict -- the field is
+# A field's key may be a tuple of keys: the item is filled when ANY of them has a value (KW-18). A field entry may carry a 4th element: a predicate over the run's stages dict -- the field is
 # only required when it is true (per-tank fields apply only to the tanks being filled).
 _uses_2a = lambda st: (st["homogenization"].get("tanks") or "") in ("2A", "2AB")
 _uses_2b = lambda st: (st["homogenization"].get("tanks") or "") in ("2B", "2AB")
+NOTE_SECTIONS = [("initiation", "Initiation"), ("feedstock", "Feedstock"), ("homogenization", "Homogenization"), ("extraction", "Extraction"), ("separation", "Separation"),
+                 ("pasteurization", "Pasteurization"), ("dilution", "Dilution & Preservation"), ("packaging", "Packaging"), ("general", "General")]
+NOTE_SECTION_LABELS = dict(NOTE_SECTIONS)
+NOTE_MAX_CHARS = 4000
+NOTE_MAX_IMAGES = 10
 EXTRACTION_BYPASS_DEFAULT = "Extraction not optimized"      # KW-15: the reason a bypassed extraction starts with (editable, never blank)
 _extracting = lambda st: not st["extraction"].get("bypassed")
 _bypassed = lambda st: bool(st["extraction"].get("bypassed"))
@@ -336,7 +343,8 @@ PROGRESS_SECTIONS = [
     {"key": "separation", "label": "Separation", "fields": [
         ("separation", "startedAt", "Started at"), ("separation", "flowrateLpm", "Flow rate (L/min)"),
         ("separation", "meshMicron", "Mesh size (micron)"), ("separation", "wetSolidsWtKg", "Total wet-solids weight (kg)"),
-        ("separation", "pctMoisture", "%Moisture centrifuge solids"), ("separation", "pctMoistureScrew", "%Moisture screw solids"),
+        # KW-18: at least ONE of the two solids moisture readings (a key that is a tuple = "any one of these keys has a value")
+        ("separation", ("pctMoisture", "pctMoistureScrew"), "%Moisture of the solids (centrifuge or screw press: at least one)"),
         ("separation", "liquidQcPh", "Filtrate QC Check: pH"), ("separation", "liquidTdsPct", "Filtrate QC Check: TDS (%)"),
         ("separation", "liquidBrixPct", "Filtrate QC Check: Brix (%)"),
         ("separation", "liquidMannitolPct", "Filtrate QC Check: Mannitol (%)"),
@@ -377,6 +385,8 @@ def required_keys_by_stage():
     for sec in PROGRESS_SECTIONS:
         for entry in sec.get("fields", []):
             stage, key = entry[0], entry[1]
+            if isinstance(key, tuple):          # "any one of" groups have no asterisk on a single field
+                continue
             out.setdefault(stage, [])
             if key not in out[stage]:
                 out[stage].append(key)
@@ -611,6 +621,26 @@ CREATE TABLE IF NOT EXISTS run_attachments (
     uploaded_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_attach_run ON run_attachments(run_id);
+
+-- Notes on a production run (KW-01): machine failures, process changes. Each carries the log section it belongs to; part of the signed production log (the images are not).
+CREATE TABLE IF NOT EXISTS run_notes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+    section     TEXT NOT NULL,          -- initiation | feedstock | homogenization | extraction | separation | pasteurization | dilution | packaging | general
+    body        TEXT NOT NULL,
+    created_by  TEXT,
+    created_at  TEXT NOT NULL,
+    updated_by  TEXT,
+    updated_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_runnotes_run ON run_notes(run_id);
+-- The pictures attached to a note (each is a run_attachments row, stored and served like any document).
+CREATE TABLE IF NOT EXISTS run_note_images (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    note_id       INTEGER NOT NULL REFERENCES run_notes(id) ON DELETE CASCADE,
+    attachment_id INTEGER NOT NULL REFERENCES run_attachments(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_noteimg_note ON run_note_images(note_id);
 
 -- Controlled documents (Standard Operating Procedures) referenced by name
 -- from spots in the production log (e.g. a QC Check's "Determining % Wet
@@ -1810,6 +1840,50 @@ def verify_password(password, stored):
 
 
 # ---- login throttling (single instance: in memory is enough) ----
+# Presence (KW-07): who has which card open, so a second person is warned before they edit the same run / batch / tote ("last save wins" has no other protection).
+# Kept in memory only -- nothing is stored or backed up, an entry simply expires PRESENCE_TIMEOUT seconds after the browser last said it was still there (setting
+# presence_timeout_seconds), and a browser re-announces itself every few seconds, so a restart loses nothing that matters.
+PRESENCE = {}                            # (user id, tab id, card key) -> {"name", "initials", "label", "seen", "since"}
+PRESENCE_ONLINE = {}                     # (user id, tab id) -> {"name", "initials", "seen"}
+PRESENCE_LOCK = threading.Lock()
+PRESENCE_MAX_CARDS = 20
+PRESENCE_KEY_RE = re.compile(r"^(run|batch|tote):\d{1,9}$")
+
+
+def presence_initials(name):
+    words = re.findall(r"[A-Za-z0-9]+", name or "")
+    return ("".join(w[0] for w in words[:2]) or "?").upper()
+
+
+def presence_update(user, tab, cards, timeout, now=None):
+    """Record that this browser tab is online and has exactly `cards` ([(key, label)]) open (an empty list = it left them all); forget what has expired.
+    Returns {"presence": {card key: [who]}, "online": [who]} where who = {id, name, initials, label?}."""
+    now = time.time() if now is None else now
+    initials = presence_initials(user["name"])
+    with PRESENCE_LOCK:
+        for k in [k for k, v in PRESENCE.items() if now - v["seen"] > timeout or (k[0] == user["id"] and k[1] == tab)]:
+            del PRESENCE[k]
+        for k in [k for k, v in PRESENCE_ONLINE.items() if now - v["seen"] > timeout]:
+            del PRESENCE_ONLINE[k]
+        PRESENCE_ONLINE[(user["id"], tab)] = {"name": user["name"], "initials": initials, "seen": now}
+        for key, label in cards:
+            PRESENCE[(user["id"], tab, key)] = {"name": user["name"], "initials": initials, "label": label, "seen": now}
+        by_card, online = {}, {}
+        for (uid, _tab, key), v in sorted(PRESENCE.items(), key=lambda kv: kv[1]["seen"]):
+            people = by_card.setdefault(key, [])
+            if not any(p["id"] == uid for p in people):
+                people.append({"id": uid, "name": v["name"], "initials": v["initials"], "label": v["label"]})
+        for (uid, _tab), v in PRESENCE_ONLINE.items():
+            online.setdefault(uid, {"id": uid, "name": v["name"], "initials": v["initials"]})
+    return {"presence": by_card, "online": sorted(online.values(), key=lambda p: p["name"].lower())}
+
+
+def presence_leave(user, tab):
+    """This browser tab is closing (or signing out): it is no longer online and has nothing open."""
+    with PRESENCE_LOCK:
+        for k in [k for k in PRESENCE if k[0] == user["id"] and k[1] == tab]:
+            del PRESENCE[k]
+        PRESENCE_ONLINE.pop((user["id"], tab), None)
 # Idle timeout (KW-08): a session that has been idle longer than the setting idle_timeout_minutes (0 = off) is ended. "Activity" = any request except the background download-token
 # refresh, plus a small POST /api/activity ping the browser sends while the person is using the screen. The server allows a short grace beyond the limit so the browser, which
 # watches the same limit, can save the open run / batch sections and sign out first. In memory: a restart simply starts every session's idle clock again.
@@ -4050,6 +4124,16 @@ def build_run_summary_pdf(S, logo_path=None):
     ]
     pdf.table(["Stage", "Started", "Key results"], rows, [92, 78, 362], ["l", "l", "l"], size=7.8, bold_first=True)
 
+    # ---- notes written on the run (KW-01): what happened that the numbers do not say
+    if S.get("notes"):
+        pdf.heading("Notes")
+        order = {k: i for i, (k, _l) in enumerate(NOTE_SECTIONS)}
+        pdf.table(["Section", "Note", "By", "When"],
+                  [[n["sectionLabel"], n["body"] + ("  [%d picture%s attached]" % (len(n["images"]), "" if len(n["images"]) == 1 else "s") if n["images"] else ""),
+                    n["by"] or "-", (n["at"] or "")[:16].replace("T", " ")]
+                   for n in sorted(S["notes"], key=lambda n: (order.get(n["section"], 99), n["id"]))],
+                  [96, 308, 70, 58], ["l", "l", "l", "l"], size=7.8, bold_first=True)
+
     # ---- quality scorecard: one matrix, metric x stage
     pdf.heading("Quality scorecard")
     cols = ["Homog.", "Extraction", "Separation", "Pasteur.", "Dilution", "Packaging"]
@@ -4492,6 +4576,8 @@ def migrate(conn):
         conn.execute("ALTER TABLE run_sample_points ADD COLUMN label_numbered INTEGER NOT NULL DEFAULT 0")
     if "label_name" not in spcols:
         conn.execute("ALTER TABLE run_sample_points ADD COLUMN label_name TEXT")
+    if "ph" not in {r["name"] for r in conn.execute("PRAGMA table_info(fg_lots)")}:     # KW-31: the lot's actual final pH (its `tds` is now the actual final TDS too)
+        conn.execute("ALTER TABLE fg_lots ADD COLUMN ph REAL")
     if "min_qty" not in spcols:      # KW-13: a required (default) sample can't be removed, retyped or reduced below this many units; NULL = an ordinary row
         conn.execute("ALTER TABLE run_sample_points ADD COLUMN min_qty INTEGER")
 
@@ -5168,7 +5254,7 @@ def fg_public(r):
     return {"id": r["id"], "lot": r["fg_lot_number"], "sku": r["sku_code"],
             "runId": r["run_id"], "packageSize": r["package_size"], "qty": r["qty"],
             "litresEach": r["litres_each"], "litres": round((r["qty"] or 0) * (r["litres_each"] or 0), 2),
-            "producedDate": r["produced_date"], "tds": r["tds"], "location": r["location"],
+            "producedDate": r["produced_date"], "tds": r["tds"], "ph": r["ph"], "location": r["location"],
             "status": r["status"]}
 
 
@@ -6344,7 +6430,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_request(self, code="-", size="-"):
         path = urlparse(self.path).path
-        if (path.startswith("/api/") and not (path == "/api/activity" and str(code) == "200")) or (str(code).isdigit() and int(code) >= 400):   # not every css / js / image / ping
+        if (path.startswith("/api/") and not (path in ("/api/presence", "/api/activity") and str(code) == "200")) or (str(code).isdigit() and int(code) >= 400):   # not every css / js / image / heartbeat / ping
             logger.info("%s %s -> %s", self.command, redact(self.path), code)
 
     def _server_error(self, exc):
@@ -7320,7 +7406,7 @@ class Handler(BaseHTTPRequestHandler):
         conn = db()
         self._created_files, self._files_to_remove = [], []
         try:
-            if method != "GET" and parsed.path not in ("/api/auth/login", "/api/activity"):       # the activity ping writes nothing
+            if method != "GET" and parsed.path not in ("/api/auth/login", "/api/presence", "/api/activity"):       # presence and the activity ping are in memory: no write transaction
                 conn.execute("BEGIN IMMEDIATE")          # take the write lock BEFORE any read the handler bases a write on
             self._actor = None
             result = self._route(method, parsed.path, query, conn)
@@ -7363,6 +7449,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if method == "POST" and seg == ["api", "auth", "download-token"]:
             return {"token": make_token(user["id"], user["token_version"], scope="dl", ttl=DOWNLOAD_TOKEN_TTL), "expiresIn": DOWNLOAD_TOKEN_TTL}
+        if method == "POST" and seg == ["api", "presence"]:
+            return self.route_presence(conn, user)
         if method == "POST" and seg == ["api", "activity"]:         # the browser says the person is using the screen (counted by _user_from_token); answers the current limit
             return {"idleTimeoutMinutes": float(get_setting_value(conn, "idle_timeout_minutes", 30) or 0)}
         if method == "GET" and seg == ["api", "me"]:
@@ -7509,6 +7597,29 @@ class Handler(BaseHTTPRequestHandler):
                 "isProductionManager": bool(row["is_production_manager"]),
                 "isQualityManager": bool(row["is_quality_manager"]),
                 "canAmendLog": bool(row["can_amend_log"])}
+
+    def route_presence(self, conn, user):
+        """POST /api/presence {tab, open: [{key, label}]}: this browser tab is here and has these cards open (replaces what it said before; an empty list = left them all).
+        {tab, leave: true}: the tab is closing, forget it. Answers who is where."""
+        d = self._body_json(8192)
+        tab = str(d.get("tab") or "")[:40]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{4,40}", tab):
+            raise ApiError(400, "A tab id of 4-40 letters or digits is needed")
+        if d.get("leave"):
+            presence_leave(user, tab)
+            return {"ok": True}
+        cards = []
+        for c in (d.get("open") or [])[:PRESENCE_MAX_CARDS + 1]:
+            key = str((c or {}).get("key") or "")
+            if not PRESENCE_KEY_RE.match(key):
+                raise ApiError(400, "Unknown card: %s" % key[:30])
+            cards.append((key, str((c or {}).get("label") or "")[:80]))
+        if len(cards) > PRESENCE_MAX_CARDS:
+            raise ApiError(400, "Too many cards open at once")
+        timeout = max(1.0, float(get_setting_value(conn, "presence_timeout_seconds", 90) or 90))
+        out = presence_update(user, tab, cards, timeout)
+        out.update({"me": user["id"], "timeoutSeconds": timeout})
+        return out
 
     # ---- users / admin ---------------------------------------------------- #
     def _user_public(self, r):
@@ -8567,6 +8678,7 @@ class Handler(BaseHTTPRequestHandler):
             "samples": samples, "requisitions": reqs, "materials": materials,
             "fgLots": [dict(f, statusLabel=fg_status.get(f["status"], f["status"])) for f in run["fgLots"]],
             "qcRecorded": (run["qcSummary"]["recorded"], run["qcSummary"]["total"]) if run.get("qcSummary") else None,
+            "notes": self._notes_public(conn, rid),
             "generatedAt": today_iso(), "generatedBy": user["name"] if user else None,
         }
 
@@ -11282,6 +11394,10 @@ class Handler(BaseHTTPRequestHandler):
         d["dilutionPasses"] = self._dilution_passes_public(conn, r["id"])
         d["samplePoints"] = self._sample_points_public(conn, r["id"])
         d["packagingEntries"] = self._packaging_entries_public(conn, r["id"])
+        notes = self._notes_public(conn, r["id"])
+        if notes:                                  # KW-01: in the signed log only when the run has notes (the pictures, like documents, are not)
+            d["logNotes"] = [{k: v for k, v in n.items() if k != "images"} for n in notes]
+            d["logNoteImages"] = {str(n["id"]): n["images"] for n in notes if n["images"]}
         d["release"] = {"state": r["release_state"], "label": RELEASE_LABELS.get(r["release_state"], "—"),
                         "finalizedBy": r["finalized_by"]}
         am = self._open_amendment(conn, r["id"])
@@ -11326,7 +11442,8 @@ class Handler(BaseHTTPRequestHandler):
                     stage, key, label = entry[:3]
                     if len(entry) > 3 and not entry[3](stages):
                         continue          # conditional field that doesn't apply to this run
-                    items.append((label, _has_value(stages[stage].get(key))))
+                    keys = key if isinstance(key, tuple) else (key,)
+                    items.append((label, any(_has_value(stages[stage].get(k)) for k in keys)))
                 if sec["key"] == "dilution":
                     for ps in conn.execute("SELECT * FROM run_dilution_passes WHERE run_id=? ORDER BY pass_no", (rid,)):
                         recv = ps["receiving"] or ""
@@ -11405,6 +11522,8 @@ class Handler(BaseHTTPRequestHandler):
             return "Packaging entry %s" % (item.get("containerUnit") or "#%s" % item["id"])
         if section == "attachments":
             return "Document %s" % (item.get("filename") or "#%s" % item["id"])
+        if section == "logNotes":
+            return "Note (%s) #%s" % (NOTE_SECTION_LABELS.get(item.get("section"), item.get("section") or "-"), item["id"])
         return "%s #%s" % (humanize_key(section), item["id"])
 
     def _flatten_snapshot(self, d):
@@ -11498,7 +11617,7 @@ class Handler(BaseHTTPRequestHandler):
     # Documents are not production-log entries, so they never change the log hash
     # (and never need an amendment).
     _RELEASE_HASH_SKIP = ("edits", "fgLots", "release", "excludeFromStats", "excludeReason",
-                          "progress", "revisions", "revision", "attachments", "amendment")
+                          "progress", "revisions", "revision", "attachments", "amendment", "logNoteImages")
 
     def _release_snapshot(self, conn, rid):
         r = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
@@ -12237,6 +12356,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.edit_run(conn, int(seg[2]), user)
         if len(seg) >= 4 and seg[2].isdigit() and seg[3] == "lab-results":
             return self.route_lab_results(method, seg, conn, user)
+        if len(seg) >= 4 and seg[2].isdigit() and seg[3] == "notes":
+            return self.route_run_notes(method, seg, conn, user)
         if len(seg) >= 4 and seg[2].isdigit() and seg[3] == "attachments":
             rid = int(seg[2])
             if not conn.execute("SELECT 1 FROM production_runs WHERE id=?", (rid,)).fetchone():
@@ -12321,6 +12442,81 @@ class Handler(BaseHTTPRequestHandler):
             if method == "DELETE":
                 return self.delete_packaging_entry(conn, rid, peid, user)
         raise ApiError(404, "Unknown production endpoint")
+
+    # ---- run notes (KW-01) ---------------------------------------------------#
+    def _notes_public(self, conn, run_id):
+        images = {}
+        for i in conn.execute("SELECT ni.note_id, a.id, a.filename FROM run_note_images ni JOIN run_attachments a ON a.id=ni.attachment_id"
+                              " JOIN run_notes n ON n.id=ni.note_id WHERE n.run_id=? ORDER BY ni.id", (run_id,)):
+            images.setdefault(i["note_id"], []).append({"id": i["id"], "filename": i["filename"]})
+        return [{"id": n["id"], "section": n["section"], "sectionLabel": NOTE_SECTION_LABELS.get(n["section"], n["section"]), "body": n["body"],
+                 "by": n["created_by"], "at": n["created_at"], "editedBy": n["updated_by"], "editedAt": n["updated_at"], "images": images.get(n["id"], [])}
+                for n in conn.execute("SELECT * FROM run_notes WHERE run_id=? ORDER BY id", (run_id,))]
+
+    def route_run_notes(self, method, seg, conn, user):
+        """/api/production/<id>/notes[/<note id>[/images[/<attachment id>]]]. Like every production-log entry a note can be added, changed or removed while the log is open (a draft, or an
+        open amendment): `_amend_guard` refuses a finished run and `_release_reconcile` voids a sign-off the change would contradict."""
+        rid = int(seg[2])
+        run = conn.execute("SELECT id FROM production_runs WHERE id=?", (rid,)).fetchone()
+        if not run:
+            raise ApiError(404, "Production run not found")
+        who = user["name"] if user else None
+
+        def note_row(nid):
+            n = conn.execute("SELECT * FROM run_notes WHERE id=? AND run_id=?", (nid, rid)).fetchone()
+            if not n:
+                raise ApiError(404, "Note not found")
+            return n
+
+        def clean(d, current=None):
+            section = (d.get("section") if "section" in d else (current["section"] if current else "")) or ""
+            body = (d.get("body") if "body" in d else (current["body"] if current else "")) or ""
+            body = str(body).strip()
+            if section not in NOTE_SECTION_LABELS:
+                raise ApiError(400, "Choose which log section the note belongs to")
+            if not body:
+                raise ApiError(400, "Write the note")
+            if len(body) > NOTE_MAX_CHARS:
+                raise ApiError(400, "A note can be at most %d characters" % NOTE_MAX_CHARS)
+            return section, body
+        if len(seg) == 4 and method == "GET":
+            return {"notes": self._notes_public(conn, rid), "sections": [{"key": k, "label": l} for k, l in NOTE_SECTIONS]}
+        if len(seg) == 4 and method == "POST":
+            section, body = clean(self._body_json())
+            cur = conn.execute("INSERT INTO run_notes (run_id,section,body,created_by,created_at) VALUES (?,?,?,?,?)", (rid, section, body, who, now_iso()))
+            return {"notes": self._notes_public(conn, rid), "id": cur.lastrowid}
+        if len(seg) >= 5 and seg[4].isdigit():
+            nid = int(seg[4])
+            n = note_row(nid)
+            if len(seg) == 5 and method == "PUT":
+                section, body = clean(self._body_json(), n)
+                if (section, body) != (n["section"], n["body"]):
+                    conn.execute("UPDATE run_notes SET section=?, body=?, updated_by=?, updated_at=? WHERE id=?", (section, body, who, now_iso(), nid))
+                return {"notes": self._notes_public(conn, rid)}
+            if len(seg) == 5 and method == "DELETE":
+                for a in conn.execute("SELECT a.* FROM run_note_images ni JOIN run_attachments a ON a.id=ni.attachment_id WHERE ni.note_id=?", (nid,)).fetchall():
+                    self._files_to_remove.append(os.path.join(UPLOAD_DIR, a["stored_name"]))
+                    conn.execute("DELETE FROM run_attachments WHERE id=?", (a["id"],))              # its link row goes with it (ON DELETE CASCADE)
+                conn.execute("DELETE FROM run_notes WHERE id=?", (nid,))
+                return {"notes": self._notes_public(conn, rid)}
+            if len(seg) == 6 and seg[5] == "images" and method == "POST":
+                d = self._body_json()
+                if conn.execute("SELECT COUNT(*) c FROM run_note_images WHERE note_id=?", (nid,)).fetchone()["c"] >= NOTE_MAX_IMAGES:
+                    raise ApiError(400, "A note can have at most %d pictures" % NOTE_MAX_IMAGES)
+                if not served_type(str(d.get("filename") or ""))[0].startswith("image/"):
+                    raise ApiError(400, "Only pictures can be attached to a note (jpg, png, gif, webp ...); other files go in the run's Documents")
+                aid = self._store_attachment(conn, rid, d.get("filename"), d.get("contentType"), d.get("dataB64") or "", who)
+                conn.execute("INSERT INTO run_note_images (note_id, attachment_id) VALUES (?,?)", (nid, aid))
+                return {"notes": self._notes_public(conn, rid)}
+            if len(seg) == 7 and seg[5] == "images" and seg[6].isdigit() and method == "DELETE":
+                aid = int(seg[6])
+                a = conn.execute("SELECT a.* FROM run_note_images ni JOIN run_attachments a ON a.id=ni.attachment_id WHERE ni.note_id=? AND a.id=?", (nid, aid)).fetchone()
+                if not a:
+                    raise ApiError(404, "Picture not found on this note")
+                self._files_to_remove.append(os.path.join(UPLOAD_DIR, a["stored_name"]))
+                conn.execute("DELETE FROM run_attachments WHERE id=?", (aid,))
+                return {"notes": self._notes_public(conn, rid)}
+        raise ApiError(404, "Unknown notes endpoint")
 
     def _attachments(self, conn, run_id):
         return [{"id": r["id"], "filename": r["filename"], "contentType": r["content_type"],
@@ -12868,6 +13064,8 @@ class Handler(BaseHTTPRequestHandler):
             self._recompute_homogenization(conn, rid)
         if stage == "extraction":
             self._apply_extraction_bypass(conn, rid)
+        if stage == "packaging" and run["status"] == "completed":
+            self._sync_fg_lot_quality(conn, rid)
         # The Packaging section's one Save button covers the packagedAt/QC/
         # Sample Point fields above *and* commits the Packaging table's net
         # container changes -- this is the "once changes have been saved"
@@ -13293,6 +13491,12 @@ class Handler(BaseHTTPRequestHandler):
             return "on_hand"
         return "hold" if st == "rejected" else "pending_release"
 
+    def _sync_fg_lot_quality(self, conn, run_id):
+        """KW-31: a finished-goods lot carries the run's ACTUAL final TDS and pH (the Packaging QC Check), never the product's target. Recomputed by the code that
+        changes the source (finalize, a Packaging QC save under an amendment), so the card, the label and the certificate cannot disagree."""
+        conn.execute("UPDATE fg_lots SET tds=(SELECT packaging_tds_pct FROM production_runs WHERE id=fg_lots.run_id),"
+                     " ph=(SELECT packaging_qc_ph FROM production_runs WHERE id=fg_lots.run_id) WHERE run_id=?", (run_id,))
+
     def _adjust_fg_lot(self, conn, run, unit, delta, unit_litres):
         lot_no = "%s-%s" % (run["processing_lot"], unit)
         lot = conn.execute("SELECT * FROM fg_lots WHERE run_id=? AND fg_lot_number=?", (run["id"], lot_no)).fetchone()
@@ -13300,9 +13504,9 @@ class Handler(BaseHTTPRequestHandler):
             if delta > 0 and unit in unit_litres:
                 conn.execute(
                     "INSERT INTO fg_lots (fg_lot_number,sku_code,run_id,package_size,qty,litres_each,produced_date,"
-                    "tds,location,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    "tds,ph,location,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (lot_no, run["sku_code"], run["id"], unit, delta, unit_litres[unit], run["run_date"],
-                     run["target_tds"], run["location"], self._lot_status_for_run(run), now_iso()))
+                     run["packaging_tds_pct"], run["packaging_qc_ph"], run["location"], self._lot_status_for_run(run), now_iso()))
             return
         new_qty = (lot["qty"] or 0) + delta
         if new_qty < 0:
@@ -13629,6 +13833,7 @@ class Handler(BaseHTTPRequestHandler):
                 (fg_lot, sku, run_id, unit, qty, unit_litres[unit], run_date,
                  target_tds, location, lot_status, ts))
             fg_created.append(fg_lot)
+            self._sync_fg_lot_quality(conn, run_id)
             # (FG labels were consumed with the containers by the packaging
             # commit above -- see _commit_label_stock.)
 
@@ -13857,8 +14062,8 @@ class Handler(BaseHTTPRequestHandler):
     FG_EDIT_STATUSES = ("on_hand", "hold", "sold")
 
     def _edit_fg_lot(self, conn, it, user):
-        """PUT /api/fg/:id. Status, units on hand and TDS decide whether and how much product can be sold, so a change needs a
-        manager (hold / un-hold: a Quality Manager; units, TDS, on-hand <-> sold: a Production or Quality Manager), a reason, and is
+        """PUT /api/fg/:id. Status and units on hand decide whether and how much product can be sold, so a change needs a
+        manager (hold / un-hold: a Quality Manager; units, on-hand <-> sold: a Production or Quality Manager), a reason, and is
         written to the audit chain. A lot's location may be changed by anyone (and goes in the move log)."""
         d = self._body_json()
         if d.get("location"):
@@ -13883,12 +14088,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(400, "Units on hand must be a number, zero or more")
             if new_qty != it["qty"]:
                 changes["qty"] = (it["qty"], new_qty)
-        if "tds" in d:
-            new_tds = numn(d["tds"])
-            if new_tds is not None and (new_tds != new_tds or new_tds in (float("inf"), float("-inf")) or new_tds < 0):
-                raise ApiError(400, "TDS must be a number, zero or more")
-            if new_tds != it["tds"]:
-                changes["tds"] = (it["tds"], new_tds)
+        if "tds" in d or "ph" in d:       # KW-31: TDS and pH are the run's actual final QC values and are not typed here
+            if numn(d.get("tds", it["tds"])) != it["tds"] or numn(d.get("ph", it["ph"])) != it["ph"]:
+                raise ApiError(400, "A lot's TDS and pH are the run's final Packaging QC Check results and cannot be changed here - amend the run to correct them")
         new_loc = it["location"]
         if "location" in d and (d["location"] or None) != it["location"]:
             new_loc = (d["location"] or "").strip() or None
@@ -13898,14 +14100,13 @@ class Handler(BaseHTTPRequestHandler):
             if hold_involved:
                 self._require_quality_manager(user, "place a finished-goods lot on hold or release it from hold")
             elif not self._is_manager(user):
-                raise ApiError(403, "Only a Production Manager or Quality Manager can change a lot's status, units on hand or TDS")
+                raise ApiError(403, "Only a Production Manager or Quality Manager can change a lot's status or units on hand")
             reason = (d.get("reason") or "").strip()
             if len(reason) < 3:
                 raise ApiError(400, "Enter the reason for this change (it is recorded in the audit trail)")
             capacity = "Quality Manager" if self._is_quality_manager(user) else "Production Manager"
-        conn.execute("UPDATE fg_lots SET qty=?, status=?, location=?, tds=? WHERE id=?",
-                     (changes["qty"][1] if "qty" in changes else it["qty"], changes["status"][1] if "status" in changes else it["status"],
-                      new_loc, changes["tds"][1] if "tds" in changes else it["tds"], it["id"]))
+        conn.execute("UPDATE fg_lots SET qty=?, status=?, location=? WHERE id=?",
+                     (changes["qty"][1] if "qty" in changes else it["qty"], changes["status"][1] if "status" in changes else it["status"], new_loc, it["id"]))
         if new_loc != it["location"]:
             self._log_move(conn, "fg", it["id"], it["fg_lot_number"], it["location"], new_loc, it["qty"], today_iso(), "Edited")
         if changes:

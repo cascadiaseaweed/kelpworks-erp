@@ -635,6 +635,14 @@ body.is-staging { padding-top: 26px; }
 .linked-at b { display: block; }
 .linked-at .muted { display: block; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
+/* Presence (KW-07): initials of the other people who have a card open, and the people online */
+.presence { display: inline-flex; gap: 2px; vertical-align: middle; }
+.presence-dot { display: inline-flex; align-items: center; justify-content: center; min-width: 22px; height: 22px; padding: 0 3px; box-sizing: border-box; border-radius: 11px;
+  background: var(--warn); color: #fff; font-size: 10px; font-weight: 700; line-height: 1; }
+#presenceOnline { display: inline-flex; gap: 3px; margin-right: 6px; vertical-align: middle; }
+#presenceOnline .presence-dot { background: var(--teal); }
+#presenceOnline .presence-dot.me { background: #8aa39f; }
+.presence-banner { background: #fff4d6; border: 1px solid var(--warn); color: #6b4a00; border-radius: 6px; padding: 8px 12px; margin: 8px 0; font-size: 13px; font-weight: 600; }
 /* Slide toggle (a checkbox shown as a switch): checked = on. Used for Extraction Active <-> Bypassed. */
 .slide-toggle { display: flex; align-items: center; gap: 10px; margin: 0 0 8px; cursor: pointer; flex-wrap: wrap; }
 .slide-toggle input { position: absolute; opacity: 0; width: 1px; height: 1px; }
@@ -644,3 +652,12 @@ body.is-staging { padding-top: 26px; }
 .slide-toggle input:checked + .slide-track .slide-knob { left: 23px; }
 .slide-toggle input:focus-visible + .slide-track { outline: 2px solid var(--teal-dark); outline-offset: 2px; }
 .slide-state { font-weight: 600; }
+
+/* Notes on a run (KW-01) */
+.note-card { border: 1px solid var(--line); border-left: 4px solid var(--teal); border-radius: 6px; padding: 8px 10px; margin: 6px 0; background: #fbfdfc; }
+.note-head { margin-bottom: 3px; }
+.note-images { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.note-images img { max-height: 96px; max-width: 140px; border-radius: 4px; border: 1px solid var(--line); object-fit: cover; }
+.note-strip { margin-top: 10px; }
+.note-strip-title { font-size: 12px; font-weight: 700; color: var(--teal-dark); text-transform: uppercase; letter-spacing: .04em; }
+.note-form { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); }

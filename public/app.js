@@ -84,6 +84,86 @@ function code128SVG(data, opts = {}) {
   return `<svg viewBox="0 0 ${totalW.toFixed(0)} ${h}" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg"><g fill="#000">${rects}</g></svg>`;
 }
 
+/* ---------------- Presence (KW-07) ---------------- */
+// Who has which run / batch / tote open. Without it two people can edit the same card and the last save wins. This browser tab tells the server every few
+// seconds which cards it has open (POST /presence); the answer is who else is where. Opening a card someone else has open asks first; a banner inside the
+// window then shows who is there (and updates when someone joins later). Initials badges sit on the cards, and the top bar lists who is online.
+const Presence = { tab: Math.random().toString(36).slice(2, 12), open: new Map(), pending: null, data: { presence: {}, online: [] }, timer: null };
+const presenceOthers = key => ((Presence.data.presence || {})[key] || []).filter(p => State.user && p.id !== State.user.id);
+async function presenceBeat() {
+  if (!State.token || !State.user) return;
+  try {
+    Presence.data = await api('POST', '/presence', { tab: Presence.tab, open: [...Presence.open].map(([key, o]) => ({ key, label: o.label })) });
+    presenceRender();
+  } catch (e) { /* signed out or offline: the next beat tries again */ }
+}
+function presenceSchedule() {
+  clearTimeout(Presence.timer);
+  Presence.timer = setTimeout(async () => { await presenceBeat(); presenceSchedule(); }, Math.max(8, (Presence.data.timeoutSeconds || 90) / 3) * 1000);
+}
+function presenceStart() { presenceBeat().then(presenceSchedule); }
+function presenceLeave() {          // this tab is closing or signing out: tell the server now instead of waiting for the timeout
+  if (!State.token || !State.user) return;
+  try { fetch('/api/presence', { method: 'POST', keepalive: true, headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + State.token }, body: JSON.stringify({ tab: Presence.tab, leave: true }) }); } catch (e) { /* nothing to do */ }
+}
+function presenceStop() { clearTimeout(Presence.timer); Presence.timer = null; Presence.open.clear(); Presence.pending = null; Presence.data = { presence: {}, online: [] }; }
+const presenceDots = (people, what) => people.map(p => el('span', { class: 'presence-dot', title: p.name + what }, p.initials));
+function presenceBadge(key) {       // initials of the OTHER people who have this card open, kept current by presenceRender
+  const sp = el('span', { class: 'presence', 'data-presence': key });
+  sp.replaceChildren(...presenceDots(presenceOthers(key), ' has this open'));
+  return sp;
+}
+function presenceRender() {
+  document.querySelectorAll('[data-presence]').forEach(sp => sp.replaceChildren(...presenceDots(presenceOthers(sp.dataset.presence), ' has this open')));
+  const host = $('#presenceOnline');
+  if (host && State.user) host.replaceChildren(...(Presence.data.online || []).map(p => el('span', { class: 'presence-dot' + (p.id === State.user.id ? ' me' : ''), title: p.name + (p.id === State.user.id ? ' (you)' : ' is online') }, p.initials)));
+  for (const [key, o] of Presence.open) {
+    const who = presenceOthers(key);
+    o.banner.classList.toggle('hidden', !who.length);
+    o.banner.textContent = who.length ? '⚠ ' + who.map(p => p.name).join(', ') + (who.length > 1 ? ' also have' : ' also has')
+      + ' this open. If you both edit it, the last save wins and the other person’s changes can be lost.' : '';
+  }
+}
+function presenceWarn(label, others) {      // resolves true = open anyway, false = cancel
+  return new Promise(resolve => {
+    const done = v => { bg.remove(); resolve(v); };
+    const bg = el('div', { class: 'modal-bg' }, el('div', { class: 'modal' },
+      el('h3', {}, 'Someone else has this open'),
+      el('div', {}, el('b', {}, others.map(p => p.name).join(', ')), others.length > 1 ? ' have ' : ' has ', label, ' open right now.'),
+      el('div', { class: 'help', style: 'margin:8px 0' }, 'If you both edit it, the last save wins and the other person’s changes can be lost. Ask them first, or open it anyway.'),
+      el('div', { class: 'modal-actions' }, el('button', { class: 'secondary', onclick: () => done(false) }, 'Cancel'), el('button', { onclick: () => done(true) }, 'Open anyway'))));
+    $('#modalRoot').append(bg);
+  });
+}
+// Call before opening an editor for `key` (run:12, batch:3, tote:45). Returns false if the person chose Cancel. The editor window that opens next is then tracked
+// until it is closed (see the observer below), however it is closed.
+async function presenceEnter(key, label) {
+  await presenceBeat();
+  const others = presenceOthers(key);
+  if (others.length && !(await presenceWarn(label, others))) return false;
+  Presence.pending = { key, label, at: Date.now() };
+  return true;
+}
+function presenceBind(bg) {
+  const p = Presence.pending; Presence.pending = null;
+  const card = bg.querySelector('.modal'); if (!card) return;
+  const banner = el('div', { class: 'presence-banner hidden' });
+  const title = card.querySelector('h3'); if (title) title.after(banner); else card.prepend(banner);
+  Presence.open.set(p.key, { label: p.label, bg, banner });
+  presenceRender(); presenceBeat();
+}
+new MutationObserver(muts => {
+  for (const m of muts) for (const n of m.addedNodes) {
+    if (n.nodeType === 1 && n.classList.contains('modal-bg') && Presence.pending) {
+      if (Date.now() - Presence.pending.at < 20000) presenceBind(n); else Presence.pending = null;
+    }
+  }
+  let gone = false;
+  for (const [key, o] of Presence.open) if (!o.bg.isConnected) { Presence.open.delete(key); gone = true; }
+  if (gone) presenceBeat();
+}).observe(document.getElementById('modalRoot'), { childList: true });
+window.addEventListener('pagehide', presenceLeave);
+
 /* ---------------- Idle timeout (KW-08) ---------------- */
 // After `idle_timeout_minutes` (Calculations page, 0 = off) without input the person is signed out -- but first every open run / batch section is saved (the same
 // Save as "Save & close"), so a tablet dropped in a tank or left on the bench loses nothing. A one-minute countdown comes first; any input cancels it. The server
@@ -141,7 +221,7 @@ function idleStop() { clearInterval(Idle.timer); Idle.timer = null; idleHideWarn
 
 /* ---------------- Auth / shell ---------------- */
 function logout(message) {
-  idleStop();
+  presenceLeave(); presenceStop(); idleStop();
   State.token = null; State.user = null; localStorage.removeItem(TOKEN_KEY); show('login');
   $('#loginError').textContent = message || '';        // e.g. "You were signed out after 30 minutes without activity ..."
 }
@@ -181,7 +261,7 @@ async function boot() {
     $('#tabs [data-tab=admin]').closest('.tab-group').classList.toggle('hidden', State.user.role !== 'admin');
     if (State.tab === 'admin' && State.user.role !== 'admin') State.tab = 'dashboard';
     show('app'); selectTab(State.tab);
-    idleStart();
+    presenceStart(); idleStart();
   } catch (err) { logout(); }
 }
 
@@ -495,7 +575,7 @@ async function pageStabilized(v) {
       },
         el('td', { class: 'checkcol' }, rowCheck(t, selected, updateBulk)),
         ...cols().map(c => el('td', { class: c.key === 'lot' ? 'mono' : (c.center ? 'ctr' : (c.numeric ? 'num' : '')) }, c.cell(t))),
-        el('td', {}, rowActions([
+        el('td', {}, presenceBadge('tote:' + t.id), rowActions([
           movable ? ['Move', () => moveTote(t)] : null,
           movable ? ['Update', () => updateCondition(t)] : null,
           ['Label', () => printLabels([toteLabel(t)])],
@@ -645,6 +725,7 @@ async function showHistory(t) {
   modal('Feedstock Stability log — ' + t.lot, body, async () => {}, 'Close', { noCancel: true });
 }
 async function updateCondition(t) {
+  if (!(await presenceEnter('tote:' + t.id, 'tote ' + t.lot))) return;
   const data = await api('GET', '/totes/' + t.id + '/ph');
   function summaryLines(d) {
     return [sl('Tote', t.lot),
@@ -925,7 +1006,7 @@ async function pageProduction(v) {
           run.excludeFromStats ? el('span', { class: 'pill', style: 'margin-left:6px', title: run.excludeReason || '' }, 'Excluded from analysis') : null,
           run.historical ? el('span', { class: 'pill', style: 'margin-left:6px', title: 'Entered retrospectively by ' + (run.historical.enteredBy || '—') + '. ' + (run.historical.release === 'grandfather' ? 'Grandfathered as released. ' : '') + (run.historical.deductInventory ? '' : 'Did not move inventory. ') + (run.historical.note ? 'Log was incomplete at entry.' : '') }, 'Historical') : null,
           run.release && run.release.state && run.release.state !== 'legacy' ? [' ', releaseBadge(run.release.state)] : null,
-          ' ', analysisInfoButton(run)),
+          ' ', analysisInfoButton(run), ' ', presenceBadge('run:' + run.id)),
         el('div', { class: 'actions' },
           canAmendLog() ? (run.amendment
             ? el('button', { onclick: () => openRunLog(run.id) }, '✏️ Continue amendment')
@@ -1219,6 +1300,7 @@ function runNoteItems(run, events) {
     add('Rev ' + r.rev + ' amendment (note to the reviewer)', r.comment, r.by, r.at);
   });
   add('Run notes', run.notes);
+  (run.logNotes || []).forEach(n => add('Note — ' + (n.sectionLabel || n.section), n.body, n.by, n.at));
   if (run.stages && run.stages.extraction && run.stages.extraction.bypassed) add('Extraction bypassed', run.stages.extraction.bypassComment);
   (run.inputs || []).forEach(i => {
     add('Feedstock ' + i.toteLot + (i.decision === 'rejected' ? ' (rejected)' : ''), i.notes);
@@ -1263,7 +1345,7 @@ function draftCard(d) {
   const pkgSummary = (d.packages || []).filter(p => p.qty > 0).map(p => `${fmt(p.qty)} × ${p.size}`).join(', ') || '—';
   return el('div', { class: 'card' },
     el('div', { class: 'page-head', style: 'margin:0 0 8px' },
-      el('h3', { style: 'margin:0' }, mono(d.processingLot), '  ', el('span', { class: 'badge hold' }, 'Not yet submitted'), d.historical ? [' ', el('span', { class: 'pill' }, 'Historical')] : null),
+      el('h3', { style: 'margin:0' }, mono(d.processingLot), '  ', el('span', { class: 'badge hold' }, 'Not yet submitted'), d.historical ? [' ', el('span', { class: 'pill' }, 'Historical')] : null, ' ', presenceBadge('run:' + d.id)),
       el('div', { class: 'actions' },
         el('button', { onclick: () => openRun(d) }, 'Resume'),
         el('button', { class: 'secondary', onclick: () => openSampleLabels(d) }, 'Print sample labels'),
@@ -2494,8 +2576,9 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot, o
   const solidsQcBox = el('div', { class: 'qc-check-box theme-quality', 'data-sop-spot': 'production.separation.solids_qc' },
     el('div', { class: 'qc-check-title' }, 'QC Check'),
     el('div', { class: 'qc-check-subtitle' }, 'Solids characterization'),
-    rfield('separation', 'pctMoisture', el('span', { html: '%Moisture<sub>centrifuge_solids</sub>' }), moistureInp),
-    rfield('separation', 'pctMoistureScrew', el('span', { html: '%Moisture<sub>screw_solids</sub>' }), moistureScrewInp));
+    field(el('span', { html: '%Moisture<sub>centrifuge_solids</sub>' }), moistureInp),
+    field(el('span', { html: '%Moisture<sub>screw_solids</sub>' }), moistureScrewInp),
+    el('div', { class: 'help' }, reqLabel('Enter at least one of the two'), ' — each is optional on its own.'));
   const solidsCollectedInp = el('input', { type: 'datetime-local',
     value: values.solidsSampleCollectedAt ? values.solidsSampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
   const solidsSamplePointBox = el('div', { class: 'qc-check-box theme-sample', 'data-sop-spot': 'production.separation.sample_point' },
@@ -2727,6 +2810,100 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
       qcCheckBox,
       samplePointBox,
       el('div', { style: 'margin-top:6px' }, saveBtn, status)));
+}
+
+// Notes (KW-01): what happened that the numbers do not say (a machine failure, a process change), each tagged with the log section it belongs to and optionally with
+// pictures. A "Notes" section lists and edits them; each log section shows its own notes at the bottom (`attach`); they are part of the signed log, so (like any entry)
+// they can be added, changed or removed while the log is open -- a draft, or an open amendment (`editable`) -- and are read-only otherwise.
+const NOTE_SECTIONS_UI = [['initiation', 'Initiation'], ['feedstock', 'Feedstock'], ['homogenization', 'Homogenization'], ['extraction', 'Extraction'], ['separation', 'Separation'],
+  ['pasteurization', 'Pasteurization'], ['dilution', 'Dilution & Preservation'], ['packaging', 'Packaging'], ['general', 'General']];
+function buildNotesSection(getRunId, editable) {
+  let notes = [], rid = null, loaded = false;
+  const listHost = el('div', {}), formHost = el('div', {}), status = el('div', { class: 'help' });
+  const strips = [];                                   // [{ key, host }] -- the per-section lists, redrawn with this one
+  const noteMeta = n => [n.by || '—', fmtWhen(n.at)].join(' · ') + (n.editedAt ? ' (edited ' + fmtWhen(n.editedAt) + ')' : '');
+  const pictures = n => n.images.length ? el('div', { class: 'note-images' }, ...n.images.map(i =>
+    el('a', { href: attDownloadUrl(rid, i.id), target: '_blank', title: i.filename }, el('img', { src: attDownloadUrl(rid, i.id), alt: i.filename, loading: 'lazy' })))) : null;
+  async function reload() {
+    rid = await getRunId();
+    notes = (await api('GET', '/production/' + rid + '/notes')).notes; loaded = true;
+    draw();
+  }
+  async function addPictures(noteId, files) {
+    for (const f0 of files) {
+      const f = await prepareUpload(f0);
+      await api('POST', '/production/' + rid + '/notes/' + noteId + '/images', { filename: f.name, contentType: f.type || 'image/jpeg', dataB64: await fileB64(f) });
+    }
+  }
+  function noteForm(n, onDone) {                       // add (n = null) or edit
+    const sel = el('select', {}, ...NOTE_SECTIONS_UI.map(([k, l]) => el('option', { value: k }, l))); sel.value = n ? n.section : 'general';
+    const txt = el('textarea', { rows: '3', maxlength: '4000', placeholder: 'What happened? (machine failure, process change, anything the reviewer should know)' }, n ? n.body : '');
+    const pics = el('input', { type: 'file', accept: 'image/*', multiple: 'multiple' });
+    const err = el('div', { class: 'error' });
+    const removeBoxes = n ? n.images.map(i => ({ i, cb: el('input', { type: 'checkbox' }) })) : [];
+    const save = el('button', { type: 'button' }, n ? 'Save note' : 'Add note');
+    save.addEventListener('click', async () => {
+      err.textContent = ''; save.disabled = true;
+      try {
+        rid = await getRunId();
+        let id = n && n.id;
+        if (n) await api('PUT', '/production/' + rid + '/notes/' + n.id, { section: sel.value, body: txt.value });
+        else id = (await api('POST', '/production/' + rid + '/notes', { section: sel.value, body: txt.value })).id;
+        for (const r of removeBoxes) if (r.cb.checked) await api('DELETE', '/production/' + rid + '/notes/' + id + '/images/' + r.i.id);
+        await addPictures(id, [...pics.files]);
+        await reload(); if (onDone) onDone();
+      } catch (e) { err.textContent = e.message; await reload().catch(() => {}); }
+      save.disabled = false;
+    });
+    return el('div', { class: 'note-form' },
+      el('div', { class: 'form-row' }, field('Log section', sel)),
+      field('Note', txt),
+      removeBoxes.length ? el('div', { class: 'help' }, 'Remove pictures: ', ...removeBoxes.map(r => el('label', { style: 'margin-right:10px' }, r.cb, ' ' + r.i.filename))) : null,
+      field(n ? 'Add pictures' : 'Pictures (optional)', pics), err,
+      el('div', { style: 'margin-top:6px;display:flex;gap:8px' }, save, n ? el('button', { type: 'button', class: 'secondary', onclick: () => { onDone(); } }, 'Cancel') : null));
+  }
+  function noteCard(n) {
+    const card = el('div', { class: 'note-card' });
+    const show = () => {
+      card.replaceChildren(
+        el('div', { class: 'note-head' }, el('span', { class: 'pill' }, n.sectionLabel), el('span', { class: 'muted' }, ' ' + noteMeta(n))),
+        el('div', { style: 'white-space:pre-wrap' }, n.body), pictures(n),
+        editable ? el('div', { style: 'margin-top:4px' }, el('button', { type: 'button', class: 'secondary', onclick: () => card.replaceChildren(noteForm(n, show)) }, 'Edit'), ' ',
+          el('button', { type: 'button', class: 'danger', onclick: async () => {
+            if (!confirm('Remove this note' + (n.images.length ? ' and its ' + n.images.length + ' picture(s)' : '') + '?')) return;
+            try { await api('DELETE', '/production/' + rid + '/notes/' + n.id); await reload(); } catch (e) { status.textContent = e.message; }
+          } }, 'Remove')) : null);
+    };
+    show();
+    return card;
+  }
+  function draw() {
+    listHost.replaceChildren(...(notes.length ? NOTE_SECTIONS_UI.flatMap(([k]) => notes.filter(n => n.section === k).map(noteCard))
+      : [el('div', { class: 'help' }, 'No notes on this run.')]));
+    strips.forEach(s => drawStrip(s));
+  }
+  function drawStrip(s) {
+    const mine = notes.filter(n => n.section === s.key);
+    s.host.classList.toggle('hidden', !mine.length);
+    s.host.replaceChildren(...(mine.length ? [el('div', { class: 'note-strip-title' }, 'Notes (' + mine.length + ')'), ...mine.map(n =>
+      el('div', { class: 'note-card' }, el('div', { class: 'muted' }, noteMeta(n)), el('div', { style: 'white-space:pre-wrap' }, n.body), pictures(n)))] : []));
+  }
+  function attach(root) {                              // a read-only list of a section's notes at the bottom of that section's window
+    for (const [key, label] of NOTE_SECTIONS_UI) {
+      if (key === 'general') continue;
+      const sum = [...root.querySelectorAll('details.accordion > summary')].find(s => s.textContent.trim() === label);
+      const bodyEl = sum && sum.parentElement.querySelector(':scope > .accordion-body');
+      if (!bodyEl) continue;
+      const host = el('div', { class: 'note-strip hidden' });
+      bodyEl.append(host); strips.push({ key, host });
+    }
+    if (loaded) strips.forEach(drawStrip); else reload().catch(() => {});
+  }
+  formHost.append(editable ? noteForm(null) : el('div', { class: 'help' }, 'Notes can be added while the run is a draft or under an open amendment.'));
+  const box = el('details', { class: 'accordion' }, el('summary', {}, 'Notes'),
+    el('div', { class: 'accordion-body' }, listHost, status, formHost));
+  box.addEventListener('toggle', () => { if (box.open && !loaded) reload().catch(e => { status.textContent = e.message; }); });
+  return { box, attach, reload };
 }
 
 const SAMPLE_TYPES = ['Slurry', 'Liquid', 'Solid'];
@@ -3831,6 +4008,7 @@ async function openRun(draftSummary, opts) {
   const fresh = !!(opts && opts.fresh);
   // Re-fetch a resumed draft in full (list snapshots omit stage/solids/dilution detail).
   const draft = (draftSummary && draftSummary.id) ? (await api('GET', '/production/drafts/' + draftSummary.id)).run : draftSummary;
+  if (draft && draft.id && !(await presenceEnter('run:' + draft.id, 'run ' + (draft.processingLot || draft.id)))) return;
   const totes = (await api('GET', '/totes?status=in_stock'
     + (draft && draft.id ? '&includeRunId=' + draft.id : ''))).totes;
   const skus = State.ref.skus.filter(s => s.active);
@@ -4070,6 +4248,7 @@ async function openRun(draftSummary, opts) {
   dilutionSummary.onChange(() => dilutionPasses.refresh());
   const dilutionsSection = buildDilutionsSection(draft?.dilutions || [], ensureRunId);
   const packagingEntriesSection = buildPackagingEntriesSection(draft?.packagingEntries || [], ensureRunId);
+  const notesSection = buildNotesSection(ensureRunId, true);
   const packagingPackagedInp = el('input', { type: 'datetime-local', value: stages.packaging?.packagedAt || '' });
   // QC Check + Sample Point ("LKE characterization") moved to the bottom of
   // Dilution & Preservation -- still packaging-stage columns/endpoints under
@@ -4158,7 +4337,9 @@ async function openRun(draftSummary, opts) {
       el('div', { class: 'accordion-body' },
         rfield('packaging', 'packagedAt', 'Packaging date and time', packagingPackagedInp),
         packagingEntriesSection.box,
-        el('div', { style: 'margin-top:6px' }, packagingSaveBtn, packagingStatus))));
+        el('div', { style: 'margin-top:6px' }, packagingSaveBtn, packagingStatus))),
+    notesSection.box);
+  notesSection.attach(body);
   filterTotes();
   renderFeedstockCards();
   renderSpecPanel();
@@ -4252,6 +4433,8 @@ async function openRun(draftSummary, opts) {
 // often completed days after the run), independent of the locked-in
 // tote-consumption / packaging numbers (corrected via the separate Edit modal).
 async function openProcessLog(run, section) {
+  // only an open amendment makes a finished run's log editable (otherwise it is read-only and nobody can overwrite anything)
+  if (run.amendment && canAmendLog() && !(await presenceEnter('run:' + run.id, 'run ' + run.processingLot))) return;
   const stages = run.stages || {};
   const feedstockHost = el('div', {});
   (run.inputs || []).forEach(inp => {
@@ -4312,6 +4495,7 @@ async function openProcessLog(run, section) {
   dilutionSummary.onChange(() => dilutionPasses.refresh());
   const dilutionsSection = buildDilutionsSection(run.dilutions || [], getRunId);
   const packagingEntriesSection = buildPackagingEntriesSection(run.packagingEntries || [], getRunId);
+  const notesSection = buildNotesSection(getRunId, !!run.amendment && canAmendLog());
   const packagingPackagedInp = el('input', { type: 'datetime-local', value: stages.packaging?.packagedAt || '' });
   // QC Check + Sample Point ("LKE characterization") moved to the bottom of
   // Dilution & Preservation -- still packaging-stage columns/endpoints under
@@ -4403,7 +4587,9 @@ async function openProcessLog(run, section) {
       el('div', { class: 'accordion-body' },
         rfield('packaging', 'packagedAt', 'Packaging date and time', packagingPackagedInp),
         packagingEntriesSection.box,
-        el('div', { style: 'margin-top:6px' }, packagingSaveBtn, packagingStatus))));
+        el('div', { style: 'margin-top:6px' }, packagingSaveBtn, packagingStatus))),
+    notesSection.box);
+  notesSection.attach(body);
 
   ['click', 'change'].forEach(ev => body.addEventListener(ev, () => {
     clearTimeout(logTimer);
@@ -4701,11 +4887,11 @@ async function pageFG(v) {
     } });
     allCb.checked = movable.length > 0 && movable.every(f => selected.has(f.id));
     host.append(table(
-      [allCb, 'FG lot', 'SKU', 'Pack', 'Units', 'Litres', 'TDS', 'Produced', 'Location', 'Status', ''],
+      [allCb, 'FG lot', 'SKU', 'Pack', 'Units', 'Litres', 'TDS', 'pH', 'Produced', 'Location', 'Status', ''],
       r.fg.map(f => [
         rowCheck(f, selected, updateBulk),
         mono(f.lot), skuName(f.sku), f.packageSize, fmt(f.qty), num(fmt(f.litres, 0)),
-        f.tds != null ? f.tds + '%' : '—', f.producedDate || '—', f.location || '—',
+        f.tds != null ? fmt(f.tds, 2) + '%' : '—', f.ph != null ? fmt(f.ph, 2) : '—', f.producedDate || '—', f.location || '—',
         fgStatusBadge(f.status), rowActions([
           f.status !== 'sold' ? ['Move', () => moveFG(f)] : null,
           ['Label', () => printLabels([fgLabel(f)])],
@@ -4746,19 +4932,17 @@ function editFG(f) {
         ? field('Status', el('div', {}, fgStatusBadge(f.status), el('div', { class: 'help' }, 'Set by the Product Release process (Product Release tab).')))
         : field('Status', selectFrom('', [['on_hand', 'On hand'], ['hold', 'Hold / QA'], ['sold', 'Sold / shipped']], null, 'f_status'))),
     el('div', { class: 'form-row' },
-      field('TDS (%)', el('input', { type: 'number', step: '0.1', id: 'f_tds', value: f.tds ?? '' })),
+      field('Final TDS / pH (from the run)', el('div', { class: 'help' }, (f.tds != null ? fmt(f.tds, 2) + ' %' : '—') + ' / ' + (f.ph != null ? fmt(f.ph, 2) : '—') + '  — the run’s Packaging QC Check; amend the run to correct it')),
       field('Location', el('input', { id: 'f_loc', value: f.location || '' }))),
-    field('Reason for the change', el('input', { id: 'f_reason', placeholder: 'Required when status, units or TDS change' })),
-    el('div', { class: 'help' }, 'Only a Production or Quality Manager can change units, TDS or status (placing a lot on hold, or releasing it from hold, is for a Quality Manager). Every change is recorded in the audit trail with your name and the reason. Moving a lot to another location is open to everyone.'));
+    field('Reason for the change', el('input', { id: 'f_reason', placeholder: 'Required when status or units change' })),
+    el('div', { class: 'help' }, 'Only a Production or Quality Manager can change units or status (placing a lot on hold, or releasing it from hold, is for a Quality Manager). Every change is recorded in the audit trail with your name and the reason. Moving a lot to another location is open to everyone.'));
   if (f.status !== 'pending_release') body.querySelector('#f_status').value = f.status;
   modal('Edit FG lot ' + f.lot, body, async () => {
     const payload = { location: body.querySelector('#f_loc').value };
     const q = +body.querySelector('#f_qty').value, st = body.querySelector('#f_status') ? body.querySelector('#f_status').value : f.status;
-    const tds = body.querySelector('#f_tds').value === '' ? null : +body.querySelector('#f_tds').value;
     if (q !== f.qty) payload.qty = q;
     if (st !== f.status) payload.status = st;
-    if (tds !== (f.tds ?? null)) payload.tds = tds;
-    if (payload.qty !== undefined || payload.status !== undefined || payload.tds !== undefined) payload.reason = body.querySelector('#f_reason').value;
+    if (payload.qty !== undefined || payload.status !== undefined) payload.reason = body.querySelector('#f_reason').value;
     await api('PUT', '/fg/' + f.id, payload);
     toast('Updated'); render();
   }, 'Save');
@@ -7407,7 +7591,7 @@ async function pagePreproc(v) {
 function preprocDraftCard(b) {
   return el('div', { class: 'card' },
     el('div', { class: 'page-head', style: 'margin:0 0 8px' },
-      el('h3', { style: 'margin:0' }, mono(b.batchLot), '  ', el('span', { class: 'badge hold' }, 'Not yet completed')),
+      el('h3', { style: 'margin:0' }, mono(b.batchLot), '  ', el('span', { class: 'badge hold' }, 'Not yet completed'), ' ', presenceBadge('batch:' + b.id)),
       el('div', { class: 'actions' },
         el('button', { onclick: () => openPreprocBatch(b.id) }, 'Resume'),
         el('button', { class: 'danger', onclick: async () => {
@@ -7447,6 +7631,7 @@ function preprocDoneCard(b) {
 
 async function openPreprocBatch(id, section) {
   let B = await api('GET', '/preproc/' + id);
+  if (B.status !== 'completed' && !(await presenceEnter('batch:' + id, 'batch ' + B.batchLot))) return;
   const v = el('div', {});            // the batch window's body (a wide window, like a production run's Process log)
   if (B.status === 'completed') {
     modal('Batch record — ' + B.batchLot, v, async () => { render(); }, 'Done', { wide: true, closeX: true, onClose: () => render() });
@@ -7742,7 +7927,7 @@ function toteLabel(t) {
 function fgLabel(f, run) {
   return { kind: 'Finished Good — LKE', lot: f.lot, barcode: f.lot, meta: [
     ['Product', skuName(f.sku)], ['Pack', f.packageSize], ['Units', fmt(f.qty)],
-    ['TDS', f.tds != null ? f.tds + '%' : '—'], ['Produced', f.producedDate || (run && run.runDate) || '—']] };
+    ['TDS', f.tds != null ? fmt(f.tds, 2) + '%' : '—'], ['pH', f.ph != null ? fmt(f.ph, 2) : '—'], ['Produced', f.producedDate || (run && run.runDate) || '—']] };
 }
 /* ---------------- Sample labels (50 mL falcon tube) ---------------- */
 // A deliberately plain label: lot number, "sample point - description", collection date. No barcode, no logo.

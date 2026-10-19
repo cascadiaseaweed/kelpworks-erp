@@ -29,6 +29,10 @@ def stage_payloads():
     out = {}
     for sec in K.PROGRESS_SECTIONS:
         for entry in sec.get("fields", []):
+            if isinstance(entry[1], tuple):          # "any one of these" (KW-18): fill them all in (older releases, which the upgrade tests boot, require each of them)
+                for k in entry[1]:
+                    out.setdefault(entry[0], {})[k] = 5
+                continue
             if entry[1] == "bypassComment":          # only required when extraction is bypassed (KW-15); the helpers run a normal extraction
                 continue
             out.setdefault(entry[0], {})[entry[1]] = TEXT_VALUES.get(entry[1], 5)

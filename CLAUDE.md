@@ -154,7 +154,7 @@ for `main` so a red run blocks the merge.
 - **Release-integrity rules** (risk review batch 1; tests in `tests/test_release_integrity.py`). *Lab results*: only a Quality Manager can add / void / scan them
   (everyone can read); after release, a voided required result or a new failure that the release did not accept puts the run's `on_hand` lots on HOLD and logs
   `lab_result_hold` (`_lab_regate`). *Finished-goods lots* (`PUT /api/fg/:id`, `_edit_fg_lot`): status is limited to on_hand / hold / sold and a lot that is
-  pending_release or disposed cannot be changed by hand; hold / un-hold needs a Quality Manager, units / TDS / on_hand<->sold a Production or Quality Manager;
+  pending_release or disposed cannot be changed by hand; hold / un-hold needs a Quality Manager, units / on_hand<->sold a Production or Quality Manager (TDS and pH are not editable here, see KW-31 below);
   each change needs a reason and is written to the hash chain (`fg_lot_edited`); location is open to all and goes in the move log. *Totes*: a tote joins a run
   only if `in_stock`, already locked to THAT run, or rejected from it (`_tote_available_for_run`); `PUT /api/totes/:id` only moves in_stock <-> hold and never
   changes the weight of a wip/consumed tote. *Shipments*: lines for the same lot are summed before checking stock, deduction is relative and conditional
@@ -342,7 +342,7 @@ for `main` so a red run blocks the merge.
   KelpWorks** (`DELETE` answers 409 `controlled_in_sharepoint`: remove the file in SharePoint and the document is withdrawn) and `_update_sop` refuses a hand-uploaded file for a numbered SOP (same code).
 - **Production-log required fields** are defined once, server-side, in `PROGRESS_SECTIONS` /
   `REQUIRED_FEEDSTOCK` (`kelp_erp_server.py`; exposed to the SPA as `refdata.requiredFields`).
-  Everything is required except: every Notes field, the extraction fields when extraction is bypassed (KW-15), **odour** (the feedstock Odour / Odour intensity are optional since KW-05 --
+  Everything is required except: every Notes field, the extraction fields when extraction is bypassed (KW-15), the two Separation solids % moisture readings individually (KW-18: ONE of them must be entered -- a registry entry whose key is a tuple, `("pctMoisture", "pctMoistureScrew")`, is filled when any key has a value; `tests/test_moisture_one_required.py`), **odour** (the feedstock Odour / Odour intensity are optional since KW-05 --
   recording an odour exposes operators to mould and VOCs -- and the final QC check's odour is optional by design, KW-06), the Homogenization / Separation /
   Pasteurization sample-point boxes, Extraction's QC Check Total-solids + Density fields,
   checkboxes, calculated values and legacy dilution-tank rows. `_run_progress` returns
@@ -366,6 +366,13 @@ for `main` so a red run blocks the merge.
   tank, NULL for two) -- the same pattern as the 6A/6B run totals, so the summary PDF, the water totals and reports keep reading the run-level fields. A total exists only when every tank in use has its value. The per-tank keys appear in
   `stages.homogenization` (and the signed log) only when set; required fields use the `_uses_2a` / `_uses_2b` predicates (the run-level fields are no longer required). Setting `homog_tank_capacity_each_l` (5000 L per tank) drives a
   warning only. A run with no tank choice is left exactly as entered.
+- **Presence: who has what open** (KW-07; tests in `tests/test_presence.py`). Concurrent edits are still "last save wins" (no record version check, by decision); presence only WARNS. The server keeps an in-memory register
+  (`PRESENCE` / `PRESENCE_ONLINE`, `presence_update`, `presence_leave`; nothing in the database or the backups, lost on restart -- browsers re-announce within seconds): a browser tab calls `POST /api/presence {tab, open: [{key, label}]}`
+  every `presence_timeout_seconds` / 3 (setting, default 90 s, on the Calculations page) and the answer is who is online and who has each card open; `{tab, leave: true}` forgets a tab (sent on `pagehide` and sign-out). The
+  call is exempt from the per-request write transaction and its 200s are not logged. Card keys: `run:<id>`, `batch:<id>`, `tote:<id>` (`PRESENCE_KEY_RE`; a new kind of card needs a regex entry). The SPA (`Presence`, `presenceEnter`)
+  asks first when someone else has the card open (Open anyway / Cancel), then tracks the editor window that opens next until it is closed, with a live banner inside it; initials badges (`presenceBadge`) sit on draft / finished
+  run cards, draft batch cards and the Feedstock Inventory rows, and the top bar lists who is online. Hooked in: `openRun` (drafts), `openProcessLog` (only under an open amendment, otherwise the log is read-only),
+  `openPreprocBatch` (drafts) and `updateCondition` (tote). A new editor that people can overwrite each other in should call `presenceEnter('<kind>:<id>', label)` before it opens.
 - **Bypass extraction** (KW-15 / KW-16; tests in `tests/test_extraction_bypass.py`). A run can bypass extraction (the product still flows through the flow cell, nothing optimized):
   `production_runs.extraction_bypassed` + `extraction_bypass_comment` (default `EXTRACTION_BYPASS_DEFAULT` "Extraction not optimized", editable, a blank reason is 400), set through the extraction stage
   save. While bypassed none of the extraction fields is required (the `_extracting` predicate) and the reason is (`_bypassed`); `_apply_extraction_bypass` clears the extraction readings on save and drops the
@@ -374,6 +381,13 @@ for `main` so a red run blocks the merge.
   homogenization TDS) and the screen (read-only table). **Extraction efficiency is not applicable** for such a run (blank, shown "bypassed", never 0 %) in the run card, summary, Yield & Usage (CSV / XLSX) and
   the QC charts (no `qc:extraction_eff` point, and no extraction readings, so the Extraction section statistics are not polluted). The reason also shows in the run's Notes panel (`runNoteItems`) and so at the
   top of the release review. Separation reads nothing from extraction, so "separation in = homogenization out" needs no code. A new consumer of extraction QC values must go through `extraction_view`.
+- **Run notes** (KW-01; tests in `tests/test_run_notes.py`). `run_notes` (run, `section` = one of `NOTE_SECTIONS`: initiation / feedstock / homogenization / extraction / separation / pasteurization / dilution / packaging / general,
+  `body` <= 4000 chars, created / updated by + at) and `run_note_images` (a note's pictures, each a `run_attachments` row stored and served like any document; pictures only, <= 10 per note, the same upload rules / quota / archive).
+  Routes `/api/production/<id>/notes[/<nid>[/images[/<aid>]]]` (`route_run_notes`): like every production-log entry a note can be added, changed or removed while the log is open (draft, or an open amendment) --
+  `_amend_guard` answers 409 `amendment_required` for a finished run and `_release_reconcile` voids a sign-off the change contradicts. **Part of the signed log**: `_run_full` carries `logNotes` ONLY when the run has notes (so a
+  log without notes is unchanged); the pictures (`logNoteImages`, in `_RELEASE_HASH_SKIP`) are not, like documents. A note added / edited / removed under an amendment is a recorded revision change (`_item_label`). The SPA's
+  `buildNotesSection` is the "Notes" accordion (add form with section + text + pictures, edit / remove) and `attach` puts each section's notes at the bottom of that section's accordion; they are also in the run's Notes panel
+  (`runNoteItems`) and on the production summary PDF ("Notes", ordered by section, pictures counted). Removing a note (or a draft) removes its picture files after the commit. `run_notes` / `run_note_images` are records (`CLEAR`).
 - **Tank 5A/5B -> 6A/6B dilution**: the plan (Pasteurization In: 5A/5B levels, receiving tanks 6A / 6B / 6A+6B, tank 6A/6B starting
   levels, TDS = Separation filtrate TDS, target = SKU) is calculated client-side by `dilutionPlanCalc` (c1V1=c2V2: max product =
   space x c2/c1, transfer = min(available, max), water = transfer x (c1/c2 - 1), 0 if c1<=c2) and stored on `production_runs`
@@ -504,6 +518,9 @@ for `main` so a red run blocks the merge.
   recommended limits (mean +/- k sigma, sigma = MRbar/1.128) appear once `qc_chart_min_n_provisional` results exist (established at `qc_chart_min_n_established`) -- constants are admin-editable settings and
   documented on the Calculations page. Signals (beyond a limit, run of N on one side, trend of N) are only raised once limits are set. Specification lines come from `coa_specs` (shown dotted, separate from
   control limits; far-off lines are noted instead of drawn). Charts are hand-written SVG (no library).
+- **Finished-goods TDS and pH** (KW-31; tests in `tests/test_fg_actual_quality.py`): `fg_lots.tds` / `fg_lots.ph` are the run's ACTUAL final Packaging QC Check results (`packaging_tds_pct` / `packaging_qc_ph`), never the product target
+  (finalize stored the target before). `_sync_fg_lot_quality` sets them at finalize and again whenever the Packaging stage is saved on a completed run (an amendment); a lot created later by a packaging edit takes them from the run
+  (`_adjust_fg_lot`). They are read-only: `PUT /api/fg/:id` answers 400 to a changed `tds` / `ph` (amend the run instead). Shown on the Finished Goods table, its Edit window and the printed FG label (the CoA already reads the run).
 - **Packaging edits after finalize** re-derive everything computed from the packaging rows in the
   same transaction (`_sync_completed_packaging`): container + FG-label stock (net-change commit),
   the run's FG lots (`_adjust_fg_lot`, refuses to go below units already shipped/moved), and
