@@ -292,7 +292,7 @@ _QC_ALL = [
     ("mannitolPct", "QC Check: Mannitol (%)"), ("tsLiquidPct", "QC Check: TSliquid (%)"),
     ("rhoLiquidGMl", "QC Check: \u03c1liquid (g/mL)"),
 ]
-# A field entry may carry a 4th element: a predicate over the run's stages dict -- the field is
+# A field's key may be a tuple of keys: the item is filled when ANY of them has a value (KW-18). A field entry may carry a 4th element: a predicate over the run's stages dict -- the field is
 # only required when it is true (per-tank fields apply only to the tanks being filled).
 _uses_2a = lambda st: (st["homogenization"].get("tanks") or "") in ("2A", "2AB")
 _uses_2b = lambda st: (st["homogenization"].get("tanks") or "") in ("2B", "2AB")
@@ -334,7 +334,8 @@ PROGRESS_SECTIONS = [
     {"key": "separation", "label": "Separation", "fields": [
         ("separation", "startedAt", "Started at"), ("separation", "flowrateLpm", "Flow rate (L/min)"),
         ("separation", "meshMicron", "Mesh size (micron)"), ("separation", "wetSolidsWtKg", "Total wet-solids weight (kg)"),
-        ("separation", "pctMoisture", "%Moisture centrifuge solids"), ("separation", "pctMoistureScrew", "%Moisture screw solids"),
+        # KW-18: at least ONE of the two solids moisture readings (a key that is a tuple = "any one of these keys has a value")
+        ("separation", ("pctMoisture", "pctMoistureScrew"), "%Moisture of the solids (centrifuge or screw press: at least one)"),
         ("separation", "liquidQcPh", "Filtrate QC Check: pH"), ("separation", "liquidTdsPct", "Filtrate QC Check: TDS (%)"),
         ("separation", "liquidBrixPct", "Filtrate QC Check: Brix (%)"),
         ("separation", "liquidMannitolPct", "Filtrate QC Check: Mannitol (%)"),
@@ -375,6 +376,8 @@ def required_keys_by_stage():
     for sec in PROGRESS_SECTIONS:
         for entry in sec.get("fields", []):
             stage, key = entry[0], entry[1]
+            if isinstance(key, tuple):          # "any one of" groups have no asterisk on a single field
+                continue
             out.setdefault(stage, [])
             if key not in out[stage]:
                 out[stage].append(key)
@@ -11292,7 +11295,8 @@ class Handler(BaseHTTPRequestHandler):
                     stage, key, label = entry[:3]
                     if len(entry) > 3 and not entry[3](stages):
                         continue          # conditional field that doesn't apply to this run
-                    items.append((label, _has_value(stages[stage].get(key))))
+                    keys = key if isinstance(key, tuple) else (key,)
+                    items.append((label, any(_has_value(stages[stage].get(k)) for k in keys)))
                 if sec["key"] == "dilution":
                     for ps in conn.execute("SELECT * FROM run_dilution_passes WHERE run_id=? ORDER BY pass_no", (rid,)):
                         recv = ps["receiving"] or ""

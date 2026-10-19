@@ -2434,8 +2434,9 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot, o
   const solidsQcBox = el('div', { class: 'qc-check-box theme-quality', 'data-sop-spot': 'production.separation.solids_qc' },
     el('div', { class: 'qc-check-title' }, 'QC Check'),
     el('div', { class: 'qc-check-subtitle' }, 'Solids characterization'),
-    rfield('separation', 'pctMoisture', el('span', { html: '%Moisture<sub>centrifuge_solids</sub>' }), moistureInp),
-    rfield('separation', 'pctMoistureScrew', el('span', { html: '%Moisture<sub>screw_solids</sub>' }), moistureScrewInp));
+    field(el('span', { html: '%Moisture<sub>centrifuge_solids</sub>' }), moistureInp),
+    field(el('span', { html: '%Moisture<sub>screw_solids</sub>' }), moistureScrewInp),
+    el('div', { class: 'help' }, reqLabel('Enter at least one of the two'), ' — each is optional on its own.'));
   const solidsCollectedInp = el('input', { type: 'datetime-local',
     value: values.solidsSampleCollectedAt ? values.solidsSampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
   const solidsSamplePointBox = el('div', { class: 'qc-check-box theme-sample', 'data-sop-spot': 'production.separation.sample_point' },
