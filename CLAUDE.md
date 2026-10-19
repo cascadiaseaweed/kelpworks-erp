@@ -500,6 +500,11 @@ for `main` so a red run blocks the merge.
   create revisions or void sign-offs. If you change what the snapshot contains, bump
   `RELEASE_SNAPSHOT_VERSION`: boot re-hashes reviewed/released runs (SYSTEM `rebaseline` event) so a
   format change is never mistaken for a tampered log.
+- **Amendments and the release queue** (KW-28 / KW-29; tests in `tests/test_amendment_queue.py`). A run is in the Product Release queue as "Awaiting production-log review" only once its amendment is SUBMITTED
+  (`_amend_close`: `pending_review`, review hash cleared, earlier review / release no longer shown -- `_release_summary` reports `reviewedBy` / `releasedBy` only while the state is `pending_release` / `released`); an open
+  amendment is listed as "Under amendment" and saving the log does not change that, so the Process log's **Save & close** under an amendment asks whether to submit it now. **Notes in one place**: `runNoteItems` / `runNotesPanel`
+  (app.js) list every free-text note -- run notes, feedstock tote notes and rejection reasons, dilution tank notes, each amendment's reason and the amender's note to the reviewer (`run_revisions` rows now carry `comment` =
+  `run_amendments.submit_comment`, not part of the signed snapshot) and the sign-off comments -- at the top of the run card and of the Product Release review window. A new free-text field on the log belongs in `runNoteItems`.
 - **Revision tracker**: `run_revisions` (append-only). Rev 1 = finalize; each submitted amendment
   adds a revision with the reason, category and field-level old -> new changes. Runs finalized
   earlier show a synthetic Rev 1. `progress`/`revisions`/`revision`/`amendment` are excluded from
