@@ -2200,6 +2200,14 @@ function buildQualityCheckBox(subtitle, values, opts) {
   // opts.reqStage (opts.keyMap renames keys, e.g. Separation's liquid* fields).
   const qf = (key, label, input) => opts.reqStage
     ? rfield(opts.reqStage, (opts.keyMap || {})[key] || key, label, input) : field(label, input);
+  // Optional odour observation (KW-06, the final QC check on the pasteurized product only): note it if it is noticeable, never required.
+  let odourSel, intensitySel;
+  if (opts.showOdour) {
+    odourSel = buildMultiSelectDropdown(REF_ODOURS.filter(o => o !== 'Other').map(o => ({ value: o, label: o })), values.odour || '',
+      { placeholder: 'Only if noticeable…', otherPlaceholder: 'Other odour', otherFieldLabel: 'Other odour' });
+    intensitySel = el('select', {}, ...ODOUR_INTENSITIES.map(i => el('option', { value: i }, i || '—')));
+    intensitySel.value = values.odourIntensity || '';
+  }
   const boxChildren = [
     el('div', { class: 'qc-check-title' }, 'QC Check'),
     el('div', { class: 'qc-check-subtitle' }, subtitle),
@@ -2216,6 +2224,9 @@ function buildQualityCheckBox(subtitle, values, opts) {
     el('div', { class: 'form-row-compact' },
       ...(opts.omitSlurrySolids ? [] : [qf('rhoSlurryGMl', 'ρslurry (g/mL)', rhoSlurryInp)]),
       qf('rhoLiquidGMl', 'ρliquid (g/mL)', rhoLiquidInp)),
+    ...(opts.showOdour ? [el('div', { class: 'qc-check-section-title' }, 'Odour (optional)'),
+      el('div', { class: 'form-row-compact' }, field('Odour', odourSel.el), field('Odour intensity', intensitySel)),
+      el('div', { class: 'help' }, 'Note the odour of the pasteurized product only if it is noticeable. Leave blank otherwise.')] : []),
   ];
   const box = el('div', { class: 'qc-check-box theme-quality', ...(opts.spot ? { 'data-sop-spot': opts.spot } : {}) }, ...boxChildren);
   function getPayload() {
@@ -2234,6 +2245,10 @@ function buildQualityCheckBox(subtitle, values, opts) {
     }
     if (opts.showSolidsLoading) {
       payload.solidsLoadingPct = solidsLoadingInp.value.trim() === '' ? null : qcParseValue(solidsLoadingInp.value);
+    }
+    if (opts.showOdour) {
+      payload.odour = odourSel.value || null;
+      payload.odourIntensity = intensitySel.value || null;
     }
     return payload;
   }
@@ -3911,7 +3926,7 @@ async function openRun(draftSummary, opts) {
   // Dilution & Preservation -- still packaging-stage columns/endpoints under
   // the hood (unchanged), just relocated in the UI, so they get their own
   // Save action separate from packagedAt's.
-  const packagingQcCheck = buildQualityCheckBox('LKE characterization', stages.packaging || {}, { omitSlurrySolids: true, reqStage: 'packaging', spot: 'production.dilution.qc_check' });
+  const packagingQcCheck = buildQualityCheckBox('LKE characterization', stages.packaging || {}, { omitSlurrySolids: true, showOdour: true, reqStage: 'packaging', spot: 'production.dilution.qc_check' });
   const packagingSampleCollectedInp = el('input', { type: 'datetime-local',
     value: stages.packaging?.sampleCollectedAt ? stages.packaging.sampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
   const packagingSamplePointBox = el('div', { class: 'qc-check-box theme-sample', 'data-sop-spot': 'production.dilution.sample_point' },
@@ -4153,7 +4168,7 @@ async function openProcessLog(run, section) {
   // Dilution & Preservation -- still packaging-stage columns/endpoints under
   // the hood (unchanged), just relocated in the UI, so they get their own
   // Save action separate from packagedAt's.
-  const packagingQcCheck = buildQualityCheckBox('LKE characterization', stages.packaging || {}, { omitSlurrySolids: true, reqStage: 'packaging', spot: 'production.dilution.qc_check' });
+  const packagingQcCheck = buildQualityCheckBox('LKE characterization', stages.packaging || {}, { omitSlurrySolids: true, showOdour: true, reqStage: 'packaging', spot: 'production.dilution.qc_check' });
   const packagingSampleCollectedInp = el('input', { type: 'datetime-local',
     value: stages.packaging?.sampleCollectedAt ? stages.packaging.sampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
   const packagingSamplePointBox = el('div', { class: 'qc-check-box theme-sample', 'data-sop-spot': 'production.dilution.sample_point' },
