@@ -56,6 +56,14 @@ Is the test check passing on the PR?
 Switch to main and pull, then restart the dev server
 ```
 
+## Working through the change log (KW items)
+
+The team's list of requested changes is the Excel workbook `KelpWorks_ChangeLog_<date>.xlsx` (SharePoint, QAQC > KelpWorks ERP); `docs/backlog/` holds a CSV snapshot of it that Claude Code reads
+(`python tools/export_backlog.py "<workbook>"` refreshes it). Work one item (or one bundle of related items) per branch with `/kw-item KW-24` (`.claude/commands/kw-item.md`): it reads the item,
+asks you about any open decision, creates `updates/kw-<number>-<name>` from the latest `main`, plans (you approve the plan for "Plan mode" items), builds with tests and a browser check, and stops
+before committing. Everything after that is the normal flow below. Merge one branch before starting another that touches the same area, so conflicts stay small. When an item is live, set its
+Status in the workbook; the live commit goes into `tests/legacy_commits.txt`.
+
 ## Testing a change
 
 1. **Click through it locally.** Open the screen you changed on `localhost:8002` and check it works with no errors in the browser. This is the main test; the automated tests cannot judge a Word form or a screen.
