@@ -4396,6 +4396,9 @@ def migrate(conn):
         conn.execute("ALTER TABLE run_sample_points ADD COLUMN label_numbered INTEGER NOT NULL DEFAULT 0")
     if "label_name" not in spcols:
         conn.execute("ALTER TABLE run_sample_points ADD COLUMN label_name TEXT")
+    if "min_qty" not in spcols:      # KW-13: a required (default) sample can't be removed, retyped or reduced below this many units; NULL = an ordinary row
+        conn.execute("ALTER TABLE run_sample_points ADD COLUMN min_qty INTEGER")
+
     def refresh_all_sample_ids():
         for r_ in conn.execute("SELECT DISTINCT run_id FROM samples").fetchall():
             refresh_sample_ids(conn, r_["run_id"])
@@ -12868,10 +12871,15 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Sample Point: repeatable sample-collection rows -------------------#
     def _sample_points_public(self, conn, run_id):
-        return [{"id": r["id"], "stage": r["stage"], "type": r["type"], "description": r["description"],
+        out = []
+        for r in conn.execute("SELECT * FROM run_sample_points WHERE run_id=? ORDER BY created_at, id", (run_id,)):
+            d = {"id": r["id"], "stage": r["stage"], "type": r["type"], "description": r["description"],
                  "qty": r["qty"], "container": r["container"], "createdAt": r["created_at"]}
-                for r in conn.execute(
-                    "SELECT * FROM run_sample_points WHERE run_id=? ORDER BY created_at, id", (run_id,))]
+            if r["min_qty"]:             # a required (default) sample: only present on those rows, so no earlier run's signed log changes
+                d["required"] = True
+                d["minQty"] = r["min_qty"]
+            out.append(d)
+        return out
 
     def _apply_sample_point_fields(self, conn, spid, d):
         updates = {}
@@ -12900,8 +12908,8 @@ class Handler(BaseHTTPRequestHandler):
     def _seed_default_samples(self, conn, run_id, lot, user):
         uname = user["name"] if user else None
         for typ, desc, qty, container in self.DEFAULT_LKE_SAMPLES:
-            conn.execute("INSERT INTO run_sample_points (run_id,type,description,qty,container,stage,created_at)"
-                         " VALUES (?,?,?,?,?,'packaging',?)", (run_id, typ, desc, qty, container, now_iso()))
+            conn.execute("INSERT INTO run_sample_points (run_id,type,description,qty,container,stage,created_at,min_qty)"
+                         " VALUES (?,?,?,?,?,'packaging',?,?)", (run_id, typ, desc, qty, container, now_iso(), qty))
             row = self._consumable_by_name(conn, container)
             if row:
                 self._consume(conn, row["id"], -qty, "Sample point added (default)", lot, uname)
@@ -12959,7 +12967,16 @@ class Handler(BaseHTTPRequestHandler):
                            (spid, run_id)).fetchone()
         if not row:
             raise ApiError(404, "Sample point entry not found")
-        d = self._sample_point_defaults(conn, row, self._body_json())
+        d = self._body_json()
+        if row["min_qty"]:                                   # KW-13: a required sample keeps its type and description and never drops below its minimum
+            for key in ("type", "description"):
+                if key in d and (d[key] or "").strip() != (row[key] or ""):
+                    raise ApiError(400, "This is a required sample (%s, %s): its type and description can't be changed. You can add more samples." % (row["type"], row["description"]))
+            if "qty" in d:
+                q = sample_qty(d["qty"])
+                if q is not None and q < row["min_qty"]:
+                    raise ApiError(400, "This is a required sample: at least %d must be taken. You can raise the quantity or add more samples." % row["min_qty"])
+        d = self._sample_point_defaults(conn, row, d)
         old_container, old_qty = row["container"], row["qty"] or 0
         new_container = ((d["container"] or "").strip() or None) if "container" in d else old_container
         new_qty = old_qty
@@ -12981,6 +12998,8 @@ class Handler(BaseHTTPRequestHandler):
                            (spid, run_id)).fetchone()
         if not row:
             raise ApiError(404, "Sample point entry not found")
+        if row["min_qty"]:
+            raise ApiError(409, "This is a required sample (%s, %s) and can't be removed. Optional samples can still be added and removed." % (row["type"], row["description"]))
         lot = conn.execute("SELECT processing_lot FROM production_runs WHERE id=?", (run_id,)).fetchone()["processing_lot"]
         self._adjust_container_stock(conn, row["container"], row["qty"] or 0, "Sample point removed", lot,
                                       user["name"] if user else None)
