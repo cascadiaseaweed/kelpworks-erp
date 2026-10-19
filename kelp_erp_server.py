@@ -275,13 +275,14 @@ QC_FIELD_REGISTRY = [
 # here has a value, and a section's progress dot only turns green once all of
 # its fields do. Keys are the JSON names in run_public()["stages"][stage]
 # (feedstock keys are the run_inputs public names). Deliberately NOT required:
-# every Notes field; the Homogenization / Separation / Pasteurization Sample
+# every Notes field; the feedstock Odour / Odour intensity (KW-05: handling mouldy feedstock exposes operators, so recording an odour is
+# never mandatory) and the final QC check's odour (KW-06); the Homogenization / Separation / Pasteurization Sample
 # Point boxes; Extraction's QC Check Total solids + Density fields; checkboxes
 # (an unticked box is a real answer); values the app calculates itself; and
 # the legacy Dilution tank rows (new ones can no longer be added).
 REQUIRED_FEEDSTOCK = [
     ("loadedAt", "Loaded at"), ("ph", "pH"), ("orp", "ORP (mV)"), ("weightKg", "Weight (kg)"),
-    ("volumeL", "Volume (L)"), ("odour", "Odour"), ("odourIntensity", "Odour intensity"),
+    ("volumeL", "Volume (L)"),
     ("decision", "Accept / reject decision"), ("surfacePhoto", "Surface photo"), ("striationPhoto", "Settling / striation photo"),
 ]
 _QC_ALL = [
@@ -3966,7 +3967,8 @@ def build_run_summary_pdf(S, logo_path=None):
                ("variance " + _pf(di.get("finalVariancePct"), 1, "%", True)) if has(di.get("finalVariancePct")) else "",
                ("pH " + _pf(di.get("measuredPh"), 1)) if has(di.get("measuredPh")) else "",
                S["reagentLine"], ("%d extra dilution pass(es)" % S["extraPasses"]) if S["extraPasses"] else ""])],
-        ["Packaging", when(pk.get("packagedAt")), join([S["packagingLine"], ("QC pH " + _pf(pk.get("qcPh"), 2)) if has(pk.get("qcPh")) else ""])],
+        ["Packaging", when(pk.get("packagedAt")), join([S["packagingLine"], ("QC pH " + _pf(pk.get("qcPh"), 2)) if has(pk.get("qcPh")) else "",
+                                                       ("final odour " + pk["odour"] + ((", " + pk["odourIntensity"].lower()) if has(pk.get("odourIntensity")) else "")) if has(pk.get("odour")) else ""])],
     ]
     pdf.table(["Stage", "Started", "Key results"], rows, [92, 78, 362], ["l", "l", "l"], size=7.8, bold_first=True)
 
@@ -4307,6 +4309,7 @@ def migrate(conn):
         ("packaging_qc_ph", "REAL"), ("packaging_tds_pct", "REAL"), ("packaging_brix_pct", "REAL"),
         ("packaging_mannitol_pct", "REAL"), ("packaging_ts_liquid_pct", "REAL"),
         ("packaging_rho_liquid_g_ml", "REAL"), ("packaging_sample_collected_at", "TEXT"),
+        ("packaging_odour", "TEXT"), ("packaging_odour_intensity", "TEXT"),       # KW-06: optional odour at the final QC check
         ("rejected_feedstock_json", "TEXT"),
     ]:
         if col not in prcols:
@@ -5161,6 +5164,10 @@ def run_public(r):
             "tsLiquidPct": r["packaging_ts_liquid_pct"], "rhoLiquidGMl": r["packaging_rho_liquid_g_ml"],
             "sampleCollectedAt": r["packaging_sample_collected_at"]},
     }
+    # the final QC check's optional odour: part of the log only when it was written, so the signed snapshot of every earlier run is unchanged
+    for key, col in (("odour", "packaging_odour"), ("odourIntensity", "packaging_odour_intensity")):
+        if r[col]:
+            d["stages"]["packaging"][key] = r[col]
     for key, col in (("citricItemId", "dilution_citric_item_id"), ("ksorbateItemId", "dilution_ksorbate_item_id"),
                      ("nabenzoateItemId", "dilution_nabenzoate_item_id")):
         if r[col] is not None:
@@ -11050,6 +11057,8 @@ class Handler(BaseHTTPRequestHandler):
             ("packaging_ts_liquid_pct", "tsLiquidPct", "num"),
             ("packaging_rho_liquid_g_ml", "rhoLiquidGMl", "num"),
             ("packaging_sample_collected_at", "sampleCollectedAt", "text"),
+            ("packaging_odour", "odour", "text"),
+            ("packaging_odour_intensity", "odourIntensity", "text"),
         ],
     }
 

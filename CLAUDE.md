@@ -333,7 +333,8 @@ for `main` so a red run blocks the merge.
   KelpWorks** (`DELETE` answers 409 `controlled_in_sharepoint`: remove the file in SharePoint and the document is withdrawn) and `_update_sop` refuses a hand-uploaded file for a numbered SOP (same code).
 - **Production-log required fields** are defined once, server-side, in `PROGRESS_SECTIONS` /
   `REQUIRED_FEEDSTOCK` (`kelp_erp_server.py`; exposed to the SPA as `refdata.requiredFields`).
-  Everything is required except: every Notes field, the Homogenization / Separation /
+  Everything is required except: every Notes field, **odour** (the feedstock Odour / Odour intensity are optional since KW-05 --
+  recording an odour exposes operators to mould and VOCs -- and the final QC check's odour is optional by design, KW-06), the Homogenization / Separation /
   Pasteurization sample-point boxes, Extraction's QC Check Total-solids + Density fields,
   checkboxes, calculated values and legacy dilution-tank rows. `_run_progress` returns
   per-section `{total, filled, missing, done}` (attached to drafts and `_run_full`; also
@@ -342,6 +343,9 @@ for `main` so a red run blocks the merge.
   finalize back. The SPA marks required labels with `rfield()/reqLabel()` (red `*`), and
   `finalizeRun` saves the header + presses every `button.section-save` before finalizing (`pressSectionSaves`); the draft's **Save & close** does the same (a section that can't be saved keeps the window open with its message), and so does Save & close on the Process log of a run under amendment. When
   adding a production-log field, add it to the registry (and use `rfield`) or it stays optional.
+  **Final QC odour (KW-06)**: the Packaging QC Check ("LKE characterization", the final check on the pasteurized product) has an optional Odour + Odour intensity (`production_runs.packaging_odour` /
+  `packaging_odour_intensity`, `buildQualityCheckBox` opts.`showOdour`, same vocabulary as feedstock). They are in `stages.packaging` (and so in the signed snapshot) ONLY when written, so no earlier run's hash
+  changes; the production summary PDF's Packaging row shows "final odour ...". Tests: `tests/test_odour_optional.py`.
   The feedstock accept/reject decision must be an explicit choice: `run_inputs.decision` is
   NOT NULL, so `run_inputs.decision_set` records whether an operator actually chose (inputs of
   runs finalized before it existed were backfilled as set; `_run_inputs_public` returns
