@@ -337,7 +337,7 @@ for `main` so a red run blocks the merge.
   KelpWorks** (`DELETE` answers 409 `controlled_in_sharepoint`: remove the file in SharePoint and the document is withdrawn) and `_update_sop` refuses a hand-uploaded file for a numbered SOP (same code).
 - **Production-log required fields** are defined once, server-side, in `PROGRESS_SECTIONS` /
   `REQUIRED_FEEDSTOCK` (`kelp_erp_server.py`; exposed to the SPA as `refdata.requiredFields`).
-  Everything is required except: every Notes field, the extraction fields when extraction is bypassed (KW-15), **odour** (the feedstock Odour / Odour intensity are optional since KW-05 --
+  Everything is required except: every Notes field, the extraction fields when extraction is bypassed (KW-15), the two Separation solids % moisture readings individually (KW-18: ONE of them must be entered -- a registry entry whose key is a tuple, `("pctMoisture", "pctMoistureScrew")`, is filled when any key has a value; `tests/test_moisture_one_required.py`), **odour** (the feedstock Odour / Odour intensity are optional since KW-05 --
   recording an odour exposes operators to mould and VOCs -- and the final QC check's odour is optional by design, KW-06), the Homogenization / Separation /
   Pasteurization sample-point boxes, Extraction's QC Check Total-solids + Density fields,
   checkboxes, calculated values and legacy dilution-tank rows. `_run_progress` returns
