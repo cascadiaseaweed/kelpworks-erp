@@ -11305,11 +11305,14 @@ class Handler(BaseHTTPRequestHandler):
         return rev
 
     def _run_revisions_public(self, conn, r):
+        # `comment` = the note the amender left for the reviewer when submitting (run_amendments.submit_comment)
         rows = [{"rev": x["rev_no"], "kind": x["kind"], "by": x["user_name"], "at": x["created_at"],
                  "summary": x["summary"], "changes": json.loads(x["changes"]) if x["changes"] else [],
-                 "logHash": x["log_hash"], "reason": x["reason"],
+                 "logHash": x["log_hash"], "reason": x["reason"], "comment": x["submit_comment"],
                  "category": self.AMEND_CATEGORIES.get(x["category"], x["category"]) if x["category"] else None}
-                for x in conn.execute("SELECT * FROM run_revisions WHERE run_id=? ORDER BY rev_no, id", (r["id"],))]
+                for x in conn.execute(
+                    "SELECT rv.*, am.submit_comment FROM run_revisions rv LEFT JOIN run_amendments am ON am.id=rv.amendment_id"
+                    " WHERE rv.run_id=? ORDER BY rv.rev_no, rv.id", (r["id"],))]
         if not any(x["rev"] == 1 for x in rows):
             rows.insert(0, {"rev": 1, "kind": "original", "by": r["finalized_by"],
                             "at": r["finalized_at"] or r["created_at"],
@@ -11827,11 +11830,11 @@ class Handler(BaseHTTPRequestHandler):
                 "state": r["release_state"], "label": RELEASE_LABELS.get(r["release_state"], "—"),
                 "lots": lots,
                 "amendment": (lambda am: self._amendment_public(am) if am else None)(self._open_amendment(conn, r["id"])),
-                "reviewedBy": (last.get("review_approved") or {}).get("user"),
-                "reviewedAt": (last.get("review_approved") or {}).get("at"),
-                "releasedBy": (last.get("released") or {}).get("user"),
-                "releasedAt": (last.get("released") or {}).get("at"),
-                "releasedComment": (last.get("released") or {}).get("comment"),
+                "reviewedBy": (last.get("review_approved") or {}).get("user") if r["release_state"] in ("pending_release", "released") else None,
+                "reviewedAt": (last.get("review_approved") or {}).get("at") if r["release_state"] in ("pending_release", "released") else None,
+                "releasedBy": (last.get("released") or {}).get("user") if r["release_state"] == "released" else None,
+                "releasedAt": (last.get("released") or {}).get("at") if r["release_state"] == "released" else None,
+                "releasedComment": (last.get("released") or {}).get("comment") if r["release_state"] == "released" else None,
                 "lab": coa_evaluate(conn, r)["summary"]}
 
     def route_release(self, method, seg, query, conn, user):

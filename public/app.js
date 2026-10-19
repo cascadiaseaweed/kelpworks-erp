@@ -880,6 +880,7 @@ async function pageProduction(v) {
           el('button', { class: 'secondary', onclick: () => openSampleLabels(run) }, 'Print sample labels'))),
       run.amendment ? amendBanner(run) : null,
       runSummaryGrid(run),
+      runNotesPanel(run),
       stageProgress(run, { onSelect: key => openProcessLog(run, key) }),
       revisionTracker(run));
     v.append(card);
@@ -1146,6 +1147,35 @@ function jumpToSection(root, key) {
 // Revision tracker for a finalized run's production log: Rev 1 is the finalized
 // record; every later change (any section) adds a revision with who/when and a
 // field-by-field old -> new diff.
+// Every free-text note on a finalized run in one list (KW-28): machine failures and process changes are written in the Notes boxes and in amendment reasons, and the reviewer has to see
+// them without opening each section. `events` (optional) adds what the signers wrote (returned for correction, release comments).
+function runNoteItems(run, events) {
+  const items = [];
+  const add = (source, text, who, at) => { if (text && String(text).trim()) items.push({ source, text: String(text).trim(), who: who || '', at: at || '' }); };
+  if (run.amendment) add('Open amendment — ' + (run.amendment.categoryLabel || ''), run.amendment.reason, run.amendment.openedBy, run.amendment.openedAt);
+  (run.revisions || []).filter(r => r.kind === 'amendment').slice().reverse().forEach(r => {
+    add('Rev ' + r.rev + ' amendment' + (r.category ? ' — ' + r.category : '') + ' (reason)', r.reason, r.by, r.at);
+    add('Rev ' + r.rev + ' amendment (note to the reviewer)', r.comment, r.by, r.at);
+  });
+  add('Run notes', run.notes);
+  (run.inputs || []).forEach(i => {
+    add('Feedstock ' + i.toteLot + (i.decision === 'rejected' ? ' (rejected)' : ''), i.notes);
+    if (i.decision === 'rejected') add('Feedstock ' + i.toteLot + ' — rejection reason', i.rejectionReason);
+  });
+  (run.dilutions || []).forEach(d => add('Dilution tank ' + (d.tank || ''), d.notes));
+  (events || []).filter(e => e.comment && e.type !== 'amendment_opened' && e.type !== 'amendment_submitted')   // both are already listed above with their revision.slice().reverse()
+    .forEach(e => add((RELEASE_EVENTS[e.type] || e.type) + ' (comment)', e.comment, e.user, e.at));
+  return items;
+}
+function runNotesPanel(run, events, opts = {}) {
+  const items = runNoteItems(run, events);
+  if (!items.length) return opts.emptyText ? el('div', { class: 'help', style: 'margin:6px 0' }, opts.emptyText) : null;
+  return el('div', { class: 'notes-panel', style: 'border-left:4px solid var(--amber,#d9a400);background:rgba(217,164,0,.10);padding:8px 12px;margin:8px 0;border-radius:4px' },
+    el('h4', { style: 'margin:0 0 4px' }, 'Notes on this run (' + items.length + ')'),
+    ...items.map(n => el('div', { style: 'margin:3px 0;font-size:13px' },
+      el('b', {}, n.source), n.who || n.at ? el('span', { class: 'muted' }, ' · ' + [n.who, n.at ? fmtWhen(n.at) : ''].filter(Boolean).join(' · ')) : null,
+      el('div', { style: 'white-space:pre-wrap' }, n.text))));
+}
 function revisionTracker(run) {
   const revs = (run.revisions || []).slice().reverse();   // newest first
   const latest = run.revision || 1;
@@ -4254,6 +4284,16 @@ async function openProcessLog(run, section) {
       if (failed.length) throw new Error('A section could not be saved: ' + failed[0]);
     }
     render();
+    // Saving does not send the run back for review: the amendment is only in the Product Release queue once it is submitted (KW-29), so offer to do it now.
+    if (editable) {
+      try {
+        const fresh = (await api('GET', '/production')).runs.find(x => x.id === run.id);
+        if (fresh && fresh.amendment) {
+          const pv = await api('GET', '/production/' + run.id + '/amendments/' + fresh.amendment.id + '/preview');
+          if (pv.changes.length && confirm('Your changes are saved, but this run is still "Under amendment" and is NOT in the Product Release queue yet.\n\nSubmit the amendment for review now?\n\n(Cancel keeps it open so you can keep editing; use "Submit amendment…" later.)')) await openSubmitAmendment(fresh);
+        }
+      } catch (e) { /* the amendment stays open; the banner on the run card still offers Submit */ }
+    }
   }, editable ? 'Save & close' : 'Done', { wide: true, closeX: true, onClose: () => render() });
   if (!editable) lockLogBody(body);   // finalized: read-only unless an amendment is open and you may amend
   if (section) jumpToSection(body, section);
@@ -4410,6 +4450,7 @@ async function openReleaseRun(id) {
   const refresh = async () => { body.closest('.modal-bg')?.remove(); await openReleaseRun(id); if (State.tab === 'release') { /* list refreshes on next visit */ } };
   body.append(el('div', { class: 'summary-line' }, sl('Run', d.lot), sl('Product', skuName(d.sku)), el('span', {}, 'Status: ', releaseBadge(d.state)),
     sl('Finalized', fmtWhen(d.finalizedAt) + (d.finalizedBy ? ' by ' + d.finalizedBy : ''))));
+  body.append(runNotesPanel(d.run, d.events, { emptyText: 'No notes were written on this run.' }));
   body.append(table(['FG lot', 'Pack', 'Units', 'Litres', 'Status'], d.lots.map(l => [mono(l.lot), l.packageSize, fmt(l.qty), num(fmt(l.litres, 0)), fgStatusBadge(l.status)]), [false, false, true, true, false]));
   body.append(el('div', { class: 'sign-box' }, el('h4', {}, 'Laboratory results & Certificate of Analysis'),
     el('div', { style: 'display:flex;gap:10px;align-items:center;flex-wrap:wrap' }, labBadge(d.lab), el('span', { class: 'help' }, labSummaryText(d.lab)),
