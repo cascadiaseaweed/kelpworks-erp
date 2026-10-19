@@ -1,8 +1,8 @@
 ﻿ID,Decision Needed,Options Discussed,Recommendation (Claude),Decided By,Decision
-KW-04,Image retention period on Render before archive to SharePoint,Keep all on Render / archive after ~1 month / don't store long-term,Archive after 30 days; keep SharePoint link on record. Keeps tote-surface catalog for expert review.,Nathan (2026-10-19),Archive after 30 days
-KW-05,Odor fields: optional or removed?,Remove required flag (Daniel) vs. remove fields (Nathan's dictation),Make optional; keep historical data for spoilage correlation.,Nathan (2026-10-19),Make optional (keep fields and history)
-KW-08,Idle-timeout behavior,Discard unsaved on timeout (Nathan) vs. auto-save draft (Daniel),Auto-save draft. Tablet drop / power loss will happen; data loss is a QC record gap.,Nathan (2026-10-19),Auto-save draft
-KW-07,Edit conflict handling depth,Presence + warning only vs. record version check,Presence + warning now; version check later if conflicts persist.,Nathan (2026-10-19),Presence + warning now
+KW-04,Image retention period on Render before archive to SharePoint,Keep all on Render / archive after ~1 month / don't store long-term,Archive after 30 days; keep SharePoint link on record. Keeps tote-surface catalog for expert review.,N. Wrana (2026-10-19),Archive after 30 days; keep a SharePoint link on the record
+KW-05,Odor fields: optional or removed?,Remove required flag (Daniel) vs. remove fields (Nathan's dictation),Make optional; keep historical data for spoilage correlation.,N. Wrana (2026-10-19),Make optional (keep fields and history)
+KW-08,Idle-timeout behavior,Discard unsaved on timeout (Nathan) vs. auto-save draft (Daniel),Auto-save draft. Tablet drop / power loss will happen; data loss is a QC record gap.,N. Wrana (2026-10-19),Auto-save draft
+KW-07,Edit conflict handling depth,Presence + warning only vs. record version check,Presence + warning now; version check later if conflicts persist.,N. Wrana (2026-10-19),Presence + warning now
 KW-18,Centrifuge / screw press % moisture required?,Required vs. optional,Keep required only if used in a KPI; otherwise optional.,,
 KW-22,'Dilution pass' naming,Dilution pass vs. pasteurization pass,Revisit after several runs.,,
 KW-26,Citric acid mass in process conversion ratio,Include vs. subtract,Subtract added citric/water mass so ratio reflects biomass only; show both if unsure.,,
