@@ -84,8 +84,88 @@ function code128SVG(data, opts = {}) {
   return `<svg viewBox="0 0 ${totalW.toFixed(0)} ${h}" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg"><g fill="#000">${rects}</g></svg>`;
 }
 
+/* ---------------- Presence (KW-07) ---------------- */
+// Who has which run / batch / tote open. Without it two people can edit the same card and the last save wins. This browser tab tells the server every few
+// seconds which cards it has open (POST /presence); the answer is who else is where. Opening a card someone else has open asks first; a banner inside the
+// window then shows who is there (and updates when someone joins later). Initials badges sit on the cards, and the top bar lists who is online.
+const Presence = { tab: Math.random().toString(36).slice(2, 12), open: new Map(), pending: null, data: { presence: {}, online: [] }, timer: null };
+const presenceOthers = key => ((Presence.data.presence || {})[key] || []).filter(p => State.user && p.id !== State.user.id);
+async function presenceBeat() {
+  if (!State.token || !State.user) return;
+  try {
+    Presence.data = await api('POST', '/presence', { tab: Presence.tab, open: [...Presence.open].map(([key, o]) => ({ key, label: o.label })) });
+    presenceRender();
+  } catch (e) { /* signed out or offline: the next beat tries again */ }
+}
+function presenceSchedule() {
+  clearTimeout(Presence.timer);
+  Presence.timer = setTimeout(async () => { await presenceBeat(); presenceSchedule(); }, Math.max(8, (Presence.data.timeoutSeconds || 90) / 3) * 1000);
+}
+function presenceStart() { presenceBeat().then(presenceSchedule); }
+function presenceLeave() {          // this tab is closing or signing out: tell the server now instead of waiting for the timeout
+  if (!State.token || !State.user) return;
+  try { fetch('/api/presence', { method: 'POST', keepalive: true, headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + State.token }, body: JSON.stringify({ tab: Presence.tab, leave: true }) }); } catch (e) { /* nothing to do */ }
+}
+function presenceStop() { clearTimeout(Presence.timer); Presence.timer = null; Presence.open.clear(); Presence.pending = null; Presence.data = { presence: {}, online: [] }; }
+const presenceDots = (people, what) => people.map(p => el('span', { class: 'presence-dot', title: p.name + what }, p.initials));
+function presenceBadge(key) {       // initials of the OTHER people who have this card open, kept current by presenceRender
+  const sp = el('span', { class: 'presence', 'data-presence': key });
+  sp.replaceChildren(...presenceDots(presenceOthers(key), ' has this open'));
+  return sp;
+}
+function presenceRender() {
+  document.querySelectorAll('[data-presence]').forEach(sp => sp.replaceChildren(...presenceDots(presenceOthers(sp.dataset.presence), ' has this open')));
+  const host = $('#presenceOnline');
+  if (host && State.user) host.replaceChildren(...(Presence.data.online || []).map(p => el('span', { class: 'presence-dot' + (p.id === State.user.id ? ' me' : ''), title: p.name + (p.id === State.user.id ? ' (you)' : ' is online') }, p.initials)));
+  for (const [key, o] of Presence.open) {
+    const who = presenceOthers(key);
+    o.banner.classList.toggle('hidden', !who.length);
+    o.banner.textContent = who.length ? '⚠ ' + who.map(p => p.name).join(', ') + (who.length > 1 ? ' also have' : ' also has')
+      + ' this open. If you both edit it, the last save wins and the other person’s changes can be lost.' : '';
+  }
+}
+function presenceWarn(label, others) {      // resolves true = open anyway, false = cancel
+  return new Promise(resolve => {
+    const done = v => { bg.remove(); resolve(v); };
+    const bg = el('div', { class: 'modal-bg' }, el('div', { class: 'modal' },
+      el('h3', {}, 'Someone else has this open'),
+      el('div', {}, el('b', {}, others.map(p => p.name).join(', ')), others.length > 1 ? ' have ' : ' has ', label, ' open right now.'),
+      el('div', { class: 'help', style: 'margin:8px 0' }, 'If you both edit it, the last save wins and the other person’s changes can be lost. Ask them first, or open it anyway.'),
+      el('div', { class: 'modal-actions' }, el('button', { class: 'secondary', onclick: () => done(false) }, 'Cancel'), el('button', { onclick: () => done(true) }, 'Open anyway'))));
+    $('#modalRoot').append(bg);
+  });
+}
+// Call before opening an editor for `key` (run:12, batch:3, tote:45). Returns false if the person chose Cancel. The editor window that opens next is then tracked
+// until it is closed (see the observer below), however it is closed.
+async function presenceEnter(key, label) {
+  await presenceBeat();
+  const others = presenceOthers(key);
+  if (others.length && !(await presenceWarn(label, others))) return false;
+  Presence.pending = { key, label, at: Date.now() };
+  return true;
+}
+function presenceBind(bg) {
+  const p = Presence.pending; Presence.pending = null;
+  const card = bg.querySelector('.modal'); if (!card) return;
+  const banner = el('div', { class: 'presence-banner hidden' });
+  const title = card.querySelector('h3'); if (title) title.after(banner); else card.prepend(banner);
+  Presence.open.set(p.key, { label: p.label, bg, banner });
+  presenceRender(); presenceBeat();
+}
+new MutationObserver(muts => {
+  for (const m of muts) for (const n of m.addedNodes) {
+    if (n.nodeType === 1 && n.classList.contains('modal-bg') && Presence.pending) {
+      if (Date.now() - Presence.pending.at < 20000) presenceBind(n); else Presence.pending = null;
+    }
+  }
+  let gone = false;
+  for (const [key, o] of Presence.open) if (!o.bg.isConnected) { Presence.open.delete(key); gone = true; }
+  if (gone) presenceBeat();
+}).observe(document.getElementById('modalRoot'), { childList: true });
+window.addEventListener('pagehide', presenceLeave);
+
 /* ---------------- Auth / shell ---------------- */
-function logout() { State.token = null; State.user = null; localStorage.removeItem(TOKEN_KEY); show('login'); }
+function logout() { presenceLeave(); presenceStop(); State.token = null; State.user = null; localStorage.removeItem(TOKEN_KEY); show('login'); }
 function show(which) {
   $('#login').classList.toggle('hidden', which !== 'login');
   $('#app').classList.toggle('hidden', which === 'login');
@@ -122,6 +202,7 @@ async function boot() {
     $('#tabs [data-tab=admin]').closest('.tab-group').classList.toggle('hidden', State.user.role !== 'admin');
     if (State.tab === 'admin' && State.user.role !== 'admin') State.tab = 'dashboard';
     show('app'); selectTab(State.tab);
+    presenceStart();
   } catch (err) { logout(); }
 }
 
@@ -435,7 +516,7 @@ async function pageStabilized(v) {
       },
         el('td', { class: 'checkcol' }, rowCheck(t, selected, updateBulk)),
         ...cols().map(c => el('td', { class: c.key === 'lot' ? 'mono' : (c.center ? 'ctr' : (c.numeric ? 'num' : '')) }, c.cell(t))),
-        el('td', {}, rowActions([
+        el('td', {}, presenceBadge('tote:' + t.id), rowActions([
           movable ? ['Move', () => moveTote(t)] : null,
           movable ? ['Update', () => updateCondition(t)] : null,
           ['Label', () => printLabels([toteLabel(t)])],
@@ -585,6 +666,7 @@ async function showHistory(t) {
   modal('Feedstock Stability log — ' + t.lot, body, async () => {}, 'Close', { noCancel: true });
 }
 async function updateCondition(t) {
+  if (!(await presenceEnter('tote:' + t.id, 'tote ' + t.lot))) return;
   const data = await api('GET', '/totes/' + t.id + '/ph');
   function summaryLines(d) {
     return [sl('Tote', t.lot),
@@ -865,7 +947,7 @@ async function pageProduction(v) {
           run.excludeFromStats ? el('span', { class: 'pill', style: 'margin-left:6px', title: run.excludeReason || '' }, 'Excluded from analysis') : null,
           run.historical ? el('span', { class: 'pill', style: 'margin-left:6px', title: 'Entered retrospectively by ' + (run.historical.enteredBy || '—') + '. ' + (run.historical.release === 'grandfather' ? 'Grandfathered as released. ' : '') + (run.historical.deductInventory ? '' : 'Did not move inventory. ') + (run.historical.note ? 'Log was incomplete at entry.' : '') }, 'Historical') : null,
           run.release && run.release.state && run.release.state !== 'legacy' ? [' ', releaseBadge(run.release.state)] : null,
-          ' ', analysisInfoButton(run)),
+          ' ', analysisInfoButton(run), ' ', presenceBadge('run:' + run.id)),
         el('div', { class: 'actions' },
           canAmendLog() ? (run.amendment
             ? el('button', { onclick: () => openRunLog(run.id) }, '✏️ Continue amendment')
@@ -1203,7 +1285,7 @@ function draftCard(d) {
   const pkgSummary = (d.packages || []).filter(p => p.qty > 0).map(p => `${fmt(p.qty)} × ${p.size}`).join(', ') || '—';
   return el('div', { class: 'card' },
     el('div', { class: 'page-head', style: 'margin:0 0 8px' },
-      el('h3', { style: 'margin:0' }, mono(d.processingLot), '  ', el('span', { class: 'badge hold' }, 'Not yet submitted'), d.historical ? [' ', el('span', { class: 'pill' }, 'Historical')] : null),
+      el('h3', { style: 'margin:0' }, mono(d.processingLot), '  ', el('span', { class: 'badge hold' }, 'Not yet submitted'), d.historical ? [' ', el('span', { class: 'pill' }, 'Historical')] : null, ' ', presenceBadge('run:' + d.id)),
       el('div', { class: 'actions' },
         el('button', { onclick: () => openRun(d) }, 'Resume'),
         el('button', { class: 'secondary', onclick: () => openSampleLabels(d) }, 'Print sample labels'),
@@ -3771,6 +3853,7 @@ async function openRun(draftSummary, opts) {
   const fresh = !!(opts && opts.fresh);
   // Re-fetch a resumed draft in full (list snapshots omit stage/solids/dilution detail).
   const draft = (draftSummary && draftSummary.id) ? (await api('GET', '/production/drafts/' + draftSummary.id)).run : draftSummary;
+  if (draft && draft.id && !(await presenceEnter('run:' + draft.id, 'run ' + (draft.processingLot || draft.id)))) return;
   const totes = (await api('GET', '/totes?status=in_stock'
     + (draft && draft.id ? '&includeRunId=' + draft.id : ''))).totes;
   const skus = State.ref.skus.filter(s => s.active);
@@ -4192,6 +4275,8 @@ async function openRun(draftSummary, opts) {
 // often completed days after the run), independent of the locked-in
 // tote-consumption / packaging numbers (corrected via the separate Edit modal).
 async function openProcessLog(run, section) {
+  // only an open amendment makes a finished run's log editable (otherwise it is read-only and nobody can overwrite anything)
+  if (run.amendment && canAmendLog() && !(await presenceEnter('run:' + run.id, 'run ' + run.processingLot))) return;
   const stages = run.stages || {};
   const feedstockHost = el('div', {});
   (run.inputs || []).forEach(inp => {
@@ -7347,7 +7432,7 @@ async function pagePreproc(v) {
 function preprocDraftCard(b) {
   return el('div', { class: 'card' },
     el('div', { class: 'page-head', style: 'margin:0 0 8px' },
-      el('h3', { style: 'margin:0' }, mono(b.batchLot), '  ', el('span', { class: 'badge hold' }, 'Not yet completed')),
+      el('h3', { style: 'margin:0' }, mono(b.batchLot), '  ', el('span', { class: 'badge hold' }, 'Not yet completed'), ' ', presenceBadge('batch:' + b.id)),
       el('div', { class: 'actions' },
         el('button', { onclick: () => openPreprocBatch(b.id) }, 'Resume'),
         el('button', { class: 'danger', onclick: async () => {
@@ -7387,6 +7472,7 @@ function preprocDoneCard(b) {
 
 async function openPreprocBatch(id, section) {
   let B = await api('GET', '/preproc/' + id);
+  if (B.status !== 'completed' && !(await presenceEnter('batch:' + id, 'batch ' + B.batchLot))) return;
   const v = el('div', {});            // the batch window's body (a wide window, like a production run's Process log)
   if (B.status === 'completed') {
     modal('Batch record — ' + B.batchLot, v, async () => { render(); }, 'Done', { wide: true, closeX: true, onClose: () => render() });
