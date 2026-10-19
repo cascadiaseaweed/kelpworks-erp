@@ -166,6 +166,8 @@ SETTINGS_DEFAULTS = [
      "Maximum working volume of EACH of Tank 2A and Tank 2B (2A + 2B = double): a Post-Dilution Tank Level above it is flagged in the production log. A warning only -- it never blocks saving."),
     ("presence_timeout_seconds", 90, "Presence timeout (seconds)",
      "How long someone who has closed their browser (or lost power) still shows as having a run, batch or tote open. Browsers announce themselves about every third of this time; it only drives the 'someone else has this open' warning."),
+    ("idle_timeout_minutes", 30, "Idle timeout (minutes)",
+     "A signed-in person who has not used the screen for this long is signed out; the run and batch sections they have open are saved first. 0 turns it off. Takes effect for everyone within a minute, no deploy needed."),
     ("sample_retention_months", 12, "Retention sample shelf life (months)",
      "How long a Retention sample is kept: its discard-by date is the collection date plus this many months (shown in the Samples tab's Retention inventory)."),
     ("preproc_target_solids_pct", 50, "Pre-processing target blend solids (%)",
@@ -1882,6 +1884,30 @@ def presence_leave(user, tab):
         for k in [k for k in PRESENCE if k[0] == user["id"] and k[1] == tab]:
             del PRESENCE[k]
         PRESENCE_ONLINE.pop((user["id"], tab), None)
+# Idle timeout (KW-08): a session that has been idle longer than the setting idle_timeout_minutes (0 = off) is ended. "Activity" = any request except the background download-token
+# refresh, plus a small POST /api/activity ping the browser sends while the person is using the screen. The server allows a short grace beyond the limit so the browser, which
+# watches the same limit, can save the open run / batch sections and sign out first. In memory: a restart simply starts every session's idle clock again.
+IDLE_LAST = {}                           # (user id, token expiry) -> time of last activity
+IDLE_LOCK = threading.Lock()
+
+
+def idle_grace_seconds(timeout_minutes):
+    return min(120.0, max(2.0, timeout_minutes * 60 * 0.2))
+
+
+def idle_check(key, timeout_minutes, touch, now=None):
+    """True when this session has been idle too long (it is then NOT refreshed); otherwise records the activity when `touch` and returns False."""
+    now = time.time() if now is None else now
+    with IDLE_LOCK:
+        last = IDLE_LAST.get(key)
+        if timeout_minutes and timeout_minutes > 0 and last is not None and now - last > timeout_minutes * 60 + idle_grace_seconds(timeout_minutes):
+            return True
+        if touch or last is None:
+            IDLE_LAST[key] = now
+        if len(IDLE_LAST) > 5000:
+            for k in [k for k, v in IDLE_LAST.items() if now - v > TOKEN_TTL]:
+                del IDLE_LAST[k]
+    return False
 
 
 LOGIN_WINDOW_SECONDS = 300
@@ -6404,7 +6430,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_request(self, code="-", size="-"):
         path = urlparse(self.path).path
-        if (path.startswith("/api/") and not (path == "/api/presence" and str(code) == "200")) or (str(code).isdigit() and int(code) >= 400):   # not every css / js / image / heartbeat
+        if (path.startswith("/api/") and not (path in ("/api/presence", "/api/activity") and str(code) == "200")) or (str(code).isdigit() and int(code) >= 400):   # not every css / js / image / heartbeat / ping
             logger.info("%s %s -> %s", self.command, redact(self.path), code)
 
     def _server_error(self, exc):
@@ -6460,6 +6486,10 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(401, "Your session has ended. Please sign in again.")
         if not row["active"]:
             raise ApiError(403, "This account has been deactivated")
+        if scope == "":
+            minutes = float(get_setting_value(conn, "idle_timeout_minutes", 30) or 0)
+            if idle_check((row["id"], payload.get("exp")), minutes, touch=urlparse(self.path).path != "/api/auth/download-token"):
+                raise ApiError(401, "You were signed out after %g minutes without activity. Sign in again; anything you had open was saved." % minutes, "idle_timeout")
         return row
 
     def _auth(self, conn):
@@ -7376,7 +7406,7 @@ class Handler(BaseHTTPRequestHandler):
         conn = db()
         self._created_files, self._files_to_remove = [], []
         try:
-            if method != "GET" and parsed.path not in ("/api/auth/login", "/api/presence"):       # presence is in memory: no write transaction
+            if method != "GET" and parsed.path not in ("/api/auth/login", "/api/presence", "/api/activity"):       # presence and the activity ping are in memory: no write transaction
                 conn.execute("BEGIN IMMEDIATE")          # take the write lock BEFORE any read the handler bases a write on
             self._actor = None
             result = self._route(method, parsed.path, query, conn)
@@ -7421,6 +7451,8 @@ class Handler(BaseHTTPRequestHandler):
             return {"token": make_token(user["id"], user["token_version"], scope="dl", ttl=DOWNLOAD_TOKEN_TTL), "expiresIn": DOWNLOAD_TOKEN_TTL}
         if method == "POST" and seg == ["api", "presence"]:
             return self.route_presence(conn, user)
+        if method == "POST" and seg == ["api", "activity"]:         # the browser says the person is using the screen (counted by _user_from_token); answers the current limit
+            return {"idleTimeoutMinutes": float(get_setting_value(conn, "idle_timeout_minutes", 30) or 0)}
         if method == "GET" and seg == ["api", "me"]:
             return self._me(user)
         if method == "POST" and seg == ["api", "me", "password"]:
