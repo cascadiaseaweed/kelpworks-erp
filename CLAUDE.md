@@ -361,6 +361,13 @@ for `main` so a red run blocks the merge.
   tank, NULL for two) -- the same pattern as the 6A/6B run totals, so the summary PDF, the water totals and reports keep reading the run-level fields. A total exists only when every tank in use has its value. The per-tank keys appear in
   `stages.homogenization` (and the signed log) only when set; required fields use the `_uses_2a` / `_uses_2b` predicates (the run-level fields are no longer required). Setting `homog_tank_capacity_each_l` (5000 L per tank) drives a
   warning only. A run with no tank choice is left exactly as entered.
+- **Presence: who has what open** (KW-07; tests in `tests/test_presence.py`). Concurrent edits are still "last save wins" (no record version check, by decision); presence only WARNS. The server keeps an in-memory register
+  (`PRESENCE` / `PRESENCE_ONLINE`, `presence_update`, `presence_leave`; nothing in the database or the backups, lost on restart -- browsers re-announce within seconds): a browser tab calls `POST /api/presence {tab, open: [{key, label}]}`
+  every `presence_timeout_seconds` / 3 (setting, default 90 s, on the Calculations page) and the answer is who is online and who has each card open; `{tab, leave: true}` forgets a tab (sent on `pagehide` and sign-out). The
+  call is exempt from the per-request write transaction and its 200s are not logged. Card keys: `run:<id>`, `batch:<id>`, `tote:<id>` (`PRESENCE_KEY_RE`; a new kind of card needs a regex entry). The SPA (`Presence`, `presenceEnter`)
+  asks first when someone else has the card open (Open anyway / Cancel), then tracks the editor window that opens next until it is closed, with a live banner inside it; initials badges (`presenceBadge`) sit on draft / finished
+  run cards, draft batch cards and the Feedstock Inventory rows, and the top bar lists who is online. Hooked in: `openRun` (drafts), `openProcessLog` (only under an open amendment, otherwise the log is read-only),
+  `openPreprocBatch` (drafts) and `updateCondition` (tote). A new editor that people can overwrite each other in should call `presenceEnter('<kind>:<id>', label)` before it opens.
 - **Tank 5A/5B -> 6A/6B dilution**: the plan (Pasteurization In: 5A/5B levels, receiving tanks 6A / 6B / 6A+6B, tank 6A/6B starting
   levels, TDS = Separation filtrate TDS, target = SKU) is calculated client-side by `dilutionPlanCalc` (c1V1=c2V2: max product =
   space x c2/c1, transfer = min(available, max), water = transfer x (c1/c2 - 1), 0 if c1<=c2) and stored on `production_runs`

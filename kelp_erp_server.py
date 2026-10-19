@@ -164,6 +164,8 @@ SETTINGS_DEFAULTS = [
      "Maximum working volume of EACH of Tank 6A and Tank 6B (6A + 6B connected = double) -- used by the Dilution plan's available space / maximum product transfer."),
     ("homog_tank_capacity_each_l", 5000, "Homogenization Tank 2A / 2B capacity, each (L)",
      "Maximum working volume of EACH of Tank 2A and Tank 2B (2A + 2B = double): a Post-Dilution Tank Level above it is flagged in the production log. A warning only -- it never blocks saving."),
+    ("presence_timeout_seconds", 90, "Presence timeout (seconds)",
+     "How long someone who has closed their browser (or lost power) still shows as having a run, batch or tote open. Browsers announce themselves about every third of this time; it only drives the 'someone else has this open' warning."),
     ("sample_retention_months", 12, "Retention sample shelf life (months)",
      "How long a Retention sample is kept: its discard-by date is the collection date plus this many months (shown in the Samples tab's Retention inventory)."),
     ("preproc_target_solids_pct", 50, "Pre-processing target blend solids (%)",
@@ -1789,6 +1791,52 @@ def verify_password(password, stored):
 
 
 # ---- login throttling (single instance: in memory is enough) ----
+# Presence (KW-07): who has which card open, so a second person is warned before they edit the same run / batch / tote ("last save wins" has no other protection).
+# Kept in memory only -- nothing is stored or backed up, an entry simply expires PRESENCE_TIMEOUT seconds after the browser last said it was still there (setting
+# presence_timeout_seconds), and a browser re-announces itself every few seconds, so a restart loses nothing that matters.
+PRESENCE = {}                            # (user id, tab id, card key) -> {"name", "initials", "label", "seen", "since"}
+PRESENCE_ONLINE = {}                     # (user id, tab id) -> {"name", "initials", "seen"}
+PRESENCE_LOCK = threading.Lock()
+PRESENCE_MAX_CARDS = 20
+PRESENCE_KEY_RE = re.compile(r"^(run|batch|tote):\d{1,9}$")
+
+
+def presence_initials(name):
+    words = re.findall(r"[A-Za-z0-9]+", name or "")
+    return ("".join(w[0] for w in words[:2]) or "?").upper()
+
+
+def presence_update(user, tab, cards, timeout, now=None):
+    """Record that this browser tab is online and has exactly `cards` ([(key, label)]) open (an empty list = it left them all); forget what has expired.
+    Returns {"presence": {card key: [who]}, "online": [who]} where who = {id, name, initials, label?}."""
+    now = time.time() if now is None else now
+    initials = presence_initials(user["name"])
+    with PRESENCE_LOCK:
+        for k in [k for k, v in PRESENCE.items() if now - v["seen"] > timeout or (k[0] == user["id"] and k[1] == tab)]:
+            del PRESENCE[k]
+        for k in [k for k, v in PRESENCE_ONLINE.items() if now - v["seen"] > timeout]:
+            del PRESENCE_ONLINE[k]
+        PRESENCE_ONLINE[(user["id"], tab)] = {"name": user["name"], "initials": initials, "seen": now}
+        for key, label in cards:
+            PRESENCE[(user["id"], tab, key)] = {"name": user["name"], "initials": initials, "label": label, "seen": now}
+        by_card, online = {}, {}
+        for (uid, _tab, key), v in sorted(PRESENCE.items(), key=lambda kv: kv[1]["seen"]):
+            people = by_card.setdefault(key, [])
+            if not any(p["id"] == uid for p in people):
+                people.append({"id": uid, "name": v["name"], "initials": v["initials"], "label": v["label"]})
+        for (uid, _tab), v in PRESENCE_ONLINE.items():
+            online.setdefault(uid, {"id": uid, "name": v["name"], "initials": v["initials"]})
+    return {"presence": by_card, "online": sorted(online.values(), key=lambda p: p["name"].lower())}
+
+
+def presence_leave(user, tab):
+    """This browser tab is closing (or signing out): it is no longer online and has nothing open."""
+    with PRESENCE_LOCK:
+        for k in [k for k in PRESENCE if k[0] == user["id"] and k[1] == tab]:
+            del PRESENCE[k]
+        PRESENCE_ONLINE.pop((user["id"], tab), None)
+
+
 LOGIN_WINDOW_SECONDS = 300
 LOGIN_MAX_FAILS_PER_ACCOUNT = 8          # failed attempts for one email from one address within the window
 LOGIN_MAX_FAILS_PER_ADDRESS = 40         # failed attempts from one address (any email) within the window
@@ -6291,7 +6339,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_request(self, code="-", size="-"):
         path = urlparse(self.path).path
-        if path.startswith("/api/") or (str(code).isdigit() and int(code) >= 400):          # not every css / js / image
+        if (path.startswith("/api/") and not (path == "/api/presence" and str(code) == "200")) or (str(code).isdigit() and int(code) >= 400):   # not every css / js / image / heartbeat
             logger.info("%s %s -> %s", self.command, redact(self.path), code)
 
     def _server_error(self, exc):
@@ -7263,7 +7311,7 @@ class Handler(BaseHTTPRequestHandler):
         conn = db()
         self._created_files, self._files_to_remove = [], []
         try:
-            if method != "GET" and parsed.path != "/api/auth/login":
+            if method != "GET" and parsed.path not in ("/api/auth/login", "/api/presence"):       # presence is in memory: no write transaction
                 conn.execute("BEGIN IMMEDIATE")          # take the write lock BEFORE any read the handler bases a write on
             self._actor = None
             result = self._route(method, parsed.path, query, conn)
@@ -7306,6 +7354,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if method == "POST" and seg == ["api", "auth", "download-token"]:
             return {"token": make_token(user["id"], user["token_version"], scope="dl", ttl=DOWNLOAD_TOKEN_TTL), "expiresIn": DOWNLOAD_TOKEN_TTL}
+        if method == "POST" and seg == ["api", "presence"]:
+            return self.route_presence(conn, user)
         if method == "GET" and seg == ["api", "me"]:
             return self._me(user)
         if method == "POST" and seg == ["api", "me", "password"]:
@@ -7450,6 +7500,29 @@ class Handler(BaseHTTPRequestHandler):
                 "isProductionManager": bool(row["is_production_manager"]),
                 "isQualityManager": bool(row["is_quality_manager"]),
                 "canAmendLog": bool(row["can_amend_log"])}
+
+    def route_presence(self, conn, user):
+        """POST /api/presence {tab, open: [{key, label}]}: this browser tab is here and has these cards open (replaces what it said before; an empty list = left them all).
+        {tab, leave: true}: the tab is closing, forget it. Answers who is where."""
+        d = self._body_json(8192)
+        tab = str(d.get("tab") or "")[:40]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{4,40}", tab):
+            raise ApiError(400, "A tab id of 4-40 letters or digits is needed")
+        if d.get("leave"):
+            presence_leave(user, tab)
+            return {"ok": True}
+        cards = []
+        for c in (d.get("open") or [])[:PRESENCE_MAX_CARDS + 1]:
+            key = str((c or {}).get("key") or "")
+            if not PRESENCE_KEY_RE.match(key):
+                raise ApiError(400, "Unknown card: %s" % key[:30])
+            cards.append((key, str((c or {}).get("label") or "")[:80]))
+        if len(cards) > PRESENCE_MAX_CARDS:
+            raise ApiError(400, "Too many cards open at once")
+        timeout = max(1.0, float(get_setting_value(conn, "presence_timeout_seconds", 90) or 90))
+        out = presence_update(user, tab, cards, timeout)
+        out.update({"me": user["id"], "timeoutSeconds": timeout})
+        return out
 
     # ---- users / admin ---------------------------------------------------- #
     def _user_public(self, r):

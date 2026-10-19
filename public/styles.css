@@ -634,3 +634,12 @@ body.is-staging { padding-top: 26px; }
 .linked-at { display: block; max-width: 220px; text-decoration: none; color: inherit; }
 .linked-at b { display: block; }
 .linked-at .muted { display: block; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* Presence (KW-07): initials of the other people who have a card open, and the people online */
+.presence { display: inline-flex; gap: 2px; vertical-align: middle; }
+.presence-dot { display: inline-flex; align-items: center; justify-content: center; min-width: 22px; height: 22px; padding: 0 3px; box-sizing: border-box; border-radius: 11px;
+  background: var(--warn); color: #fff; font-size: 10px; font-weight: 700; line-height: 1; }
+#presenceOnline { display: inline-flex; gap: 3px; margin-right: 6px; vertical-align: middle; }
+#presenceOnline .presence-dot { background: var(--teal); }
+#presenceOnline .presence-dot.me { background: #8aa39f; }
+.presence-banner { background: #fff4d6; border: 1px solid var(--warn); color: #6b4a00; border-radius: 6px; padding: 8px 12px; margin: 8px 0; font-size: 13px; font-weight: 600; }
