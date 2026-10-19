@@ -1296,9 +1296,31 @@ function applySopSlots(root) {
 let sopSlotTimer = null;
 new MutationObserver(() => { clearTimeout(sopSlotTimer); sopSlotTimer = setTimeout(() => applySopSlots(document.body), 100); })
   .observe(document.body, { childList: true, subtree: true });
-function uploadAtt(rid, file) {
+// Photos are shrunk in the browser before they are uploaded (KW-03): the server keeps every image exactly as it arrives on a small disk, and a phone / tablet photo is 2-5 MB.
+// JPEG / PNG / WebP photos are redrawn at most IMAGE_MAX_PX on the long side and saved as JPEG at IMAGE_QUALITY (typically 150-500 KB). Anything the browser cannot redraw (HEIC, GIF, PDF,
+// Word ...) is sent as it is, and so is a photo that is already smaller than the shrunk copy.
+const IMAGE_MAX_PX = 1600, IMAGE_QUALITY = 0.8;
+async function shrinkImage(file) {
+  if (!file || !/^image\/(jpeg|png|webp)$/.test(file.type || '') || typeof createImageBitmap !== 'function') return null;
+  try {
+    const bmp = await createImageBitmap(file);                       // honours the photo's rotation (EXIF) in current browsers
+    const scale = Math.min(1, IMAGE_MAX_PX / Math.max(bmp.width, bmp.height));
+    const w = Math.max(1, Math.round(bmp.width * scale)), h = Math.max(1, Math.round(bmp.height * scale));
+    const canvas = document.createElement('canvas'); canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);                // a PNG's transparent areas must not turn black
+    ctx.drawImage(bmp, 0, 0, w, h);
+    if (bmp.close) bmp.close();
+    const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', IMAGE_QUALITY));
+    if (!blob || blob.size >= file.size) return null;
+    return new File([blob], file.name.replace(/\.[^.]+$/, '') + '.jpg', { type: 'image/jpeg', lastModified: file.lastModified });
+  } catch (e) { return null; }
+}
+async function prepareUpload(file) { return (await shrinkImage(file)) || file; }
+async function uploadAtt(rid, file0) {
+  const file = await prepareUpload(file0);
   return new Promise((resolve, reject) => {
-    if (file.size > 25 * 1024 * 1024) return reject(new Error(file.name + ' exceeds the 25 MB limit'));
+    if (file.size > 25 * 1024 * 1024) return reject(new Error(file0.name + ' exceeds the 25 MB limit'));
     const reader = new FileReader();
     reader.onload = async () => {
       try {
@@ -2917,8 +2939,9 @@ function buildFeedstockCard(opts) {
     // capture="environment" hands off to the rear camera on phones/tablets.
     const cameraInput = el('input', { type: 'file', accept: 'image/*', capture: 'environment', style: 'display:none' });
     const status = el('span', { class: 'help' });
-    async function handle(file) {
-      if (!file) return;
+    async function handle(file0) {
+      if (!file0) return;
+      const file = await prepareUpload(file0);
       const reader = new FileReader();
       reader.onload = async () => {
         img.src = String(reader.result); img.style.display = '';
@@ -5063,8 +5086,8 @@ function receiptDocUrl(rid, aid) { return '/api/receipts/' + rid + '/attachments
 function fileB64(file) {
   return new Promise((resolve, reject) => { const r = new FileReader(); r.onload = () => resolve(String(r.result).split(',')[1]); r.onerror = () => reject(new Error('Could not read ' + file.name)); r.readAsDataURL(file); });
 }
-async function uploadReceiptDocs(rid, files, kind) {
-  for (const f of files) await api('POST', '/receipts/' + rid + '/attachments', { filename: f.name, contentType: f.type || 'application/octet-stream', dataB64: await fileB64(f), kind });
+async function uploadReceiptDocs(rid, files0, kind) {
+  for (const f0 of files0) { const f = await prepareUpload(f0); await api('POST', '/receipts/' + rid + '/attachments', { filename: f.name, contentType: f.type || 'application/octet-stream', dataB64: await fileB64(f), kind }); }
 }
 // Adjust: one button for everything that changes stock outside a delivery or a production run. COUNT sets the stock to what is on the shelf (the difference is logged with who, when and why;
 // a shortage comes out of the earliest-expiry lot); USED records stock that left without being counted (a spill, lab or R&D use, a discard).
