@@ -30,3 +30,14 @@ f5fd678  2026-10-15  integrity check covers Pre-Processing batches merged to mai
 0bdfb25  2026-10-16  receiving deliveries, documents, pack sizes, Adjust > Count, receiving archive merged to main and live
 8624345  2026-10-16  Whole grind merged to main and live
 e0416b9  2026-10-16  historical readings and editable received date merged to main and live
+9eb65e3  2026-10-19  photos shrunk in the browser before upload (KW-03) merged to main and live
+634b37b  2026-10-19  amended runs re-enter the review queue, notes shown up front (KW-28, KW-29) merged to main and live
+7455ebb  2026-10-19  odour optional, optional final QC odour (KW-05, KW-06) merged to main and live
+4135594  2026-10-19  default LKE samples required and locked (KW-13) merged to main and live
+0f7d3d5  2026-10-19  homogenization tank 2A / 2B with per-tank dilution (KW-10, KW-11) merged to main and live
+8ccdcf3  2026-10-19  bypass extraction, QC metrics relinked to homogenization (KW-15, KW-16) merged to main and live
+940f08c  2026-10-19  presence: warn when someone else has the same card open (KW-07) merged to main and live
+f4651f4  2026-10-19  run notes (KW-01) merged to main and live
+51f183b  2026-10-19  finished-goods lot shows the actual final TDS and pH (KW-31) merged to main and live
+efb4c50  2026-10-19  separation solids moisture, at least one required (KW-18) merged to main and live
+95951e0  2026-10-19  configurable idle timeout (KW-08) merged to main and live

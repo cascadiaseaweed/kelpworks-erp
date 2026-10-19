@@ -3,7 +3,7 @@ KW-04,Image retention period on Render before archive to SharePoint,Keep all on 
 KW-05,Odor fields: optional or removed?,Remove required flag (Daniel) vs. remove fields (Nathan's dictation),Make optional; keep historical data for spoilage correlation.,N. Wrana (2026-10-19),Make optional (keep fields and history)
 KW-08,Idle-timeout behavior,Discard unsaved on timeout (Nathan) vs. auto-save draft (Daniel),Auto-save draft. Tablet drop / power loss will happen; data loss is a QC record gap.,N. Wrana (2026-10-19),Auto-save draft
 KW-07,Edit conflict handling depth,Presence + warning only vs. record version check,Presence + warning now; version check later if conflicts persist.,N. Wrana (2026-10-19),Presence + warning now
-KW-18,Centrifuge / screw press % moisture required?,Required vs. optional,Keep required only if used in a KPI; otherwise optional.,,
+KW-18,Centrifuge / screw press % moisture required?,Required vs. optional,Keep required only if used in a KPI; otherwise optional.,N. Wrana (2026-10-19),"Both optional individually, at least one required"
 KW-22,'Dilution pass' naming,Dilution pass vs. pasteurization pass,Revisit after several runs.,,
 KW-26,Citric acid mass in process conversion ratio,Include vs. subtract,Subtract added citric/water mass so ratio reflects biomass only; show both if unsure.,,
 KW-39,Certified-lab pH/TDS/TSS frequency,Every lot vs. periodic,"Every lot for first ~10 lots to establish internal-vs-lab variance, then periodic. Confirm cost.",,
