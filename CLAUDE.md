@@ -185,6 +185,9 @@ for `main` so a red run blocks the merge.
   X-Frame-Options DENY, Referrer-Policy and (over https) HSTS from `end_headers`; CORS headers are gone (the app is same-origin); the app page carries `APP_CSP`
   (`script-src 'self'`: NO inline script, so print windows are printed by the opener via `printWhenReady`, and every value written into a print window goes through
   `escHtml`). Don't add an inline `<script>`, an inline event attribute or an un-escaped template string.
+  **Photos are shrunk in the browser before upload** (KW-03; `shrinkImage` / `prepareUpload` in app.js, constants `IMAGE_MAX_PX` 1600 and `IMAGE_QUALITY` 0.8): JPEG / PNG / WebP are redrawn at most 1600 px on the long side and
+  saved as JPEG (PNG transparency becomes white, the file name gets `.jpg`); HEIC, GIF, PDF, Word etc. and any photo that would not get smaller are sent unchanged, and a failure falls back to the original. Every image upload
+  goes through `prepareUpload` (feedstock photo slots, run documents `uploadAtt`, delivery documents `uploadReceiptDocs`); the server is unchanged and still stores whatever arrives, so a new upload path must call it too.
 - **Request limits, bounded parsing and logging** (risk review batch 4; tests in `tests/test_limits_logging.py`). `_body_json(limit)` refuses a body over
   `MAX_REQUEST_BYTES` (40 MB; the login, the only open route, 8 KB) with 413 BEFORE reading it, and `Handler.timeout` (`KELP_ERP_SOCKET_TIMEOUT`, 30 s) drops a client that goes silent.
   Untrusted .docx / .xlsx / .pdf are unpacked only through `zip_read` (parts over `MAX_ZIP_MEMBER_BYTES`, 10 MB, are refused) and `_inflate` (PDF streams capped); spreadsheet previews
