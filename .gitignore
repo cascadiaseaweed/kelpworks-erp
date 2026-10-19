@@ -11,5 +11,9 @@ kelp_secret.key
 backups/
 tools/archive-key.txt
 tools/sync.log
+# Claude Code: personal permissions and lock files stay local (the shared commands in .claude/commands are committed)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/launch.json
 # backups (they hold password hashes and every record): never commit one
 *.zip
