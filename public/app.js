@@ -1159,6 +1159,7 @@ function runNoteItems(run, events) {
     add('Rev ' + r.rev + ' amendment (note to the reviewer)', r.comment, r.by, r.at);
   });
   add('Run notes', run.notes);
+  (run.logNotes || []).forEach(n => add('Note — ' + (n.sectionLabel || n.section), n.body, n.by, n.at));
   if (run.stages && run.stages.extraction && run.stages.extraction.bypassed) add('Extraction bypassed', run.stages.extraction.bypassComment);
   (run.inputs || []).forEach(i => {
     add('Feedstock ' + i.toteLot + (i.decision === 'rejected' ? ' (rejected)' : ''), i.notes);
@@ -2669,6 +2670,100 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
       el('div', { style: 'margin-top:6px' }, saveBtn, status)));
 }
 
+// Notes (KW-01): what happened that the numbers do not say (a machine failure, a process change), each tagged with the log section it belongs to and optionally with
+// pictures. A "Notes" section lists and edits them; each log section shows its own notes at the bottom (`attach`); they are part of the signed log, so (like any entry)
+// they can be added, changed or removed while the log is open -- a draft, or an open amendment (`editable`) -- and are read-only otherwise.
+const NOTE_SECTIONS_UI = [['initiation', 'Initiation'], ['feedstock', 'Feedstock'], ['homogenization', 'Homogenization'], ['extraction', 'Extraction'], ['separation', 'Separation'],
+  ['pasteurization', 'Pasteurization'], ['dilution', 'Dilution & Preservation'], ['packaging', 'Packaging'], ['general', 'General']];
+function buildNotesSection(getRunId, editable) {
+  let notes = [], rid = null, loaded = false;
+  const listHost = el('div', {}), formHost = el('div', {}), status = el('div', { class: 'help' });
+  const strips = [];                                   // [{ key, host }] -- the per-section lists, redrawn with this one
+  const noteMeta = n => [n.by || '—', fmtWhen(n.at)].join(' · ') + (n.editedAt ? ' (edited ' + fmtWhen(n.editedAt) + ')' : '');
+  const pictures = n => n.images.length ? el('div', { class: 'note-images' }, ...n.images.map(i =>
+    el('a', { href: attDownloadUrl(rid, i.id), target: '_blank', title: i.filename }, el('img', { src: attDownloadUrl(rid, i.id), alt: i.filename, loading: 'lazy' })))) : null;
+  async function reload() {
+    rid = await getRunId();
+    notes = (await api('GET', '/production/' + rid + '/notes')).notes; loaded = true;
+    draw();
+  }
+  async function addPictures(noteId, files) {
+    for (const f0 of files) {
+      const f = await prepareUpload(f0);
+      await api('POST', '/production/' + rid + '/notes/' + noteId + '/images', { filename: f.name, contentType: f.type || 'image/jpeg', dataB64: await fileB64(f) });
+    }
+  }
+  function noteForm(n, onDone) {                       // add (n = null) or edit
+    const sel = el('select', {}, ...NOTE_SECTIONS_UI.map(([k, l]) => el('option', { value: k }, l))); sel.value = n ? n.section : 'general';
+    const txt = el('textarea', { rows: '3', maxlength: '4000', placeholder: 'What happened? (machine failure, process change, anything the reviewer should know)' }, n ? n.body : '');
+    const pics = el('input', { type: 'file', accept: 'image/*', multiple: 'multiple' });
+    const err = el('div', { class: 'error' });
+    const removeBoxes = n ? n.images.map(i => ({ i, cb: el('input', { type: 'checkbox' }) })) : [];
+    const save = el('button', { type: 'button' }, n ? 'Save note' : 'Add note');
+    save.addEventListener('click', async () => {
+      err.textContent = ''; save.disabled = true;
+      try {
+        rid = await getRunId();
+        let id = n && n.id;
+        if (n) await api('PUT', '/production/' + rid + '/notes/' + n.id, { section: sel.value, body: txt.value });
+        else id = (await api('POST', '/production/' + rid + '/notes', { section: sel.value, body: txt.value })).id;
+        for (const r of removeBoxes) if (r.cb.checked) await api('DELETE', '/production/' + rid + '/notes/' + id + '/images/' + r.i.id);
+        await addPictures(id, [...pics.files]);
+        await reload(); if (onDone) onDone();
+      } catch (e) { err.textContent = e.message; await reload().catch(() => {}); }
+      save.disabled = false;
+    });
+    return el('div', { class: 'note-form' },
+      el('div', { class: 'form-row' }, field('Log section', sel)),
+      field('Note', txt),
+      removeBoxes.length ? el('div', { class: 'help' }, 'Remove pictures: ', ...removeBoxes.map(r => el('label', { style: 'margin-right:10px' }, r.cb, ' ' + r.i.filename))) : null,
+      field(n ? 'Add pictures' : 'Pictures (optional)', pics), err,
+      el('div', { style: 'margin-top:6px;display:flex;gap:8px' }, save, n ? el('button', { type: 'button', class: 'secondary', onclick: () => { onDone(); } }, 'Cancel') : null));
+  }
+  function noteCard(n) {
+    const card = el('div', { class: 'note-card' });
+    const show = () => {
+      card.replaceChildren(
+        el('div', { class: 'note-head' }, el('span', { class: 'pill' }, n.sectionLabel), el('span', { class: 'muted' }, ' ' + noteMeta(n))),
+        el('div', { style: 'white-space:pre-wrap' }, n.body), pictures(n),
+        editable ? el('div', { style: 'margin-top:4px' }, el('button', { type: 'button', class: 'secondary', onclick: () => card.replaceChildren(noteForm(n, show)) }, 'Edit'), ' ',
+          el('button', { type: 'button', class: 'danger', onclick: async () => {
+            if (!confirm('Remove this note' + (n.images.length ? ' and its ' + n.images.length + ' picture(s)' : '') + '?')) return;
+            try { await api('DELETE', '/production/' + rid + '/notes/' + n.id); await reload(); } catch (e) { status.textContent = e.message; }
+          } }, 'Remove')) : null);
+    };
+    show();
+    return card;
+  }
+  function draw() {
+    listHost.replaceChildren(...(notes.length ? NOTE_SECTIONS_UI.flatMap(([k]) => notes.filter(n => n.section === k).map(noteCard))
+      : [el('div', { class: 'help' }, 'No notes on this run.')]));
+    strips.forEach(s => drawStrip(s));
+  }
+  function drawStrip(s) {
+    const mine = notes.filter(n => n.section === s.key);
+    s.host.classList.toggle('hidden', !mine.length);
+    s.host.replaceChildren(...(mine.length ? [el('div', { class: 'note-strip-title' }, 'Notes (' + mine.length + ')'), ...mine.map(n =>
+      el('div', { class: 'note-card' }, el('div', { class: 'muted' }, noteMeta(n)), el('div', { style: 'white-space:pre-wrap' }, n.body), pictures(n)))] : []));
+  }
+  function attach(root) {                              // a read-only list of a section's notes at the bottom of that section's window
+    for (const [key, label] of NOTE_SECTIONS_UI) {
+      if (key === 'general') continue;
+      const sum = [...root.querySelectorAll('details.accordion > summary')].find(s => s.textContent.trim() === label);
+      const bodyEl = sum && sum.parentElement.querySelector(':scope > .accordion-body');
+      if (!bodyEl) continue;
+      const host = el('div', { class: 'note-strip hidden' });
+      bodyEl.append(host); strips.push({ key, host });
+    }
+    if (loaded) strips.forEach(drawStrip); else reload().catch(() => {});
+  }
+  formHost.append(editable ? noteForm(null) : el('div', { class: 'help' }, 'Notes can be added while the run is a draft or under an open amendment.'));
+  const box = el('details', { class: 'accordion' }, el('summary', {}, 'Notes'),
+    el('div', { class: 'accordion-body' }, listHost, status, formHost));
+  box.addEventListener('toggle', () => { if (box.open && !loaded) reload().catch(e => { status.textContent = e.message; }); });
+  return { box, attach, reload };
+}
+
 const SAMPLE_TYPES = ['Slurry', 'Liquid', 'Solid'];
 const SAMPLE_DESCRIPTIONS = ['Microbial', 'Retention', 'Metals & Nutrients', 'Proximate Analysis', 'R&D', 'Other'];
 // Sample Point container options are the container consumables flagged
@@ -4010,6 +4105,7 @@ async function openRun(draftSummary, opts) {
   dilutionSummary.onChange(() => dilutionPasses.refresh());
   const dilutionsSection = buildDilutionsSection(draft?.dilutions || [], ensureRunId);
   const packagingEntriesSection = buildPackagingEntriesSection(draft?.packagingEntries || [], ensureRunId);
+  const notesSection = buildNotesSection(ensureRunId, true);
   const packagingPackagedInp = el('input', { type: 'datetime-local', value: stages.packaging?.packagedAt || '' });
   // QC Check + Sample Point ("LKE characterization") moved to the bottom of
   // Dilution & Preservation -- still packaging-stage columns/endpoints under
@@ -4098,7 +4194,9 @@ async function openRun(draftSummary, opts) {
       el('div', { class: 'accordion-body' },
         rfield('packaging', 'packagedAt', 'Packaging date and time', packagingPackagedInp),
         packagingEntriesSection.box,
-        el('div', { style: 'margin-top:6px' }, packagingSaveBtn, packagingStatus))));
+        el('div', { style: 'margin-top:6px' }, packagingSaveBtn, packagingStatus))),
+    notesSection.box);
+  notesSection.attach(body);
   filterTotes();
   renderFeedstockCards();
   renderSpecPanel();
@@ -4252,6 +4350,7 @@ async function openProcessLog(run, section) {
   dilutionSummary.onChange(() => dilutionPasses.refresh());
   const dilutionsSection = buildDilutionsSection(run.dilutions || [], getRunId);
   const packagingEntriesSection = buildPackagingEntriesSection(run.packagingEntries || [], getRunId);
+  const notesSection = buildNotesSection(getRunId, !!run.amendment && canAmendLog());
   const packagingPackagedInp = el('input', { type: 'datetime-local', value: stages.packaging?.packagedAt || '' });
   // QC Check + Sample Point ("LKE characterization") moved to the bottom of
   // Dilution & Preservation -- still packaging-stage columns/endpoints under
@@ -4343,7 +4442,9 @@ async function openProcessLog(run, section) {
       el('div', { class: 'accordion-body' },
         rfield('packaging', 'packagedAt', 'Packaging date and time', packagingPackagedInp),
         packagingEntriesSection.box,
-        el('div', { style: 'margin-top:6px' }, packagingSaveBtn, packagingStatus))));
+        el('div', { style: 'margin-top:6px' }, packagingSaveBtn, packagingStatus))),
+    notesSection.box);
+  notesSection.attach(body);
 
   ['click', 'change'].forEach(ev => body.addEventListener(ev, () => {
     clearTimeout(logTimer);
