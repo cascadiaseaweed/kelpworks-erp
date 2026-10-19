@@ -643,3 +643,12 @@ body.is-staging { padding-top: 26px; }
 #presenceOnline .presence-dot { background: var(--teal); }
 #presenceOnline .presence-dot.me { background: #8aa39f; }
 .presence-banner { background: #fff4d6; border: 1px solid var(--warn); color: #6b4a00; border-radius: 6px; padding: 8px 12px; margin: 8px 0; font-size: 13px; font-weight: 600; }
+/* Slide toggle (a checkbox shown as a switch): checked = on. Used for Extraction Active <-> Bypassed. */
+.slide-toggle { display: flex; align-items: center; gap: 10px; margin: 0 0 8px; cursor: pointer; flex-wrap: wrap; }
+.slide-toggle input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.slide-track { position: relative; width: 46px; height: 26px; flex: 0 0 46px; border-radius: 13px; background: var(--warn); transition: background .15s; }
+.slide-knob { position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.3); transition: left .15s; }
+.slide-toggle input:checked + .slide-track { background: var(--teal); }
+.slide-toggle input:checked + .slide-track .slide-knob { left: 23px; }
+.slide-toggle input:focus-visible + .slide-track { outline: 2px solid var(--teal-dark); outline-offset: 2px; }
+.slide-state { font-weight: 600; }

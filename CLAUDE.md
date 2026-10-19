@@ -337,7 +337,7 @@ for `main` so a red run blocks the merge.
   KelpWorks** (`DELETE` answers 409 `controlled_in_sharepoint`: remove the file in SharePoint and the document is withdrawn) and `_update_sop` refuses a hand-uploaded file for a numbered SOP (same code).
 - **Production-log required fields** are defined once, server-side, in `PROGRESS_SECTIONS` /
   `REQUIRED_FEEDSTOCK` (`kelp_erp_server.py`; exposed to the SPA as `refdata.requiredFields`).
-  Everything is required except: every Notes field, **odour** (the feedstock Odour / Odour intensity are optional since KW-05 --
+  Everything is required except: every Notes field, the extraction fields when extraction is bypassed (KW-15), **odour** (the feedstock Odour / Odour intensity are optional since KW-05 --
   recording an odour exposes operators to mould and VOCs -- and the final QC check's odour is optional by design, KW-06), the Homogenization / Separation /
   Pasteurization sample-point boxes, Extraction's QC Check Total-solids + Density fields,
   checkboxes, calculated values and legacy dilution-tank rows. `_run_progress` returns
@@ -368,6 +368,14 @@ for `main` so a red run blocks the merge.
   asks first when someone else has the card open (Open anyway / Cancel), then tracks the editor window that opens next until it is closed, with a live banner inside it; initials badges (`presenceBadge`) sit on draft / finished
   run cards, draft batch cards and the Feedstock Inventory rows, and the top bar lists who is online. Hooked in: `openRun` (drafts), `openProcessLog` (only under an open amendment, otherwise the log is read-only),
   `openPreprocBatch` (drafts) and `updateCondition` (tote). A new editor that people can overwrite each other in should call `presenceEnter('<kind>:<id>', label)` before it opens.
+- **Bypass extraction** (KW-15 / KW-16; tests in `tests/test_extraction_bypass.py`). A run can bypass extraction (the product still flows through the flow cell, nothing optimized):
+  `production_runs.extraction_bypassed` + `extraction_bypass_comment` (default `EXTRACTION_BYPASS_DEFAULT` "Extraction not optimized", editable, a blank reason is 400), set through the extraction stage
+  save. While bypassed none of the extraction fields is required (the `_extracting` predicate) and the reason is (`_bypassed`); `_apply_extraction_bypass` clears the extraction readings on save and drops the
+  reason when the bypass is turned off. `bypassed` / `bypassComment` are in `stages.extraction` (and the signed log) only when set. **The Extraction Performance card of a bypassed run is the Homogenization-out QC
+  check** -- nothing is copied: `extraction_view(extraction, homogenization)` relinks it for the production summary (Extraction row "Bypassed: <reason>", scorecard column), Yield & Usage (`tdsAfterExtraction` = the
+  homogenization TDS) and the screen (read-only table). **Extraction efficiency is not applicable** for such a run (blank, shown "bypassed", never 0 %) in the run card, summary, Yield & Usage (CSV / XLSX) and
+  the QC charts (no `qc:extraction_eff` point, and no extraction readings, so the Extraction section statistics are not polluted). The reason also shows in the run's Notes panel (`runNoteItems`) and so at the
+  top of the release review. Separation reads nothing from extraction, so "separation in = homogenization out" needs no code. A new consumer of extraction QC values must go through `extraction_view`.
 - **Tank 5A/5B -> 6A/6B dilution**: the plan (Pasteurization In: 5A/5B levels, receiving tanks 6A / 6B / 6A+6B, tank 6A/6B starting
   levels, TDS = Separation filtrate TDS, target = SKU) is calculated client-side by `dilutionPlanCalc` (c1V1=c2V2: max product =
   space x c2/c1, transfer = min(available, max), water = transfer x (c1/c2 - 1), 0 if c1<=c2) and stored on `production_runs`

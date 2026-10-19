@@ -298,6 +298,9 @@ _QC_ALL = [
 # only required when it is true (per-tank fields apply only to the tanks being filled).
 _uses_2a = lambda st: (st["homogenization"].get("tanks") or "") in ("2A", "2AB")
 _uses_2b = lambda st: (st["homogenization"].get("tanks") or "") in ("2B", "2AB")
+EXTRACTION_BYPASS_DEFAULT = "Extraction not optimized"      # KW-15: the reason a bypassed extraction starts with (editable, never blank)
+_extracting = lambda st: not st["extraction"].get("bypassed")
+_bypassed = lambda st: bool(st["extraction"].get("bypassed"))
 _uses_6a = lambda st: (st["pasteurization"].get("receivingTanks") or "") in ("6A", "6AB")
 _uses_6b = lambda st: (st["pasteurization"].get("receivingTanks") or "") in ("6B", "6AB")
 PROGRESS_SECTIONS = [
@@ -323,11 +326,13 @@ PROGRESS_SECTIONS = [
            ("homogenization", "tsSolidsPct", "QC Check: %Moisture solids"),
            ("homogenization", "solidsLoadingPct", "QC Check: Solids Loading (%)")]},
     {"key": "extraction", "label": "Extraction", "fields": [
-        ("extraction", "startedAt", "Started at"), ("extraction", "amplitudePct", "Amplitude (%)"),
-        ("extraction", "flowrateLpm", "Flow rate (L/min)"), ("extraction", "pressurePsi", "Pressure (psi)"),
-        ("extraction", "startingPowerW", "Starting power (W)"),
-        ("extraction", "qcPh", "QC Check: pH"), ("extraction", "tdsPct", "QC Check: TDS (%)"),
-        ("extraction", "brixPct", "QC Check: Brix (%)"), ("extraction", "mannitolPct", "QC Check: Mannitol (%)")]},
+        # KW-15: when extraction is bypassed none of these is required; the reason is
+        ("extraction", "startedAt", "Started at", _extracting), ("extraction", "amplitudePct", "Amplitude (%)", _extracting),
+        ("extraction", "flowrateLpm", "Flow rate (L/min)", _extracting), ("extraction", "pressurePsi", "Pressure (psi)", _extracting),
+        ("extraction", "startingPowerW", "Starting power (W)", _extracting),
+        ("extraction", "qcPh", "QC Check: pH", _extracting), ("extraction", "tdsPct", "QC Check: TDS (%)", _extracting),
+        ("extraction", "brixPct", "QC Check: Brix (%)", _extracting), ("extraction", "mannitolPct", "QC Check: Mannitol (%)", _extracting),
+        ("extraction", "bypassComment", "Reason extraction was bypassed", _bypassed)]},
     {"key": "separation", "label": "Separation", "fields": [
         ("separation", "startedAt", "Started at"), ("separation", "flowrateLpm", "Flow rate (L/min)"),
         ("separation", "meshMicron", "Mesh size (micron)"), ("separation", "wetSolidsWtKg", "Total wet-solids weight (kg)"),
@@ -407,6 +412,7 @@ _KEY_LABELS = {
     "dilutionWaterL2b": "Dilution water added, Tank 2B (L)",
     "postDilutionTankL2b": "Post-Dilution Tank Level, Tank 2B (L)",
     "lotPctSolids2b": "Lot %Solids Loading, (w/w), Tank 2B",
+    "bypassed": "Extraction bypassed", "bypassComment": "Reason extraction was bypassed",
     "tank5aL": "Tank 5A level (L)", "tank5bL": "Tank 5B level (L)", "receivingTanks": "Receiving tanks",
     "tank6aStartL": "Tank 6A level before transfer (L)", "tank6bStartL": "Tank 6B level before transfer (L)",
     "maxTransferL": "Max product to transfer (L)", "recommendedTransferL": "Recommended product transfer (L)",
@@ -417,6 +423,19 @@ _KEY_LABELS = {
     "nabenzoateAddedL6b": "Sodium benzoate added, Tank 6B (L)", "finalVariancePct": "Final volume variance (%)",
     "fillLevelTank6abL": "Total final volume, Tanks 6A/6B (L)",
 }
+
+
+_EXTRACTION_QC_KEYS = ("qcPh", "tdsPct", "brixPct", "mannitolPct", "tsLiquidPct", "rhoLiquidGMl", "tsSlurryPct", "rhoSlurryGMl", "tsSolidsPct")
+
+
+def extraction_view(extraction, homogenization):
+    """KW-16: the Extraction Performance QC values of a run. A normal run has its own; a run that bypassed extraction has none, and its Extraction Performance
+    card is the Homogenization-out (lot characterization) QC check -- separation takes in what homogenization put out. Returns a copy; nothing is stored."""
+    out = dict(extraction)
+    if out.get("bypassed"):
+        for k in _EXTRACTION_QC_KEYS:
+            out[k] = homogenization.get(k)
+    return out
 
 
 def humanize_key(k):
@@ -3985,7 +4004,7 @@ def build_run_summary_pdf(S, logo_path=None):
     conv = (S["outputL"] / S["measuredKg"]) if (S["outputL"] and S["measuredKg"]) else None
     he0, ex0 = st["homogenization"], st["extraction"]
     eff0 = None
-    if ex0.get("tdsPct") not in (None, "") and he0.get("tdsPct"):
+    if ex0.get("tdsPct") not in (None, "") and he0.get("tdsPct") and not ex0.get("bypassed"):
         eff0 = (ex0["tdsPct"] - he0["tdsPct"]) / he0["tdsPct"] * 100.0
     pdf.kpis([
         ("Feedstock", _pf(S["measuredKg"], 0, "kg"), "%d tote%s" % (S["toteCount"], "" if S["toteCount"] == 1 else "s")),
@@ -4010,7 +4029,7 @@ def build_run_summary_pdf(S, logo_path=None):
     def has(v):
         return v is not None and v != ""
     eff = None
-    if has(ex.get("tdsPct")) and has(he.get("tdsPct")) and he["tdsPct"]:
+    if has(ex.get("tdsPct")) and has(he.get("tdsPct")) and he["tdsPct"] and not ex.get("bypassed"):
         eff = (ex["tdsPct"] - he["tdsPct"]) / he["tdsPct"] * 100.0
     rows = [
         ["Feedstock", when(S["firstLoaded"]),
@@ -4023,7 +4042,8 @@ def build_run_summary_pdf(S, logo_path=None):
                ("solids loading " + _pf(he.get("solidsLoadingPct"), 1, "%")) if has(he.get("solidsLoadingPct")) else
                (("wet solids " + _pf(he.get("pctWetSolids"), 1, "%")) if has(he.get("pctWetSolids")) else ""),
                ("initial pH " + _pf(he.get("initialPh"), 2)) if has(he.get("initialPh")) else ""])],
-        ["Extraction", when(ex.get("startedAt")),
+        ["Extraction", "bypassed" if ex.get("bypassed") else when(ex.get("startedAt")),
+         ("Bypassed: " + (ex.get("bypassComment") or EXTRACTION_BYPASS_DEFAULT) + "  ·  readings are the Homogenization-out QC check") if ex.get("bypassed") else
          join([("amplitude " + _pf(ex.get("amplitudePct"), 0, "%")) if has(ex.get("amplitudePct")) else "",
                ("flow " + _pf(ex.get("flowrateLpm"), 0, "L/min")) if has(ex.get("flowrateLpm")) else "",
                ("pressure " + _pf(ex.get("pressurePsi"), 0, "psi")) if has(ex.get("pressurePsi")) else "",
@@ -4368,6 +4388,7 @@ def migrate(conn):
         ("extraction_amplitude_pct", "REAL"), ("extraction_flowrate_lpm", "REAL"),
         ("extraction_pressure_psi", "REAL"), ("extraction_starting_power_w", "REAL"),
         ("extraction_started_at", "TEXT"),
+        ("extraction_bypassed", "INTEGER DEFAULT 0"), ("extraction_bypass_comment", "TEXT"),      # KW-15
         ("extraction_qc_ph", "REAL"), ("extraction_tds_pct", "REAL"), ("extraction_brix_pct", "REAL"),
         ("extraction_mannitol_pct", "REAL"), ("extraction_ts_liquid_pct", "REAL"),
         ("extraction_rho_liquid_g_ml", "REAL"), ("extraction_ts_slurry_pct", "REAL"),
@@ -5289,6 +5310,10 @@ def run_public(r):
     for key, col in (("odour", "packaging_odour"), ("odourIntensity", "packaging_odour_intensity")):
         if r[col]:
             d["stages"]["packaging"][key] = r[col]
+    # KW-15: extraction bypassed (the product still flowed through the flow cell, nothing was optimized) -- in the log only when it is
+    if r["extraction_bypassed"]:
+        d["stages"]["extraction"]["bypassed"] = True
+        d["stages"]["extraction"]["bypassComment"] = r["extraction_bypass_comment"]
     for key, col in (("citricItemId", "dilution_citric_item_id"), ("ksorbateItemId", "dilution_ksorbate_item_id"),
                      ("nabenzoateItemId", "dilution_nabenzoate_item_id")):
         if r[col] is not None:
@@ -8506,6 +8531,7 @@ class Handler(BaseHTTPRequestHandler):
         stages = {k: dict(v) for k, v in run["stages"].items()}
         for k in ("homogenization", "extraction", "separation", "pasteurization", "dilution", "packaging"):
             stages.setdefault(k, {})
+        stages["extraction"] = extraction_view(stages["extraction"], stages["homogenization"])
         water_parts = [stages["homogenization"].get("rinsingWaterL"), stages["homogenization"].get("dilutionWaterL"),
                        stages["dilution"].get("waterAddedL")] + [p_.get("waterAddedL") for p_ in run["dilutionPasses"]]
         water_vals = [w_ for w_ in water_parts if w_ not in (None, "")]
@@ -11138,6 +11164,8 @@ class Handler(BaseHTTPRequestHandler):
         ],
         "extraction": [
             ("extraction_started_at", "startedAt", "text"),
+            ("extraction_bypassed", "bypassed", "bool"),
+            ("extraction_bypass_comment", "bypassComment", "text"),
             ("extraction_amplitude_pct", "amplitudePct", "num"),
             ("extraction_flowrate_lpm", "flowrateLpm", "num"),
             ("extraction_pressure_psi", "pressurePsi", "num"),
@@ -12859,6 +12887,8 @@ class Handler(BaseHTTPRequestHandler):
         d = self._body_json()
         if stage == "homogenization" and (d.get("tanks") or "").strip() not in ("", "2A", "2B", "2AB"):
             raise ApiError(400, "Homogenization tank(s) must be 2A, 2B or 2A + 2B")
+        if stage == "extraction" and d.get("bypassed") and "bypassComment" in d and not (d.get("bypassComment") or "").strip():
+            raise ApiError(400, "Enter the reason extraction was bypassed")
         updates = {}
         for col, key, kind in self.STAGE_FIELDS[stage]:
             if key not in d:
@@ -12875,6 +12905,8 @@ class Handler(BaseHTTPRequestHandler):
             self._log_qc_field_changes(conn, rid, stage, updates, user["name"] if user else None)
         if stage == "homogenization":
             self._recompute_homogenization(conn, rid)
+        if stage == "extraction":
+            self._apply_extraction_bypass(conn, rid)
         # The Packaging section's one Save button covers the packagedAt/QC/
         # Sample Point fields above *and* commits the Packaging table's net
         # container changes -- this is the "once changes have been saved"
@@ -12937,6 +12969,22 @@ class Handler(BaseHTTPRequestHandler):
         conn.execute("UPDATE production_runs SET %s WHERE id=?" % ", ".join("%s=?" % c for c in sets), (*sets.values(), rid))
 
     HOMOG_TANK_STEMS = ("slurry_l", "wet_solids_wt_g", "liquid_wt_g", "pct_wet_solids", "dilution_water_target_l", "dilution_water_l", "post_dilution_tank_l", "lot_pct_solids")
+
+    # ---- Extraction bypass (KW-15, KW-16) ------------------------------------#
+    EXTRACTION_VALUE_COLUMNS = ("extraction_started_at", "extraction_amplitude_pct", "extraction_flowrate_lpm", "extraction_pressure_psi", "extraction_starting_power_w",
+                                "extraction_qc_ph", "extraction_tds_pct", "extraction_brix_pct", "extraction_mannitol_pct", "extraction_ts_liquid_pct",
+                                "extraction_rho_liquid_g_ml", "extraction_ts_slurry_pct", "extraction_rho_slurry_g_ml", "extraction_ts_solids_pct")
+
+    def _apply_extraction_bypass(self, conn, rid):
+        """A run that bypassed extraction has no extraction readings of its own: whatever was typed there is cleared (the Extraction Performance card shows the
+        Homogenization-out QC values instead, see `extraction_view`) and the reason defaults to EXTRACTION_BYPASS_DEFAULT; a run that is not bypassed carries no reason."""
+        r = conn.execute("SELECT extraction_bypassed, extraction_bypass_comment FROM production_runs WHERE id=?", (rid,)).fetchone()
+        if r["extraction_bypassed"]:
+            sets = {c: None for c in self.EXTRACTION_VALUE_COLUMNS}
+            sets["extraction_bypass_comment"] = (r["extraction_bypass_comment"] or "").strip() or EXTRACTION_BYPASS_DEFAULT
+        else:
+            sets = {"extraction_bypass_comment": None}
+        conn.execute("UPDATE production_runs SET %s WHERE id=?" % ", ".join("%s=?" % c for c in sets), (*sets.values(), rid))
 
     # ---- Dilution & Preservation: repeatable tank entries ------------------#
     def _dilutions_public(self, conn, run_id):
@@ -14395,7 +14443,7 @@ class Handler(BaseHTTPRequestHandler):
             if r["dilution_final_variance_pct"] is not None:
                 info = QC_MEASURE_INFO["volume_variance"]
                 add("qc", "qc:volume_variance", info[0], info[1], info[2], "dilution", {"r": r["id"], "v": float(r["dilution_final_variance_pct"])})
-            if r["homog_tds_pct"] and r["extraction_tds_pct"] is not None:
+            if r["homog_tds_pct"] and r["extraction_tds_pct"] is not None and not r["extraction_bypassed"]:
                 info = QC_MEASURE_INFO["extraction_eff"]
                 add("qc", "qc:extraction_eff", info[0], info[1], info[2], "extraction",
                     {"r": r["id"], "v": round((r["extraction_tds_pct"] - r["homog_tds_pct"]) / r["homog_tds_pct"] * 100.0, 2)})
@@ -14581,9 +14629,11 @@ class Handler(BaseHTTPRequestHandler):
                 "finalPh": r["packaging_qc_ph"], "finalTds": r["packaging_tds_pct"],
                 # Extraction efficiency (%) = (TDS after extraction - TDS before) / TDS before,
                 # using the Extraction Performance and Homogenization Lot characterization TDS.
-                "tdsBeforeExtraction": r["homog_tds_pct"], "tdsAfterExtraction": r["extraction_tds_pct"],
+                # KW-15 / KW-16: a bypassed extraction has no TDS gain to measure (efficiency is blank, never 0) and its TDS after is the Homogenization-out TDS
+                "tdsBeforeExtraction": r["homog_tds_pct"], "extractionBypassed": bool(r["extraction_bypassed"]),
+                "tdsAfterExtraction": r["homog_tds_pct"] if r["extraction_bypassed"] else r["extraction_tds_pct"],
                 "extractionEfficiency": (round((r["extraction_tds_pct"] - r["homog_tds_pct"]) / r["homog_tds_pct"] * 100, 1)
-                                         if r["homog_tds_pct"] and r["extraction_tds_pct"] is not None else None),
+                                         if r["homog_tds_pct"] and r["extraction_tds_pct"] is not None and not r["extraction_bypassed"] else None),
                 "farms": sites, "species": species, "mixed": mixed,
                 "stabilization": sorted({t["stabilization_method"] for t in rt if t["stabilization_method"]}),
                 "harvestKg": round(harvest_kg, 2), "processKg": process_kg, "outputL": round(out_l, 2),
@@ -15252,7 +15302,7 @@ def yield_usage_workbook(data):
                T(" / ".join(r["farmNames"]) or "—"), T(" / ".join(r["speciesNames"]) or "—"),
                T(" / ".join(r["stabilization"]) or "—"),
                N(r["harvestKg"], 5), N(r["processKg"], 5), N(r["outputL"], 5), N(r["harvestRate"]), N(r["processRate"]),
-               N(r["finalPh"], 6), N(r["finalTds"], 6), N(r["extractionEfficiency"], 6),
+               N(r["finalPh"], 6), N(r["finalTds"], 6), T("Bypassed") if r.get("extractionBypassed") else N(r["extractionEfficiency"], 6),
                T("Yes" if r["excluded"] else ""), T(r["excludeReason"] or ""), T(", ".join(r["flags"]))])
     sheets.append(s)
     return xlsx_build(sheets)
