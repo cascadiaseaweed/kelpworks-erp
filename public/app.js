@@ -902,7 +902,8 @@ function runSummaryStats(run) {
   return {
     farms, toteCount, measuredKg, out,
     finalPh: st.packaging ? st.packaging.qcPh : null, finalTds: st.packaging ? st.packaging.tdsPct : null,
-    extractionEff: (tdsBefore && tdsAfter != null) ? (tdsAfter - tdsBefore) / tdsBefore * 100 : null,
+    extractionBypassed: !!(st.extraction && st.extraction.bypassed),
+    extractionEff: (tdsBefore && tdsAfter != null && !(st.extraction && st.extraction.bypassed)) ? (tdsAfter - tdsBefore) / tdsBefore * 100 : null,
     processRate: measuredKg && out > 0 ? out / measuredKg : null,
     harvestRate: run.inputKg > 0 && out > 0 ? out / run.inputKg : null,
   };
@@ -924,7 +925,7 @@ function runSummaryGrid(run) {
     cell('Product volume out', x.out ? fmt(x.out, 0) + ' L' : dash),
     cell('Final pH', x.finalPh != null ? fmt(x.finalPh, 2) : dash),
     cell('Final TDS', x.finalTds != null ? fmt(x.finalTds, 2) + ' %' : dash),
-    cell('Extraction efficiency', x.extractionEff != null ? fmt(x.extractionEff, 1) + ' %' : dash),
+    cell('Extraction efficiency', x.extractionBypassed ? [el('span', { class: 'help' }, 'n/a'), el('small', {}, 'extraction bypassed')] : (x.extractionEff != null ? fmt(x.extractionEff, 1) + ' %' : dash)),
     cell('Conversion rate — process', x.processRate != null ? [fmt(x.processRate, 3), el('small', {}, 'L/kg · measured weight')] : dash),
     cell('Conversion rate — harvest', x.harvestRate != null ? [fmt(x.harvestRate, 3), el('small', {}, 'L/kg · batch-average weight')] : dash));
 }
@@ -1158,6 +1159,7 @@ function runNoteItems(run, events) {
     add('Rev ' + r.rev + ' amendment (note to the reviewer)', r.comment, r.by, r.at);
   });
   add('Run notes', run.notes);
+  if (run.stages && run.stages.extraction && run.stages.extraction.bypassed) add('Extraction bypassed', run.stages.extraction.bypassComment);
   (run.inputs || []).forEach(i => {
     add('Feedstock ' + i.toteLot + (i.decision === 'rejected' ? ' (rejected)' : ''), i.notes);
     if (i.decision === 'rejected') add('Feedstock ' + i.toteLot + ' — rejection reason', i.rejectionReason);
@@ -2291,6 +2293,7 @@ function buildQualityCheckBox(subtitle, values, opts) {
 // used in Homogenization Output, just under its own subtitle. Bespoke like
 // Homogenization for the same reason -- the generic field-list renderer
 // can't do custom defaults/placeholders or a QC Check card.
+const EXTRACTION_BYPASS_DEFAULT = 'Extraction not optimized';      // same text as the server's default reason
 function buildExtractionSection(getRunId, values, onSaved) {
   values = values || {};
   const startedAt = el('input', { type: 'datetime-local', value: values.startedAt || '' });
@@ -2309,13 +2312,56 @@ function buildExtractionSection(getRunId, values, onSaved) {
 
   const qcCheck = buildQualityCheckBox('Extraction Performance', values, { reqStage: 'extraction', spot: 'production.extraction.qc_check' });
 
+  // Bypass extraction (KW-15): the product still flows through the flow cell but nothing is optimized (no amplitude / flow rate). The reason starts as
+  // EXTRACTION_BYPASS_DEFAULT, can be edited, and cannot be blank. Nothing else in this section is required then, and (KW-16) the Extraction Performance
+  // card is the Homogenization-out QC check: separation takes in what homogenization put out.
+  // A slide toggle, Active (the default: extraction is performed) <-> Bypassed.
+  const activeChk = el('input', { type: 'checkbox', role: 'switch', id: 'ex_active', 'aria-label': 'Extraction active' }); activeChk.checked = !values.bypassed;
+  const toggleState = el('span', { class: 'slide-state' });
+  const bypassOn = () => !activeChk.checked;
+  const reasonInp = el('input', { value: values.bypassComment || EXTRACTION_BYPASS_DEFAULT, placeholder: 'Why was extraction bypassed?' });
+  const normalEl = el('div', {});
+  const reasonField = el('div', { class: 'hidden' }, rfield('extraction', 'bypassComment', 'Reason extraction was bypassed', reasonInp));
+  const relinkBox = el('div', { class: 'qc-check-box theme-quality hidden', 'data-sop-spot': 'production.extraction.qc_check' });
+  const hasEntries = () => [startedAt, amplitudeInp, flowrateInp, pressureInp, startingPowerInp].some(i => i.value && i !== amplitudeInp && i !== flowrateInp)
+    || Object.values(qcCheck.getPayload()).some(v => v != null);
+  async function latestHomogenization(rid) {            // the lot characterization as it is saved now, from the draft or the finalized run
+    const d = (await api('GET', '/production/drafts')).drafts.find(x => x.id === rid)
+      || (await api('GET', '/production')).runs.find(x => x.id === rid);
+    return (d && d.stages && d.stages.homogenization) || {};
+  }
+  async function drawRelinked() {
+    let h = {};
+    try { h = await latestHomogenization(await getRunId()); } catch (e) { /* the run is not saved yet: nothing to show */ }
+    const row = (label, v, d, unit) => [label, v != null ? fmt(v, d) + (unit ? ' ' + unit : '') : '—'];
+    relinkBox.replaceChildren(el('div', { class: 'qc-check-title' }, 'QC Check'), el('div', { class: 'qc-check-subtitle' }, 'Extraction Performance'),
+      el('div', { class: 'help' }, 'Extraction was bypassed, so these are the Homogenization → Lot characterization readings (read-only). Change them in Homogenization.'),
+      table(['Reading', 'Value'], [row('pH', h.qcPh, 1), row('TDS', h.tdsPct, 1, '%'), row('Brix', h.brixPct, 1, '%'), row('Mannitol', h.mannitolPct, 1, '%'),
+        row('TSliquid', h.tsLiquidPct, 1, '%'), row('ρliquid', h.rhoLiquidGMl, 3, 'g/mL'), row('TSslurry', h.tsSlurryPct, 1, '%'),
+        row('ρslurry', h.rhoSlurryGMl, 3, 'g/mL'), row('%Moisture solids', h.tsSolidsPct, 1, '%')], [false, true]));
+  }
+  function refreshBypass() {
+    const on = bypassOn();
+    toggleState.textContent = on ? 'Bypassed' : 'Active';
+    normalEl.classList.toggle('hidden', on);
+    reasonField.classList.toggle('hidden', !on);
+    relinkBox.classList.toggle('hidden', !on);
+    if (on) drawRelinked();
+  }
+  activeChk.addEventListener('change', () => {
+    if (bypassOn() && hasEntries() && !confirm('Bypassing extraction removes the extraction readings already entered here when you save. Continue?')) { activeChk.checked = true; return; }
+    if (bypassOn() && !reasonInp.value.trim()) reasonInp.value = EXTRACTION_BYPASS_DEFAULT;
+    refreshBypass();
+  });
+
   const status = el('span', { class: 'help' });
   const saveBtn = el('button', { type: 'button', class: 'secondary section-save', onclick: save }, 'Save');
   async function save() {
     status.textContent = ''; saveBtn.disabled = true;
     try {
       const rid = await getRunId();
-      const payload = {
+      const payload = bypassOn() ? { bypassed: true, bypassComment: reasonInp.value } : {
+        bypassed: false,
         startedAt: startedAt.value || null,
         amplitudePct: amplitudeInp.value.trim() === '' ? null : qcParseValue(amplitudeInp.value),
         flowrateLpm: flowrateInp.value.trim() === '' ? null : qcParseValue(flowrateInp.value),
@@ -2334,21 +2380,29 @@ function buildExtractionSection(getRunId, values, onSaved) {
     } catch (e) { status.textContent = e.message; }
     saveBtn.disabled = false;
   }
-  return el('details', { class: 'accordion', 'data-sop-spot': 'production.extraction' }, el('summary', {}, 'Extraction'),
+  normalEl.append(
+    el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Start Conditions'),
+    el('div', { class: 'form-row' }, rfield('extraction', 'startedAt', 'Started at', startedAt)),
+    el('div', { class: 'form-row-compact' },
+      rfield('extraction', 'amplitudePct', 'Amplitude (%)', amplitudeInp),
+      rfield('extraction', 'flowrateLpm', 'Flow rate (L/min)', flowrateInp)),
+    // Pressure/Starting power each get the full row width (not shared
+    // 2-up, not the compact 108px fields above) so their long SOP-target
+    // placeholder text is never clipped.
+    rfield('extraction', 'pressurePsi', 'Pressure (psi)', pressureInp),
+    rfield('extraction', 'startingPowerW', 'Starting power (W)', startingPowerInp),
+    el('div', { class: 'qc-check-section-title' }, 'Extraction Out'),
+    qcCheck.box);
+  const section = el('details', { class: 'accordion', 'data-sop-spot': 'production.extraction' }, el('summary', {}, 'Extraction'),
     el('div', { class: 'accordion-body' },
-      el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Start Conditions'),
-      el('div', { class: 'form-row' }, rfield('extraction', 'startedAt', 'Started at', startedAt)),
-      el('div', { class: 'form-row-compact' },
-        rfield('extraction', 'amplitudePct', 'Amplitude (%)', amplitudeInp),
-        rfield('extraction', 'flowrateLpm', 'Flow rate (L/min)', flowrateInp)),
-      // Pressure/Starting power each get the full row width (not shared
-      // 2-up, not the compact 108px fields above) so their long SOP-target
-      // placeholder text is never clipped.
-      rfield('extraction', 'pressurePsi', 'Pressure (psi)', pressureInp),
-      rfield('extraction', 'startingPowerW', 'Starting power (W)', startingPowerInp),
-      el('div', { class: 'qc-check-section-title' }, 'Extraction Out'),
-      qcCheck.box,
+      el('label', { class: 'slide-toggle', for: 'ex_active' }, activeChk, el('span', { class: 'slide-track' }, el('span', { class: 'slide-knob' })),
+        el('b', {}, 'Extraction'), toggleState,
+        el('span', { class: 'help' }, 'slide to Bypassed if the product still flows through the flow cell but nothing is optimized')),
+      reasonField, normalEl, relinkBox,
       el('div', { style: 'margin-top:6px' }, saveBtn, status)));
+  section.addEventListener('toggle', () => { if (section.open && bypassOn()) drawRelinked(); });      // pick up Homogenization changes made since
+  refreshBypass();
+  return section;
 }
 // Separation: "Start Conditions" groups the stage's process parameters
 // (Started at, Flow rate, Mesh size -- Water addition (L) was removed);
@@ -5967,7 +6021,7 @@ async function pageYield(v) {
           r.farmNames.join(' · ') || '—', r.speciesNames.join(' · ') || '—',
           fmt(r.harvestKg, 1), r.processKg != null ? fmt(r.processKg, 1) : '—', fmt(r.outputL, 0),
           r.harvestRate != null ? fmt(r.harvestRate, 3) : '—', r.processRate != null ? fmt(r.processRate, 3) : '—',
-          r.extractionEfficiency != null ? fmt(r.extractionEfficiency, 1) : '—',
+          r.extractionBypassed ? 'bypassed' : (r.extractionEfficiency != null ? fmt(r.extractionEfficiency, 1) : '—'),
           r.finalPh != null ? fmt(r.finalPh, 2) : '—', r.finalTds != null ? fmt(r.finalTds, 2) : '—',
           (r.excluded ? ['Excluded' + (r.excludeReason ? ': ' + r.excludeReason : '')] : []).concat(r.flags.map(f => YU_FLAGS[f] || f)).join(' · ') || '—',
           rowActions([['Edit', async () => {
@@ -6018,7 +6072,7 @@ function exportYieldCsv(d) {
     'Harvest kg', 'Process kg', 'Output L', 'Harvest rate', 'Process rate', 'TDS before extraction (%)', 'TDS after extraction (%)', 'Extraction efficiency (%)', 'Final pH', 'Final TDS (%)', 'Excluded', 'Reason', 'Flags');
   d.runs.forEach(r => add(r.lot, r.processingDate, r.processingDateEstimated ? 'yes' : '', yuRange(r.harvestDateFrom, r.harvestDateTo),
     r.skuName, r.farmNames.join(' / '), r.speciesNames.join(' / '), r.stabilization.join(' / '),
-    r.harvestKg, r.processKg ?? '', r.outputL, r.harvestRate ?? '', r.processRate ?? '', r.tdsBeforeExtraction ?? '', r.tdsAfterExtraction ?? '', r.extractionEfficiency ?? '', r.finalPh ?? '', r.finalTds ?? '',
+    r.harvestKg, r.processKg ?? '', r.outputL, r.harvestRate ?? '', r.processRate ?? '', r.tdsBeforeExtraction ?? '', r.tdsAfterExtraction ?? '', r.extractionBypassed ? 'bypassed' : (r.extractionEfficiency ?? ''), r.finalPh ?? '', r.finalTds ?? '',
     r.excluded ? 'yes' : '', r.excludeReason || '', r.flags.join(' ')));
   const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
   const a = el('a', { href: URL.createObjectURL(blob), download: 'kelpworks-yield-usage.csv' });
@@ -6247,7 +6301,7 @@ const CALCULATIONS = [
   {
     title: 'Extraction efficiency (Yield & Usage)',
     formula: 'Extraction efficiency (%) = (TDS after extraction − TDS before extraction) / TDS before extraction × 100',
-    description: 'TDS before extraction is the Homogenization → Lot characterization TDS (%); TDS after extraction is the Extraction → Extraction Performance TDS (%). Blank when either value is missing or the before-TDS is zero.',
+    description: 'TDS before extraction is the Homogenization → Lot characterization TDS (%); TDS after extraction is the Extraction → Extraction Performance TDS (%). Blank when either value is missing or the before-TDS is zero. When extraction was bypassed (KW-15) there is no TDS gain to measure: the efficiency is not applicable (shown as “bypassed”, never 0 %), the run adds no point to the Extraction charts, and its TDS after extraction is the Homogenization-out TDS (the Extraction Performance card of a bypassed run is the Homogenization → Lot characterization QC check).',
     location: 'Yield & Usage tab → Runs table',
     settings: [],
   },
