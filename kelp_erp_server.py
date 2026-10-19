@@ -298,6 +298,11 @@ _QC_ALL = [
 # only required when it is true (per-tank fields apply only to the tanks being filled).
 _uses_2a = lambda st: (st["homogenization"].get("tanks") or "") in ("2A", "2AB")
 _uses_2b = lambda st: (st["homogenization"].get("tanks") or "") in ("2B", "2AB")
+NOTE_SECTIONS = [("initiation", "Initiation"), ("feedstock", "Feedstock"), ("homogenization", "Homogenization"), ("extraction", "Extraction"), ("separation", "Separation"),
+                 ("pasteurization", "Pasteurization"), ("dilution", "Dilution & Preservation"), ("packaging", "Packaging"), ("general", "General")]
+NOTE_SECTION_LABELS = dict(NOTE_SECTIONS)
+NOTE_MAX_CHARS = 4000
+NOTE_MAX_IMAGES = 10
 EXTRACTION_BYPASS_DEFAULT = "Extraction not optimized"      # KW-15: the reason a bypassed extraction starts with (editable, never blank)
 _extracting = lambda st: not st["extraction"].get("bypassed")
 _bypassed = lambda st: bool(st["extraction"].get("bypassed"))
@@ -611,6 +616,26 @@ CREATE TABLE IF NOT EXISTS run_attachments (
     uploaded_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_attach_run ON run_attachments(run_id);
+
+-- Notes on a production run (KW-01): machine failures, process changes. Each carries the log section it belongs to; part of the signed production log (the images are not).
+CREATE TABLE IF NOT EXISTS run_notes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+    section     TEXT NOT NULL,          -- initiation | feedstock | homogenization | extraction | separation | pasteurization | dilution | packaging | general
+    body        TEXT NOT NULL,
+    created_by  TEXT,
+    created_at  TEXT NOT NULL,
+    updated_by  TEXT,
+    updated_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_runnotes_run ON run_notes(run_id);
+-- The pictures attached to a note (each is a run_attachments row, stored and served like any document).
+CREATE TABLE IF NOT EXISTS run_note_images (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    note_id       INTEGER NOT NULL REFERENCES run_notes(id) ON DELETE CASCADE,
+    attachment_id INTEGER NOT NULL REFERENCES run_attachments(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_noteimg_note ON run_note_images(note_id);
 
 -- Controlled documents (Standard Operating Procedures) referenced by name
 -- from spots in the production log (e.g. a QC Check's "Determining % Wet
@@ -4069,6 +4094,16 @@ def build_run_summary_pdf(S, logo_path=None):
                                                        ("final odour " + pk["odour"] + ((", " + pk["odourIntensity"].lower()) if has(pk.get("odourIntensity")) else "")) if has(pk.get("odour")) else ""])],
     ]
     pdf.table(["Stage", "Started", "Key results"], rows, [92, 78, 362], ["l", "l", "l"], size=7.8, bold_first=True)
+
+    # ---- notes written on the run (KW-01): what happened that the numbers do not say
+    if S.get("notes"):
+        pdf.heading("Notes")
+        order = {k: i for i, (k, _l) in enumerate(NOTE_SECTIONS)}
+        pdf.table(["Section", "Note", "By", "When"],
+                  [[n["sectionLabel"], n["body"] + ("  [%d picture%s attached]" % (len(n["images"]), "" if len(n["images"]) == 1 else "s") if n["images"] else ""),
+                    n["by"] or "-", (n["at"] or "")[:16].replace("T", " ")]
+                   for n in sorted(S["notes"], key=lambda n: (order.get(n["section"], 99), n["id"]))],
+                  [96, 308, 70, 58], ["l", "l", "l", "l"], size=7.8, bold_first=True)
 
     # ---- quality scorecard: one matrix, metric x stage
     pdf.heading("Quality scorecard")
@@ -8606,6 +8641,7 @@ class Handler(BaseHTTPRequestHandler):
             "samples": samples, "requisitions": reqs, "materials": materials,
             "fgLots": [dict(f, statusLabel=fg_status.get(f["status"], f["status"])) for f in run["fgLots"]],
             "qcRecorded": (run["qcSummary"]["recorded"], run["qcSummary"]["total"]) if run.get("qcSummary") else None,
+            "notes": self._notes_public(conn, rid),
             "generatedAt": today_iso(), "generatedBy": user["name"] if user else None,
         }
 
@@ -11321,6 +11357,10 @@ class Handler(BaseHTTPRequestHandler):
         d["dilutionPasses"] = self._dilution_passes_public(conn, r["id"])
         d["samplePoints"] = self._sample_points_public(conn, r["id"])
         d["packagingEntries"] = self._packaging_entries_public(conn, r["id"])
+        notes = self._notes_public(conn, r["id"])
+        if notes:                                  # KW-01: in the signed log only when the run has notes (the pictures, like documents, are not)
+            d["logNotes"] = [{k: v for k, v in n.items() if k != "images"} for n in notes]
+            d["logNoteImages"] = {str(n["id"]): n["images"] for n in notes if n["images"]}
         d["release"] = {"state": r["release_state"], "label": RELEASE_LABELS.get(r["release_state"], "—"),
                         "finalizedBy": r["finalized_by"]}
         am = self._open_amendment(conn, r["id"])
@@ -11444,6 +11484,8 @@ class Handler(BaseHTTPRequestHandler):
             return "Packaging entry %s" % (item.get("containerUnit") or "#%s" % item["id"])
         if section == "attachments":
             return "Document %s" % (item.get("filename") or "#%s" % item["id"])
+        if section == "logNotes":
+            return "Note (%s) #%s" % (NOTE_SECTION_LABELS.get(item.get("section"), item.get("section") or "-"), item["id"])
         return "%s #%s" % (humanize_key(section), item["id"])
 
     def _flatten_snapshot(self, d):
@@ -11537,7 +11579,7 @@ class Handler(BaseHTTPRequestHandler):
     # Documents are not production-log entries, so they never change the log hash
     # (and never need an amendment).
     _RELEASE_HASH_SKIP = ("edits", "fgLots", "release", "excludeFromStats", "excludeReason",
-                          "progress", "revisions", "revision", "attachments", "amendment")
+                          "progress", "revisions", "revision", "attachments", "amendment", "logNoteImages")
 
     def _release_snapshot(self, conn, rid):
         r = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
@@ -12276,6 +12318,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.edit_run(conn, int(seg[2]), user)
         if len(seg) >= 4 and seg[2].isdigit() and seg[3] == "lab-results":
             return self.route_lab_results(method, seg, conn, user)
+        if len(seg) >= 4 and seg[2].isdigit() and seg[3] == "notes":
+            return self.route_run_notes(method, seg, conn, user)
         if len(seg) >= 4 and seg[2].isdigit() and seg[3] == "attachments":
             rid = int(seg[2])
             if not conn.execute("SELECT 1 FROM production_runs WHERE id=?", (rid,)).fetchone():
@@ -12360,6 +12404,81 @@ class Handler(BaseHTTPRequestHandler):
             if method == "DELETE":
                 return self.delete_packaging_entry(conn, rid, peid, user)
         raise ApiError(404, "Unknown production endpoint")
+
+    # ---- run notes (KW-01) ---------------------------------------------------#
+    def _notes_public(self, conn, run_id):
+        images = {}
+        for i in conn.execute("SELECT ni.note_id, a.id, a.filename FROM run_note_images ni JOIN run_attachments a ON a.id=ni.attachment_id"
+                              " JOIN run_notes n ON n.id=ni.note_id WHERE n.run_id=? ORDER BY ni.id", (run_id,)):
+            images.setdefault(i["note_id"], []).append({"id": i["id"], "filename": i["filename"]})
+        return [{"id": n["id"], "section": n["section"], "sectionLabel": NOTE_SECTION_LABELS.get(n["section"], n["section"]), "body": n["body"],
+                 "by": n["created_by"], "at": n["created_at"], "editedBy": n["updated_by"], "editedAt": n["updated_at"], "images": images.get(n["id"], [])}
+                for n in conn.execute("SELECT * FROM run_notes WHERE run_id=? ORDER BY id", (run_id,))]
+
+    def route_run_notes(self, method, seg, conn, user):
+        """/api/production/<id>/notes[/<note id>[/images[/<attachment id>]]]. Like every production-log entry a note can be added, changed or removed while the log is open (a draft, or an
+        open amendment): `_amend_guard` refuses a finished run and `_release_reconcile` voids a sign-off the change would contradict."""
+        rid = int(seg[2])
+        run = conn.execute("SELECT id FROM production_runs WHERE id=?", (rid,)).fetchone()
+        if not run:
+            raise ApiError(404, "Production run not found")
+        who = user["name"] if user else None
+
+        def note_row(nid):
+            n = conn.execute("SELECT * FROM run_notes WHERE id=? AND run_id=?", (nid, rid)).fetchone()
+            if not n:
+                raise ApiError(404, "Note not found")
+            return n
+
+        def clean(d, current=None):
+            section = (d.get("section") if "section" in d else (current["section"] if current else "")) or ""
+            body = (d.get("body") if "body" in d else (current["body"] if current else "")) or ""
+            body = str(body).strip()
+            if section not in NOTE_SECTION_LABELS:
+                raise ApiError(400, "Choose which log section the note belongs to")
+            if not body:
+                raise ApiError(400, "Write the note")
+            if len(body) > NOTE_MAX_CHARS:
+                raise ApiError(400, "A note can be at most %d characters" % NOTE_MAX_CHARS)
+            return section, body
+        if len(seg) == 4 and method == "GET":
+            return {"notes": self._notes_public(conn, rid), "sections": [{"key": k, "label": l} for k, l in NOTE_SECTIONS]}
+        if len(seg) == 4 and method == "POST":
+            section, body = clean(self._body_json())
+            cur = conn.execute("INSERT INTO run_notes (run_id,section,body,created_by,created_at) VALUES (?,?,?,?,?)", (rid, section, body, who, now_iso()))
+            return {"notes": self._notes_public(conn, rid), "id": cur.lastrowid}
+        if len(seg) >= 5 and seg[4].isdigit():
+            nid = int(seg[4])
+            n = note_row(nid)
+            if len(seg) == 5 and method == "PUT":
+                section, body = clean(self._body_json(), n)
+                if (section, body) != (n["section"], n["body"]):
+                    conn.execute("UPDATE run_notes SET section=?, body=?, updated_by=?, updated_at=? WHERE id=?", (section, body, who, now_iso(), nid))
+                return {"notes": self._notes_public(conn, rid)}
+            if len(seg) == 5 and method == "DELETE":
+                for a in conn.execute("SELECT a.* FROM run_note_images ni JOIN run_attachments a ON a.id=ni.attachment_id WHERE ni.note_id=?", (nid,)).fetchall():
+                    self._files_to_remove.append(os.path.join(UPLOAD_DIR, a["stored_name"]))
+                    conn.execute("DELETE FROM run_attachments WHERE id=?", (a["id"],))              # its link row goes with it (ON DELETE CASCADE)
+                conn.execute("DELETE FROM run_notes WHERE id=?", (nid,))
+                return {"notes": self._notes_public(conn, rid)}
+            if len(seg) == 6 and seg[5] == "images" and method == "POST":
+                d = self._body_json()
+                if conn.execute("SELECT COUNT(*) c FROM run_note_images WHERE note_id=?", (nid,)).fetchone()["c"] >= NOTE_MAX_IMAGES:
+                    raise ApiError(400, "A note can have at most %d pictures" % NOTE_MAX_IMAGES)
+                if not served_type(str(d.get("filename") or ""))[0].startswith("image/"):
+                    raise ApiError(400, "Only pictures can be attached to a note (jpg, png, gif, webp ...); other files go in the run's Documents")
+                aid = self._store_attachment(conn, rid, d.get("filename"), d.get("contentType"), d.get("dataB64") or "", who)
+                conn.execute("INSERT INTO run_note_images (note_id, attachment_id) VALUES (?,?)", (nid, aid))
+                return {"notes": self._notes_public(conn, rid)}
+            if len(seg) == 7 and seg[5] == "images" and seg[6].isdigit() and method == "DELETE":
+                aid = int(seg[6])
+                a = conn.execute("SELECT a.* FROM run_note_images ni JOIN run_attachments a ON a.id=ni.attachment_id WHERE ni.note_id=? AND a.id=?", (nid, aid)).fetchone()
+                if not a:
+                    raise ApiError(404, "Picture not found on this note")
+                self._files_to_remove.append(os.path.join(UPLOAD_DIR, a["stored_name"]))
+                conn.execute("DELETE FROM run_attachments WHERE id=?", (aid,))
+                return {"notes": self._notes_public(conn, rid)}
+        raise ApiError(404, "Unknown notes endpoint")
 
     def _attachments(self, conn, run_id):
         return [{"id": r["id"], "filename": r["filename"], "contentType": r["content_type"],

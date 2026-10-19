@@ -376,6 +376,13 @@ for `main` so a red run blocks the merge.
   homogenization TDS) and the screen (read-only table). **Extraction efficiency is not applicable** for such a run (blank, shown "bypassed", never 0 %) in the run card, summary, Yield & Usage (CSV / XLSX) and
   the QC charts (no `qc:extraction_eff` point, and no extraction readings, so the Extraction section statistics are not polluted). The reason also shows in the run's Notes panel (`runNoteItems`) and so at the
   top of the release review. Separation reads nothing from extraction, so "separation in = homogenization out" needs no code. A new consumer of extraction QC values must go through `extraction_view`.
+- **Run notes** (KW-01; tests in `tests/test_run_notes.py`). `run_notes` (run, `section` = one of `NOTE_SECTIONS`: initiation / feedstock / homogenization / extraction / separation / pasteurization / dilution / packaging / general,
+  `body` <= 4000 chars, created / updated by + at) and `run_note_images` (a note's pictures, each a `run_attachments` row stored and served like any document; pictures only, <= 10 per note, the same upload rules / quota / archive).
+  Routes `/api/production/<id>/notes[/<nid>[/images[/<aid>]]]` (`route_run_notes`): like every production-log entry a note can be added, changed or removed while the log is open (draft, or an open amendment) --
+  `_amend_guard` answers 409 `amendment_required` for a finished run and `_release_reconcile` voids a sign-off the change contradicts. **Part of the signed log**: `_run_full` carries `logNotes` ONLY when the run has notes (so a
+  log without notes is unchanged); the pictures (`logNoteImages`, in `_RELEASE_HASH_SKIP`) are not, like documents. A note added / edited / removed under an amendment is a recorded revision change (`_item_label`). The SPA's
+  `buildNotesSection` is the "Notes" accordion (add form with section + text + pictures, edit / remove) and `attach` puts each section's notes at the bottom of that section's accordion; they are also in the run's Notes panel
+  (`runNoteItems`) and on the production summary PDF ("Notes", ordered by section, pictures counted). Removing a note (or a draft) removes its picture files after the commit. `run_notes` / `run_note_images` are records (`CLEAR`).
 - **Tank 5A/5B -> 6A/6B dilution**: the plan (Pasteurization In: 5A/5B levels, receiving tanks 6A / 6B / 6A+6B, tank 6A/6B starting
   levels, TDS = Separation filtrate TDS, target = SKU) is calculated client-side by `dilutionPlanCalc` (c1V1=c2V2: max product =
   space x c2/c1, transfer = min(available, max), water = transfer x (c1/c2 - 1), 0 if c1<=c2) and stored on `production_runs`
