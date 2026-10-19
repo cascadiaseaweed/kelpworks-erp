@@ -12,7 +12,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 import kelp_erp_server as K  # noqa: E402   (read-only: the registry of required fields)
 
-TEXT_VALUES = {"startedAt": "2026-05-04T10:00", "packagedAt": "2026-05-04T12:00", "sampleCollectedAt": "2026-05-04T12:00", "receivingTanks": "6A"}
+TEXT_VALUES = {"tanks": "2A", "startedAt": "2026-05-04T10:00", "packagedAt": "2026-05-04T12:00", "sampleCollectedAt": "2026-05-04T12:00", "receivingTanks": "6A"}
 MICROBIAL = {"apc": "<10", "yeast": "<10", "mold": "<10", "fecal": "<1", "salm": "Negative"}
 
 
@@ -30,6 +30,8 @@ def stage_payloads():
     for sec in K.PROGRESS_SECTIONS:
         for entry in sec.get("fields", []):
             out.setdefault(entry[0], {})[entry[1]] = TEXT_VALUES.get(entry[1], 5)
+    # Releases older than KW-10 (the upgrade tests boot them) still require the single-tank homogenization fields; the current server accepts them and then recalculates them from the tank entries
+    out["homogenization"].update({k: 5 for k in ("slurryL", "wetSolidsWtG", "liquidWtG", "dilutionWaterL", "postDilutionTankL")})
     return out
 
 

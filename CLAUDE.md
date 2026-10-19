@@ -354,6 +354,13 @@ for `main` so a red run blocks the merge.
   NOT NULL, so `run_inputs.decision_set` records whether an operator actually chose (inputs of
   runs finalized before it existed were backfilled as set; `_run_inputs_public` returns
   `decision: None` until set).
+- **Homogenization tank 2A / 2B** (KW-10 / KW-11; tests in `tests/test_homogenization_tanks.py`). A run names its tank(s) -- `production_runs.homog_tanks` `2A` | `2B` | `2AB`, required, no default -- and each tank in use has its OWN
+  Pre-Dilution Tank Level, solids-loading Process Check (wet / liquid weights), Dilution water added and Post-Dilution Tank Level in the `homog_<stem>_2a` / `_2b` columns (JSON `slurryL2a`, `wetSolidsWtG2b`, ...). The Target %Solids
+  Loading is shared; QC Check, Sample Point and Rinse water stay one set for the lot. `_recompute_homogenization` (called by `save_stage`) calculates each tank's Measured %Solids, Recommended Dilution Water (c1V1 = c2V2) and Lot %Solids,
+  clears the tank not in use, and sets the RUN-LEVEL values (`slurryL`, `dilutionWaterL`, `postDilutionTankL`, `dilutionWaterTargetL` = sums; `pctWetSolids`, `lotPctSolids` = volume-weighted; `wetSolidsWtG` / `liquidWtG` copied for one
+  tank, NULL for two) -- the same pattern as the 6A/6B run totals, so the summary PDF, the water totals and reports keep reading the run-level fields. A total exists only when every tank in use has its value. The per-tank keys appear in
+  `stages.homogenization` (and the signed log) only when set; required fields use the `_uses_2a` / `_uses_2b` predicates (the run-level fields are no longer required). Setting `homog_tank_capacity_each_l` (5000 L per tank) drives a
+  warning only. A run with no tank choice is left exactly as entered.
 - **Tank 5A/5B -> 6A/6B dilution**: the plan (Pasteurization In: 5A/5B levels, receiving tanks 6A / 6B / 6A+6B, tank 6A/6B starting
   levels, TDS = Separation filtrate TDS, target = SKU) is calculated client-side by `dilutionPlanCalc` (c1V1=c2V2: max product =
   space x c2/c1, transfer = min(available, max), water = transfer x (c1/c2 - 1), 0 if c1<=c2) and stored on `production_runs`

@@ -2019,6 +2019,7 @@ async function openQcForRun(run) {
 // c2 = target TDS, so the diluted volume is V1 x c1/c2. The receiving tanks' current contents
 // are part of the fit check.
 const RECEIVING_TANKS = [['6A', 'Tank 6A only'], ['6B', 'Tank 6B only'], ['6AB', 'Tank 6A + 6B connected']];
+const HOMOG_TANKS = [['2A', 'Tank 2A only'], ['2B', 'Tank 2B only'], ['2AB', 'Tank 2A + 2B']];
 const usesTank = (receiving, t) => receiving === '6AB' || receiving === t;
 function dilutionPlanCalc(p) {
   const cap = settingValue('dilution_tank_capacity_each_l', 5000);
@@ -2449,109 +2450,126 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot, o
 function buildHomogenizationSection(getRunId, values, samplePoints, processingLot) {
   values = values || {};
   const startedAt = el('input', { type: 'datetime-local', value: values.startedAt || '' });
-
   const rinsingInp = el('input', { inputmode: 'decimal', placeholder: 'Measured using garden hose' }); attachNumericMask(rinsingInp, 2);
   if (values.rinsingWaterL != null) rinsingInp.value = formatQcValue(values.rinsingWaterL, 2);
-  // Pre-Dilution Tank Level (L) is also V1, the starting volume the Recommended Dilution
-  // Water calc (in the Output section, below) works from.
-  const tankInp = el('input', { inputmode: 'decimal', placeholder: 'Measured using level sensor' }); attachNumericMask(tankInp, 2);
-  if (values.slurryL != null) tankInp.value = formatQcValue(values.slurryL, 2);
-  // Process Check (Solids loading): Measured %Solids Loading, (w/w) = Wet-solids-wt /
-  // (Wet-solids-wt + Liquid-wt) -- shown as a percentage, but kept internally
-  // as the raw 0-1 ratio so the Output section's dilution calc (which reuses
-  // this function) can use it directly.
-  const wetInp = el('input', { inputmode: 'decimal', placeholder: 'g' });
-  attachNumericMask(wetInp, 2);
-  if (values.wetSolidsWtG != null) wetInp.value = formatQcValue(values.wetSolidsWtG, 2);
-  const liquidInp = el('input', { inputmode: 'decimal', placeholder: 'g' });
-  attachNumericMask(liquidInp, 2);
-  if (values.liquidWtG != null) liquidInp.value = formatQcValue(values.liquidWtG, 2);
-  function calcPctWetSolids() {
-    const w = wetInp.value.trim() === '' ? null : qcParseValue(wetInp.value);
-    const l = liquidInp.value.trim() === '' ? null : qcParseValue(liquidInp.value);
-    return (w != null && l != null && (w + l) > 0) ? w / (w + l) : null;
-  }
-  function fmtPct1(ratio) { return ratio != null ? (ratio * 100).toFixed(1) + '%' : '—'; }
-  const resultValue = el('span', { class: 'qc-check-result-value' }, fmtPct1(values.pctWetSolids));
-  [wetInp, liquidInp].forEach(inp => inp.addEventListener('input', () => {
-    resultValue.textContent = fmtPct1(calcPctWetSolids());
-    refreshDilutionTarget();
-  }));
-  const processCheck1Box = el('div', { class: 'qc-check-box', 'data-sop-spot': 'production.homogenization.process_check' },
-    el('div', { class: 'qc-check-title' }, 'Process Check'),
-    el('div', { class: 'qc-check-subtitle' }, 'Solids loading'),
-    el('div', { class: 'form-row' },
-      rfield('homogenization', 'wetSolidsWtG', 'Wet-solids-wt (g)', wetInp),
-      rfield('homogenization', 'liquidWtG', 'Liquid-wt (g)', liquidInp)),
-    el('div', { class: 'qc-check-result' },
-      el('span', { class: 'qc-check-result-label' }, 'Measured %Solids Loading, (w/w)'), resultValue));
 
-  // Output: the Target %Solids Loading, (w/w) to dilute the tank down to, and the
-  // Recommended Dilution Water (L) to get there. Mass-conservation dilution
-  // (c1V1 = c2V2): c1 = Measured %Solids Loading, V1 = Tank level (L), c2 = target,
-  // so V2 = V1 x c1 / c2 and the water to add is V2 - V1 = V1 x (c1/c2 - 1) --
-  // 0 when the measured loading is already at or below the target.
+  // Tank choice (KW-10): 2A, 2B or both, like the 6A / 6B receiving-tank choice. Each tank in use has its own Pre-Dilution Tank Level, solids-loading
+  // Process Check and dilution entries (KW-11: the tanks can differ, e.g. liquid vs. solid totes, so the dilution is worked out per tank). The target
+  // %Solids Loading is shared. QC Check and Sample Point stay one composite set. The server calculates the same numbers when it saves.
+  const tanksSel = el('select', {}, el('option', { value: '' }, 'Select…'), ...HOMOG_TANKS.map(([v, l]) => el('option', { value: v }, l)));
+  tanksSel.value = values.tanks || '';
+  const usesHomogTank = (sel, t) => sel === '2AB' || sel === t;
+  const tankCapacity = () => settingValue('homog_tank_capacity_each_l', 5000);
+  const num = inp => inp.value.trim() === '' ? null : qcParseValue(inp.value);
+  const fmtPct1 = ratio => ratio != null ? (ratio * 100).toFixed(1) + '%' : '—';
+
+  // Target %Solids Loading, (w/w) -- shared by the tanks. Mass-conservation dilution (c1V1 = c2V2): c1 = a tank's Measured %Solids Loading,
+  // V1 = its Pre-Dilution Tank Level, c2 = the target, so the water to add is V1 x (c1/c2 - 1), 0 when c1 <= c2.
   const targetPctInp = el('input', { inputmode: 'decimal', placeholder: '%' }); attachNumericMask(targetPctInp, 1);
   targetPctInp.value = values.targetPctWetSolids != null ? formatQcValue(values.targetPctWetSolids, 1)
     : formatQcValue(settingValue('homog_default_target_pct_wet_solids', 50.0), 1);
-  // Shown with an explicit "%" suffix beside the input, not just implied by
-  // the label, so the value's units are unambiguous at a glance.
-  const targetPctField = el('div', { style: 'display:flex;align-items:center;gap:6px' },
-    targetPctInp, el('span', { class: 'help' }, '%'));
-  // Shown large once calculable, rounded to the nearest 10 L with no decimals --
-  // an operator adds a round number, not a precise fraction of a litre.
-  const dilutionTargetValue = el('span', { class: 'help' });
-  function calcDilutionTarget() {
-    const c1 = calcPctWetSolids();
-    const c2Raw = targetPctInp.value.trim() === '' ? null : qcParseValue(targetPctInp.value);
-    const v1 = tankInp.value.trim() === '' ? null : qcParseValue(tankInp.value);
-    if (c1 == null || !c2Raw || v1 == null) return null;
-    const c2 = c2Raw / 100;
-    if (c1 <= c2) return 0;
-    return v1 * c1 / c2 - v1;
-  }
-  function refreshDilutionTarget() {
-    const v = calcDilutionTarget();
-    dilutionTargetValue.className = v != null ? 'qc-check-result-value' : 'help';
-    dilutionTargetValue.textContent = v != null ? fmt(Math.round(v / 10) * 10, 0) + ' L'
-      : 'Needs the tank level, Process Check and target';
-  }
-  refreshDilutionTarget();
-  targetPctInp.addEventListener('input', refreshDilutionTarget);
-  tankInp.addEventListener('input', refreshDilutionTarget);
+  const targetPctField = el('div', { style: 'display:flex;align-items:center;gap:6px' }, targetPctInp, el('span', { class: 'help' }, '%'));
 
-  const dilutionInp = el('input', { inputmode: 'decimal', placeholder: 'Measured using dilution totalizer' }); attachNumericMask(dilutionInp, 2);
-  if (values.dilutionWaterL != null) dilutionInp.value = formatQcValue(values.dilutionWaterL, 2);
-  const postTankInp = el('input', { inputmode: 'decimal', placeholder: 'Measured using level sensor' }); attachNumericMask(postTankInp, 2);
-  if (values.postDilutionTankL != null) postTankInp.value = formatQcValue(values.postDilutionTankL, 2);
-  // Lot %Solids Loading, (w/w) (calculated): the measured loading after dilution. Mass
-  // balance c1V1 = c2V2 with V2 = the final (Post-Dilution) tank volume and V1 = V2 minus
-  // the dilution water added, so lot %solids = measured x (V2 - water) / V2.
-  const lotPctValue = el('span', { class: 'help' });
-  function calcLotPctSolids() {
-    const c1 = calcPctWetSolids();
-    const water = dilutionInp.value.trim() === '' ? null : qcParseValue(dilutionInp.value);
-    const v2 = postTankInp.value.trim() === '' ? null : qcParseValue(postTankInp.value);
-    if (c1 == null || water == null || !v2 || water > v2) return null;
-    return c1 * (v2 - water) / v2;
+  const blocks = [];
+  function tankBlock(suf, name) {
+    const v = k => values[k + suf];
+    const tankInp = el('input', { inputmode: 'decimal', placeholder: 'Measured using level sensor' }); attachNumericMask(tankInp, 2);
+    if (v('slurryL') != null) tankInp.value = formatQcValue(v('slurryL'), 2);
+    const wetInp = el('input', { inputmode: 'decimal', placeholder: 'g' }); attachNumericMask(wetInp, 2);
+    if (v('wetSolidsWtG') != null) wetInp.value = formatQcValue(v('wetSolidsWtG'), 2);
+    const liquidInp = el('input', { inputmode: 'decimal', placeholder: 'g' }); attachNumericMask(liquidInp, 2);
+    if (v('liquidWtG') != null) liquidInp.value = formatQcValue(v('liquidWtG'), 2);
+    const dilutionInp = el('input', { inputmode: 'decimal', placeholder: 'Measured using dilution totalizer' }); attachNumericMask(dilutionInp, 2);
+    if (v('dilutionWaterL') != null) dilutionInp.value = formatQcValue(v('dilutionWaterL'), 2);
+    const postTankInp = el('input', { inputmode: 'decimal', placeholder: 'Measured using level sensor' }); attachNumericMask(postTankInp, 2);
+    if (v('postDilutionTankL') != null) postTankInp.value = formatQcValue(v('postDilutionTankL'), 2);
+    const resultValue = el('span', { class: 'qc-check-result-value' }, fmtPct1(v('pctWetSolids')));
+    const dilutionTargetValue = el('span', { class: 'help' });
+    const lotPctValue = el('span', { class: 'help' });
+    const capWarn = el('div', { class: 'plan-status warn hidden' });
+    // Measured %Solids Loading = Wet-solids-wt / (Wet-solids-wt + Liquid-wt), kept as the raw 0-1 ratio
+    const c1 = () => { const w = num(wetInp), l = num(liquidInp); return (w != null && l != null && (w + l) > 0) ? w / (w + l) : null; };
+    const target = () => { const t = num(targetPctInp); return t ? t / 100 : null; };
+    const rec = () => { const c = c1(), c2 = target(), v1 = num(tankInp); if (c == null || !c2 || v1 == null) return null; return c <= c2 ? 0 : v1 * c / c2 - v1; };
+    // Lot %Solids Loading: the loading after dilution; V2 = the final tank volume, V1 = V2 minus the water added, so lot % = measured x (V2 - water) / V2
+    const lot = () => { const c = c1(), w = num(dilutionInp), v2 = num(postTankInp); return (c != null && w != null && v2 && w <= v2) ? c * (v2 - w) / v2 : null; };
+    function refresh() {
+      resultValue.textContent = fmtPct1(c1());
+      const r = rec();
+      dilutionTargetValue.className = r != null ? 'qc-check-result-value' : 'help';
+      dilutionTargetValue.textContent = r != null ? fmt(Math.round(r / 10) * 10, 0) + ' L' : 'Needs the tank level, Process Check and target';
+      const l = lot();
+      lotPctValue.className = l != null ? 'qc-check-result-value' : 'help';
+      lotPctValue.textContent = l != null ? (l * 100).toFixed(1) + '%' : 'Needs the Process Check, water added and final level';
+      const v2 = num(postTankInp), cap = tankCapacity();
+      capWarn.classList.toggle('hidden', !(v2 != null && cap > 0 && v2 > cap));
+      capWarn.textContent = '⚠ ' + fmt(v2, 0) + ' L is above the capacity of one tank (' + fmt(cap, 0) + ' L, an administrator can change it on the Calculations page).';
+      refreshComposite();
+    }
+    [tankInp, wetInp, liquidInp, dilutionInp, postTankInp].forEach(i => i.addEventListener('input', refresh));
+    const processEl = el('div', { class: 'homog-tank-' + suf },
+      el('div', { class: 'qc-check-section-title', style: 'margin-top:6px' }, 'Tank ' + name),
+      rfield('homogenization', 'slurryL' + suf, 'Pre-Dilution Tank Level (L)', tankInp),
+      el('div', { class: 'form-row' },
+        rfield('homogenization', 'wetSolidsWtG' + suf, 'Wet-solids-wt (g)', wetInp),
+        rfield('homogenization', 'liquidWtG' + suf, 'Liquid-wt (g)', liquidInp)),
+      el('div', { class: 'qc-check-result' }, el('span', { class: 'qc-check-result-label' }, 'Measured %Solids Loading, (w/w)'), resultValue));
+    const dilutionEl = el('div', { class: 'homog-tank-' + suf },
+      el('div', { class: 'qc-check-section-title', style: 'margin-top:6px' }, 'Tank ' + name),
+      field('Recommended Dilution Water (L)', el('div', { class: 'calc-tile' }, dilutionTargetValue)),
+      el('div', { class: 'form-row' },
+        rfield('homogenization', 'dilutionWaterL' + suf, 'Dilution water added (L)', dilutionInp),
+        rfield('homogenization', 'postDilutionTankL' + suf, 'Post-Dilution Tank Level (L)', postTankInp)),
+      capWarn,
+      el('div', { class: 'qc-check-result' }, el('span', { class: 'qc-check-result-label' }, 'Lot %Solids Loading, (w/w) (calculated)'), lotPctValue));
+    const b = {
+      suf, name, processEl, dilutionEl, refresh,
+      used: () => usesHomogTank(tanksSel.value, suf.toUpperCase()),
+      // the tank's own inputs (its calculated values are worked out again by the server)
+      payload: () => ({ ['slurryL' + suf]: num(tankInp), ['wetSolidsWtG' + suf]: num(wetInp), ['liquidWtG' + suf]: num(liquidInp),
+        ['dilutionWaterL' + suf]: num(dilutionInp), ['postDilutionTankL' + suf]: num(postTankInp) }),
+      calc: () => ({ v1: num(tankInp), c1: c1(), rec: rec(), water: num(dilutionInp), v2: num(postTankInp), lot: lot() }),
+    };
+    blocks.push(b);
+    return b;
   }
-  function refreshLotPct() {
-    const v = calcLotPctSolids();
-    lotPctValue.className = v != null ? 'qc-check-result-value' : 'help';
-    lotPctValue.textContent = v != null ? (v * 100).toFixed(1) + '%'
-      : 'Needs the Process Check, water added and final level';
-  }
-  [wetInp, liquidInp, dilutionInp, postTankInp].forEach(inp => inp.addEventListener('input', refreshLotPct));
-  refreshLotPct();
+  const tankA = tankBlock('2a', '2A'), tankB = tankBlock('2b', '2B');
 
-  // QC Check (lot characterization): liquid-phase and slurry/solids-phase
-  // readings, each its own compact wrapping row -- shared with Extraction
-  // Out, which uses the same card under its own subtitle.
+  // Both tanks together: totals in litres, volume-weighted %solids (the same totals the server stores on the run)
+  const compositeHost = el('div', { class: 'help', style: 'margin-top:8px' });
+  function refreshComposite() {
+    const used = blocks.filter(b => b.used()).map(b => b.calc());
+    compositeHost.innerHTML = '';
+    if (used.length < 2) return;
+    const all = k => used.every(u => u[k] != null);
+    const sum = k => used.reduce((a, u) => a + u[k], 0);
+    const v1 = all('v1') ? sum('v1') : null, v2 = all('v2') ? sum('v2') : null;
+    const measured = (v1 && all('c1')) ? used.reduce((a, u) => a + u.c1 * u.v1, 0) / v1 : null;
+    const lotPct = (v2 && all('lot')) ? used.reduce((a, u) => a + u.lot * u.v2, 0) / v2 : null;
+    compositeHost.append(el('b', {}, 'Both tanks: '),
+      'pre-dilution ' + (v1 != null ? fmt(v1, 0) + ' L' : '—') + ' · measured ' + fmtPct1(measured)
+      + ' · recommended water ' + (all('rec') ? fmt(Math.round(sum('rec') / 10) * 10, 0) + ' L' : '—')
+      + ' · water added ' + (all('water') ? fmt(sum('water'), 0) + ' L' : '—') + ' · final ' + (v2 != null ? fmt(v2, 0) + ' L' : '—')
+      + ' · lot ' + fmtPct1(lotPct) + ' (volume-weighted)');
+  }
+  function refreshTanks() {
+    blocks.forEach(b => { b.processEl.classList.toggle('hidden', !b.used()); b.dilutionEl.classList.toggle('hidden', !b.used()); b.refresh(); });
+    refreshComposite();
+  }
+  tanksSel.addEventListener('change', refreshTanks);
+  targetPctInp.addEventListener('input', () => blocks.forEach(b => b.refresh()));
+
+  const processCheck1Box = el('div', { class: 'qc-check-box', 'data-sop-spot': 'production.homogenization.process_check' },
+    el('div', { class: 'qc-check-title' }, 'Process Check'),
+    el('div', { class: 'qc-check-subtitle' }, 'Solids loading, per tank'),
+    el('div', { class: 'help' }, 'Check each tank in use: the tanks can start at different solids loading, so each one needs its own check to work out its dilution.'),
+    tankA.processEl, tankB.processEl);
+
+  // QC Check (lot characterization): liquid-phase and slurry/solids-phase readings, each its own compact wrapping row -- one composite set for the lot.
   const qcCheck = buildQualityCheckBox('Lot characterization', values, { showSolidsLoading: true, reqStage: 'homogenization', spot: 'production.homogenization.qc_check' });
   const qcCheckBox = qcCheck.box;
 
-  // Sample Point (lot input): a repeatable table of samples taken at this
-  // point in the process -- see buildSamplePointsSection, below.
+  // Sample Point (lot input): a repeatable table of samples taken at this point in the process -- see buildSamplePointsSection, below.
   const collectedInp = el('input', { type: 'datetime-local',
     value: values.sampleCollectedAt ? values.sampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
   const samplePointBox = el('div', { class: 'qc-check-box theme-sample', 'data-sop-spot': 'production.homogenization.sample_point' },
@@ -2566,47 +2584,32 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
     status.textContent = ''; saveBtn.disabled = true;
     try {
       const rid = await getRunId();
-      await api('PUT', '/production/' + rid + '/stages/homogenization', {
+      await api('PUT', '/production/' + rid + '/stages/homogenization', Object.assign({
         startedAt: startedAt.value || null,
-        rinsingWaterL: rinsingInp.value.trim() === '' ? null : qcParseValue(rinsingInp.value),
-        slurryL: tankInp.value.trim() === '' ? null : qcParseValue(tankInp.value),
-        wetSolidsWtG: wetInp.value.trim() === '' ? null : qcParseValue(wetInp.value),
-        liquidWtG: liquidInp.value.trim() === '' ? null : qcParseValue(liquidInp.value),
-        pctWetSolids: calcPctWetSolids(),
-        targetPctWetSolids: targetPctInp.value.trim() === '' ? null : qcParseValue(targetPctInp.value),
-        dilutionWaterTargetL: calcDilutionTarget(),
-        dilutionWaterL: dilutionInp.value.trim() === '' ? null : qcParseValue(dilutionInp.value),
-        postDilutionTankL: postTankInp.value.trim() === '' ? null : qcParseValue(postTankInp.value),
-        lotPctSolids: calcLotPctSolids(),
-        ...qcCheck.getPayload(),
-        sampleCollectedAt: collectedInp.value || null,
-      });
+        rinsingWaterL: num(rinsingInp),
+        tanks: tanksSel.value || null,
+        targetPctWetSolids: num(targetPctInp),
+      }, ...blocks.filter(b => b.used()).map(b => b.payload()),
+      qcCheck.getPayload(), { sampleCollectedAt: collectedInp.value || null }));
       status.textContent = 'Saved.';
     } catch (e) { status.textContent = e.message; }
     saveBtn.disabled = false;
   }
+  refreshTanks();
   return el('details', { class: 'accordion', 'data-sop-spot': 'production.homogenization' }, el('summary', {}, 'Homogenization'),
     el('div', { class: 'accordion-body' },
       el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Homogenization In'),
-      el('div', { class: 'form-row' }, rfield('homogenization', 'startedAt', 'Started at', startedAt)),
-      el('div', { class: 'form-row' },
-        rfield('homogenization', 'rinsingWaterL', 'Rinse water (L)', rinsingInp),
-        rfield('homogenization', 'slurryL', 'Pre-Dilution Tank Level (L)', tankInp)),
+      el('div', { class: 'form-row' }, rfield('homogenization', 'startedAt', 'Started at', startedAt),
+        rfield('homogenization', 'tanks', 'Homogenization tank(s)', tanksSel)),
+      el('div', { class: 'form-row' }, rfield('homogenization', 'rinsingWaterL', 'Rinse water (L)', rinsingInp)),
       processCheck1Box,
       el('div', { class: 'qc-check-section-title' }, 'Homogenization Out'),
-      // Dilution card: the target and the water recommended for it, then what was actually
-      // added and the resulting tank level, then the lot %solids that follows from them.
+      // Dilution card: the shared target, then for each tank the water recommended for it, what was actually added and the resulting tank level, and the lot %solids that follows.
       el('div', { class: 'qc-check-box', 'data-sop-spot': 'production.homogenization.dilution' },
         el('div', { class: 'qc-check-title' }, 'Dilution'),
-        el('div', { class: 'qc-check-subtitle' }, 'Target, water added and final volume'),
-        el('div', { class: 'form-row' },
-          rfield('homogenization', 'targetPctWetSolids', 'Target %Solids Loading, (w/w)', targetPctField),
-          field('Recommended Dilution Water (L)', el('div', { class: 'calc-tile' }, dilutionTargetValue))),
-        el('div', { class: 'form-row' },
-          rfield('homogenization', 'dilutionWaterL', 'Dilution water added (L)', dilutionInp),
-          rfield('homogenization', 'postDilutionTankL', 'Post-Dilution Tank Level (L)', postTankInp)),
-        el('div', { class: 'qc-check-result' },
-          el('span', { class: 'qc-check-result-label' }, 'Lot %Solids Loading, (w/w) (calculated)'), lotPctValue)),
+        el('div', { class: 'qc-check-subtitle' }, 'Target, water added and final volume, per tank'),
+        el('div', { class: 'form-row' }, rfield('homogenization', 'targetPctWetSolids', 'Target %Solids Loading, (w/w)', targetPctField)),
+        tankA.dilutionEl, tankB.dilutionEl, compositeHost),
       qcCheckBox,
       samplePointBox,
       el('div', { style: 'margin-top:6px' }, saveBtn, status)));
@@ -6069,23 +6072,30 @@ const CALCULATIONS = [
   {
     title: 'Measured %Solids Loading, (w/w)',
     formula: 'Measured %Solids Loading = Wet-solids-wt (g) / (Wet-solids-wt (g) + Liquid-wt (g))',
-    description: 'The solids loading (w/w) of a homogenized tank sample, from a Process Check split of a weighed sample into its solid and liquid portions.',
-    location: 'Production → Process log → Homogenization → Homogenization In → Process Check box',
+    description: 'The solids loading (w/w) of a homogenized tank sample, from a Process Check split of a weighed sample into its solid and liquid portions. Each tank in use (2A, 2B or both) has its own Process Check, because the tanks can start at different loadings. For a run using both tanks the run-level value is the volume-weighted mean: Σ (Measured %Solids of the tank × its Pre-Dilution Tank Level) ÷ Σ Pre-Dilution Tank Level, blank until both tanks have it.',
+    location: 'Production → Process log → Homogenization → Homogenization In → Process Check box (one block per tank)',
     settings: [],
   },
   {
     title: 'Recommended Dilution Water (L)',
-    formula: 'c₁V₁ = c₂V₂, so Recommended Dilution Water (L) = V₂ − V₁ = Pre-Dilution Tank Level (L) × (Measured %Solids Loading ÷ Target %Solids Loading − 1), or 0 when Measured ≤ Target',
-    description: 'c₁ is the Measured %Solids Loading, V₁ the Pre-Dilution Tank Level (L), c₂ the Target %Solids Loading and V₂ the volume the tank reaches once diluted to the target. Rounded to the nearest 10 L; 0 when the measured loading is already at or below the target.',
-    location: 'Production → Process log → Homogenization → Homogenization Out',
+    formula: 'c₁V₁ = c₂V₂, so Recommended Dilution Water (L) = V₂ − V₁ = Pre-Dilution Tank Level (L) × (Measured %Solids Loading ÷ Target %Solids Loading − 1), or 0 when Measured ≤ Target   ·   worked out for each tank separately; both tanks: the run-level value is the sum of the two',
+    description: 'c₁ is the tank’s own Measured %Solids Loading, V₁ its Pre-Dilution Tank Level (L), c₂ the Target %Solids Loading (one target for the run) and V₂ the volume the tank reaches once diluted to the target. Rounded to the nearest 10 L on screen; 0 when the measured loading is already at or below the target (so with two tanks one can need water and the other none).',
+    location: 'Production → Process log → Homogenization → Homogenization Out (one block per tank)',
     settings: [],
   },
   {
     title: 'Lot %Solids Loading, (w/w) (calculated)',
-    formula: 'Lot %Solids Loading = Measured %Solids Loading × (Post-Dilution Tank Level (L) − Dilution water added (L)) ÷ Post-Dilution Tank Level (L)',
-    description: 'The solids loading of the lot after dilution, by the same c₁V₁ = c₂V₂ balance: V₂ is the final (Post-Dilution) tank volume, V₁ = V₂ − the dilution water added, c₁ the Measured %Solids Loading and c₂ the result. Blank until all three inputs are entered.',
-    location: 'Production → Process log → Homogenization → Homogenization Out',
+    formula: 'Lot %Solids Loading = Measured %Solids Loading × (Post-Dilution Tank Level (L) − Dilution water added (L)) ÷ Post-Dilution Tank Level (L)   ·   both tanks: Σ (tank lot %Solids × its Post-Dilution Tank Level) ÷ Σ Post-Dilution Tank Level',
+    description: 'The solids loading of the lot after dilution, by the same c₁V₁ = c₂V₂ balance: V₂ is the final (Post-Dilution) tank volume, V₁ = V₂ − the dilution water added, c₁ the tank’s Measured %Solids Loading and c₂ the result. Calculated for each tank; for a run using both tanks the lot value is their volume-weighted mean (the two tanks are mixed into one lot). Blank until all inputs of every tank in use are entered. The run-level litre fields (Pre-Dilution Tank Level, Recommended Dilution Water, Dilution water added, Post-Dilution Tank Level) are the sums of the tanks.',
+    location: 'Production → Process log → Homogenization → Homogenization Out (one block per tank)',
     settings: [],
+  },
+  {
+    title: 'Homogenization tank capacity check (L)',
+    formula: 'Warning when Post-Dilution Tank Level (L) of a tank > Tank 2A / 2B capacity, each (L)',
+    description: 'Each tank in use is compared with the capacity of ONE homogenization tank (2A and 2B are the same size). Only a warning beside the field: it never stops the log being saved.',
+    location: 'Production → Process log → Homogenization → Homogenization Out',
+    settings: ['homog_tank_capacity_each_l'],
   },
   {
     title: 'Maximum product to transfer, Tanks 5A/5B → 6A/6B (L)',

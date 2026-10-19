@@ -162,6 +162,8 @@ SETTINGS_DEFAULTS = [
      " at or above it, \"Stable / safe zone\"."),
     ("dilution_tank_capacity_each_l", 5000, "Tank 6A / 6B capacity, each (L)",
      "Maximum working volume of EACH of Tank 6A and Tank 6B (6A + 6B connected = double) -- used by the Dilution plan's available space / maximum product transfer."),
+    ("homog_tank_capacity_each_l", 5000, "Homogenization Tank 2A / 2B capacity, each (L)",
+     "Maximum working volume of EACH of Tank 2A and Tank 2B (2A + 2B = double): a Post-Dilution Tank Level above it is flagged in the production log. A warning only -- it never blocks saving."),
     ("sample_retention_months", 12, "Retention sample shelf life (months)",
      "How long a Retention sample is kept: its discard-by date is the collection date plus this many months (shown in the Samples tab's Retention inventory)."),
     ("preproc_target_solids_pct", 50, "Pre-processing target blend solids (%)",
@@ -292,16 +294,27 @@ _QC_ALL = [
 ]
 # A field entry may carry a 4th element: a predicate over the run's stages dict -- the field is
 # only required when it is true (per-tank fields apply only to the tanks being filled).
+_uses_2a = lambda st: (st["homogenization"].get("tanks") or "") in ("2A", "2AB")
+_uses_2b = lambda st: (st["homogenization"].get("tanks") or "") in ("2B", "2AB")
 _uses_6a = lambda st: (st["pasteurization"].get("receivingTanks") or "") in ("6A", "6AB")
 _uses_6b = lambda st: (st["pasteurization"].get("receivingTanks") or "") in ("6B", "6AB")
 PROGRESS_SECTIONS = [
     {"key": "feedstock", "label": "Feedstock"},
     {"key": "homogenization", "label": "Homogenization", "fields": [
         ("homogenization", "startedAt", "Started at"), ("homogenization", "rinsingWaterL", "Rinse water (L)"),
-        ("homogenization", "slurryL", "Pre-Dilution Tank Level (L)"), ("homogenization", "wetSolidsWtG", "Wet-solids-wt (g)"),
-        ("homogenization", "liquidWtG", "Liquid-wt (g)"), ("homogenization", "targetPctWetSolids", "Target %Solids Loading, (w/w)"),
-        ("homogenization", "dilutionWaterL", "Dilution water added (L)"),
-        ("homogenization", "postDilutionTankL", "Post-Dilution Tank Level (L)")]
+        ("homogenization", "tanks", "Homogenization tank(s)"), ("homogenization", "targetPctWetSolids", "Target %Solids Loading, (w/w)"),
+        # KW-10 / KW-11: each tank in use has its own level, solids-loading Process Check and dilution entries (the run-level slurryL / wetSolidsWtG /
+        # liquidWtG / dilutionWaterL / postDilutionTankL are now the totals of the tanks, calculated on save)
+        ("homogenization", "slurryL2a", "Pre-Dilution Tank Level, Tank 2A (L)", _uses_2a),
+        ("homogenization", "wetSolidsWtG2a", "Wet-solids-wt, Tank 2A (g)", _uses_2a),
+        ("homogenization", "liquidWtG2a", "Liquid-wt, Tank 2A (g)", _uses_2a),
+        ("homogenization", "dilutionWaterL2a", "Dilution water added, Tank 2A (L)", _uses_2a),
+        ("homogenization", "postDilutionTankL2a", "Post-Dilution Tank Level, Tank 2A (L)", _uses_2a),
+        ("homogenization", "slurryL2b", "Pre-Dilution Tank Level, Tank 2B (L)", _uses_2b),
+        ("homogenization", "wetSolidsWtG2b", "Wet-solids-wt, Tank 2B (g)", _uses_2b),
+        ("homogenization", "liquidWtG2b", "Liquid-wt, Tank 2B (g)", _uses_2b),
+        ("homogenization", "dilutionWaterL2b", "Dilution water added, Tank 2B (L)", _uses_2b),
+        ("homogenization", "postDilutionTankL2b", "Post-Dilution Tank Level, Tank 2B (L)", _uses_2b)]
         + [("homogenization", k, l) for k, l in _QC_ALL]
         + [("homogenization", "tsSlurryPct", "QC Check: TSslurry (%)"),
            ("homogenization", "rhoSlurryGMl", "QC Check: \u03c1slurry (g/mL)"),
@@ -375,7 +388,23 @@ _KEY_LABELS = {
     "slurryL": "Pre-Dilution Tank Level (L)", "postDilutionTankL": "Post-Dilution Tank Level (L)",
     "dilutionWaterL": "Dilution water added (L)", "lotPctSolids": "Lot %Solids Loading, (w/w)",
     "pctWetSolids": "Measured %Solids Loading, (w/w)", "targetPctWetSolids": "Target %Solids Loading, (w/w)",
-    "dilutionWaterTargetL": "Recommended Dilution Water (L)",
+    "dilutionWaterTargetL": "Recommended Dilution Water (L)", "tanks": "Homogenization tank(s)",
+    "slurryL2a": "Pre-Dilution Tank Level, Tank 2A (L)",
+    "wetSolidsWtG2a": "Wet-solids-wt, Tank 2A (g)",
+    "liquidWtG2a": "Liquid-wt, Tank 2A (g)",
+    "pctWetSolids2a": "Measured %Solids Loading, (w/w), Tank 2A",
+    "dilutionWaterTargetL2a": "Recommended Dilution Water, Tank 2A (L)",
+    "dilutionWaterL2a": "Dilution water added, Tank 2A (L)",
+    "postDilutionTankL2a": "Post-Dilution Tank Level, Tank 2A (L)",
+    "lotPctSolids2a": "Lot %Solids Loading, (w/w), Tank 2A",
+    "slurryL2b": "Pre-Dilution Tank Level, Tank 2B (L)",
+    "wetSolidsWtG2b": "Wet-solids-wt, Tank 2B (g)",
+    "liquidWtG2b": "Liquid-wt, Tank 2B (g)",
+    "pctWetSolids2b": "Measured %Solids Loading, (w/w), Tank 2B",
+    "dilutionWaterTargetL2b": "Recommended Dilution Water, Tank 2B (L)",
+    "dilutionWaterL2b": "Dilution water added, Tank 2B (L)",
+    "postDilutionTankL2b": "Post-Dilution Tank Level, Tank 2B (L)",
+    "lotPctSolids2b": "Lot %Solids Loading, (w/w), Tank 2B",
     "tank5aL": "Tank 5A level (L)", "tank5bL": "Tank 5B level (L)", "receivingTanks": "Receiving tanks",
     "tank6aStartL": "Tank 6A level before transfer (L)", "tank6bStartL": "Tank 6B level before transfer (L)",
     "maxTransferL": "Max product to transfer (L)", "recommendedTransferL": "Recommended product transfer (L)",
@@ -3940,7 +3969,8 @@ def build_run_summary_pdf(S, logo_path=None):
          join([S["feedstockLine"], ("pH %s" % S["phRange"]) if S["phRange"] else "", S["orpLine"],
                ("%d rejected" % S["rejectedCount"]) if S["rejectedCount"] else "all accepted"])],
         ["Homogenization", when(he.get("startedAt")),
-         join([("slurry " + _pf(he.get("slurryL"), 0, "L")) if has(he.get("slurryL")) else "",
+         join([("tank " + he["tanks"].replace("AB", "A + 2B")) if has(he.get("tanks")) else "",
+               ("slurry " + _pf(he.get("slurryL"), 0, "L")) if has(he.get("slurryL")) else "",
                ("output " + _pf(he.get("outputL"), 0, "L")) if has(he.get("outputL")) else "",
                ("solids loading " + _pf(he.get("solidsLoadingPct"), 1, "%")) if has(he.get("solidsLoadingPct")) else
                (("wet solids " + _pf(he.get("pctWetSolids"), 1, "%")) if has(he.get("pctWetSolids")) else ""),
@@ -4266,6 +4296,23 @@ def migrate(conn):
         ("homog_ts_liquid_pct", "REAL"), ("homog_rho_liquid_g_ml", "REAL"),
         ("homog_ts_slurry_pct", "REAL"), ("homog_rho_slurry_g_ml", "REAL"), ("homog_ts_solids_pct", "REAL"),
         ("homog_solids_loading_pct", "REAL"),
+        ("homog_tanks", "TEXT"),            # KW-10: 2A | 2B | 2AB -- which homogenization tank(s) this run used
+        ("homog_slurry_l_2a", "REAL"),
+        ("homog_wet_solids_wt_g_2a", "REAL"),
+        ("homog_liquid_wt_g_2a", "REAL"),
+        ("homog_pct_wet_solids_2a", "REAL"),
+        ("homog_dilution_water_target_l_2a", "REAL"),
+        ("homog_dilution_water_l_2a", "REAL"),
+        ("homog_post_dilution_tank_l_2a", "REAL"),
+        ("homog_lot_pct_solids_2a", "REAL"),
+        ("homog_slurry_l_2b", "REAL"),
+        ("homog_wet_solids_wt_g_2b", "REAL"),
+        ("homog_liquid_wt_g_2b", "REAL"),
+        ("homog_pct_wet_solids_2b", "REAL"),
+        ("homog_dilution_water_target_l_2b", "REAL"),
+        ("homog_dilution_water_l_2b", "REAL"),
+        ("homog_post_dilution_tank_l_2b", "REAL"),
+        ("homog_lot_pct_solids_2b", "REAL"),
         ("homog_sample_slurry_microbial", "INTEGER DEFAULT 0"),
         ("homog_sample_slurry_retention", "INTEGER DEFAULT 0"),
         ("homog_sample_liquid_metals", "INTEGER DEFAULT 0"),
@@ -5167,6 +5214,29 @@ def run_public(r):
             "tsLiquidPct": r["packaging_ts_liquid_pct"], "rhoLiquidGMl": r["packaging_rho_liquid_g_ml"],
             "sampleCollectedAt": r["packaging_sample_collected_at"]},
     }
+    # KW-10 / KW-11: which homogenization tanks were used and each tank's own entries (the run-level homogenization values above are the totals)
+    if r["homog_tanks"]:
+        d["stages"]["homogenization"]["tanks"] = r["homog_tanks"]
+    for key, col in (
+        ("slurryL2a", "homog_slurry_l_2a"),
+        ("wetSolidsWtG2a", "homog_wet_solids_wt_g_2a"),
+        ("liquidWtG2a", "homog_liquid_wt_g_2a"),
+        ("pctWetSolids2a", "homog_pct_wet_solids_2a"),
+        ("dilutionWaterTargetL2a", "homog_dilution_water_target_l_2a"),
+        ("dilutionWaterL2a", "homog_dilution_water_l_2a"),
+        ("postDilutionTankL2a", "homog_post_dilution_tank_l_2a"),
+        ("lotPctSolids2a", "homog_lot_pct_solids_2a"),
+        ("slurryL2b", "homog_slurry_l_2b"),
+        ("wetSolidsWtG2b", "homog_wet_solids_wt_g_2b"),
+        ("liquidWtG2b", "homog_liquid_wt_g_2b"),
+        ("pctWetSolids2b", "homog_pct_wet_solids_2b"),
+        ("dilutionWaterTargetL2b", "homog_dilution_water_target_l_2b"),
+        ("dilutionWaterL2b", "homog_dilution_water_l_2b"),
+        ("postDilutionTankL2b", "homog_post_dilution_tank_l_2b"),
+        ("lotPctSolids2b", "homog_lot_pct_solids_2b"),
+    ):
+        if r[col] is not None:
+            d["stages"]["homogenization"][key] = r[col]
     # the final QC check's optional odour: part of the log only when it was written, so the signed snapshot of every earlier run is unchanged
     for key, col in (("odour", "packaging_odour"), ("odourIntensity", "packaging_odour_intensity")):
         if r[col]:
@@ -10958,6 +11028,23 @@ class Handler(BaseHTTPRequestHandler):
             ("homog_dilution_water_l", "dilutionWaterL", "num"),
             ("homog_post_dilution_tank_l", "postDilutionTankL", "num"),
             ("homog_lot_pct_solids", "lotPctSolids", "num"),
+            ("homog_tanks", "tanks", "text"),
+            ("homog_slurry_l_2a", "slurryL2a", "num"),
+            ("homog_wet_solids_wt_g_2a", "wetSolidsWtG2a", "num"),
+            ("homog_liquid_wt_g_2a", "liquidWtG2a", "num"),
+            ("homog_pct_wet_solids_2a", "pctWetSolids2a", "num"),
+            ("homog_dilution_water_target_l_2a", "dilutionWaterTargetL2a", "num"),
+            ("homog_dilution_water_l_2a", "dilutionWaterL2a", "num"),
+            ("homog_post_dilution_tank_l_2a", "postDilutionTankL2a", "num"),
+            ("homog_lot_pct_solids_2a", "lotPctSolids2a", "num"),
+            ("homog_slurry_l_2b", "slurryL2b", "num"),
+            ("homog_wet_solids_wt_g_2b", "wetSolidsWtG2b", "num"),
+            ("homog_liquid_wt_g_2b", "liquidWtG2b", "num"),
+            ("homog_pct_wet_solids_2b", "pctWetSolids2b", "num"),
+            ("homog_dilution_water_target_l_2b", "dilutionWaterTargetL2b", "num"),
+            ("homog_dilution_water_l_2b", "dilutionWaterL2b", "num"),
+            ("homog_post_dilution_tank_l_2b", "postDilutionTankL2b", "num"),
+            ("homog_lot_pct_solids_2b", "lotPctSolids2b", "num"),
             ("homog_qc_ph", "qcPh", "num"),
             ("homog_sample_collected_at", "sampleCollectedAt", "text"),
             ("homog_tds_pct", "tdsPct", "num"),
@@ -12697,6 +12784,8 @@ class Handler(BaseHTTPRequestHandler):
         if not run:
             raise ApiError(404, "Production run not found")
         d = self._body_json()
+        if stage == "homogenization" and (d.get("tanks") or "").strip() not in ("", "2A", "2B", "2AB"):
+            raise ApiError(400, "Homogenization tank(s) must be 2A, 2B or 2A + 2B")
         updates = {}
         for col, key, kind in self.STAGE_FIELDS[stage]:
             if key not in d:
@@ -12711,6 +12800,8 @@ class Handler(BaseHTTPRequestHandler):
             sets = ", ".join("%s=?" % c for c in updates)
             conn.execute("UPDATE production_runs SET %s WHERE id=?" % sets, (*updates.values(), rid))
             self._log_qc_field_changes(conn, rid, stage, updates, user["name"] if user else None)
+        if stage == "homogenization":
+            self._recompute_homogenization(conn, rid)
         # The Packaging section's one Save button covers the packagedAt/QC/
         # Sample Point fields above *and* commits the Packaging table's net
         # container changes -- this is the "once changes have been saved"
@@ -12726,6 +12817,53 @@ class Handler(BaseHTTPRequestHandler):
             self._commit_reagent_usage(conn, rid, user["name"] if user else None)
         return {"run": run_public(conn.execute(
             "SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone())}
+
+    # ---- Homogenization: tank 2A / 2B (KW-10, KW-11) -----------------------#
+    def _recompute_homogenization(self, conn, rid):
+        """A run that names its homogenization tank(s) keeps each tank's own entries in the `_2a` / `_2b` columns. Each tank's Measured %Solids (from its own Process Check), Recommended Dilution
+        Water and Lot %Solids are calculated HERE (c1V1 = c2V2, the same formulas the screen shows), the unused tank's columns are cleared, and the run-level homogenization values -- which the
+        summary, the water totals and the log read -- become the totals of the tanks in use: litres are summed, %solids are volume-weighted. A total exists only when every tank in use has its
+        value. A run with no tank choice (`homog_tanks` empty) is left exactly as entered."""
+        r = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
+        tanks = r["homog_tanks"]
+        if tanks not in ("2A", "2B", "2AB"):
+            return
+        target = r["homog_target_pct_wet_solids"]
+        c2 = target / 100.0 if target else None
+        sets, per = {}, []
+        for suf in ("2a", "2b"):
+            if not (tanks == "2AB" or tanks == suf.upper()):
+                for stem in self.HOMOG_TANK_STEMS:
+                    sets["homog_%s_%s" % (stem, suf)] = None
+                continue
+            g = lambda stem: r["homog_%s_%s" % (stem, suf)]
+            v1, w, liq, water, v2 = g("slurry_l"), g("wet_solids_wt_g"), g("liquid_wt_g"), g("dilution_water_l"), g("post_dilution_tank_l")
+            c1 = w / (w + liq) if (w is not None and liq is not None and (w + liq) > 0) else None
+            rec = None
+            if c1 is not None and c2 and v1 is not None:
+                rec = 0.0 if c1 <= c2 else v1 * c1 / c2 - v1
+            lot = c1 * (v2 - water) / v2 if (c1 is not None and water is not None and v2 and water <= v2) else None
+            sets["homog_pct_wet_solids_" + suf] = c1
+            sets["homog_dilution_water_target_l_" + suf] = rec
+            sets["homog_lot_pct_solids_" + suf] = lot
+            per.append({"v1": v1, "c1": c1, "rec": rec, "water": water, "v2": v2, "lot": lot, "w": w, "l": liq})
+
+        def total(key):
+            vals = [p[key] for p in per]
+            return None if any(v is None for v in vals) else sum(vals)
+        sets["homog_slurry_l"] = total("v1")
+        sets["homog_dilution_water_target_l"] = total("rec")
+        sets["homog_dilution_water_l"] = total("water")
+        sets["homog_post_dilution_tank_l"] = total("v2")
+        v1_all = total("v1")
+        sets["homog_pct_wet_solids"] = (sum(p["c1"] * p["v1"] for p in per) / v1_all) if (v1_all and all(p["c1"] is not None for p in per)) else None
+        v2_all = total("v2")
+        sets["homog_lot_pct_solids"] = (sum(p["lot"] * p["v2"] for p in per) / v2_all) if (v2_all and all(p["lot"] is not None for p in per)) else None
+        sets["homog_wet_solids_wt_g"] = per[0]["w"] if len(per) == 1 else None      # the sample weights of two tanks are not additive
+        sets["homog_liquid_wt_g"] = per[0]["l"] if len(per) == 1 else None
+        conn.execute("UPDATE production_runs SET %s WHERE id=?" % ", ".join("%s=?" % c for c in sets), (*sets.values(), rid))
+
+    HOMOG_TANK_STEMS = ("slurry_l", "wet_solids_wt_g", "liquid_wt_g", "pct_wet_solids", "dilution_water_target_l", "dilution_water_l", "post_dilution_tank_l", "lot_pct_solids")
 
     # ---- Dilution & Preservation: repeatable tank entries ------------------#
     def _dilutions_public(self, conn, run_id):
