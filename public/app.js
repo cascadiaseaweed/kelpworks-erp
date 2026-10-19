@@ -4641,11 +4641,11 @@ async function pageFG(v) {
     } });
     allCb.checked = movable.length > 0 && movable.every(f => selected.has(f.id));
     host.append(table(
-      [allCb, 'FG lot', 'SKU', 'Pack', 'Units', 'Litres', 'TDS', 'Produced', 'Location', 'Status', ''],
+      [allCb, 'FG lot', 'SKU', 'Pack', 'Units', 'Litres', 'TDS', 'pH', 'Produced', 'Location', 'Status', ''],
       r.fg.map(f => [
         rowCheck(f, selected, updateBulk),
         mono(f.lot), skuName(f.sku), f.packageSize, fmt(f.qty), num(fmt(f.litres, 0)),
-        f.tds != null ? f.tds + '%' : '—', f.producedDate || '—', f.location || '—',
+        f.tds != null ? fmt(f.tds, 2) + '%' : '—', f.ph != null ? fmt(f.ph, 2) : '—', f.producedDate || '—', f.location || '—',
         fgStatusBadge(f.status), rowActions([
           f.status !== 'sold' ? ['Move', () => moveFG(f)] : null,
           ['Label', () => printLabels([fgLabel(f)])],
@@ -4686,19 +4686,17 @@ function editFG(f) {
         ? field('Status', el('div', {}, fgStatusBadge(f.status), el('div', { class: 'help' }, 'Set by the Product Release process (Product Release tab).')))
         : field('Status', selectFrom('', [['on_hand', 'On hand'], ['hold', 'Hold / QA'], ['sold', 'Sold / shipped']], null, 'f_status'))),
     el('div', { class: 'form-row' },
-      field('TDS (%)', el('input', { type: 'number', step: '0.1', id: 'f_tds', value: f.tds ?? '' })),
+      field('Final TDS / pH (from the run)', el('div', { class: 'help' }, (f.tds != null ? fmt(f.tds, 2) + ' %' : '—') + ' / ' + (f.ph != null ? fmt(f.ph, 2) : '—') + '  — the run’s Packaging QC Check; amend the run to correct it')),
       field('Location', el('input', { id: 'f_loc', value: f.location || '' }))),
-    field('Reason for the change', el('input', { id: 'f_reason', placeholder: 'Required when status, units or TDS change' })),
-    el('div', { class: 'help' }, 'Only a Production or Quality Manager can change units, TDS or status (placing a lot on hold, or releasing it from hold, is for a Quality Manager). Every change is recorded in the audit trail with your name and the reason. Moving a lot to another location is open to everyone.'));
+    field('Reason for the change', el('input', { id: 'f_reason', placeholder: 'Required when status or units change' })),
+    el('div', { class: 'help' }, 'Only a Production or Quality Manager can change units or status (placing a lot on hold, or releasing it from hold, is for a Quality Manager). Every change is recorded in the audit trail with your name and the reason. Moving a lot to another location is open to everyone.'));
   if (f.status !== 'pending_release') body.querySelector('#f_status').value = f.status;
   modal('Edit FG lot ' + f.lot, body, async () => {
     const payload = { location: body.querySelector('#f_loc').value };
     const q = +body.querySelector('#f_qty').value, st = body.querySelector('#f_status') ? body.querySelector('#f_status').value : f.status;
-    const tds = body.querySelector('#f_tds').value === '' ? null : +body.querySelector('#f_tds').value;
     if (q !== f.qty) payload.qty = q;
     if (st !== f.status) payload.status = st;
-    if (tds !== (f.tds ?? null)) payload.tds = tds;
-    if (payload.qty !== undefined || payload.status !== undefined || payload.tds !== undefined) payload.reason = body.querySelector('#f_reason').value;
+    if (payload.qty !== undefined || payload.status !== undefined) payload.reason = body.querySelector('#f_reason').value;
     await api('PUT', '/fg/' + f.id, payload);
     toast('Updated'); render();
   }, 'Save');
@@ -7682,7 +7680,7 @@ function toteLabel(t) {
 function fgLabel(f, run) {
   return { kind: 'Finished Good — LKE', lot: f.lot, barcode: f.lot, meta: [
     ['Product', skuName(f.sku)], ['Pack', f.packageSize], ['Units', fmt(f.qty)],
-    ['TDS', f.tds != null ? f.tds + '%' : '—'], ['Produced', f.producedDate || (run && run.runDate) || '—']] };
+    ['TDS', f.tds != null ? fmt(f.tds, 2) + '%' : '—'], ['pH', f.ph != null ? fmt(f.ph, 2) : '—'], ['Produced', f.producedDate || (run && run.runDate) || '—']] };
 }
 /* ---------------- Sample labels (50 mL falcon tube) ---------------- */
 // A deliberately plain label: lot number, "sample point - description", collection date. No barcode, no logo.
