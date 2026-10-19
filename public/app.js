@@ -2635,7 +2635,7 @@ function buildSamplePointsSection(initial, getRunId, processingLot, getCollected
       // description / type changes set a default qty + container (Microbial: 1 x 50 mL falcon tube;
       // Metals & Nutrients: 2 x 50 mL falcon tube; Solid: 100 g sample bag) -- show what was saved
       if ('description' in payload || 'type' in payload) draw();
-    } catch (e) { status.textContent = e.message; }
+    } catch (e) { status.textContent = e.message; draw(); }     // the server refused: show what is actually saved, not what was typed
   }
   function draw() {
     tbody.innerHTML = '';
@@ -2645,14 +2645,16 @@ function buildSamplePointsSection(initial, getRunId, processingLot, getCollected
     items.forEach(it => {
       const typeSel = selectCell(SAMPLE_TYPES, it.type, () => patch(it.id, { type: typeSel.value }));
       const descSel = selectCell(SAMPLE_DESCRIPTIONS, it.description, () => patch(it.id, { description: descSel.value }));
-      const qtyInp = el('input', { type: 'number', min: '1', max: '10', value: String(it.qty || 1) });
+      const floor = it.required ? (it.minQty || 1) : 1;     // KW-13: the default samples are required: no removing, retyping or going below their minimum
+      if (it.required) { typeSel.disabled = true; descSel.disabled = true; }
+      const qtyInp = el('input', { type: 'number', min: String(floor), max: '10', value: String(it.qty || 1) });
       qtyInp.addEventListener('change', () => {
-        const q = Math.max(1, Math.min(10, +qtyInp.value || 1));
+        const q = Math.max(floor, Math.min(10, +qtyInp.value || floor));
         qtyInp.value = String(q);
         patch(it.id, { qty: q });
       });
       const containerSel = selectCell(sampleContainerOptions(), it.container, () => patch(it.id, { container: containerSel.value }));
-      const removeBtn = el('button', {
+      const removeBtn = it.required ? el('span', { class: 'help', title: 'A required sample: it can be added to but not removed or reduced below ' + floor }, '🔒 required') : el('button', {
         type: 'button', class: 'icon-btn remove', title: 'Remove sample', onclick: async () => {
           if (!confirm('Remove this sample?')) return;
           const rid = await getRunId();

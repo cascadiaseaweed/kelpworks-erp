@@ -96,6 +96,10 @@ for `main` so a red run blocks the merge.
   enough ... on hand". **Sample Point defaults** (`_sample_point_defaults`, applied when the description/type is changed, never over a
   value sent in the same request, new rows start Slurry/Microbial): Microbial -> qty 1 + 50 mL falcon tube; Metals & Nutrients -> qty 2 +
   50 mL falcon tube; type Solid -> 100 g sample bag.
+  **Required samples (KW-13; tests in `tests/test_required_samples.py`)**: the four default LKE characterization samples (`Handler.DEFAULT_LKE_SAMPLES`, seeded by `_seed_default_samples`) are locked rows
+  (`run_sample_points.min_qty` = the default quantity; NULL = an ordinary row): `DELETE` answers 409, a changed type / description or a quantity below `min_qty` is 400 (a bigger quantity and another container are fine),
+  and the UI shows them as "required" with the selects locked. This holds under an amendment too; optional samples can still be added, changed and removed. `_sample_points_public` adds `required` / `minQty`
+  ONLY to locked rows, so no earlier run's signed log changes.
 - **Reagent types** (`consumables.reagent_type`: Citric Acid / Potassium Sorbate / Sodium Benzoate, set in Inventory Items > Edit; backfilled
   from the item names once) group inventory items that are the same reagent. A run stores which item it draws each reagent from
   (`production_runs.dilution_{citric,ksorbate,nabenzoate}_item_id`, shown in the log only when set so old signed snapshots don't change;
