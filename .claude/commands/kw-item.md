@@ -26,11 +26,15 @@ Follow these steps in order. Do not skip one; say so if one does not apply.
 6. **Build.** Standard library only (no new pip packages). Match the code around it. Add tests in `tests/` (extend the right file or add one) that fail without the change; run the FULL suite
    (`python -m pytest`) and fix failures. Verify the change in the browser preview (restart the server first) and look at the console for errors. Update `CLAUDE.md` and any guide the change makes
    untrue.
-7. **Stop and report.** Summarise: what changed (files), how each acceptance criterion is met, tests run, anything decided on the user's behalf, anything needing the user (decisions, Quality
+7. **Stop and report.** (Keep the workbook current as you go, see step 10.) Summarise: what changed (files), how each acceptance criterion is met, tests run, anything decided on the user's behalf, anything needing the user (decisions, Quality
    Manager, a setting to change on the live site). Do NOT commit, push or open a pull request until the user says so.
 8. **When told to commit / push / open the pull request:** commit message and pull request title start with the item ID ("KW-24: ..."); the pull request body lists the acceptance criteria as
    a checklist, says what was tested, and names any follow-up. Never merge: the user merges.
-9. **After the user says it is live:** add the live commit to `tests/legacy_commits.txt` (a small follow-up pull request) and remind the user to set the item's Status to Released in the
-   Excel workbook (re-run `python tools/export_backlog.py "<workbook>"` to refresh the CSV).
+9. **After the user says it is live:** add the live commit to `tests/legacy_commits.txt` (a small follow-up pull request).
+10. **Keep the master workbook up to date** (the user asked for this, and gave permission): whenever an item changes state -- plan approved or work started (`In progress`), pull request open
+    (`In progress`, note the PR number), merged (`Released`, note the PR number and the date), found not to be a bug / dropped (`Won't do`, say why), a decision made (Open Decisions: Decided By +
+    Decision, and a note on the item) -- write it into the workbook with `python tools/update_backlog_xlsx.py "<workbook>" updates.json` (standard library only; it edits just those cells inside
+    the file; the workbook must be closed in Excel; use `--dry-run` first), then refresh the snapshot with `python tools/export_backlog.py "<workbook>"`. Keep a copy of the workbook outside
+    SharePoint before the first edit of a session. The workbook is `KelpWorks_ChangeLog_2026-10-16.xlsx` in `...\QAQC\KelpWorks ERP\` (OneDrive).
 
 Keep it small: one item (or the bundle named in the arguments) per branch.
