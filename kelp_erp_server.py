@@ -4547,6 +4547,8 @@ def migrate(conn):
         conn.execute("ALTER TABLE run_sample_points ADD COLUMN label_numbered INTEGER NOT NULL DEFAULT 0")
     if "label_name" not in spcols:
         conn.execute("ALTER TABLE run_sample_points ADD COLUMN label_name TEXT")
+    if "ph" not in {r["name"] for r in conn.execute("PRAGMA table_info(fg_lots)")}:     # KW-31: the lot's actual final pH (its `tds` is now the actual final TDS too)
+        conn.execute("ALTER TABLE fg_lots ADD COLUMN ph REAL")
     if "min_qty" not in spcols:      # KW-13: a required (default) sample can't be removed, retyped or reduced below this many units; NULL = an ordinary row
         conn.execute("ALTER TABLE run_sample_points ADD COLUMN min_qty INTEGER")
 
@@ -5223,7 +5225,7 @@ def fg_public(r):
     return {"id": r["id"], "lot": r["fg_lot_number"], "sku": r["sku_code"],
             "runId": r["run_id"], "packageSize": r["package_size"], "qty": r["qty"],
             "litresEach": r["litres_each"], "litres": round((r["qty"] or 0) * (r["litres_each"] or 0), 2),
-            "producedDate": r["produced_date"], "tds": r["tds"], "location": r["location"],
+            "producedDate": r["produced_date"], "tds": r["tds"], "ph": r["ph"], "location": r["location"],
             "status": r["status"]}
 
 
@@ -13026,6 +13028,8 @@ class Handler(BaseHTTPRequestHandler):
             self._recompute_homogenization(conn, rid)
         if stage == "extraction":
             self._apply_extraction_bypass(conn, rid)
+        if stage == "packaging" and run["status"] == "completed":
+            self._sync_fg_lot_quality(conn, rid)
         # The Packaging section's one Save button covers the packagedAt/QC/
         # Sample Point fields above *and* commits the Packaging table's net
         # container changes -- this is the "once changes have been saved"
@@ -13451,6 +13455,12 @@ class Handler(BaseHTTPRequestHandler):
             return "on_hand"
         return "hold" if st == "rejected" else "pending_release"
 
+    def _sync_fg_lot_quality(self, conn, run_id):
+        """KW-31: a finished-goods lot carries the run's ACTUAL final TDS and pH (the Packaging QC Check), never the product's target. Recomputed by the code that
+        changes the source (finalize, a Packaging QC save under an amendment), so the card, the label and the certificate cannot disagree."""
+        conn.execute("UPDATE fg_lots SET tds=(SELECT packaging_tds_pct FROM production_runs WHERE id=fg_lots.run_id),"
+                     " ph=(SELECT packaging_qc_ph FROM production_runs WHERE id=fg_lots.run_id) WHERE run_id=?", (run_id,))
+
     def _adjust_fg_lot(self, conn, run, unit, delta, unit_litres):
         lot_no = "%s-%s" % (run["processing_lot"], unit)
         lot = conn.execute("SELECT * FROM fg_lots WHERE run_id=? AND fg_lot_number=?", (run["id"], lot_no)).fetchone()
@@ -13458,9 +13468,9 @@ class Handler(BaseHTTPRequestHandler):
             if delta > 0 and unit in unit_litres:
                 conn.execute(
                     "INSERT INTO fg_lots (fg_lot_number,sku_code,run_id,package_size,qty,litres_each,produced_date,"
-                    "tds,location,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    "tds,ph,location,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (lot_no, run["sku_code"], run["id"], unit, delta, unit_litres[unit], run["run_date"],
-                     run["target_tds"], run["location"], self._lot_status_for_run(run), now_iso()))
+                     run["packaging_tds_pct"], run["packaging_qc_ph"], run["location"], self._lot_status_for_run(run), now_iso()))
             return
         new_qty = (lot["qty"] or 0) + delta
         if new_qty < 0:
@@ -13787,6 +13797,7 @@ class Handler(BaseHTTPRequestHandler):
                 (fg_lot, sku, run_id, unit, qty, unit_litres[unit], run_date,
                  target_tds, location, lot_status, ts))
             fg_created.append(fg_lot)
+            self._sync_fg_lot_quality(conn, run_id)
             # (FG labels were consumed with the containers by the packaging
             # commit above -- see _commit_label_stock.)
 
@@ -14015,8 +14026,8 @@ class Handler(BaseHTTPRequestHandler):
     FG_EDIT_STATUSES = ("on_hand", "hold", "sold")
 
     def _edit_fg_lot(self, conn, it, user):
-        """PUT /api/fg/:id. Status, units on hand and TDS decide whether and how much product can be sold, so a change needs a
-        manager (hold / un-hold: a Quality Manager; units, TDS, on-hand <-> sold: a Production or Quality Manager), a reason, and is
+        """PUT /api/fg/:id. Status and units on hand decide whether and how much product can be sold, so a change needs a
+        manager (hold / un-hold: a Quality Manager; units, on-hand <-> sold: a Production or Quality Manager), a reason, and is
         written to the audit chain. A lot's location may be changed by anyone (and goes in the move log)."""
         d = self._body_json()
         if d.get("location"):
@@ -14041,12 +14052,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(400, "Units on hand must be a number, zero or more")
             if new_qty != it["qty"]:
                 changes["qty"] = (it["qty"], new_qty)
-        if "tds" in d:
-            new_tds = numn(d["tds"])
-            if new_tds is not None and (new_tds != new_tds or new_tds in (float("inf"), float("-inf")) or new_tds < 0):
-                raise ApiError(400, "TDS must be a number, zero or more")
-            if new_tds != it["tds"]:
-                changes["tds"] = (it["tds"], new_tds)
+        if "tds" in d or "ph" in d:       # KW-31: TDS and pH are the run's actual final QC values and are not typed here
+            if numn(d.get("tds", it["tds"])) != it["tds"] or numn(d.get("ph", it["ph"])) != it["ph"]:
+                raise ApiError(400, "A lot's TDS and pH are the run's final Packaging QC Check results and cannot be changed here - amend the run to correct them")
         new_loc = it["location"]
         if "location" in d and (d["location"] or None) != it["location"]:
             new_loc = (d["location"] or "").strip() or None
@@ -14056,14 +14064,13 @@ class Handler(BaseHTTPRequestHandler):
             if hold_involved:
                 self._require_quality_manager(user, "place a finished-goods lot on hold or release it from hold")
             elif not self._is_manager(user):
-                raise ApiError(403, "Only a Production Manager or Quality Manager can change a lot's status, units on hand or TDS")
+                raise ApiError(403, "Only a Production Manager or Quality Manager can change a lot's status or units on hand")
             reason = (d.get("reason") or "").strip()
             if len(reason) < 3:
                 raise ApiError(400, "Enter the reason for this change (it is recorded in the audit trail)")
             capacity = "Quality Manager" if self._is_quality_manager(user) else "Production Manager"
-        conn.execute("UPDATE fg_lots SET qty=?, status=?, location=?, tds=? WHERE id=?",
-                     (changes["qty"][1] if "qty" in changes else it["qty"], changes["status"][1] if "status" in changes else it["status"],
-                      new_loc, changes["tds"][1] if "tds" in changes else it["tds"], it["id"]))
+        conn.execute("UPDATE fg_lots SET qty=?, status=?, location=? WHERE id=?",
+                     (changes["qty"][1] if "qty" in changes else it["qty"], changes["status"][1] if "status" in changes else it["status"], new_loc, it["id"]))
         if new_loc != it["location"]:
             self._log_move(conn, "fg", it["id"], it["fg_lot_number"], it["location"], new_loc, it["qty"], today_iso(), "Edited")
         if changes:

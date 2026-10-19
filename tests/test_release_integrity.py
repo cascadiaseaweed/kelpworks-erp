@@ -49,7 +49,7 @@ def test_plain_user_cannot_change_status_units_or_tds(srv, people):
     rid, lots = released(srv, people)
     lot = lots[0]
     before = lot_row(srv, lot["id"])
-    for body in ({"status": "hold", "reason": "x y z"}, {"qty": 999, "reason": "x y z"}, {"tds": 9, "reason": "x y z"}):
+    for body in ({"status": "hold", "reason": "x y z"}, {"qty": 999, "reason": "x y z"}):
         assert people["plain"].put("/api/fg/%d" % lot["id"], body).status == 403, body
     assert lot_row(srv, lot["id"]) == before
 

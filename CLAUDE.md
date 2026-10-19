@@ -154,7 +154,7 @@ for `main` so a red run blocks the merge.
 - **Release-integrity rules** (risk review batch 1; tests in `tests/test_release_integrity.py`). *Lab results*: only a Quality Manager can add / void / scan them
   (everyone can read); after release, a voided required result or a new failure that the release did not accept puts the run's `on_hand` lots on HOLD and logs
   `lab_result_hold` (`_lab_regate`). *Finished-goods lots* (`PUT /api/fg/:id`, `_edit_fg_lot`): status is limited to on_hand / hold / sold and a lot that is
-  pending_release or disposed cannot be changed by hand; hold / un-hold needs a Quality Manager, units / TDS / on_hand<->sold a Production or Quality Manager;
+  pending_release or disposed cannot be changed by hand; hold / un-hold needs a Quality Manager, units / on_hand<->sold a Production or Quality Manager (TDS and pH are not editable here, see KW-31 below);
   each change needs a reason and is written to the hash chain (`fg_lot_edited`); location is open to all and goes in the move log. *Totes*: a tote joins a run
   only if `in_stock`, already locked to THAT run, or rejected from it (`_tote_available_for_run`); `PUT /api/totes/:id` only moves in_stock <-> hold and never
   changes the weight of a wip/consumed tote. *Shipments*: lines for the same lot are summed before checking stock, deduction is relative and conditional
@@ -513,6 +513,9 @@ for `main` so a red run blocks the merge.
   recommended limits (mean +/- k sigma, sigma = MRbar/1.128) appear once `qc_chart_min_n_provisional` results exist (established at `qc_chart_min_n_established`) -- constants are admin-editable settings and
   documented on the Calculations page. Signals (beyond a limit, run of N on one side, trend of N) are only raised once limits are set. Specification lines come from `coa_specs` (shown dotted, separate from
   control limits; far-off lines are noted instead of drawn). Charts are hand-written SVG (no library).
+- **Finished-goods TDS and pH** (KW-31; tests in `tests/test_fg_actual_quality.py`): `fg_lots.tds` / `fg_lots.ph` are the run's ACTUAL final Packaging QC Check results (`packaging_tds_pct` / `packaging_qc_ph`), never the product target
+  (finalize stored the target before). `_sync_fg_lot_quality` sets them at finalize and again whenever the Packaging stage is saved on a completed run (an amendment); a lot created later by a packaging edit takes them from the run
+  (`_adjust_fg_lot`). They are read-only: `PUT /api/fg/:id` answers 400 to a changed `tds` / `ph` (amend the run instead). Shown on the Finished Goods table, its Edit window and the printed FG label (the CoA already reads the run).
 - **Packaging edits after finalize** re-derive everything computed from the packaging rows in the
   same transaction (`_sync_completed_packaging`): container + FG-label stock (net-change commit),
   the run's FG lots (`_adjust_fg_lot`, refuses to go below units already shipped/moved), and
