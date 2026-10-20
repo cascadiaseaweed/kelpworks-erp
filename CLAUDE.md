@@ -434,7 +434,7 @@ for `main` so a red run blocks the merge.
   `/api/production/...` write and `sync_pending_samples` at boot, which also backfills older runs); a unit whose row was
   removed/shrunk is dropped only while it is still available/in_cart -- submitted/removed samples are history. Status: available ->
   in_cart -> submitted (on a requisition) | removed (reason required, `sample_events` is the append-only history). Retention
-  inventory = samples whose description is `Retention`; discard-by = collection date + `sample_retention_months`. Labs + their
+  inventory = samples whose description is `Retention`; discard-by = collection date + `sample_retention_months` (default 24 months, KW-33; a database that still held the old default 12 moved to 24 once, `retention_months_24`). Labs + their
   analyses (`labs`, `lab_analyses`) and an optional per-lab Word template (stored under `LAB_DIR`) are admin-maintained in Admin >
   Labs & analyses. The cart (`sample_cart`) holds a lab + analysis ids per sample; "Create requisitions" makes one
   `lab_requisitions` row per run + lab, fills the lab's .docx with `docx_fill` (stdlib `zipfile` + regex on the XML: `{{tokens}}`
@@ -473,6 +473,10 @@ for `main` so a red run blocks the merge.
   on the Word form, the sample sheet and the notes -- with Container Qty and Total sample volume added up, the tests requested combined (the mineral scan is re-sized for the combined minerals) and no ID-conflict warning;
   every sample is still marked submitted. Labs without the flag keep one form row per sample and the old sheet rule (same ID + description + tests).
   Notes entries are separated by a blank line and start on the line below the label (`{{br}}` token in the template).
+- **Samples / lab small changes** (KW-14 / 27 / 34 / 35; tests in `tests/test_samples_lab_small.py`). The Analysis catalogue hides the *ID Detailed* and *ID Simplified* columns by default (a per-browser "Columns" chooser,
+  `sampleColumnMenu`, key `kelp.sampleCols.catalogue`) and its status filter is a multi-select (`multiFilterButton`, `f.statuses`) that starts as every status except *Sent to lab* so what was sent is one click away; the Retention
+  inventory keeps its own "Show removed / sent samples" box. In the production log each Sample Point card ends with *Containers to collect* (`sampleContainerTotals`: the quantities added up per container), and a *Sample summary*
+  card after the Notes section, at the end of the log (`buildSampleSummaryCard`, refreshed with the section progress) shows samples per process point and type with the container totals, the same grouping as the Production Log Summary PDF.
 - **Sample IDs and labels.** Every sample has a UNIQUE ID (`samples.sample_code`, e.g. `PR-20261006-053-HOM-01`, never changes) plus two label IDs:
   **Sample ID Detailed** (`id_detailed`) = the first line of the Detailed label = the processing lot, and **Sample ID Simplified** (`id_simplified`) = the first line of
   the Simplified label = `Lot-` + the run's last 3 digits (`lot_simplified`), both with `-<unit no>` when the point's labels are numbered. They are derived, never typed:

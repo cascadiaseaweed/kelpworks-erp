@@ -168,7 +168,7 @@ SETTINGS_DEFAULTS = [
      "How long someone who has closed their browser (or lost power) still shows as having a run, batch or tote open. Browsers announce themselves about every third of this time; it only drives the 'someone else has this open' warning."),
     ("idle_timeout_minutes", 30, "Idle timeout (minutes)",
      "A signed-in person who has not used the screen for this long is signed out; the run and batch sections they have open are saved first. 0 turns it off. Takes effect for everyone within a minute, no deploy needed."),
-    ("sample_retention_months", 12, "Retention sample shelf life (months)",
+    ("sample_retention_months", 24, "Retention sample shelf life (months)",
      "How long a Retention sample is kept: its discard-by date is the collection date plus this many months (shown in the Samples tab's Retention inventory)."),
     ("preproc_target_solids_pct", 50, "Pre-processing target blend solids (%)",
      "Default solids loading a shred-and-blend (Pre-Processing) batch is diluted to. Recommended dilution water = shredded kg x (starting % solids / target % solids - 1), taking 1 kg of water = 1 L."),
@@ -4773,6 +4773,9 @@ def migrate(conn):
         conn.execute(
             "INSERT OR IGNORE INTO settings (key,value,label,description,updated_at)"
             " VALUES (?,?,?,?,?)", (key, value, label, desc, now_iso()))
+    # KW-33: the retention shelf life default went from 12 to 24 months. A database that still holds the old default (nobody changed it) moves to the new one, once;
+    # a value an administrator set is left alone.
+    run_once(conn, "retention_months_24", lambda: conn.execute("UPDATE settings SET value=24 WHERE key='sample_retention_months' AND value=12"))
     # homog_dilution_density_kg_per_l was replaced by homog_tank_2ab_max_level_l
     # when the dilution-target formula changed to solve for a fill level
     # instead of a water-to-add amount -- no formula reads it anymore, so
@@ -8981,7 +8984,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def route_samples(self, method, seg, query, conn, user):
         uname = user["name"] if user else None
-        months = get_setting_value(conn, "sample_retention_months", 12)
+        months = get_setting_value(conn, "sample_retention_months", 24)
         if seg == ["api", "samples"] and method == "GET":
             where, params = [], []
             if query.get("runId", [""])[0]:
@@ -9267,7 +9270,7 @@ class Handler(BaseHTTPRequestHandler):
         return [self._sample_public(conn, r, months) for r in conn.execute(sql)]
 
     def _cart_response(self, conn):
-        return {"items": self._cart_items(conn, get_setting_value(conn, "sample_retention_months", 12)),
+        return {"items": self._cart_items(conn, get_setting_value(conn, "sample_retention_months", 24)),
                 "labs": [l for l in self._labs_all(conn) if l["active"]]}
 
     def _validate_assignment(self, conn, lab_id, analysis_ids):

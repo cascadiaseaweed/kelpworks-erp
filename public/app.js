@@ -2980,6 +2980,46 @@ function sampleContainerOptions() {
 // tags which one this instance is, and every mutation re-filters the
 // server's full (all-stages) sample-points list back down to just this
 // box's rows -- untagged legacy rows count as 'homogenization'.
+// KW-14 / KW-27: how many of each container a set of sample rows needs (so nobody adds them up before collecting), and the run-wide summary shown at the end of the log.
+const SAMPLE_POINT_STAGE_LABELS = { homogenization: 'Homogenization', separation_solids: 'Separation (solids)', pasteurization_pre: 'Pasteurization (pre)',
+  pasteurization_post: 'Pasteurization (post)', packaging: 'Packaging' };
+const SAMPLE_SUMMARY_DESCS = ['Microbial', 'Metals & Nutrients', 'Retention', 'Proximate Analysis', 'R&D', 'Other'];
+function sampleContainerTotals(items) {
+  const m = new Map();
+  (items || []).forEach(it => { const k = it.container || 'No container chosen'; m.set(k, (m.get(k) || 0) + (+it.qty || 0)); });
+  return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+}
+const containerTotalsText = items => sampleContainerTotals(items).map(([c, n]) => n + ' × ' + c).join(', ');
+// The end-of-log card: samples per process point and type (the same grouping as the production log summary report) with the containers they need.
+function buildSampleSummaryCard(initialItems) {
+  const host = el('div', { class: 'sample-summary' });
+  function draw(items) {
+    host.innerHTML = '';
+    items = (items || []).filter(it => (+it.qty || 0) > 0);
+    if (!items.length) { host.append(el('div', { class: 'help' }, 'No samples added yet.')); return; }
+    const descs = SAMPLE_SUMMARY_DESCS.filter(d => items.some(it => it.description === d));
+    const other = items.some(it => !SAMPLE_SUMMARY_DESCS.includes(it.description));
+    const stages = [...Object.keys(SAMPLE_POINT_STAGE_LABELS), ...new Set(items.map(it => it.stage || 'homogenization'))]
+      .filter((s, i, a) => a.indexOf(s) === i && items.some(it => (it.stage || 'homogenization') === s));
+    const count = (list, pred) => list.filter(pred).reduce((a, it) => a + (+it.qty || 0), 0);
+    const rows = stages.map(st => {
+      const grp = items.filter(it => (it.stage || 'homogenization') === st);
+      return [el('b', {}, SAMPLE_POINT_STAGE_LABELS[st] || st), ...descs.map(d => count(grp, it => it.description === d) || ''),
+        ...(other ? [count(grp, it => !SAMPLE_SUMMARY_DESCS.includes(it.description)) || ''] : []), el('b', {}, count(grp, () => true))];
+    });
+    rows.push([el('b', {}, 'Total'), ...descs.map(d => el('b', {}, count(items, it => it.description === d) || '')),
+      ...(other ? [el('b', {}, count(items, it => !SAMPLE_SUMMARY_DESCS.includes(it.description)) || '')] : []), el('b', {}, count(items, () => true))]);
+    host.append(el('div', { class: 'tablewrap' }, table(['Process point', ...descs, ...(other ? ['Other types'] : []), 'Total'], rows, [false, ...descs.map(() => true), ...(other ? [true] : []), true])),
+      el('div', { class: 'sample-summary-line' }, el('b', {}, 'Containers to collect: '), containerTotalsText(items)));
+  }
+  draw(initialItems);
+  return {
+    box: el('div', { class: 'qc-check-box' }, el('div', { class: 'qc-check-title' }, 'Sample summary'),
+      el('div', { class: 'qc-check-subtitle' }, 'Every sample added in this log, by process point and type: check the count and the containers before finalizing'), host),
+    draw,
+    async refresh(runId) { if (!runId) return; try { draw((await api('GET', '/production/' + runId + '/sample-points')).samplePoints); } catch (e) { /* non-critical */ } },
+  };
+}
 function buildSamplePointsSection(initial, getRunId, processingLot, getCollectedAt, stage) {
   function filterStage(list) { return (list || []).filter(s => (s.stage || 'homogenization') === stage); }
   let items = filterStage(initial);
@@ -2997,12 +3037,22 @@ function buildSamplePointsSection(initial, getRunId, processingLot, getCollected
       const r = await api('PUT', '/production/' + rid + '/sample-points/' + id, payload);
       items = filterStage(r.samplePoints);
       status.textContent = '';
+      drawSummary();
       // description / type changes set a default qty + container (Microbial: 1 x 50 mL falcon tube;
       // Metals & Nutrients: 2 x 50 mL falcon tube; Solid: 100 g sample bag) -- show what was saved
       if ('description' in payload || 'type' in payload) draw();
     } catch (e) { status.textContent = e.message; draw(); }     // the server refused: show what is actually saved, not what was typed
   }
+  const summaryHost = el('div', { class: 'sample-summary' });
+  function drawSummary() {
+    summaryHost.innerHTML = '';
+    const totals = sampleContainerTotals(items.filter(it => (+it.qty || 0) > 0));
+    if (!totals.length) return;
+    summaryHost.append(el('div', { class: 'sample-summary-title' }, 'Containers to collect'),
+      table(['Container', 'Total qty'], totals.map(([c, n]) => [c, el('b', {}, n)]), [false, true]));
+  }
   function draw() {
+    drawSummary();
     tbody.innerHTML = '';
     if (!items.length) {
       tbody.append(el('tr', {}, el('td', { colspan: 6, class: 'empty' }, 'No samples added yet.')));
@@ -3048,6 +3098,7 @@ function buildSamplePointsSection(initial, getRunId, processingLot, getCollected
         el('th', {}, 'Container'), el('th', {}, ''))),
       tbody),
     el('div', { style: 'margin-top:8px' }, addBtn),
+    summaryHost,
     stage === 'packaging' ? el('div', { class: 'help' }, reqLabel('At least one sample is required')) : null, status);
 }
 
@@ -4373,6 +4424,7 @@ async function openRun(draftSummary, opts) {
   // Section progress (chips + overall meter) at the top of the log; refreshed from
   // the server after saves so the chips only turn green once a section's required
   // fields are all saved.
+  const sampleSummary = buildSampleSummaryCard(draft?.samplePoints);
   const progressHost = el('div', {});
   function drawProgress(prog) { progressHost.innerHTML = ''; const p = stageProgress({ progress: prog }, { onSelect: key => jumpToSection(body, key) }); if (p) progressHost.append(p); }
   drawProgress(draft?.progress);
@@ -4380,6 +4432,7 @@ async function openRun(draftSummary, opts) {
   async function refreshProgress() {
     if (!draftId) return;
     try { drawProgress((await api('GET', '/production/' + draftId + '/progress')).progress); } catch (e) { /* non-critical */ }
+    sampleSummary.refresh(draftId);
   }
   const body = el('div', {},
     draft ? el('div', { class: 'summary-line', style: 'margin-bottom:10px' },
@@ -4414,7 +4467,8 @@ async function openRun(draftSummary, opts) {
         rfield('packaging', 'packagedAt', 'Packaging date and time', packagingPackagedInp),
         packagingEntriesSection.box,
         el('div', { style: 'margin-top:6px' }, packagingSaveBtn, packagingStatus))),
-    notesSection.box);
+    notesSection.box,
+    sampleSummary.box);
   notesSection.attach(body);
   filterTotes();
   renderFeedstockCards();
@@ -6930,6 +6984,55 @@ async function openSampleDetails(id) {
   }, 'Save changes', { wide: true });
 }
 
+// A "pick one or more" filter button (the look of the Feedstock Inventory column filters). `options` = [[value, label]]; nothing ticked = no filter.
+function multiFilterButton(options, get, set, onChange) {
+  const btn = el('button', { type: 'button', class: 'ms-filter', style: 'max-width:200px' });
+  let panel = null;
+  const labelOf = v => (options.find(o => o[0] === v) || [v, v])[1];
+  function paint() {
+    const chosen = get();
+    const left = options.filter(o => !chosen.includes(o[0])).map(o => o[1]);
+    btn.classList.toggle('active', chosen.length > 0 && left.length > 0);
+    btn.title = chosen.length ? chosen.map(labelOf).join(', ') : 'Filter (pick one or more)';
+    btn.replaceChildren(el('span', {}, !chosen.length || !left.length ? 'All statuses' : chosen.length <= 2 ? chosen.map(labelOf).join(', ')
+      : left.length <= 2 ? 'All except ' + left.join(', ') : chosen.length + ' selected'), el('span', { class: 'ms-caret' }, '▾'));
+  }
+  function close() { if (panel) { panel.remove(); panel = null; document.removeEventListener('mousedown', outside, true); } }
+  function outside(e) { if (panel && !panel.contains(e.target) && !btn.contains(e.target)) close(); }
+  function open() {
+    if (panel) { close(); return; }
+    panel = el('div', { class: 'ms-panel' });
+    const fill = () => {
+      panel.replaceChildren(el('button', { type: 'button', class: 'ghost ms-clear', onclick: () => { set([]); paint(); fill(); onChange(); } }, 'Show all'),
+        ...options.map(([v, text]) => {
+          const cb = el('input', { type: 'checkbox' }); cb.checked = get().includes(v);
+          cb.addEventListener('change', () => { const cur = new Set(get()); cb.checked ? cur.add(v) : cur.delete(v); set([...cur]); paint(); onChange(); });
+          return el('label', {}, cb, ' ' + text);
+        }));
+    };
+    fill(); document.body.append(panel);
+    const r = btn.getBoundingClientRect();
+    panel.style.left = Math.max(4, Math.min(r.left, innerWidth - 230)) + 'px'; panel.style.top = (r.bottom + 2) + 'px'; panel.style.minWidth = Math.max(r.width, 170) + 'px';
+    document.addEventListener('mousedown', outside, true);
+  }
+  btn.addEventListener('click', e => { e.stopPropagation(); open(); });
+  paint();
+  return btn;
+}
+// "Columns" chooser for a samples table (a per-browser preference). Columns marked `hidden` start switched off.
+function sampleColumnMenu(storeKey, cols, onChange) {
+  let shown;
+  try { const saved = JSON.parse(localStorage.getItem(storeKey)); if (Array.isArray(saved)) shown = new Set(saved); } catch (e) { /* default */ }
+  if (!shown) shown = new Set(cols.filter(c => !c.hidden).map(c => c.key));
+  const menu = el('details', { class: 'col-menu' }, el('summary', {}, '⚙ Columns'),
+    el('div', { class: 'col-menu-panel' }, ...cols.map(c => {
+      const cb = el('input', { type: 'checkbox' }); cb.checked = shown.has(c.key);
+      cb.addEventListener('change', () => { cb.checked ? shown.add(c.key) : shown.delete(c.key);
+        try { localStorage.setItem(storeKey, JSON.stringify([...shown])); } catch (e) { /* ignore */ } onChange(); });
+      return el('label', {}, cb, ' ' + c.label);
+    })));
+  return { menu, visible: () => cols.filter(c => shown.has(c.key)) };
+}
 function sampleFilterBar(f, samples, onChange, extra) {
   const uniq = k => [...new Set(samples.map(s => s[k]).filter(Boolean))].sort();
   const sel = (key, label, opts) => {
@@ -6941,12 +7044,13 @@ function sampleFilterBar(f, samples, onChange, extra) {
   return el('div', { class: 'toolbar' }, q,
     sel('run', 'All runs', uniq('processingLot').map(x => [x, x])),
     ...(extra || []).map(k => k === 'status' ? sel('status', 'All statuses', Object.entries(SAMPLE_STATUS_LABELS))
+      : k === 'statuses' ? multiFilterButton(Object.entries(SAMPLE_STATUS_LABELS), () => f.statuses || [], v => { f.statuses = v; }, onChange)
       : k === 'stage' ? sel('stage', 'All process points', [...new Set(samples.map(s => s.stageLabel))].sort().map(x => [x, x]))
       : sel('desc', 'All descriptions', uniq('description').map(x => [x, x]))));
 }
 function sampleMatches(s, f) {
   const q = (f.q || '').toLowerCase();
-  return (!f.run || s.processingLot === f.run) && (!f.status || s.status === f.status) && (!f.stage || s.stageLabel === f.stage) &&
+  return (!f.run || s.processingLot === f.run) && (!f.status || s.status === f.status) && (!(f.statuses && f.statuses.length) || f.statuses.includes(s.status)) && (!f.stage || s.stageLabel === f.stage) &&
     (!f.desc || s.description === f.desc) &&
     (!q || (s.idDetailed + ' ' + s.idSimplified + ' ' + s.code + ' ' + s.processingLot + ' ' + (s.location || '') + ' ' + (s.description || '')).toLowerCase().includes(q));
 }
@@ -7014,27 +7118,32 @@ const sdim = k => c => el('td', {}, SAMPLE_DIMS[k][1](c));
 async function drawSampleCatalogue(host) {
   const { samples } = await api('GET', '/samples?retention=0');
   const f = State.sampleFilters = State.sampleFilters || {};
+  // KW-35: samples already sent to a lab are hidden until asked for (the status filter is multi-select), so the list is what can still be used
+  if (!f.statuses) f.statuses = Object.keys(SAMPLE_STATUS_LABELS).filter(k => k !== 'submitted');
   const selected = State.sampleSel = State.sampleSel || new Set();
   const vs = sampleViewState('catalogue');
   const byId = id => samples.find(s => s.id === id);
   const bulk = sampleBulkBar(selected, byId);
   const tableHost = el('div', {}), count = el('span', { class: 'muted' });
-  const cols = [
-    { label: 'Unique ID', cell: s => el('td', { class: 'mono' }, s.code) }, { label: 'ID Detailed', cell: s => el('td', { class: 'mono' }, el('b', {}, s.idDetailed)) },
-    { label: 'ID Simplified', cell: s => el('td', { class: 'mono' }, el('b', {}, s.idSimplified)) },
-    { label: 'Run date', cell: s => el('td', {}, s.runDate) },
-    { label: 'Process point', dim: 'stage', cell: sdim('stage') }, { label: 'Type', dim: 'type', cell: sdim('type') },
-    { label: 'Description', dim: 'description', cell: sdim('description') }, { label: 'Container', dim: 'container', cell: sdim('container') },
-    { label: 'Collected', collected: true, cell: s => el('td', {}, sampleWhen(s.collectedAt)) }, { label: 'Location', cell: s => el('td', {}, s.location || '—') },
-    { label: 'Status', cell: s => el('td', {}, sampleStatusBadge(s)) }, { label: 'Requisition', cell: s => el('td', {}, s.reqNumber || '—') }];
+  // KW-34: the two label ID columns start hidden (the Unique ID identifies a sample; both are in its details window); "Columns" switches them on
+  const allCols = [
+    { key: 'code', label: 'Unique ID', cell: s => el('td', { class: 'mono' }, s.code) },
+    { key: 'idDetailed', label: 'ID Detailed', hidden: true, cell: s => el('td', { class: 'mono' }, el('b', {}, s.idDetailed)) },
+    { key: 'idSimplified', label: 'ID Simplified', hidden: true, cell: s => el('td', { class: 'mono' }, el('b', {}, s.idSimplified)) },
+    { key: 'runDate', label: 'Run date', cell: s => el('td', {}, s.runDate) },
+    { key: 'stage', label: 'Process point', dim: 'stage', cell: sdim('stage') }, { key: 'type', label: 'Type', dim: 'type', cell: sdim('type') },
+    { key: 'description', label: 'Description', dim: 'description', cell: sdim('description') }, { key: 'container', label: 'Container', dim: 'container', cell: sdim('container') },
+    { key: 'collected', label: 'Collected', collected: true, cell: s => el('td', {}, sampleWhen(s.collectedAt)) }, { key: 'location', label: 'Location', cell: s => el('td', {}, s.location || '—') },
+    { key: 'status', label: 'Status', cell: s => el('td', {}, sampleStatusBadge(s)) }, { key: 'req', label: 'Requisition', cell: s => el('td', {}, s.reqNumber || '—') }];
+  const colMenu = sampleColumnMenu('kelp.sampleCols.catalogue', allCols, () => draw());
   function draw() {
     const rows = samples.filter(s => sampleMatches(s, f));
     count.textContent = rows.length + ' of ' + samples.length + ' samples';
     tableHost.innerHTML = '';
-    tableHost.append(sampleTable(rows, cols, vs, selected, bulk, draw, 'No samples match.'));
+    tableHost.append(sampleTable(rows, colMenu.visible(), vs, selected, bulk, draw, 'No samples match.'));
   }
-  host.append(sampleFilterBar(f, samples, draw, ['status', 'stage', 'desc']), sampleViewBar(vs, ['stage', 'type', 'description', 'container'], draw),
-    el('div', { style: 'margin:6px 0' }, count), bulk.el, tableHost,
+  host.append(sampleFilterBar(f, samples, draw, ['statuses', 'stage', 'desc']), sampleViewBar(vs, ['stage', 'type', 'description', 'container'], draw),
+    el('div', { style: 'margin:6px 0;display:flex;gap:16px;align-items:center;flex-wrap:wrap' }, count, colMenu.menu), bulk.el, tableHost,
     el('div', { class: 'help', style: 'margin-top:8px' }, 'Every tube / bag logged in a finalized run’s Sample Point boxes for analysis is catalogued here with its own ID — Retention samples are kept in the Retention inventory instead. Click a row for its full history; tick samples to add them to the lab cart or set their storage location. Group the rows with the “Group by” boxes, and sort by collected date from the bar or by clicking the Collected heading.'));
   draw(); bulk.update();
 }
