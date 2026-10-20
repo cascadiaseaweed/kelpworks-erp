@@ -248,3 +248,18 @@ def test_a_missing_seed_file_stops_the_first_start(tmp_path, monkeypatch):
         assert conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0           # nothing half-built was kept: the next start seeds properly
     finally:
         conn.close()
+
+
+def test_saving_the_draft_releases_a_locked_tote_that_is_no_longer_selected(srv, admin):
+    """A tote locked by its card's own Save but left out of the saved selection used to stay WIP for good: hidden from every pick list, and finalize refused the run."""
+    totes = harvest_totes(admin, 2)
+    rid, _ = finalize_run(admin, totes, finalize=False)                                # both totes are locked to the draft
+    assert {r[0] for r in sql(srv, "SELECT status FROM tote_lots WHERE id IN (?,?)", tuple(totes))} == {"wip"}
+    keep = totes[:1]
+    body = {"sku": "KELPIVEX", "toteIds": keep, "feedstockDetails": {str(totes[0]): feedstock_detail()}, "runDate": "2026-05-04", "operators": "NW", "location": "Cold"}
+    assert admin.put("/api/production/drafts/%d" % rid, body).status == 200
+    assert sql(srv, "SELECT status, run_id FROM tote_lots WHERE id=?", (totes[1],)) == [("in_stock", None)]            # back in stock, free for any run
+    assert sql(srv, "SELECT status, run_id FROM tote_lots WHERE id=?", (totes[0],)) == [("wip", rid)]                  # the selected one stays locked
+    assert not sql(srv, "SELECT 1 FROM run_inputs WHERE run_id=? AND tote_lot_id=?", (rid, totes[1]))
+    assert sql(srv, "SELECT new_value FROM tote_stability_log WHERE tote_lot_id=? AND field='Status' ORDER BY id DESC LIMIT 1", (totes[1],)) == [("in_stock",)]
+    assert admin.post("/api/production/drafts/%d/finalize" % rid, body).status == 200                                    # and the run is no longer stuck

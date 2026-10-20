@@ -14124,7 +14124,15 @@ class Handler(BaseHTTPRequestHandler):
                 rejected_ids.append(tid)
             else:
                 kept_ids.append(tid)
-        feedstock_details = {k: v for k, v in feedstock_details.items() if int(k) not in rejected_ids}
+        # The selection saved here is the truth: a tote this draft locked as WIP (its characterization card's own Save) that is no longer selected goes back to stock. Without this
+        # such a tote stays locked to the run, is hidden from every pick list, and finalize refuses the run because the tote is "locked to this run but not included".
+        for t in conn.execute("SELECT * FROM tote_lots WHERE run_id=? AND status='wip'", (rid,)).fetchall():
+            if t["id"] in kept_ids:
+                continue
+            conn.execute("DELETE FROM run_inputs WHERE run_id=? AND tote_lot_id=?", (rid, t["id"]))
+            self._log_stability(conn, t["id"], user, "Status", "wip", "in_stock", "Removed from production run %s (no longer selected)" % processing_lot, run_id=rid)
+            conn.execute("UPDATE tote_lots SET status='in_stock', run_id=NULL WHERE id=?", (t["id"],))
+        feedstock_details = {k: v for k, v in feedstock_details.items() if int(k) in kept_ids}
         draft_data = json.dumps({"toteIds": kept_ids, "feedstockDetails": feedstock_details})
         conn.execute("UPDATE production_runs SET draft_data=? WHERE id=?", (draft_data, rid))
         return {"run": run_public(conn.execute(
