@@ -16,6 +16,15 @@ TEXT_VALUES = {"tanks": "2A", "startedAt": "2026-05-04T10:00", "packagedAt": "20
 MICROBIAL = {"apc": "<10", "yeast": "<10", "mold": "<10", "fecal": "<1", "salm": "Negative"}
 
 
+TEST_SUPPLIERS = ("Acme", "Acme Chemicals", "DuBois", "DuBois Chemicals Canada Inc.", "Island Barrels", "S", "Tote Co", "Univar", "Univar Solutions")
+
+
+def approve_suppliers(admin, cid, names=TEST_SUPPLIERS):
+    """KW-23: a delivery's supplier is chosen from the item's approved list, so a test item gets the suppliers its tests receive from."""
+    for n in names:
+        admin.post("/api/consumables/%d/suppliers" % cid, {"name": n})
+
+
 def harvest_totes(client, n=2, site="JAM", species="SL", date="2026-05-04"):
     """Check in n totes and return their ids."""
     r = client.post("/api/harvest", {"site": site, "species": species, "harvestDate": date, "toteCount": n, "totalKg": 200 * n, "location": "Cold"})

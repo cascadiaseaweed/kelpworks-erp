@@ -5560,6 +5560,39 @@ function adjustStock(c) {
     render();
   }, 'Save');
 }
+// KW-23: a delivery's supplier is chosen from the item's approved suppliers (never typed). An administrator or Production Manager maintains the list (Inventory Items > Edit, or
+// "+ Add a supplier…" while receiving).
+const canMaintainSuppliers = () => !!(State.user && (State.user.role === 'admin' || State.user.isProductionManager));
+// A <select> of `names` (the current value is kept as a choice even if it is no longer approved, so an unchanged record can be saved). `allowNew` adds "+ Add a supplier…".
+function supplierSelect(names, current, allowNew) {
+  const opts = [['', '— none —'], ...names.map(n => [n, n])];
+  if (current && !names.some(n => n.toLowerCase() === current.toLowerCase())) opts.push([current, current + ' (not on the approved list)']);
+  if (allowNew) opts.push(['__new__', '+ Add a supplier…']);
+  const s = selectFrom('', opts);
+  if (current) s.value = (opts.find(o => o[0].toLowerCase() === current.toLowerCase()) || [''])[0];
+  return s;
+}
+const supplierNames = list => (list || []).map(s => s.name);
+// Wires a "+ Add a supplier…" choice: shows a name box, and `resolve()` returns the supplier to use (adding it to the item's list first when it is new).
+function supplierPicker(c, current) {
+  const may = canMaintainSuppliers();
+  const sel = supplierSelect(supplierNames(c.suppliers), current, may);
+  const nameBox = el('input', { placeholder: 'new supplier’s name', style: 'display:none;margin-top:4px' });
+  sel.addEventListener('change', () => { nameBox.style.display = sel.value === '__new__' ? '' : 'none'; if (sel.value === '__new__') nameBox.focus(); });
+  const note = !c.suppliers.length ? el('div', { class: 'help' }, may ? 'No approved suppliers yet: choose “+ Add a supplier…”.' : 'No approved suppliers yet for this item. Ask a Production Manager or administrator to add one (Inventory Items > Edit).')
+    : (may ? null : el('div', { class: 'help' }, 'Missing a supplier? A Production Manager or administrator adds it (Inventory Items > Edit).'));
+  return {
+    node: el('div', {}, sel, nameBox, note),
+    async resolve() {
+      if (sel.value !== '__new__') return sel.value;
+      const wanted = nameBox.value.trim().replace(/\s+/g, ' ');
+      const have = (await api('GET', '/consumables/' + c.id + '/suppliers')).suppliers.find(s => s.name.toLowerCase() === wanted.toLowerCase());
+      if (have) return have.name;                                  // added meanwhile (or already there)
+      const r = await api('POST', '/consumables/' + c.id + '/suppliers', { name: nameBox.value });
+      return (r.suppliers.find(s => s.name.toLowerCase() === wanted.toLowerCase()) || { name: wanted }).name;
+    },
+  };
+}
 // Receiving stock records a LOT per supplier lot: who supplied it, the supplier's lot number, when it arrived and when it expires, and ONE delivery (invoice, PO, order, carrier, documents)
 // that all the lots of the invoice share. Every later use of the item is assigned to a lot automatically (earliest expiry first), which is what lets a recall be traced.
 async function receiveStock(c) {
@@ -5568,7 +5601,8 @@ async function receiveStock(c) {
   try { last = ((await api('GET', '/consumables/' + c.id + '/lots')).lots || [])[0] || null; } catch (e) { /* no earlier lot */ }
   const packaging = c.isContainer;
   const inp = (attrs, v) => el('input', Object.assign({}, attrs || {}, v != null ? { value: v } : {}));
-  const sup = inp({ placeholder: 'e.g. supplier name' }, last && last.supplier || ''), rec = inp({ type: 'date' }, today);
+  c = Object.assign({}, c, { suppliers: ((await api('GET', '/consumables/' + c.id + '/suppliers')).suppliers) || [] });
+  const supPick = supplierPicker(c, last && last.supplier || ''), rec = inp({ type: 'date' }, today);
   const inv = inp({ placeholder: 'supplier invoice number' }), invDate = inp({ type: 'date' }), po = inp({ placeholder: 'your PO number' }), ord = inp({ placeholder: 'supplier order / sales order' });
   const doc = inp({ placeholder: 'bill of lading / packing slip / PRO' }), car = inp({ placeholder: 'carrier' }), ship = inp({ type: 'date' });
   const code = inp({ placeholder: 'supplier product code (optional)' }, last && last.supplierItemCode || '');
@@ -5604,7 +5638,7 @@ async function receiveStock(c) {
   addRow();
   const body = el('div', {},
     el('h4', { style: 'margin:0 0 4px' }, 'Delivery'),
-    el('div', { class: 'form-row' }, field('Supplier', sup), field('Received date', rec)),
+    el('div', { class: 'form-row' }, field('Supplier', supPick.node), field('Received date', rec)),
     el('div', { class: 'form-row' }, field('Invoice number', inv), field('Invoice date', invDate)),
     el('div', { class: 'form-row' }, field('PO number', po), field('Supplier order number', ord)),
     el('div', { class: 'form-row' }, field('Delivery document no.', doc), field('Carrier', car), field('Ship date', ship)),
@@ -5626,7 +5660,8 @@ async function receiveStock(c) {
       if (p) return Object.assign(base, { packs: +r.qty.value, packId: p.id, priceBasis: 'pack' });
       return Object.assign(base, { qty: +r.qty.value, priceBasis: 'unit' });
     });
-    const r = await api('POST', '/consumables/' + c.id + '/receive', { supplier: sup.value, receivedDate: rec.value, invoiceNo: inv.value, invoiceDate: invDate.value, poNumber: po.value, orderNo: ord.value,
+    const supplier = await supPick.resolve();
+    const r = await api('POST', '/consumables/' + c.id + '/receive', { supplier, receivedDate: rec.value, invoiceNo: inv.value, invoiceDate: invDate.value, poNumber: po.value, orderNo: ord.value,
       deliveryDoc: doc.value, carrier: car.value, shipDate: ship.value, arrivalCondition: cond.value, conditionNote: condNote.value, notes: nt.value, lines });
     let msg = 'Received as ' + (r.lots.length > 1 ? r.lots.length + ' lots' : 'lot ' + r.lot.lotCode);
     if (files.files.length) {
@@ -5643,6 +5678,10 @@ async function openDelivery(lot) {
   if (!rid) rid = (await api('POST', '/lots/' + lot.id + '/receipt')).id;
   const d = await api('GET', '/receipts/' + rid);
   const f = {};
+  const itemIds = [...new Set(d.lots.map(l => l.consumableId))];
+  const approved = await Promise.all(itemIds.map(id => api('GET', '/consumables/' + id + '/suppliers').then(r => supplierNames(r.suppliers))));
+  const common = approved.length ? approved[0].filter(n => approved.every(a => a.some(x => x.toLowerCase() === n.toLowerCase()))) : [];      // approved for every item on this delivery
+  f.supplier = supplierSelect(common, d.supplier || '', false);
   const mk = (key, label, attrs) => { f[key] = el('input', Object.assign({ value: d[key] || '' }, attrs || {})); return field(label, f[key]); };
   const cond = selectFrom('', [['', '—'], ['ok', 'OK'], ['issue', 'Problem found']]); cond.value = d.arrivalCondition || '';
   const reason = el('input', { placeholder: 'required only when you change a value that was already filled in' });
@@ -5662,7 +5701,7 @@ async function openDelivery(lot) {
   } }, 'Attach');
   const body = el('div', {},
     el('div', { class: 'summary-line' }, sl('Received', d.receivedDate), sl('Entered by', d.createdBy || '—'), sl('Lots', d.lots.length)),
-    el('div', { class: 'form-row' }, mk('supplier', 'Supplier'), mk('invoiceNo', 'Invoice number'), mk('invoiceDate', 'Invoice date', { type: 'date' })),
+    el('div', { class: 'form-row' }, field('Supplier', f.supplier), mk('invoiceNo', 'Invoice number'), mk('invoiceDate', 'Invoice date', { type: 'date' })),
     el('div', { class: 'form-row' }, mk('poNumber', 'PO number'), mk('orderNo', 'Supplier order number'), mk('deliveryDoc', 'Delivery document no.')),
     el('div', { class: 'form-row' }, mk('carrier', 'Carrier'), mk('shipDate', 'Ship date', { type: 'date' }), field('Condition on arrival', cond)),
     el('div', { class: 'form-row' }, mk('conditionNote', 'If a problem, what'), mk('notes', 'Notes')),
@@ -5761,8 +5800,9 @@ function holdLot(l) {
     el('div', { class: 'help' }, l.onHold ? 'New uses will be assigned to this lot again.' : 'No new use of this item will be assigned to this lot. Use already recorded stays on the record.')),
     async () => { await api('PUT', '/lots/' + l.id, { onHold: !l.onHold, reason: reason.value }); toast('Saved'); await lotReload(l.id); }, 'Save');
 }
-function editLot(l) {
-  const sl_ = el('input', { value: l.supplierLot }), sup = el('input', { value: l.supplier || '' }), exp = el('input', { type: 'date', value: l.expiryDate || '' }), po = el('input', { value: l.poRef || '' }),
+async function editLot(l) {
+  const approvedList = supplierNames((await api('GET', '/consumables/' + l.consumableId + '/suppliers')).suppliers);
+  const sl_ = el('input', { value: l.supplierLot }), sup = supplierSelect(approvedList, l.supplier || '', false), exp = el('input', { type: 'date', value: l.expiryDate || '' }), po = el('input', { value: l.poRef || '' }),
     nt = el('input', { value: l.notes || '' }), reason = el('input', { placeholder: 'e.g. misread the label' });
   modal('Correct lot details', el('div', {}, el('div', { class: 'form-row' }, field('Supplier lot number', sl_), field('Supplier', sup)),
     el('div', { class: 'form-row' }, field('Expiry date', exp), field('PO / reference', po)), field('Notes', nt), field('Reason for the correction (required)', reason)),
@@ -5807,6 +5847,24 @@ async function materialsCard(runId) {
       : el('div', { class: 'help' }, 'No inventory usage is recorded against this run.'),
     el('div', { class: 'help' }, 'Lots are assigned when the stock is used (earliest expiry first). “No lot recorded” means stock was used that was received before lots were recorded.'));
 }
+// The item's approved suppliers: listed for everyone, changed (immediately, each change is logged) by an administrator or Production Manager.
+function supplierEditor(c) {
+  const host = el('div', { class: 'field' });
+  const draw = list => {
+    host.replaceChildren(el('label', {}, 'Approved suppliers (a delivery’s supplier is chosen from this list)'),
+      list.length ? el('div', { class: 'chips' }, ...list.map(s => el('span', { class: 'badge', style: 'margin:2px 4px 2px 0' }, s.name, ' ',
+        canMaintainSuppliers() ? el('a', { href: '#', title: 'Remove ' + s.name + ' from this item', onclick: async e => { e.preventDefault();
+          try { draw((await api('DELETE', '/consumables/' + c.id + '/suppliers/' + s.id)).suppliers); } catch (x) { toast(x.message, true); } } }, '✕') : null)))
+        : el('div', { class: 'help' }, 'None yet.'));
+    if (!canMaintainSuppliers()) { host.append(el('div', { class: 'help' }, 'A Production Manager or administrator maintains this list.')); return; }
+    const name = el('input', { placeholder: 'supplier name', style: 'max-width:260px' });
+    const add = async () => { try { draw((await api('POST', '/consumables/' + c.id + '/suppliers', { name: name.value })).suppliers); } catch (x) { toast(x.message, true); } };
+    name.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); add(); } });
+    host.append(el('div', { style: 'display:flex;gap:6px;margin-top:4px' }, name, el('button', { type: 'button', class: 'secondary', onclick: add }, '+ Add')));
+  };
+  draw(c.suppliers || []);
+  return host;
+}
 function editC(c) {
   const locs = State.ref.locations.map(l => [l, l]);
   const litresInp = c.isContainer
@@ -5828,6 +5886,7 @@ function editC(c) {
       field('Volume (L, blank if not an FG package)', litresInp),
       field('Used for Sample Point', sampleCb)) : null);
   body.querySelector('#c_loc').value = c.location || '';
+  body.append(supplierEditor(c));
   modal('Edit ' + c.name, body, async () => {
     const payload = { reorderLevel: +body.querySelector('#c_re').value, costPerUnit: body.querySelector('#c_cost').value || null, location: body.querySelector('#c_loc').value,
       itemNumber: body.querySelector('#c_itemno').value };

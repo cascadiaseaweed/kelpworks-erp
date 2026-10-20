@@ -1652,6 +1652,25 @@ CREATE TABLE IF NOT EXISTS consumable_lot_log (
     user_name  TEXT,
     created_at TEXT NOT NULL
 );
+-- Approved suppliers of an inventory item (KW-23). A delivery's supplier is chosen from this list (never typed); an administrator or Production Manager maintains it.
+CREATE TABLE IF NOT EXISTS consumable_suppliers (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    consumable_id INTEGER NOT NULL REFERENCES consumables(id) ON DELETE CASCADE,
+    name          TEXT NOT NULL,
+    created_by    TEXT,
+    created_at    TEXT NOT NULL,
+    UNIQUE (consumable_id, name COLLATE NOCASE)
+);
+-- Append-only: who added or removed an approved supplier, and when.
+CREATE TABLE IF NOT EXISTS consumable_supplier_log (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    consumable_id INTEGER NOT NULL,
+    supplier      TEXT NOT NULL,
+    action        TEXT NOT NULL,         -- added | removed
+    user_name     TEXT,
+    created_at    TEXT NOT NULL
+);
+
 -- A delivery: the supplier's invoice, PO and order numbers, the carrier and delivery document, and the documents (invoice, bill of lading, certificate of analysis, freight invoice).
 -- Every lot received from it points here (consumable_lots.receipt_id); lots received with the same supplier + invoice number share one delivery.
 CREATE TABLE IF NOT EXISTS inventory_receipts (
@@ -10144,6 +10163,36 @@ class Handler(BaseHTTPRequestHandler):
                 return u
         raise ApiError(400, "The unit must be one of: %s" % ", ".join(cls.RECEIVE_UNITS))
 
+    # ---- approved suppliers of an inventory item (KW-23) ---------------------#
+    @staticmethod
+    def _may_maintain_suppliers(user):
+        return bool(user and (user["role"] == "admin" or user["is_production_manager"]))
+
+    def _supplier_list(self, conn, cid):
+        return [{"id": s["id"], "name": s["name"]} for s in conn.execute("SELECT * FROM consumable_suppliers WHERE consumable_id=? ORDER BY name COLLATE NOCASE", (cid,))]
+
+    def _approved_supplier(self, conn, item, raw):
+        """The supplier as stored on the item's approved list (so it is always spelled the same), None when none was given; 400 when it is not approved for this item."""
+        name = ("" if raw is None else str(raw)).strip()
+        if not name:
+            return None
+        row = conn.execute("SELECT name FROM consumable_suppliers WHERE consumable_id=? AND name=? COLLATE NOCASE", (item["id"], name)).fetchone()
+        if not row:
+            raise ApiError(400, "%s is not an approved supplier of %s. Choose one from the list; a Production Manager or administrator adds approved suppliers on the item (Inventory Items > Edit)." % (name[:60], item["name"]))
+        return row["name"]
+
+    def _supplier_add(self, conn, user, cid, raw):
+        if not self._may_maintain_suppliers(user):
+            raise ApiError(403, "Only an administrator or Production Manager can change an item's approved suppliers")
+        name = re.sub(r"\s+", " ", ("" if raw is None else str(raw))).strip()[:80]
+        if not name:
+            raise ApiError(400, "Enter the supplier's name")
+        if conn.execute("SELECT 1 FROM consumable_suppliers WHERE consumable_id=? AND name=? COLLATE NOCASE", (cid, name)).fetchone():
+            raise ApiError(409, "%s is already an approved supplier of this item" % name)
+        cur = conn.execute("INSERT INTO consumable_suppliers (consumable_id,name,created_by,created_at) VALUES (?,?,?,?)", (cid, name, user["name"], now_iso()))
+        conn.execute("INSERT INTO consumable_supplier_log (consumable_id,supplier,action,user_name,created_at) VALUES (?,?,?,?,?)", (cid, name, "added", user["name"], now_iso()))
+        return {"id": cur.lastrowid, "name": name}
+
     def _receipt_clean(self, d):
         """The delivery fields present in a request body, cleaned ({column: value or None}); a field that is left out is not touched."""
         out = {}
@@ -10234,6 +10283,7 @@ class Handler(BaseHTTPRequestHandler):
         if received > today_iso():
             raise ApiError(400, "The received date cannot be in the future")
         packaging = bool(c["is_container"])                    # packaging has no supplier lot on its invoice: the invoice number stands in
+        d = dict(d, supplier=self._approved_supplier(conn, c, d.get("supplier")))      # KW-23: from the item's approved list, spelled as stored (blank stays blank)
         inv = (str(d.get("invoiceNo") or "")).strip()
         who = user["name"] if user else None
         prepared = []
@@ -10342,6 +10392,9 @@ class Handler(BaseHTTPRequestHandler):
                 d = self._body_json()
                 reason = (d.get("reason") or "").strip()
                 vals = self._receipt_clean(d)
+                if vals.get("supplier") and (vals["supplier"].lower() != (r["supplier"] or "").lower()):      # KW-23: approved for every item on this delivery
+                    for item in conn.execute("SELECT DISTINCT c.* FROM consumable_lots l JOIN consumables c ON c.id=l.consumable_id WHERE l.receipt_id=?", (r["id"],)).fetchall():
+                        vals["supplier"] = self._approved_supplier(conn, item, vals["supplier"])
                 changes = [(col, r[col], v) for col, v in vals.items() if (r[col] or None) != (v or None)]
                 if any(old for _c, old, _n in changes) and not reason:
                     raise ApiError(400, "Enter the reason for the correction")
@@ -10508,6 +10561,8 @@ class Handler(BaseHTTPRequestHandler):
                 for key, col in (("supplier", "supplier"), ("poRef", "po_ref"), ("notes", "notes")):
                     if key in d:
                         new[col] = (d.get(key) or "").strip() or None
+                if "supplier" in d and (new["supplier"] or "").lower() != (lot["supplier"] or "").lower():      # KW-23: a changed supplier must be one of the item's approved suppliers
+                    new["supplier"] = self._approved_supplier(conn, conn.execute("SELECT * FROM consumables WHERE id=?", (lot["consumable_id"],)).fetchone(), new["supplier"])
                 if "supplierLot" in d:
                     new["supplier_lot"] = (d.get("supplierLot") or "").strip()
                     if not new["supplier_lot"]:
@@ -10547,8 +10602,11 @@ class Handler(BaseHTTPRequestHandler):
                 packs = {}
                 for p in conn.execute("SELECT * FROM consumable_packs WHERE active=1 ORDER BY name"):
                     packs.setdefault(p["consumable_id"], []).append(self._pack_public(p))
+                suppliers = {}
+                for s in conn.execute("SELECT * FROM consumable_suppliers ORDER BY name COLLATE NOCASE"):
+                    suppliers.setdefault(s["consumable_id"], []).append({"id": s["id"], "name": s["name"]})
                 return {"consumables": [dict(self._consumable_public(r), sds=sds.get(r["id"], []), lotCount=lots.get(r["id"], (0, 0))[0],
-                                             lotsRemaining=round(lots.get(r["id"], (0, 0))[1], 4), packs=packs.get(r["id"], [])) for r in rows]}
+                                             lotsRemaining=round(lots.get(r["id"], (0, 0))[1], 4), packs=packs.get(r["id"], []), suppliers=suppliers.get(r["id"], [])) for r in rows]}
             if method == "POST":
                 d = self._body_json()
                 label_sku = (d.get("labelSku") or "").strip()
@@ -10618,6 +10676,24 @@ class Handler(BaseHTTPRequestHandler):
                     "untraced": round(max(0.0, c["on_hand"] - left), 4)}
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "receive" and method == "POST":
             return self._receive_lot(conn, user, int(seg[2]), self._body_json())
+        if len(seg) >= 4 and seg[2].isdigit() and seg[3] == "suppliers":          # KW-23: /api/consumables/:id/suppliers[/:supplier id]
+            cid = int(seg[2])
+            if not conn.execute("SELECT 1 FROM consumables WHERE id=?", (cid,)).fetchone():
+                raise ApiError(404, "Item not found")
+            if len(seg) == 4 and method == "GET":
+                return {"suppliers": self._supplier_list(conn, cid)}
+            if len(seg) == 4 and method == "POST":
+                self._supplier_add(conn, user, cid, self._body_json().get("name"))
+                return {"suppliers": self._supplier_list(conn, cid)}
+            if len(seg) == 5 and seg[4].isdigit() and method == "DELETE":
+                if not self._may_maintain_suppliers(user):
+                    raise ApiError(403, "Only an administrator or Production Manager can change an item's approved suppliers")
+                s = conn.execute("SELECT * FROM consumable_suppliers WHERE id=? AND consumable_id=?", (int(seg[4]), cid)).fetchone()
+                if not s:
+                    raise ApiError(404, "Supplier not found on this item")
+                conn.execute("DELETE FROM consumable_suppliers WHERE id=?", (s["id"],))
+                conn.execute("INSERT INTO consumable_supplier_log (consumable_id,supplier,action,user_name,created_at) VALUES (?,?,?,?,?)", (cid, s["name"], "removed", user["name"], now_iso()))
+                return {"suppliers": self._supplier_list(conn, cid)}
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "packs":
             cid = int(seg[2])
             if not conn.execute("SELECT 1 FROM consumables WHERE id=?", (cid,)).fetchone():

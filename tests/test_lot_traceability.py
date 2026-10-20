@@ -3,7 +3,7 @@ import datetime
 
 import pytest
 
-from factories import finished_run, release_run, sql
+from factories import approve_suppliers, finished_run, release_run, sql
 from harness import Server
 
 TODAY = datetime.date.today()
@@ -25,13 +25,17 @@ def people(srv):
 
 
 def item_id(admin, name):
-    return [c["id"] for c in admin.get("/api/consumables").json["consumables"] if c["name"] == name][0]
+    cid = [c["id"] for c in admin.get("/api/consumables").json["consumables"] if c["name"] == name][0]
+    approve_suppliers(admin, cid)                                      # idempotent: a seeded item receives from the test suppliers too
+    return cid
 
 
 def new_item(srv, admin, name):
     r = admin.post("/api/consumables", {"name": name, "unit": "kg", "onHand": 0})
     r.raise_for_status()
-    return item_id(admin, name)
+    cid = item_id(admin, name)
+    approve_suppliers(admin, cid)
+    return cid
 
 
 def receive(client, cid, qty, lot, expiry=None, supplier="Acme Chemicals", received=None, **kw):
