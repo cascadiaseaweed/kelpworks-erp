@@ -4578,6 +4578,12 @@ def migrate(conn):
         conn.execute("ALTER TABLE run_sample_points ADD COLUMN label_name TEXT")
     if "ph" not in {r["name"] for r in conn.execute("PRAGMA table_info(fg_lots)")}:     # KW-31: the lot's actual final pH (its `tds` is now the actual final TDS too)
         conn.execute("ALTER TABLE fg_lots ADD COLUMN ph REAL")
+    fgcols = {r["name"] for r in conn.execute("PRAGMA table_info(fg_lots)")}
+    # KW-32: Sugar Kelp / Macrocystis Kelp Extract (the products that use no labels) are finished goods whose SKU is assigned later, when they ship
+    for col, ddl in (("made_as", "TEXT"), ("sku_assigned", "INTEGER NOT NULL DEFAULT 1"), ("parent_lot_id", "INTEGER REFERENCES fg_lots(id)"),
+                     ("assigned_by", "TEXT"), ("assigned_at", "TEXT")):
+        if col not in fgcols:
+            conn.execute("ALTER TABLE fg_lots ADD COLUMN %s %s" % (col, ddl))
     if "min_qty" not in spcols:      # KW-13: a required (default) sample can't be removed, retyped or reduced below this many units; NULL = an ordinary row
         conn.execute("ALTER TABLE run_sample_points ADD COLUMN min_qty INTEGER")
 
@@ -5255,7 +5261,8 @@ def fg_public(r):
             "runId": r["run_id"], "packageSize": r["package_size"], "qty": r["qty"],
             "litresEach": r["litres_each"], "litres": round((r["qty"] or 0) * (r["litres_each"] or 0), 2),
             "producedDate": r["produced_date"], "tds": r["tds"], "ph": r["ph"], "location": r["location"],
-            "status": r["status"]}
+            "status": r["status"], "madeAs": r["made_as"] or r["sku_code"], "skuAssigned": r["sku_assigned"] is None or bool(r["sku_assigned"]),
+            "parentLotId": r["parent_lot_id"], "assignedBy": r["assigned_by"], "assignedAt": r["assigned_at"]}
 
 
 def run_public(r):
@@ -13491,11 +13498,69 @@ class Handler(BaseHTTPRequestHandler):
             return "on_hand"
         return "hold" if st == "rejected" else "pending_release"
 
+    def _mark_fg_assignment(self, conn, run_id):
+        """KW-32: a lot remembers what it was made as (the run's product). A product that uses no labels (Sugar Kelp / Macrocystis Kelp Extract) is finished
+        goods WITHOUT a SKU yet (`sku_assigned` 0); every other product is assigned from the start."""
+        conn.execute("UPDATE fg_lots SET made_as=sku_code,"
+                     " sku_assigned=CASE WHEN (SELECT COALESCE(uses_labels,1) FROM fg_skus WHERE code=fg_lots.sku_code)=0 THEN 0 ELSE 1 END"
+                     " WHERE run_id=? AND made_as IS NULL", (run_id,))
+
     def _sync_fg_lot_quality(self, conn, run_id):
         """KW-31: a finished-goods lot carries the run's ACTUAL final TDS and pH (the Packaging QC Check), never the product's target. Recomputed by the code that
         changes the source (finalize, a Packaging QC save under an amendment), so the card, the label and the certificate cannot disagree."""
         conn.execute("UPDATE fg_lots SET tds=(SELECT packaging_tds_pct FROM production_runs WHERE id=fg_lots.run_id),"
                      " ph=(SELECT packaging_qc_ph FROM production_runs WHERE id=fg_lots.run_id) WHERE run_id=?", (run_id,))
+        self._mark_fg_assignment(conn, run_id)
+
+    def _require_sku_signer(self, conn, user, d):
+        """Assigning a SKU decides what label the customer gets: a Production or Quality Manager, password re-entered (a signed act)."""
+        if not self._is_manager(user):
+            raise ApiError(403, "Only a Production Manager or Quality Manager can assign a SKU to finished goods")
+        if not verify_password(d.get("password") or "", user["password_hash"]):
+            raise ApiError(400, "Password is incorrect - your signature was not recorded")
+
+    def _assign_sku(self, conn, lot, sku_code, qty, user, why):
+        """KW-32: give `qty` units of an unassigned finished-goods lot the SKU they ship as. The whole lot is renamed in place (the lot number stays: it is on the IBCs);
+        part of a lot is split into a child lot (linked to its parent and the same run). The labels of that SKU + package are deducted (stock never blocks), the act is
+        written to the hash-chained audit trail. Returns the lot row that now carries the SKU."""
+        who = user["name"] if user else None
+        if lot["sku_assigned"] is not None and lot["sku_assigned"]:
+            raise ApiError(409, "%s already has its SKU (%s)" % (lot["fg_lot_number"], lot["sku_code"]))
+        if lot["status"] != "on_hand":
+            raise ApiError(400, "%s cannot be assigned a SKU: it is not released for sale (status: %s)" % (
+                lot["fg_lot_number"], "Pending Release" if lot["status"] == "pending_release" else lot["status"]))
+        sku = conn.execute("SELECT * FROM fg_skus WHERE code=? AND active=1", (sku_code,)).fetchone()
+        if not sku or not self._sku_uses_labels(conn, sku_code):
+            raise ApiError(400, "Choose a product SKU that has a finished label (for example Kelpivex, RegenaKelp or FieldKelp)")
+        qty = num(qty, lot["qty"])
+        if qty != qty or qty <= 0 or qty > lot["qty"] or abs(qty - round(qty)) > 1e-9:
+            raise ApiError(400, "Assign a whole number of units, between 1 and the %g on hand" % lot["qty"])
+        qty = int(round(qty))
+        label = conn.execute("SELECT id FROM consumables WHERE label_sku_code=? AND label_package=?", (sku_code, lot["package_size"])).fetchone()
+        if label:
+            self._consume(conn, label["id"], -qty, "FG labels (SKU assigned)", lot["fg_lot_number"], who)
+        now = now_iso()
+        if qty >= lot["qty"]:
+            conn.execute("UPDATE fg_lots SET sku_code=?, sku_assigned=1, assigned_by=?, assigned_at=? WHERE id=?", (sku_code, who, now, lot["id"]))
+            target = lot["id"]
+        else:
+            cur = conn.execute("UPDATE fg_lots SET qty=qty-? WHERE id=? AND qty>=?", (qty, lot["id"], qty))
+            if cur.rowcount != 1:
+                raise ApiError(409, "%s no longer has %d units on hand" % (lot["fg_lot_number"], qty))
+            number = self._unique_fg_lot(conn, "%s-%s" % (lot["fg_lot_number"], re.sub(r"[^A-Z0-9]", "", sku_code.upper())[:10]))
+            target = conn.execute(
+                "INSERT INTO fg_lots (fg_lot_number,sku_code,run_id,package_size,qty,litres_each,produced_date,tds,ph,location,status,created_at,"
+                "made_as,sku_assigned,parent_lot_id,assigned_by,assigned_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (number, sku_code, lot["run_id"], lot["package_size"], qty, lot["litres_each"], lot["produced_date"], lot["tds"], lot["ph"], lot["location"],
+                 lot["status"], now, lot["made_as"] or lot["sku_code"], 1, lot["id"], who, now)).lastrowid
+        new = conn.execute("SELECT * FROM fg_lots WHERE id=?", (target,)).fetchone()
+        release_log(conn, lot["run_id"] or 0, "fg_lot_sku_assigned", user,
+                    capacity="Quality Manager" if self._is_quality_manager(user) else "Production Manager",
+                    meaning="Finished goods %s (made as %s): %d unit(s) assigned the SKU %s%s." % (
+                        lot["fg_lot_number"], lot["made_as"] or lot["sku_code"], qty, sku["name"], "" if target == lot["id"] else " (split into lot %s)" % new["fg_lot_number"]),
+                    comment=why, detail={"from": lot["fg_lot_number"], "lot": new["fg_lot_number"], "madeAs": lot["made_as"] or lot["sku_code"], "sku": sku_code, "units": qty,
+                                         "labelItemDeducted": bool(label), "split": target != lot["id"]})
+        return new
 
     def _adjust_fg_lot(self, conn, run, unit, delta, unit_litres):
         lot_no = "%s-%s" % (run["processing_lot"], unit)
@@ -13507,6 +13572,7 @@ class Handler(BaseHTTPRequestHandler):
                     "tds,ph,location,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (lot_no, run["sku_code"], run["id"], unit, delta, unit_litres[unit], run["run_date"],
                      run["packaging_tds_pct"], run["packaging_qc_ph"], run["location"], self._lot_status_for_run(run), now_iso()))
+                self._mark_fg_assignment(conn, run["id"])
             return
         new_qty = (lot["qty"] or 0) + delta
         if new_qty < 0:
@@ -14148,6 +14214,13 @@ class Handler(BaseHTTPRequestHandler):
             if not it:
                 raise ApiError(404, "FG lot not found")
 
+            # /api/fg/:id/assign-sku — KW-32: give an unassigned lot (or part of it) the SKU it ships as
+            if len(seg) == 4 and seg[3] == "assign-sku" and method == "POST":
+                d = self._body_json()
+                self._require_sku_signer(conn, user, d)
+                new = self._assign_sku(conn, it, (d.get("skuCode") or "").strip(), d.get("qty"), user, (d.get("note") or "").strip() or None)
+                return {"fg": fg_public(new), "lots": [fg_public(r) for r in conn.execute("SELECT * FROM fg_lots WHERE id=? OR parent_lot_id=? ORDER BY id", (fid, fid))]}
+
             # /api/fg/:id/move — relocate units (whole lot or a partial split)
             if len(seg) == 4 and seg[3] == "move":
                 if method == "GET":
@@ -14183,10 +14256,11 @@ class Handler(BaseHTTPRequestHandler):
                             cur = conn.cursor()
                             cur.execute(
                                 "INSERT INTO fg_lots (fg_lot_number,sku_code,run_id,package_size,qty,"
-                                "litres_each,produced_date,tds,location,status,created_at)"
-                                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                                "litres_each,produced_date,tds,ph,location,status,created_at,made_as,sku_assigned,parent_lot_id,assigned_by,assigned_at)"
+                                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                 (new_lot, it["sku_code"], it["run_id"], it["package_size"], qty,
-                                 it["litres_each"], it["produced_date"], it["tds"], to, it["status"], now_iso()))
+                                 it["litres_each"], it["produced_date"], it["tds"], it["ph"], to, it["status"], now_iso(),
+                                 it["made_as"], it["sku_assigned"], it["parent_lot_id"] or it["id"], it["assigned_by"], it["assigned_at"]))
                             dest_id = cur.lastrowid
                         self._log_move(conn, "fg", fid, it["fg_lot_number"], it["location"], to, qty, date, note)
                         self._log_move(conn, "fg", dest_id, it["fg_lot_number"], it["location"], to, qty, date, note)
@@ -14319,24 +14393,37 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             if qty <= 0 or qty != qty or qty == float("inf"):
                 continue
-            wanted[fid] = wanted.get(fid, 0) + qty
-        prepared = []
-        for fid, qty in wanted.items():
+            lot_now = conn.execute("SELECT sku_assigned FROM fg_lots WHERE id=?", (fid,)).fetchone()
+            sku = "" if (not lot_now or lot_now["sku_assigned"] is None or lot_now["sku_assigned"]) else (ln.get("skuCode") or "").strip()   # KW-32: an unassigned lot ships as the SKU chosen on the line
+            wanted[(fid, sku)] = wanted.get((fid, sku), 0) + qty
+        prepared, assign_jobs, per_lot = [], [], {}
+        for (fid, sku), qty in wanted.items():
             fg = conn.execute("SELECT * FROM fg_lots WHERE id=?", (fid,)).fetchone()
             if not fg:
                 continue
+            per_lot[fid] = per_lot.get(fid, 0) + qty
             if fg["status"] != "on_hand":
                 raise ApiError(400, "%s cannot be shipped: it is not released for sale (status: %s)"
                                % (fg["fg_lot_number"], "Pending Release" if fg["status"] == "pending_release" else fg["status"]))
             rs = conn.execute("SELECT release_state FROM production_runs WHERE id=?", (fg["run_id"],)).fetchone()
             if rs and rs["release_state"] not in (None, "legacy", "released"):
                 raise ApiError(400, "%s cannot be shipped: its production run has not been released" % fg["fg_lot_number"])
-            if qty > fg["qty"]:
+            if per_lot[fid] > fg["qty"]:
                 raise ApiError(400, "Only %g of %s on hand (asked %g)"
-                               % (fg["qty"], fg["fg_lot_number"], qty))
-            prepared.append((fg, qty))
-        if not prepared:
+                               % (fg["qty"], fg["fg_lot_number"], per_lot[fid]))
+            if fg["sku_assigned"] is not None and not fg["sku_assigned"]:
+                if not sku:
+                    raise ApiError(400, "%s has no SKU yet (it was made as %s): choose the SKU it ships as" % (fg["fg_lot_number"], fg["made_as"] or fg["sku_code"]))
+                assign_jobs.append((fg, sku, qty))
+            else:
+                prepared.append((fg, qty))
+        if not prepared and not assign_jobs:
             raise ApiError(400, "Add at least one finished-goods line to ship")
+        if assign_jobs:                                           # assigning is a signed act, done in the same transaction as the shipment
+            self._require_sku_signer(conn, user, d)
+            for fg, sku, qty in assign_jobs:
+                current = conn.execute("SELECT * FROM fg_lots WHERE id=?", (fg["id"],)).fetchone()
+                prepared.append((self._assign_sku(conn, current, sku, qty, user, "Assigned when shipping"), qty))
 
         seq = conn.execute("SELECT COUNT(*) c FROM shipments").fetchone()["c"] + 1
         ship_no = (d.get("shipmentNo") or "").strip() or "SH-%s-%03d" % (ship_date.replace("-", ""), seq)

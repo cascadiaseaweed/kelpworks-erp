@@ -50,6 +50,24 @@ const el = (tag, attrs = {}, ...kids) => {
 };
 const fmt = (n, d = 0) => (n == null ? '—' : Number(n).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d }));
 const speciesName = c => { const s = (State.ref?.species || []).find(x => x.code === c); return s ? (s.common || s.name) : (c || '—'); };
+// KW-32: Sugar Kelp / Macrocystis Kelp Extract are finished goods whose SKU is assigned when they ship; until then the lot reads "<product> (no SKU yet)" (its FG label says so too).
+const fgSkuText = f => skuName(f.sku) + (f.skuAssigned === false ? ' (no SKU yet)' : '');
+// The product picker of a production run: grouped (1) no SKU yet (the products whose SKU is assigned when they ship), (2) non-organic, (3) organic. `selected` is the value
+// to start on (a new run starts on Sugar Kelp Extract). `placeholder` adds an empty first choice.
+const NEW_RUN_DEFAULT_SKU = 'SACC-LKE';
+const isOrganicSku = s => /(^|[\s-])O$/i.test((s.name || '').trim()) || /organic/i.test(s.name || '') || /-O$/i.test(s.code || '');
+function skuGroupedSelect(skus, selected, onchange, id, placeholder) {
+  const opt = s => el('option', { value: s.code }, s.name);
+  const noSku = skus.filter(s => !s.usesLabels).sort((a, b) => (b.code === NEW_RUN_DEFAULT_SKU) - (a.code === NEW_RUN_DEFAULT_SKU)), labelled = skus.filter(s => s.usesLabels);
+  const groups = [['No SKU yet (assigned when shipped)', noSku], ['Non-organic', labelled.filter(s => !isOrganicSku(s))], ['Organic', labelled.filter(isOrganicSku)]];
+  const sel = el('select', id ? { id } : {}, ...(placeholder ? [el('option', { value: '' }, placeholder)] : []),
+    ...groups.filter(([, list]) => list.length).map(([label, list]) => el('optgroup', { label }, ...list.map(opt))));
+  if (selected && skus.some(s => s.code === selected)) sel.value = selected;
+  if (onchange) sel.addEventListener('change', onchange);
+  return sel;
+}
+const labelSkus = () => (State.ref?.skus || []).filter(s => s.active && s.usesLabels);
+const skuOptions = () => [['', 'Choose the SKU…'], ...labelSkus().map(s => [s.code, s.name])];
 const skuName = c => { const s = (State.ref?.skus || []).find(x => x.code === c); return s ? s.name : (c || '—'); };
 // The sites a tote can be checked in from (active, by name); an inactive site stays in State.ref.sites so old totes still show its name.
 const activeSites = () => (State.ref?.sites || []).filter(s => s.active !== false && s.code !== 'MIX').sort((a, b) => a.name.localeCompare(b.name));
@@ -3924,7 +3942,7 @@ function buildDilutionsSection(initial, getRunId) {
 // actually exists.
 async function openNewRun() {
   const skus = State.ref.skus.filter(s => s.active);
-  const skuSel = selectFrom('', [['', 'Select a SKU…'], ...skus.map(s => [s.code, s.name])], () => renderSpecPanel(), 'nr_sku');
+  const skuSel = skuGroupedSelect(skus, NEW_RUN_DEFAULT_SKU, () => renderSpecPanel(), 'nr_sku');
   const specPanel = el('div', { class: 'summary-line' });
   function renderSpecPanel() {
     const s = skus.find(x => x.code === skuSel.value);
@@ -3971,7 +3989,7 @@ async function openNewRun() {
 async function openHistoricalRun() {
   const skus = State.ref.skus.filter(s => s.active);
   const lot = el('input', { placeholder: 'e.g. PR-20260506-012' });
-  const skuSel = selectFrom('', [['', 'Select a SKU…'], ...skus.map(s => [s.code, s.name])]);
+  const skuSel = skuGroupedSelect(skus, NEW_RUN_DEFAULT_SKU);
   const dateInp = el('input', { type: 'date', max: new Date().toISOString().slice(0, 10) });
   const locSel = productionLocationSelect('hr_loc');
   const operatorsSelect = buildOperatorsSelect('');
@@ -4012,7 +4030,7 @@ async function openRun(draftSummary, opts) {
   const totes = (await api('GET', '/totes?status=in_stock'
     + (draft && draft.id ? '&includeRunId=' + draft.id : ''))).totes;
   const skus = State.ref.skus.filter(s => s.active);
-  const skuSel = selectFrom('', skus.map(s => [s.code, s.name]),
+  const skuSel = skuGroupedSelect(skus, draft && draft.sku,
     () => { filterTotes(); renderSpecPanel(); pasteurizationSection.refresh(); dilutionSummary.refresh(); }, 'r_sku');
   if (draft && draft.sku) skuSel.value = draft.sku;
   const specPanel = el('div', { class: 'summary-line' });
@@ -4641,7 +4659,7 @@ const RELEASE_EVENTS = {
   resubmitted: 'Resubmitted for review', released: 'RELEASED for sale', release_rejected: 'Release REJECTED',
   reopened: 'Reopened', voided: 'Sign-off VOIDED (log changed)', legacy_release: 'Grandfathered as released',
   amendment_opened: 'Amendment OPENED (log unlocked)', amendment_submitted: 'Amendment submitted for review',
-  amendment_cancelled: 'Amendment cancelled', integrity_repair: 'Integrity repair applied',
+  amendment_cancelled: 'Amendment cancelled', fg_lot_sku_assigned: 'SKU assigned to finished goods', integrity_repair: 'Integrity repair applied',
   rebaseline: 'Log hash re-baselined (snapshot format change)', historical_entry: 'Entered retrospectively (historical run)',
   lab_results_added: 'Lab results entered', lab_result_voided: 'Lab result VOIDED',
   fg_lot_edited: 'Finished-goods lot edited', lab_result_hold: 'Lots put on HOLD (lab result changed after release)',
@@ -4890,11 +4908,12 @@ async function pageFG(v) {
       [allCb, 'FG lot', 'SKU', 'Pack', 'Units', 'Litres', 'TDS', 'pH', 'Produced', 'Location', 'Status', ''],
       r.fg.map(f => [
         rowCheck(f, selected, updateBulk),
-        mono(f.lot), skuName(f.sku), f.packageSize, fmt(f.qty), num(fmt(f.litres, 0)),
+        mono(f.lot), fgSkuText(f), f.packageSize, fmt(f.qty), num(fmt(f.litres, 0)),
         f.tds != null ? fmt(f.tds, 2) + '%' : '—', f.ph != null ? fmt(f.ph, 2) : '—', f.producedDate || '—', f.location || '—',
         fgStatusBadge(f.status), rowActions([
           f.status !== 'sold' ? ['Move', () => moveFG(f)] : null,
           ['Label', () => printLabels([fgLabel(f)])],
+          f.skuAssigned === false && f.status === 'on_hand' && f.qty > 0 ? ['Assign SKU', () => assignSkuModal(f)] : null,
           ['Edit', () => editFG(f)]
         ])
       ]), [false, false, false, false, true, true, false, false, false, false, false]));
@@ -4923,6 +4942,24 @@ function printLabelsFromFG() {
   const fg = (window.__fg || []).filter(f => f.status === 'on_hand');
   if (!fg.length) return toast('No on-hand finished goods.', true);
   printLabels(fg.map(f => fgLabel(f)));
+}
+// Assign the SKU an unassigned lot (or part of it) ships as: the whole lot is renamed in place, part of it is split into a child lot; the SKU's labels are deducted. A Production or
+// Quality Manager's signed act (password re-entered), recorded in the audit trail.
+function assignSkuModal(f) {
+  const skuSel = selectFrom('', skuOptions(), null, 'as_sku');
+  const qty = el('input', { type: 'number', min: '1', max: f.qty, step: '1', value: f.qty, id: 'as_qty' });
+  const note = el('input', { id: 'as_note', placeholder: 'e.g. customer order / reason (optional)' });
+  const pw = el('input', { type: 'password', autocomplete: 'off', id: 'as_pw', placeholder: 'Re-enter your password to sign' });
+  const body = el('div', {},
+    el('div', { class: 'summary-line' }, sl('Lot', f.lot), sl('Made as', skuName(f.madeAs || f.sku)), sl('Pack', f.packageSize), sl('On hand', fmt(f.qty))),
+    el('div', { class: 'help' }, 'The SKU decides which finished label the customer gets. Assigning part of the lot splits it: those units become their own lot (linked to this one), the rest stay without a SKU.'),
+    el('div', { class: 'form-row' }, field('SKU it ships as', skuSel), field('Units to assign', qty)),
+    field('Note', note), field('Password', pw));
+  modal('Assign SKU — ' + f.lot, body, async () => {
+    if (!skuSel.value) throw new Error('Choose the SKU.');
+    await api('POST', '/fg/' + f.id + '/assign-sku', { skuCode: skuSel.value, qty: +qty.value, note: note.value || null, password: pw.value });
+    toast('SKU assigned'); render();
+  }, 'Sign & assign');
 }
 function editFG(f) {
   const body = el('div', {},
@@ -4997,14 +5034,23 @@ async function newShipment() {
     el('th', {}, 'FG lot'), el('th', {}, 'Product'), el('th', {}, 'Pack'), el('th', {}, 'Location'),
     el('th', { class: 'num' }, 'On hand'), el('th', { class: 'num' }, 'Ship qty'))));
   const tb = el('tbody', {});
+  const skuInputs = {};                              // KW-32: a lot with no SKU yet ships as the SKU chosen here (assigned, and signed, when the shipment is created)
+  const signBox = el('div', { class: 'sign-box hidden' }, el('div', { class: 'help' }, 'These lots have no SKU yet. Shipping assigns the SKU you chose (and deducts its labels): a Production or Quality Manager signs it.'),
+    field('Password', el('input', { type: 'password', id: 'sh_pw', autocomplete: 'off', placeholder: 'Re-enter your password to sign' })));
   for (const f of fg) {
-    const inp = el('input', { type: 'number', min: '0', max: f.qty, value: '0', style: 'width:80px', oninput: recompute });
+    const inp = el('input', { type: 'number', min: '0', max: f.qty, value: '0', style: 'width:80px', oninput: () => { recompute(); refreshSign(); } });
     qtyInputs[f.id] = inp;
-    tb.append(el('tr', {}, el('td', { class: 'mono' }, f.lot), el('td', {}, skuName(f.sku)),
+    let productCell = el('td', {}, skuName(f.sku));
+    if (f.skuAssigned === false) {
+      skuInputs[f.id] = selectFrom('', skuOptions());
+      productCell = el('td', {}, el('div', { class: 'muted' }, skuName(f.madeAs || f.sku) + ' — ships as:'), skuInputs[f.id]);
+    }
+    tb.append(el('tr', {}, el('td', { class: 'mono' }, f.lot), productCell,
       el('td', {}, f.packageSize), el('td', {}, f.location || '—'),
       el('td', { class: 'num' }, fmt(f.qty)), el('td', { class: 'num' }, inp)));
   }
   tbl.append(tb); lineHost.append(tbl);
+  function refreshSign() { signBox.classList.toggle('hidden', !fg.some(f => skuInputs[f.id] && (+qtyInputs[f.id].value || 0) > 0)); }
   const locs = State.ref.customers.map(c => [c.id, c.name]);
   const body = el('div', {},
     el('div', { class: 'form-row' }, field('Customer', custSel),
@@ -5012,13 +5058,16 @@ async function newShipment() {
     el('div', { class: 'form-row' }, field('Carrier', el('input', { id: 'sh_carrier', placeholder: 'e.g. truck / courier' })),
       field('Tracking #', el('input', { id: 'sh_track' }))),
     field('Customer PO / reference', el('input', { id: 'sh_ref' })),
-    el('h3', { style: 'margin:14px 0 6px;font-size:14px' }, 'Finished goods to ship'), lineHost, summary,
+    el('h3', { style: 'margin:14px 0 6px;font-size:14px' }, 'Finished goods to ship'), lineHost, summary, signBox,
     field('Notes', el('textarea', { id: 'sh_notes', rows: '2' })));
   recompute();
   modal('New shipment', body, async () => {
-    const lines = fg.map(f => ({ fgLotId: f.id, qty: +qtyInputs[f.id].value || 0 })).filter(l => l.qty > 0);
+    const lines = fg.map(f => ({ fgLotId: f.id, qty: +qtyInputs[f.id].value || 0, skuCode: skuInputs[f.id] ? skuInputs[f.id].value : undefined })).filter(l => l.qty > 0);
     if (!lines.length) throw new Error('Enter a ship quantity for at least one lot.');
+    const unassigned = lines.find(l => l.skuCode === '');
+    if (unassigned) throw new Error('Choose the SKU that ' + fg.find(f => f.id === unassigned.fgLotId).lot + ' ships as.');
     const r = await api('POST', '/shipments', {
+      password: body.querySelector('#sh_pw') ? body.querySelector('#sh_pw').value : undefined,
       customerId: +custSel.value, shipDate: body.querySelector('#sh_date').value,
       carrier: body.querySelector('#sh_carrier').value || null, trackingNo: body.querySelector('#sh_track').value || null,
       reference: body.querySelector('#sh_ref').value || null, notes: body.querySelector('#sh_notes').value || null, lines
@@ -7926,7 +7975,7 @@ function toteLabel(t) {
 }
 function fgLabel(f, run) {
   return { kind: 'Finished Good — LKE', lot: f.lot, barcode: f.lot, meta: [
-    ['Product', skuName(f.sku)], ['Pack', f.packageSize], ['Units', fmt(f.qty)],
+    ['Product', fgSkuText(f)], ['Pack', f.packageSize], ['Units', fmt(f.qty)],
     ['TDS', f.tds != null ? fmt(f.tds, 2) + '%' : '—'], ['pH', f.ph != null ? fmt(f.ph, 2) : '—'], ['Produced', f.producedDate || (run && run.runDate) || '—']] };
 }
 /* ---------------- Sample labels (50 mL falcon tube) ---------------- */
