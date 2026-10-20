@@ -344,7 +344,7 @@ for `main` so a red run blocks the merge.
   Shipping, stage = the section, kind = Section / Page / View / Process Check / QC Check / Sample Point / Other box / Window, mirrored by `SOP_KIND_ORDER` in app.js; the picker (`sopPlacePicker`, `sopPlaceControls`,
   `sopPlaceGroups`) filters by area and groups by section or by kind, and is shared with the "Where SOPs are linked" table (Admin; kept MINIMIZED -- a collapsed section that is always closed when the page loads; it stays open only while you work in it, `State.sopPlacesOpen`); the production-log WINDOWS are deliberately not offered; links to places no longer listed are pruned at start) and an element with `data-sop-spot="<key>"` (app.js: sections, boxes,
   pages, `buildQualityCheckBox` opts.spot, `buildFeedstockCard` opts.sopSpot, `SAMPLE_VIEW_SPOTS`) or a window whose title starts with an entry of `SOP_WINDOW_SPOTS`; a debounced MutationObserver
-  (`applySopSlots`) puts the "SOP" line in each spot, from `refdata.sopLinks`. `tests/test_sop_links.py` fails when the two key lists differ: add a new place in BOTH. **An SOP cannot be deleted in
+  (`applySopSlots`) puts a small SOP icon (KW-12) beside the title of each spot (a QC check box's title, a window's heading, a section's summary line; a plain block gets a small icon row at its top), from `refdata.sopLinks`; clicking it opens a popup (`showSopPopup`) listing the linked SOPs, each opening its file. `tests/test_sop_links.py` fails when the two key lists differ: add a new place in BOTH. **An SOP cannot be deleted in
   KelpWorks** (`DELETE` answers 409 `controlled_in_sharepoint`: remove the file in SharePoint and the document is withdrawn) and `_update_sop` refuses a hand-uploaded file for a numbered SOP (same code).
 - **Production-log required fields** are defined once, server-side, in `PROGRESS_SECTIONS` /
   `REQUIRED_FEEDSTOCK` (`kelp_erp_server.py`; exposed to the SPA as `refdata.requiredFields`).
@@ -602,6 +602,11 @@ for `main` so a red run blocks the merge.
   Fulfilment, Insights, Admin -- each `.tab-group.g-*` has its own colour in
   `styles.css`), an entry in the `render()` map, and a `pageX(v)` function.
   There is no Labels tab: labels print from each row's Label button (`printLabels`).
+- **Dark theme** (KW-43; tests in `tests/test_theme.py`): each person's own choice, `users.theme` (`light` | `dark`, NULL = light; returned as `theme` by `/api/me` and the sign-in answer, set by `PUT /api/me/theme`), mirrored in
+  `localStorage` so the page and the sign-in screen are drawn in it at once (`applyTheme` / `toggleTheme`, the moon / sun button in the top bar); the page is `<html data-theme="dark">`. `styles.css` states every
+  hard-coded light surface / border / dark-text colour as a variable (`--bg-xxxxxx`, `--bd-xxxxxx`, `--fg-xxxxxx`: the light value in `:root`, the dark one in the `html[data-theme="dark"]` block, a test fails if one is missing) and the
+  heading colour as `--accent-text`. **Do not hard-code a light colour for a background, border or dark text in CSS or an inline style: use one of these variables (or a new pair, with its dark value).** The Quality Control charts
+  are SVG with fixed colours; their dark-mode overrides are attribute selectors at the end of `styles.css`. Print windows and the document previews stay light on purpose.
 
 ## Domain model (key tables)
 

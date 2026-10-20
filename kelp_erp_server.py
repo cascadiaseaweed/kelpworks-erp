@@ -4416,6 +4416,8 @@ def migrate(conn):
             conn.execute("INSERT INTO user_permission_log (user_id,user_email,permission,old_value,new_value,changed_by,changed_at)"
                          " VALUES (?,?,?,?,?,?,?)", (u["id"], u["email"], "Production Log Amender", 0, 1,
                                                     "SYSTEM (migration: existing managers)", now_iso()))
+    if "theme" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN theme TEXT")                    # KW-43: 'light' | 'dark', each person's own choice (NULL = light)
     prcols = {r["name"] for r in conn.execute("PRAGMA table_info(production_runs)")}
     if "status" not in prcols:
         conn.execute("ALTER TABLE production_runs ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'")
@@ -7483,6 +7485,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._me(user)
         if method == "POST" and seg == ["api", "me", "password"]:
             return self.change_my_password(conn, user)
+        if method == "PUT" and seg == ["api", "me", "theme"]:             # KW-43: the person's own display choice; nothing else is touched
+            theme = self._body_json(1024).get("theme")
+            if theme not in ("light", "dark"):
+                raise ApiError(400, "Theme must be light or dark")
+            conn.execute("UPDATE users SET theme=? WHERE id=?", (theme, user["id"]))
+            return {"theme": theme}
         if seg[:2] == ["api", "users"]:
             return self.route_users(method, seg, conn, user)
         if method == "GET" and seg == ["api", "refdata"]:
@@ -7622,7 +7630,8 @@ class Handler(BaseHTTPRequestHandler):
                 "role": row["role"], "mustChange": bool(row["must_change_password"]),
                 "isProductionManager": bool(row["is_production_manager"]),
                 "isQualityManager": bool(row["is_quality_manager"]),
-                "canAmendLog": bool(row["can_amend_log"])}
+                "canAmendLog": bool(row["can_amend_log"]),
+                "theme": "dark" if row["theme"] == "dark" else "light"}
 
     def route_presence(self, conn, user):
         """POST /api/presence {tab, open: [{key, label}]}: this browser tab is here and has these cards open (replaces what it said before; an empty list = left them all).

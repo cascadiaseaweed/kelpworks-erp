@@ -238,6 +238,23 @@ function idleStart() { Idle.last = Date.now(); Idle.pinged = 0; clearInterval(Id
 function idleStop() { clearInterval(Idle.timer); Idle.timer = null; idleHideWarning(); }
 
 /* ---------------- Auth / shell ---------------- */
+// Light / dark theme (KW-43): each person's own choice, kept on their account (users.theme) and mirrored in this browser so the page (and the sign-in screen) is drawn in it at once.
+const THEME_KEY = 'kelp_theme';
+function applyTheme(theme) {
+  const dark = theme === 'dark';
+  document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  const b = document.getElementById('themeToggle');
+  if (b) { b.textContent = dark ? '☀️' : '🌙'; b.title = dark ? 'Switch to the light theme' : 'Switch to the dark theme'; }
+  try { localStorage.setItem(THEME_KEY, dark ? 'dark' : 'light'); } catch (e) { /* private window: the account setting still applies */ }
+}
+function currentTheme() { return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light'; }
+applyTheme((() => { try { return localStorage.getItem(THEME_KEY); } catch (e) { return null; } })());
+async function toggleTheme() {
+  const next = currentTheme() === 'dark' ? 'light' : 'dark';
+  applyTheme(next);
+  if (State.token) { try { await api('PUT', '/me/theme', { theme: next }); } catch (e) { toast('The theme could not be saved to your account: ' + e.message, true); } }
+}
+document.getElementById('themeToggle').addEventListener('click', toggleTheme);
 function logout(message) {
   presenceLeave(); presenceStop(); idleStop();
   State.token = null; State.user = null; localStorage.removeItem(TOKEN_KEY); show('login');
@@ -251,7 +268,7 @@ $('#loginForm').addEventListener('submit', async e => {
   e.preventDefault(); $('#loginError').textContent = '';
   try {
     const r = await api('POST', '/auth/login', { email: $('#email').value, password: $('#password').value });
-    State.token = r.token; localStorage.setItem(TOKEN_KEY, r.token); State.user = r.user;
+    State.token = r.token; localStorage.setItem(TOKEN_KEY, r.token); State.user = r.user; applyTheme(r.user.theme);
     await boot();
   } catch (err) { $('#loginError').textContent = err.message; }
 });
@@ -266,7 +283,7 @@ function selectTab(tab) {
 
 async function boot() {
   try {
-    State.user = (await api('GET', '/me'));
+    State.user = (await api('GET', '/me')); applyTheme(State.user.theme);
     if (State.user.mustChange) {
       $('#whoName').textContent = State.user.name;
       show('app');
@@ -962,7 +979,7 @@ async function openFeedstockImport() {
     if (ok) {
       report.append(el('div', { class: 'sign-box' }, el('b', {}, '✔ ' + r.count + ' tote(s) can be imported.'),
         el('div', { class: 'help' }, 'Lot numbers: ' + r.lots.slice(0, 6).join(', ') + (r.lots.length > 6 ? ' … and ' + (r.lots.length - 6) + ' more' : '')),
-        ...(r.warnings || []).map(w => el('div', { class: 'help', style: 'color:#8a5a00' }, '⚠ ' + w))));
+        ...(r.warnings || []).map(w => el('div', { class: 'help', style: 'color:var(--fg-8a5a00)' }, '⚠ ' + w))));
       return;
     }
     const shown = r.problems || [];
@@ -1454,35 +1471,50 @@ function sopDownloadUrl(sid, dl) {
     (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(dlToken());
 }
 // SOP links: an administrator chooses which SOPs are linked at each place of the production log, the CIP log, Samples and Shipping (Admin > SOPs). A spot is any element carrying
-// data-sop-spot="<key>" (a section, a box) or a window whose title starts with one of SOP_WINDOW_SPOTS: a small "SOP" line with links to the SOPs'
-// current files is placed in it automatically (and kept up to date as the page changes). The keys are SOP_SPOTS on the server; a test keeps both lists in step.
+// data-sop-spot="<key>" (a section, a box) or a window whose title starts with one of SOP_WINDOW_SPOTS: a small SOP icon (KW-12) is placed next to its title automatically (and kept
+// up to date as the page changes); clicking it lists the SOPs linked there, each opening its current file. The keys are SOP_SPOTS on the server; a test keeps both lists in step.
 const SOP_WINDOW_SPOTS = [['Log CIP', 'cip.event_window'], ['Edit CIP —', 'cip.event_window'], ['Sample —', 'samples.sample_window'],
   ['Preview requisition —', 'samples.requisition_window'], ['Requisition REQ-', 'samples.requisition_window'], ['Requisitions created', 'samples.requisition_window'],
   ['New shipment', 'shipping.shipment_window'], ['Edit shipment —', 'shipping.shipment_window']];
 const SAMPLE_VIEW_SPOTS = { catalogue: 'samples.catalogue', retention: 'samples.retention', cart: 'samples.cart', requisitions: 'samples.requisitions' };
+const sopLabel = s => (s.docNumber ? s.docNumber + ' ' : '') + s.name + (s.revision ? ' (rev ' + s.revision + ')' : '');
+const sopsAt = spot => ((State.ref && State.ref.sopLinks && State.ref.sopLinks[spot]) || []).map(id => (State.ref.sops || []).find(s => s.id === id)).filter(Boolean);
+// The list shown when an SOP icon is clicked: a small popup under the icon, closed by a click elsewhere, Escape or a scroll of the page.
+function showSopPopup(anchor, sops) {
+  document.querySelectorAll('.sop-popup').forEach(p => p.remove());
+  const items = sops.map(s => s.status === 'withdrawn' ? el('div', { class: 'sop-popup-item muted', title: 'This SOP has been withdrawn' }, '📄 ' + sopLabel(s) + ' — withdrawn')
+    : !s.hasFile ? el('div', { class: 'sop-popup-item muted' }, '📄 ' + sopLabel(s) + ' — no file yet')
+    : el('a', { class: 'sop-popup-item', href: sopDownloadUrl(s.id, false), target: '_blank', rel: 'noopener' }, '📄 ' + sopLabel(s)));
+  const pop = el('div', { class: 'sop-popup', role: 'menu' }, el('div', { class: 'sop-popup-head' }, sops.length === 1 ? 'SOP for this section' : 'SOPs for this section'), ...items);
+  document.body.append(pop);
+  const r = anchor.getBoundingClientRect();
+  pop.style.top = Math.min(r.bottom + 6, window.innerHeight - pop.offsetHeight - 8) + 'px';
+  pop.style.left = Math.max(8, Math.min(r.left, window.innerWidth - pop.offsetWidth - 8)) + 'px';
+  const close = e => { if (e && e.type === 'keydown' && e.key !== 'Escape') return; if (e && e.type === 'click' && (pop.contains(e.target) || anchor.contains(e.target))) return;
+    pop.remove(); document.removeEventListener('click', close, true); document.removeEventListener('keydown', close, true); window.removeEventListener('scroll', close, true); };
+  setTimeout(() => { document.addEventListener('click', close, true); document.addEventListener('keydown', close, true); window.addEventListener('scroll', close, true); });
+}
 function sopSlotNode(spot) {
-  const ids = (State.ref && State.ref.sopLinks && State.ref.sopLinks[spot]) || [];
-  const sops = ids.map(id => (State.ref.sops || []).find(s => s.id === id)).filter(Boolean);
+  const sops = sopsAt(spot);
   if (!sops.length) return null;
-  const label = s => (s.docNumber ? s.docNumber + ' ' : '') + s.name + (s.revision ? ' (rev ' + s.revision + ')' : '');
-  const items = sops.map(s => s.status === 'withdrawn' ? el('span', { class: 'muted', title: 'This SOP has been withdrawn' }, '📄 ' + label(s) + ' — withdrawn')
-    : !s.hasFile ? el('span', { class: 'muted' }, '📄 ' + label(s) + ' — no file yet')
-    : el('a', { href: sopDownloadUrl(s.id, false), target: '_blank', rel: 'noopener' }, '📄 ' + label(s)));
-  return el('div', { class: 'sop-slot' }, el('span', { class: 'sop-slot-label' }, 'SOP'), ...items.flatMap((x, i) => [i ? ' · ' : null, x]));
+  const btn = el('button', { type: 'button', class: 'sop-icon', title: 'SOP: ' + sops.map(sopLabel).join(' · '), 'aria-label': 'Show the SOPs for this section' }, '📄');
+  btn.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); showSopPopup(btn, sopsAt(spot)); });         // inside an accordion summary: do not open / close the section
+  return btn;
 }
 function applySopSlots(root) {
   (root || document).querySelectorAll('[data-sop-spot]').forEach(host => {
     const want = sopSlotNode(host.getAttribute('data-sop-spot'));
-    const have = host._sopSlot;
-    if (have && want && have.isConnected && have.textContent === want.textContent && have.innerHTML === want.innerHTML) return;   // already showing the same thing
+    const have = host._sopSlot, sig = want ? want.title : '';
+    if (have && want && have.isConnected && host._sopSig === sig) return;                  // already showing the same thing
     if (have) have.remove();
-    host._sopSlot = want;
+    host._sopSlot = want; host._sopSig = sig;
     if (!want) return;
-    let at = null;                                                       // where in the element: after a box's title / subtitle, at the top of a section or window
-    if (host.classList.contains('qc-check-box')) at = host.querySelector(':scope > .qc-check-subtitle') || host.querySelector(':scope > .qc-check-title');
-    else if (host.classList.contains('modal')) at = host.querySelector(':scope > h3');
-    if (at) at.after(want);
-    else (host.querySelector(':scope > .accordion-body') || host).prepend(want);
+    // where in the element: beside the title of a QC check box, of a window, or of a section (its summary line); a plain block gets a small right-aligned icon row at its top
+    const title = host.classList.contains('qc-check-box') ? host.querySelector(':scope > .qc-check-title')
+      : host.classList.contains('modal') ? host.querySelector(':scope > h3')
+      : host.tagName === 'DETAILS' ? host.querySelector(':scope > summary') : null;
+    if (title) title.append(want);
+    else { const row = el('div', { class: 'sop-icon-row' }, want); host._sopSlot = row; host.prepend(row); }
   });
 }
 let sopSlotTimer = null;
@@ -6746,7 +6778,7 @@ async function pageCalculations(v) {
   CALCULATIONS.forEach(c => {
     v.append(el('div', { class: 'card' },
       el('h3', {}, c.title),
-      el('div', { class: 'mono', style: 'background:#f6faf9;border-radius:8px;padding:10px 12px;margin-bottom:10px;white-space:pre-wrap;font-size:13px' }, c.formula),
+      el('div', { class: 'mono', style: 'background:var(--bg-f6faf9);border-radius:8px;padding:10px 12px;margin-bottom:10px;white-space:pre-wrap;font-size:13px' }, c.formula),
       el('div', { style: 'margin-bottom:6px' }, c.description),
       el('div', { class: 'muted', style: 'font-size:12px' }, 'Found in: ' + c.location),
       c.settings.length ? el('div', { class: 'muted', style: 'font-size:12px;margin-top:4px' },
@@ -7627,7 +7659,7 @@ function labTemplateModal(l) {
     el('div', { class: 'help' }, l.hasTemplate ? 'Current template: ' + l.templateName : 'No template uploaded — requisitions use the built-in layout.'),
     l.hasTemplate ? el('div', { style: 'margin:6px 0' }, el('a', { href: '/api/labs/' + l.id + '/template/download?token=' + encodeURIComponent(dlToken()) }, '⬇ Download current template'),
       '  ', el('button', { class: 'secondary', onclick: async () => { await api('DELETE', '/labs/' + l.id + '/template'); toast('Template removed'); document.querySelector('.modal-bg')?.remove(); render(); } }, 'Remove')) : null,
-    l.readyTemplate ? el('div', { style: 'margin:8px 0;padding:10px 12px;background:#eef8f6;border-radius:10px' }, el('b', {}, 'Ready-made form available'),
+    l.readyTemplate ? el('div', { style: 'margin:8px 0;padding:10px 12px;background:var(--bg-eef8f6);border-radius:10px' }, el('b', {}, 'Ready-made form available'),
       el('div', { class: 'help' }, l.readyTemplate + ' — the lab’s own form with the placeholders already in place.'),
       el('button', { type: 'button', style: 'margin-top:6px', onclick: () => useReadyTemplate(l, async () => { document.querySelector('.modal-bg')?.remove(); render(); }) }, 'Use this form for ' + l.name)) : null,
     field('Upload a Word template (.docx)', file), out,
