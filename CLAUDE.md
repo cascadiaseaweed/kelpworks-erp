@@ -407,6 +407,10 @@ for `main` so a red run blocks the merge.
   run-level Ksorbate/benzoate totals = pass 1 + all extra passes, so the reagent deduction covers every pass (each pass also has its own pH balancing: measured pH + citric acid added, with the
   citric acid summed into the run's citric usage by `_commit_reagent_usage`). Pass items are
   required-field items in the Dilution & Preservation section, and `dilutionPasses` is part of the signed-log snapshot.
+  **Small dilution tweaks** (KW-19 / KW-20 / KW-21; tests in `tests/test_dilution_tweaks.py`): the plan's "TDS concentrated" follows the Separation filtrate TDS AS IT IS TYPED (`separationTds(stages)`: the live value
+  `stages.separation.liveLiquidTdsPct` kept by the Separation section, else the saved `liquidTdsPct`), not only after Separation is saved; the preservative totals are an `amountTile` (litres, with the kilograms the
+  stock solution holds on the line under it); a preservative whose SKU target is 0 starts at 0 in each tank's "added (L)" box (`zeroFillIfNotUsed`: only a blank box, taken away again if the SKU changes to one
+  that uses it) while a preservative the product needs stays blank and required. A 0 counts as entered, and `_commit_reagent_usage` writes no ledger line for a 0 net change.
 - **Pre-Processing (shred + blend)** (`preproc_batches` / `preproc_inputs` / `preproc_packaging`, `route_preproc`,
   `/api/preproc`, the "Pre-Processing" tab: batches are cards like production runs -- `pagePreproc` / `preprocDraftCard` (section chips from `_preproc_progress`, the same `stageProgress` component) / `preprocDoneCard` -- and `openPreprocBatch` opens the editor / batch record in a wide window) turns coarse-grind feedstock into
   fine-grind feedstock (harvest check-in / CSV import set `grind`, default Coarse; check-in no longer has a storage-unit source or deducts empty-IBC stock). A draft batch pulls coarse or whole totes (`tote_lots.grind` Coarse or Whole, in stock, not on QAQC Hold) from a

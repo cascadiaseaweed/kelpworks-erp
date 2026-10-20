@@ -2234,6 +2234,8 @@ function dilutionPlanCalc(p) {
   return out;
 }
 const round10 = v => Math.round(v / 10) * 10;
+// The Separation filtrate TDS the dilution plan works from: what is typed in Separation right now, else what was saved (KW-19).
+const separationTds = stages => { const s = stages && stages.separation; return s ? (s.liveLiquidTdsPct !== undefined ? s.liveLiquidTdsPct : s.liquidTdsPct) : undefined; };
 const fmtL = v => v == null ? null : fmt(round10(v), 0) + ' L';
 
 // Pasteurization: "Start Conditions" groups the stage's process parameters
@@ -2645,6 +2647,9 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot, o
   }, { omitSlurrySolids: true, reqStage: 'separation', spot: 'production.separation.filtrate_qc', keyMap: {
     qcPh: 'liquidQcPh', tdsPct: 'liquidTdsPct', brixPct: 'liquidBrixPct', mannitolPct: 'liquidMannitolPct',
     tsLiquidPct: 'liquidTsLiquidPct', rhoLiquidGMl: 'liquidRhoLiquidGMl' } });
+  // KW-19: the dilution plan (Pasteurization, extra passes) reads the filtrate TDS from the shared stages.separation object; keep a live copy of what is typed so the plan fills in
+  // before this section is saved (Save then makes it the stored value)
+  liquidQc.box.addEventListener('input', () => { values.liveLiquidTdsPct = liquidQc.getPayload().tdsPct; if (onSaved) onSaved(); });
 
   const status = el('span', { class: 'help' });
   const saveBtn = el('button', { type: 'button', class: 'secondary section-save', onclick: save }, 'Save');
@@ -2669,6 +2674,7 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot, o
       // keep the shared stages.separation object current and let Pasteurization's dilution plan
       // re-read the filtrate TDS right now, not just next time the window is opened
       Object.assign(values, sepPayload);
+      delete values.liveLiquidTdsPct;
       if (onSaved) onSaved();
       status.textContent = 'Saved.';
     } catch (e) { status.textContent = e.message; }
@@ -3512,6 +3518,26 @@ function buildReagentWatch(runId, selected) {
   };
   return w;
 }
+// KW-20: a preservative amount reads as the stock solution added (L) with the preservative it holds (kg) on the line under it, instead of two bold figures side by side.
+function amountTile() {
+  const main = el('span', { class: 'help' }), sub = el('span', { class: 'amount-sub' });
+  return { node: el('span', { class: 'amount-tile' }, main, sub),
+    set(litres, kg, what) {
+      main.className = litres != null ? 'qc-check-result-value' : 'help';
+      main.textContent = litres != null ? formatQcValue(litres, 2) + ' L' : '—';
+      sub.textContent = litres != null && kg != null ? '= ' + formatQcValue(kg, 2) + ' kg ' + what : '';
+    } };
+}
+// KW-21: a preservative the product does not use (its SKU target is 0) starts at 0 in each tank's box, so nothing has to be typed for it. Only a blank box is filled, a value the person
+// typed is never touched, and a 0 put here is taken away again if the SKU changes to one that uses the preservative.
+function zeroFillIfNotUsed(inputs, target) {
+  const unused = target != null && +target === 0;
+  Object.values(inputs).forEach(i => {
+    if (!i._autoWired) { i._autoWired = true; i.addEventListener('input', () => { delete i.dataset.auto; }); }
+    if (unused && i.value.trim() === '') { i.value = formatQcValue(0, 2); i.dataset.auto = '1'; }
+    else if (!unused && i.dataset.auto === '1') { i.value = ''; delete i.dataset.auto; }
+  });
+}
 function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsorbateTarget, getPlan, getNabenzoateTarget, runId) {
   values = values || {};
   const numOf = inp => inp.value.trim() === '' ? null : qcParseValue(inp.value);
@@ -3565,7 +3591,7 @@ function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsor
     rowT[t].tr = el('tr', {}, el('td', {}, el('b', {}, 'Tank ' + t)), el('td', { class: 'num' }, rowT[t].fin),
       el('td', { class: 'num' }, rowT[t].ksCalc), el('td', {}, ks[t]), el('td', { class: 'num' }, rowT[t].nbCalc), el('td', {}, nb[t]));
   });
-  const ksTotalL = tile(), ksTotalKg = tile(), nbTotalL = tile(), nbTotalKg = tile();
+  const ksAmt = amountTile(), nbAmt = amountTile();
   const changeCbs = [];
 
   const finalIn = t => numOf(t === '6A' ? final6aInp : final6bInp);
@@ -3604,6 +3630,7 @@ function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsor
 
   function refresh() {
     refreshTargetPh();
+    zeroFillIfNotUsed(ks, getKsorbateTarget()); zeroFillIfNotUsed(nb, getNabenzoateTarget ? getNabenzoateTarget() : null);
     const { p, a, b } = used();
     const c = p.calc || {};
     noPlanNote.textContent = p.receiving ? '' : 'Choose the receiving tank(s) and enter the tank levels in Pasteurization → Dilution plan first; the tank fields for this section then appear here.'
@@ -3639,10 +3666,8 @@ function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsor
     });
     const kL = sumAdded(ks), nL = sumAdded(nb);
     const ksPct = numOf(ksorbateStockInp), nbPct = numOf(nabenzoateStockInp);
-    setTile(ksTotalL, kL != null ? formatQcValue(kL, 2) + ' L' : null);
-    setTile(ksTotalKg, kL != null && ksPct != null ? formatQcValue(kL * ksPct / 100, 2) + ' kg' : null);
-    setTile(nbTotalL, nL != null ? formatQcValue(nL, 2) + ' L' : null);
-    setTile(nbTotalKg, nL != null && nbPct != null ? formatQcValue(nL * nbPct / 100, 2) + ' kg' : null);
+    ksAmt.set(kL, kL != null && ksPct != null ? kL * ksPct / 100 : null, 'potassium sorbate');
+    nbAmt.set(nL, nL != null && nbPct != null ? nL * nbPct / 100 : null, 'sodium benzoate');
     reagentWatch.setUsage('Potassium Sorbate', 'main', kL != null && ksPct != null ? kL * ksPct / 100 : 0);
     reagentWatch.setUsage('Sodium Benzoate', 'main', nL != null && nbPct != null ? nL * nbPct / 100 : 0);
     changeCbs.forEach(cb => cb());
@@ -3721,8 +3746,8 @@ function buildDilutionAndPreservativesBox(getRunId, values, getTargetPh, getKsor
           el('th', { class: 'num' }, 'Benzoate calc.'), el('th', {}, reqLabel('Benzoate added (L)')))),
         el('tbody', {}, rowT['6A'].tr, rowT['6B'].tr))),
       el('div', { class: 'qc-check-box' },
-        resultRow('Ksorbate added, total', el('span', {}, ksTotalL, ' ', ksTotalKg)), ksNote,
-        resultRow('Sodium benzoate added, total', el('span', {}, nbTotalL, ' ', nbTotalKg)), nbNote),
+        resultRow('Ksorbate added, total', ksAmt.node), ksNote,
+        resultRow('Sodium benzoate added, total', nbAmt.node), nbNote),
       el('div', { class: 'qc-check-section-title' }, 'pH Balancing'),
       el('div', { class: 'form-row' },
         rfield('dilution', 'measuredPh', 'Measured pH', measuredPhInp), field('Target pH', targetPhValue)),
@@ -3777,7 +3802,7 @@ function buildDilutionPassCard(pass, ctx) {
     rowT[t].tr = el('tr', {}, el('td', {}, el('b', {}, 'Tank ' + t)), el('td', { class: 'num' }, rowT[t].fin),
       el('td', { class: 'num' }, rowT[t].ksCalc), el('td', {}, ks[t]), el('td', { class: 'num' }, rowT[t].nbCalc), el('td', {}, nb[t]));
   });
-  const ksTotal = tile(), nbTotal = tile();
+  const ksAmt = amountTile(), nbAmt = amountTile();
   let lastCalc = null;
 
   const used = () => { const r = recvSel.value; return { r, a: usesTank(r, '6A'), b: usesTank(r, '6B') }; };
@@ -3808,6 +3833,7 @@ function buildDilutionPassCard(pass, ctx) {
   }
   function refresh() {
     const u = used(), p = planOf(), c = lastCalc = dilutionPlanCalc(p);
+    { const st0 = ctx.getStock(); zeroFillIfNotUsed(ks, st0.ksTarget); zeroFillIfNotUsed(nb, st0.nbTarget); }
     const tph = ctx.getTargetPh ? ctx.getTargetPh() : null;
     targetPhTile.textContent = tph != null ? formatQcValue(tph, 1) : '—';
     sA.classList.toggle('hidden', !u.a); sB.classList.toggle('hidden', !u.b);
@@ -3839,8 +3865,8 @@ function buildDilutionPassCard(pass, ctx) {
       setTile(rowT[t].ksCalc, k != null ? formatQcValue(k, 2) + ' L' : null); setTile(rowT[t].nbCalc, n != null ? formatQcValue(n, 2) + ' L' : null);
     });
     const kL = addedSum(ks), nL = addedSum(nb), st = ctx.getStock();
-    setTile(ksTotal, kL != null ? formatQcValue(kL, 2) + ' L' + (st.ksPct != null ? '  ·  ' + formatQcValue(kL * st.ksPct / 100, 2) + ' kg' : '') : null);
-    setTile(nbTotal, nL != null ? formatQcValue(nL, 2) + ' L' + (st.nbPct != null ? '  ·  ' + formatQcValue(nL * st.nbPct / 100, 2) + ' kg' : '') : null);
+    ksAmt.set(kL, kL != null && st.ksPct != null ? kL * st.ksPct / 100 : null, 'potassium sorbate');
+    nbAmt.set(nL, nL != null && st.nbPct != null ? nL * st.nbPct / 100 : null, 'sodium benzoate');
     if (rw) {
       rw.setUsage('Citric Acid', pk, numOf(citricInp));
       rw.setUsage('Potassium Sorbate', pk, kL != null && st.ksPct != null ? kL * st.ksPct / 100 : 0);
@@ -3898,7 +3924,7 @@ function buildDilutionPassCard(pass, ctx) {
       el('thead', {}, el('tr', {}, el('th', {}, 'Tank'), el('th', { class: 'num' }, 'Final volume'), el('th', { class: 'num' }, 'Ksorbate calc.'),
         el('th', {}, reqLabel('Ksorbate added (L)')), el('th', { class: 'num' }, 'Benzoate calc.'), el('th', {}, reqLabel('Benzoate added (L)')))),
       el('tbody', {}, rowT['6A'].tr, rowT['6B'].tr))),
-    resultRow('Ksorbate added, this pass', ksTotal), kNote, resultRow('Sodium benzoate added, this pass', nbTotal), bNote,
+    resultRow('Ksorbate added, this pass', ksAmt.node), kNote, resultRow('Sodium benzoate added, this pass', nbAmt.node), bNote,
     el('div', { class: 'qc-check-section-title' }, 'pH Balancing (this pass)'),
     el('div', { class: 'form-row-3' }, field(reqLabel('Measured pH'), phInp), field('Target pH', targetPhTile),
       field(reqLabel('Citric acid added (kg)'), el('div', {}, citricInp, cNote))),
@@ -4325,7 +4351,7 @@ async function openRun(draftSummary, opts) {
   const pasteurizationSection = buildPasteurizationSection(
     ensureRunId, stages.pasteurization, draft?.samplePoints || [], draft?.processingLot,
     () => skus.find(x => x.code === skuSel.value)?.tdsTarget,
-    () => stages.separation?.liquidTdsPct);
+    () => separationTds(stages));
   pasteurizationSectionRef = pasteurizationSection;
   const dilutionSummary = buildDilutionAndPreservativesBox(
     ensureRunId, stages.dilution,
@@ -4337,7 +4363,7 @@ async function openRun(draftSummary, opts) {
   dilutionSummary.refresh();
   const dilutionPasses = buildDilutionPassesSection(draft?.dilutionPasses || [], ensureRunId, {
     reagentWatch: dilutionSummary.reagentWatch,
-    getTdsConc: () => stages.separation?.liquidTdsPct, getTdsTarget: () => skus.find(x => x.code === skuSel.value)?.tdsTarget,
+    getTdsConc: () => separationTds(stages), getTdsTarget: () => skus.find(x => x.code === skuSel.value)?.tdsTarget,
     ensureSaved: async () => {
       const b = pasteurizationSection.box.querySelector('button.section-save');
       b.click(); for (let i = 0; i < 100 && b.disabled; i++) await new Promise(r => setTimeout(r, 50));
@@ -4575,7 +4601,7 @@ async function openProcessLog(run, section) {
   const pasteurizationSection = buildPasteurizationSection(
     getRunId, stages.pasteurization, run.samplePoints || [], run.processingLot,
     () => run.targetTds,
-    () => stages.separation?.liquidTdsPct);
+    () => separationTds(stages));
   pasteurizationSectionRef = pasteurizationSection;
   const dilutionSummary = buildDilutionAndPreservativesBox(
     getRunId, stages.dilution,
@@ -4587,7 +4613,7 @@ async function openProcessLog(run, section) {
   dilutionSummary.refresh();
   const dilutionPasses = buildDilutionPassesSection(run.dilutionPasses || [], getRunId, {
     reagentWatch: dilutionSummary.reagentWatch,
-    getTdsConc: () => stages.separation?.liquidTdsPct, getTdsTarget: () => run.targetTds,
+    getTdsConc: () => separationTds(stages), getTdsTarget: () => run.targetTds,
     ensureSaved: async () => {
       const b = pasteurizationSection.box.querySelector('button.section-save');
       b.click(); for (let i = 0; i < 100 && b.disabled; i++) await new Promise(r => setTimeout(r, 50));

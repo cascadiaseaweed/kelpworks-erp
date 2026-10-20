@@ -407,6 +407,8 @@ th.sortable:hover { background: var(--bg-e2ece9); }
 .sample-summary .tablewrap { display: inline-block; max-width: 100%; vertical-align: top; }        /* fit the table: no empty white space beside it */
 .sample-summary table { width: auto; }
 .sample-summary-line { margin-top: 8px; font-size: 13px; }
+.amount-tile { display: inline-flex; flex-direction: column; align-items: flex-end; line-height: 1.25; }
+.amount-sub { font-size: 12px; color: var(--muted); }
 .sop-icon { display: inline-flex; align-items: center; justify-content: center; margin-left: 8px; padding: 1px 6px; font-size: 13px; line-height: 1.3; border: 1px solid var(--line);
   border-radius: 6px; background: var(--bg-f1f6f5); cursor: pointer; vertical-align: middle; text-transform: none; letter-spacing: 0; }
 .sop-icon:hover { border-color: var(--teal); background: var(--bg-e3efec); }
