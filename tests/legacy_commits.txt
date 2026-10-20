@@ -41,3 +41,4 @@ f4651f4  2026-10-19  run notes (KW-01) merged to main and live
 51f183b  2026-10-19  finished-goods lot shows the actual final TDS and pH (KW-31) merged to main and live
 efb4c50  2026-10-19  separation solids moisture, at least one required (KW-18) merged to main and live
 95951e0  2026-10-19  configurable idle timeout (KW-08) merged to main and live
+b5feb52  2026-10-20  finished goods with no SKU yet, SKU assigned at shipping (KW-32) merged to main and live
