@@ -2830,9 +2830,31 @@ def coa_loading_text(v, qual=""):
     return (qual if qual == "<" else "") + (("%.2f" % v) if v >= 10 else ("%.3g" % v))
 
 
+def json_text(v, what):
+    """A JSON field that should be text, as a stripped string: None -> '', a string as is, a finite number -> str(number) (0.5 -> '0.5').
+    Anything else (a list, an object, true / false, NaN) is a 400 naming the field, never an AttributeError / 500."""
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v.strip()
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v):
+        return str(v)
+    raise ApiError(400, "%s must be text" % what)
+
+
+def json_id(v, what):
+    """A JSON field that should be a record id: None / '' -> None, a whole number or digit string -> int, else 400."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, bool) or not (isinstance(v, int) or (isinstance(v, str) and v.strip().isdigit())):
+        raise ApiError(400, "%s must be a record number" % what)
+    return int(v)
+
+
 def parse_result_value(text):
-    """'<20', '100', '1,200', 'Negative' -> (qualifier, number, text). Raises ApiError when it is none of these."""
-    t = (text or "").strip()
+    """'<20', '100', '1,200', 'Negative' -> (qualifier, number, text). A JSON number is read as its text (0.5 -> '0.5').
+    Raises ApiError when it is none of these."""
+    t = json_text(text, "The result")
     m = re.fullmatch(r"([<>]=?)?\s*([0-9][0-9,]*\.?[0-9]*(?:[eE][-+]?[0-9]+)?|\.[0-9]+)", t)
     if m:
         qual = (m.group(1) or "")[:1]
@@ -8815,38 +8837,57 @@ class Handler(BaseHTTPRequestHandler):
             return parse_lab_report(lines)
         if len(seg) == 4 and method == "POST":
             d = self._body_json()
-            lab_name = (d.get("labName") or "").strip()
-            lab_id = d.get("labId")
+            if not isinstance(d, dict):
+                raise ApiError(400, "Invalid request")
+            lab_name = json_text(d.get("labName"), "The laboratory")
+            lab_id = json_id(d.get("labId"), "The laboratory")
             if lab_id:
                 lb = conn.execute("SELECT name FROM labs WHERE id=?", (lab_id,)).fetchone()
                 lab_name = lb["name"] if lb else lab_name
-            report = (d.get("reportNumber") or "").strip()
-            rdate = (d.get("reportDate") or "").strip()
+            report = json_text(d.get("reportNumber"), "The lab report number")
+            rdate = json_text(d.get("reportDate"), "The report date")
+            sample_ref = json_text(d.get("sampleRef"), "The sample reference")
             if not lab_name:
                 raise ApiError(400, "Enter the laboratory")
             if not report:
                 raise ApiError(400, "Enter the lab report number")
             if rdate and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", rdate):
                 raise ApiError(400, "Report date must be a date")
-            att = d.get("attachmentId")
+            att = json_id(d.get("attachmentId"), "The document")
             if att and not conn.execute("SELECT 1 FROM run_attachments WHERE id=? AND run_id=?", (att, rid)).fetchone():
                 raise ApiError(400, "That document is not attached to this run")
             rows = d.get("results") or []
             if not rows:
                 raise ApiError(400, "Add at least one result")
+            if not isinstance(rows, list):
+                raise ApiError(400, "The results must be a list")
             current = {x["code"]: x for x in coa_evaluate(conn, r)["rows"]}
             need_report = bool(float(get_setting_value(conn, "lab_result_require_report", 1) or 0))
             gated = {x["code"] for x in conn.execute("SELECT code FROM coa_specs WHERE release_rule IN ('pass','min')")}
             now = now_iso()
             added = []
             for i, x in enumerate(rows, 1):
-                code = (x.get("specCode") or "").strip() or None
+                if not isinstance(x, dict):
+                    raise ApiError(400, "Row %d: the result must be an object" % i)
+
+                def row_text(key, what):
+                    try:
+                        return json_text(x.get(key), what)
+                    except ApiError:
+                        raise ApiError(400, "Row %d: the %s must be text%s" % (i, what, " such as 0.5, <10 or Negative" if key == "value" else ""))
+                code = row_text("specCode", "test code") or None
                 spec = None
                 if code:
                     spec = conn.execute("SELECT * FROM coa_specs WHERE code=? AND basis!='run'", (code,)).fetchone()
                     if not spec:
                         raise ApiError(400, "Row %d: unknown test" % i)
-                analyte = spec["name"] if spec else (x.get("analyte") or "").strip()
+                typed_analyte = row_text("analyte", "test name")
+                analyte = spec["name"] if spec else typed_analyte
+                unit = row_text("unit", "unit")
+                meth = row_text("method", "method")
+                raw_value = x.get("value")
+                if raw_value is not None:
+                    row_text("value", "value")
                 if not analyte:
                     raise ApiError(400, "Row %d: enter the test name" % i)
                 if code and current.get(code, {}).get("status") == "fail" and current[code].get("result"):
@@ -8855,10 +8896,9 @@ class Handler(BaseHTTPRequestHandler):
                 if code and code in gated and need_report and not att:
                     raise ApiError(400, "%s: attach the lab report to the run and choose it here (a result that decides release needs its report)." % analyte, "report_required")
                 try:
-                    qual, num, vtext = parse_result_value(x.get("value"))
+                    qual, num, vtext = parse_result_value(raw_value)
                 except ApiError as e:
                     raise ApiError(400, "%s: %s" % (analyte, e.message))
-                unit = (x.get("unit") or "").strip()
                 if spec and spec["basis"] in ("value", "absent"):
                     unit = spec["unit"]
                     if spec["basis"] == "absent" and num is not None:
@@ -8869,10 +8909,10 @@ class Handler(BaseHTTPRequestHandler):
                         raise ApiError(400, "%s: unit must be ppm, %%, ppb or mg/kg" % analyte)
                     if num is None:
                         raise ApiError(400, "%s: enter a number" % analyte)
-                meth = (x.get("method") or "").strip() or (spec["method"] if spec else "") or None
+                meth = meth or (spec["method"] if spec else "") or None
                 conn.execute("INSERT INTO lab_results (run_id,spec_code,analyte,lab_id,lab_name,report_number,report_date,sample_ref,method,"
                              "qualifier,value_num,value_text,unit,attachment_id,entered_by,entered_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                             (rid, code, analyte, lab_id or None, lab_name, report, rdate or None, (d.get("sampleRef") or "").strip() or None, meth,
+                             (rid, code, analyte, lab_id or None, lab_name, report, rdate or None, sample_ref or None, meth,
                               qual, num, vtext, unit or None, att or None, user["name"], now))
                 added.append(analyte)
             release_log(conn, rid, "lab_results_added", user, capacity=None,
