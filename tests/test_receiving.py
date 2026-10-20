@@ -4,7 +4,7 @@ import datetime
 
 import pytest
 
-from factories import sql
+from factories import approve_suppliers, sql
 from harness import Server
 
 TODAY = datetime.date.today().isoformat()
@@ -26,7 +26,9 @@ def people(srv):
 def new_item(admin, name, unit="kg", **kw):
     r = admin.post("/api/consumables", dict({"name": name, "unit": unit, "onHand": 0}, **kw))
     assert r.ok, r.text
-    return [c["id"] for c in admin.get("/api/consumables").json["consumables"] if c["name"] == name][0]
+    cid = [c["id"] for c in admin.get("/api/consumables").json["consumables"] if c["name"] == name][0]
+    approve_suppliers(admin, cid)
+    return cid
 
 
 def item(admin, cid):
@@ -87,6 +89,7 @@ def test_a_bad_line_receives_nothing(srv, people):
 def test_packaging_needs_no_supplier_lot_and_uses_the_invoice_number(srv, people):
     a = people["admin"]
     cid = [c["id"] for c in a.get("/api/consumables").json["consumables"] if c["name"] == "New 1,000 L IBC Tote"][0]
+    approve_suppliers(a, cid)
     r = a.post("/api/consumables/%d/receive" % cid, {"qty": 60, "supplier": "Island Barrels", "invoiceNo": "304"})
     assert r.status == 200 and r.json["lot"]["supplierLot"] == "INV 304"
     r = a.post("/api/consumables/%d/receive" % cid, {"qty": 1})
