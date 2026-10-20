@@ -8,3 +8,6 @@ KW-22,'Dilution pass' naming,Dilution pass vs. pasteurization pass,Revisit after
 KW-26,Citric acid mass in process conversion ratio,Include vs. subtract,Subtract added citric/water mass so ratio reflects biomass only; show both if unsure.,,
 KW-39,Certified-lab pH/TDS/TSS frequency,Every lot vs. periodic,"Every lot for first ~10 lots to establish internal-vs-lab variance, then periodic. Confirm cost.",,
 —,Labels: simplified vs. detailed,Drop 'finished product' from simplified label,Decided in meeting: keep as-is (traceability to sample point/section).,,
+KW-48,Harvest tab scope and data captured,Daily weights per date vs. season total per site assigned to all totes (Nathan: 'could be as simple as that'),Capture daily totals per site/date (audit needs received weight by site); derive per-tote averages from them. Walk through with Sean and Dalton.,,
+KW-50,Nominal IBC tare weight,~65-70 kg (Dalton/Cam),"Weigh 5 empty IBCs, use the mean; store in calculations table.",,
+KW-58,Farm inventory: standalone tool or KelpWorks module,Separate simple tool (Cam/Sean) vs. module,Decide after KW-48 design; one system avoids duplicate data and backups.,,
