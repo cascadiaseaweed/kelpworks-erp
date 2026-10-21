@@ -402,6 +402,16 @@ th.sortable:hover { background: var(--bg-e2ece9); }
 .qc-check-sop { margin-top: 10px; font-size: 13px; }
 .qc-check-sop a { font-weight: 600; }
 /* SOP links an administrator chose for a section, box or window (Admin > SOPs) */
+.run-card-summary { background: var(--bg-eef4f2); border-radius: 10px; padding: 14px 16px; margin: 8px 0; }
+.rs-headline { display: flex; justify-content: center; flex-wrap: wrap; gap: 10px 32px; text-align: center; padding-bottom: 12px; }
+.rs-headline + .rs-details { border-top: 1px solid var(--line); padding-top: 12px; }
+.rs-big { display: flex; flex-direction: column; align-items: center; min-width: 92px; }
+.rs-big-v { font-size: 24px; font-weight: 700; line-height: 1.1; color: var(--accent-text-2); font-variant-numeric: tabular-nums; }
+.rs-big-k { margin-top: 3px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.rs-details { display: grid; grid-template-columns: max-content 1fr; gap: 5px 20px; margin: 0 auto; max-width: 560px; font-size: 13px; }
+.rs-details dt { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .03em; padding-top: 1px; }
+.rs-details dd { margin: 0; font-weight: 600; color: var(--accent-text-2); overflow-wrap: anywhere; }
+.rs-details dd small { font-weight: 400; color: var(--muted); margin-left: 6px; }
 .sample-summary { margin-top: 10px; }
 .sample-summary-title { font-size: 12px; font-weight: 700; color: var(--accent-text); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px; }
 .sample-summary .tablewrap { display: inline-block; max-width: 100%; vertical-align: top; }        /* fit the table: no empty white space beside it */
