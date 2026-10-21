@@ -4634,6 +4634,9 @@ def migrate(conn):
             conn.execute("ALTER TABLE consumable_lots ADD COLUMN %s %s" % (col, decl))
     if "active" not in {r["name"] for r in conn.execute("PRAGMA table_info(sites)")}:        # a site that is not active is not offered for a new tote; its old totes keep it
         conn.execute("ALTER TABLE sites ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+    racols = {r["name"] for r in conn.execute("PRAGMA table_info(run_attachments)")}
+    if "purpose" not in racols:
+        conn.execute("ALTER TABLE run_attachments ADD COLUMN purpose TEXT")          # KW-02: 'feedstock_photo' for a photo taken for a feedstock characterization card
     # KW-04: a photo's copy in the SharePoint records library is confirmed (path + SHA-256 of what was saved), and later its file is taken off the server disk (purged_at)
     for table in ("run_attachments", "tote_attachments"):
         tcols = {r["name"] for r in conn.execute("PRAGMA table_info(%s)" % table)}
@@ -12833,7 +12836,7 @@ class Handler(BaseHTTPRequestHandler):
             if len(seg) == 4 and method == "POST":
                 return self.add_attachment(conn, rid, user)
             if len(seg) == 5 and seg[4].isdigit() and method == "DELETE":
-                return self.delete_attachment(conn, rid, int(seg[4]))
+                return self.delete_attachment(conn, rid, int(seg[4]), user)
             if len(seg) == 6 and seg[4].isdigit() and seg[5] == "preview" and method == "GET":
                 a = conn.execute("SELECT * FROM run_attachments WHERE id=? AND run_id=?", (int(seg[4]), rid)).fetchone()
                 if not a:
@@ -12850,6 +12853,8 @@ class Handler(BaseHTTPRequestHandler):
                         "html": docx_to_html(raw) if name.endswith(".docx") else xlsx_to_html(raw)}
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "feedstock-photo" and method == "POST":
             return self.feedstock_photo_draft(conn, int(seg[2]), user)
+        if len(seg) == 5 and seg[2].isdigit() and seg[3] == "feedstock-photo" and seg[4].isdigit() and method == "DELETE":
+            return self.remove_feedstock_photo(conn, int(seg[2]), int(seg[4]), user)
         if len(seg) == 5 and seg[2].isdigit() and seg[3] == "inputs" and seg[4].isdigit() and method == "PUT":
             return self.update_run_input(conn, int(seg[2]), int(seg[4]), user)
         if (len(seg) == 6 and seg[2].isdigit() and seg[3] == "feedstock" and seg[4].isdigit()
@@ -13032,7 +13037,7 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
-    def _store_attachment(self, conn, run_id, filename, content_type, data_b64, uploaded_by):
+    def _store_attachment(self, conn, run_id, filename, content_type, data_b64, uploaded_by, purpose=None):
         """Decode+store one base64 file and insert its run_attachments row.
         Shared by generic document uploads and every stage/tote photo slot."""
         filename = (filename or "document").strip().replace("\\", "/").split("/")[-1] or "document"
@@ -13054,9 +13059,9 @@ class Handler(BaseHTTPRequestHandler):
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO run_attachments (run_id,filename,content_type,size,stored_name,"
-            "uploaded_by,uploaded_at) VALUES (?,?,?,?,?,?,?)",
+            "uploaded_by,uploaded_at,purpose) VALUES (?,?,?,?,?,?,?,?)",
             (run_id, filename, served_type(filename)[0], len(raw),
-             stored, uploaded_by, now_iso()))
+             stored, uploaded_by, now_iso(), purpose))
         return cur.lastrowid
 
     def add_attachment(self, conn, run_id, user):
@@ -13077,11 +13082,77 @@ class Handler(BaseHTTPRequestHandler):
             pass
         conn.execute("DELETE FROM run_attachments WHERE id=?", (aid,))
 
-    def delete_attachment(self, conn, run_id, aid):
+    PHOTO_SLOTS = (("surface_photo", "surfacePhotoId", "Surface photo"), ("striation_photo", "striationPhotoId", "Settling/striation photo"))
+
+    def _feedstock_photo_refs(self, conn, run, aid):
+        """Where this attachment is used as a feedstock photo of the run: [(run_inputs id or None, tote id, run_inputs column or None, draft key or None, label)]."""
+        refs = []
+        for ri in conn.execute("SELECT * FROM run_inputs WHERE run_id=?", (run["id"],)):
+            for col, key, label in self.PHOTO_SLOTS:
+                if str(ri[col] or "") == str(aid):
+                    refs.append((ri["id"], ri["tote_lot_id"], col, None, label))
+        try:
+            dd = json.loads(run["draft_data"] or "{}")
+        except ValueError:
+            dd = {}
+        for tid, fd in (dd.get("feedstockDetails") or {}).items():
+            for col, key, label in self.PHOTO_SLOTS:
+                if str((fd or {}).get(key) or "") == str(aid):
+                    refs.append((None, int(tid), None, key, label))
+        return refs
+
+    def _is_feedstock_photo(self, conn, run, att):
+        """A photo taken for a feedstock card: uploaded through a photo slot (purpose), or pointed to by the run's feedstock records."""
+        return att["purpose"] == "feedstock_photo" or bool(self._feedstock_photo_refs(conn, run, att["id"]))
+
+    def _release_feedstock_photo(self, conn, run, aid, user, new_id=None):
+        """Take a feedstock photo (KW-02) out of a run that is still being logged: every place that points to it is cleared (or, when it is replaced, pointed at the new photo), a line
+        goes into the tote's Feedstock Stability log, and the file is deleted from the disk once the request commits."""
+        att = conn.execute("SELECT * FROM run_attachments WHERE id=? AND run_id=?", (aid, run["id"])).fetchone()
+        if not att:
+            raise ApiError(404, "Photo not found on this run")
+        refs = self._feedstock_photo_refs(conn, run, aid)
+        if not refs and not self._is_feedstock_photo(conn, run, att):
+            raise ApiError(409, "That file is not a feedstock photo of this run")
+        try:
+            dd = json.loads(run["draft_data"] or "{}")
+        except ValueError:
+            dd = {}
+        logged = set()
+        for input_id, tote_id, col, key, label in refs:
+            if col:
+                conn.execute("UPDATE run_inputs SET %s=? WHERE id=?" % col, (new_id, input_id))
+            else:
+                (dd.get("feedstockDetails") or {}).get(str(tote_id), {})[key] = new_id
+            if (tote_id, label) not in logged:
+                logged.add((tote_id, label))
+                self._log_stability(conn, tote_id, user, label, att["filename"], "(replaced)" if new_id else "(removed)",
+                                    "Photo %s in production run %s" % ("replaced" if new_id else "removed", run["processing_lot"]), run_id=run["id"])
+        if any(r[2] is None for r in refs):
+            conn.execute("UPDATE production_runs SET draft_data=? WHERE id=?", (json.dumps(dd), run["id"]))
+        conn.execute("DELETE FROM run_attachments WHERE id=?", (aid,))
+        self._files_to_remove.append(os.path.join(UPLOAD_DIR, att["stored_name"]))
+
+    def remove_feedstock_photo(self, conn, run_id, aid, user):
+        run = conn.execute("SELECT * FROM production_runs WHERE id=?", (run_id,)).fetchone()
+        if not run:
+            raise ApiError(404, "Production run not found")
+        if run["status"] != "draft":
+            raise ApiError(409, "This run is finalized: its photos are part of the production log and are locked. Use an amendment to change the log.", "photo_locked")
+        self._release_feedstock_photo(conn, run, aid, user)
+        return {"ok": True}
+
+    def delete_attachment(self, conn, run_id, aid, user=None):
         r = conn.execute("SELECT * FROM run_attachments WHERE id=? AND run_id=?",
                          (aid, run_id)).fetchone()
         if not r:
             raise ApiError(404, "Attachment not found")
+        run = conn.execute("SELECT * FROM production_runs WHERE id=?", (run_id,)).fetchone()
+        if run and self._is_feedstock_photo(conn, run, r):             # a feedstock photo belongs to the production log (KW-02)
+            if run["status"] != "draft":
+                raise ApiError(409, "This is a feedstock photo of a finalized run: it is part of the production log and is locked. Use an amendment to change the log.", "photo_locked")
+            self._release_feedstock_photo(conn, run, aid, user)
+            return {"attachments": self._attachments(conn, run_id)}
         try:
             os.remove(os.path.join(UPLOAD_DIR, r["stored_name"]))
         except OSError:
@@ -13475,7 +13546,7 @@ class Handler(BaseHTTPRequestHandler):
         label = "Surface" if slot == "surface" else "Settling-Striation"
         filename = d.get("filename") or ("%s %s.jpg" % (tote["lot_number"] if tote else "tote", label))
         new_id = self._store_attachment(conn, run_id, filename, d.get("contentType"),
-                                        d.get("dataB64") or "", user["name"] if user else None)
+                                        d.get("dataB64") or "", user["name"] if user else None, purpose="feedstock_photo")
         old_id = row[col]
         conn.execute("UPDATE run_inputs SET %s=? WHERE id=?" % col, (new_id, input_id))
         if old_id:
@@ -13496,7 +13567,15 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "Invalid photo slot")
         new_id = self._store_attachment(conn, run_id, d.get("filename") or "feedstock.jpg",
                                         d.get("contentType"), d.get("dataB64") or "",
-                                        user["name"] if user else None)
+                                        user["name"] if user else None, purpose="feedstock_photo")
+        if d.get("replaces") not in (None, ""):                 # KW-02: replacing a photo takes the old one away (file and all) and points its places at the new one
+            try:
+                old = int(d["replaces"])
+            except (TypeError, ValueError):
+                raise ApiError(400, "Invalid photo to replace")
+            oatt = conn.execute("SELECT * FROM run_attachments WHERE id=? AND run_id=?", (old, run_id)).fetchone()
+            if old != new_id and oatt and self._is_feedstock_photo(conn, run, oatt):
+                self._release_feedstock_photo(conn, run, old, user, new_id=new_id)       # (anything else, or a photo that is already gone, is simply left alone)
         return {"attachmentId": new_id}
 
     # ---- process stages (Homogenization / Extraction / Separation / ------- #
