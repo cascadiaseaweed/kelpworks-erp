@@ -6,8 +6,13 @@ re-run this after the workbook changes:
 
     python tools/export_backlog.py "C:\\path\\to\\KelpWorks_ChangeLog_2026-10-16.xlsx"
 
-Sheets exported: "Change Log" -> items.csv and "Open Decisions" -> open-decisions.csv. The workbook's "Claude Code Prompt" column is left out: it was written for a
-different tech stack (Flask / SQLAlchemy) and would mislead; the /kw-item command builds its own plan from the repo instead.
+Sheets exported: "Change Log" -> items.csv and "Open Decisions" -> open-decisions.csv. Every other sheet (Summary, Workflow Rules, the playbook ...) is ignored. Columns are found by
+their HEADER NAME in row 1, never by position, so columns can be added or moved (the workbook now also has Approved to Start, PR #, Released Date, Verified By (on live),
+Verified Date, QM-001 Ref, Row Updated and Updated By) and a column this tool does not know is simply exported too. The workbook's "Claude Code Prompt" column is left out: it was
+written for a different tech stack (Flask / SQLAlchemy) and would mislead; the /kw-item command builds its own plan from the repo instead.
+
+The Change Log sheet must have an ID, a Status and an Approved to Start column (Claude Code only starts an item whose Approved to Start is Y or Pre-rule). Afterwards the tool
+prints how many items have each Status and warns about a Status it does not know (the known ones are Not started, In progress, On staging, Released, Blocked, Deferred, Won't do).
 """
 import csv
 import os
@@ -19,6 +24,8 @@ import zipfile
 NS = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
       "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
 DROP_COLUMNS = {"Claude Code Prompt"}
+REQUIRED_HEADERS = {"Change Log": ("ID", "Status", "Approved to Start"), "Open Decisions": ("ID",)}
+KNOWN_STATUSES = ("Not started", "In progress", "On staging", "Released", "Blocked", "Deferred", "Won't do")
 SHEETS = {"Change Log": "items.csv", "Open Decisions": "open-decisions.csv"}
 
 
@@ -75,6 +82,10 @@ def main(argv):
             print("The workbook has no sheet called '%s'" % name)
             return 2
         header = rows[0]
+        missing = [h for h in REQUIRED_HEADERS.get(name, ()) if h not in header]
+        if missing:
+            print("The '%s' sheet has no %s column in row 1 (columns are found by their header name)." % (name, " / ".join(missing)))
+            return 2
         keep = [i for i, h in enumerate(header) if h and h not in DROP_COLUMNS]
         with open(os.path.join(outdir, fname), "w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f, lineterminator="\r\n")
@@ -82,6 +93,16 @@ def main(argv):
                 if any(x for x in r):
                     w.writerow([(r[i] if i < len(r) else "") for i in keep])
         print("wrote docs/backlog/%s (%d rows)" % (fname, sum(1 for r in rows if any(r)) - 1))
+        if name == "Change Log":
+            si = header.index("Status")
+            counts = {}
+            for r in rows[1:]:
+                if any(r) and si < len(r):
+                    counts[r[si] or "(blank)"] = counts.get(r[si] or "(blank)", 0) + 1
+            print("  by Status: " + ", ".join("%s %d" % kv for kv in sorted(counts.items())))
+            unknown = [s for s in counts if s not in KNOWN_STATUSES and s != "(blank)"]
+            if unknown:
+                print("  WARNING: unknown Status value(s): %s" % ", ".join(unknown))
     return 0
 
 

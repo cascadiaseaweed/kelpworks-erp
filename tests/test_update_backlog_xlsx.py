@@ -49,23 +49,14 @@ def run(tool, xlsx, tmp_path, updates, extra=()):
     return tool.main(["update_backlog_xlsx.py", str(xlsx), str(spec), *extra])
 
 
-def test_status_owner_and_notes_are_set_and_everything_else_is_left_alone(tmp_path):
+def test_a_change_log_item_is_refused_and_points_to_the_guarded_tool(tmp_path, capsys):
     tool = load("update_backlog_xlsx")
     xlsx = tmp_path / "log.xlsx"
     make(xlsx)
-    with zipfile.ZipFile(xlsx) as before:
-        keep = {n: before.read(n) for n in before.namelist() if n not in ("xl/worksheets/sheet1.xml", "xl/workbook.xml")}
-    assert run(tool, xlsx, tmp_path, [{"id": "KW-05", "status": "Released", "owner": "NW", "notes": "PR #48 merged & live - Won't break"},
-                                      {"id": "KW-06", "notes": "second"}]) == 0
-    rows = sheets(str(xlsx))["Change Log"]
-    assert rows[1] == ["KW-05", "Released", "NW", "PR #48 merged & live - Won't break"]
-    assert rows[2] == ["KW-06", "Not started", "", "second"]                      # an omitted field keeps its value; the old note is replaced
-    with zipfile.ZipFile(xlsx) as after:
-        assert {n: after.read(n) for n in after.namelist() if n not in ("xl/worksheets/sheet1.xml", "xl/workbook.xml")} == keep
-        sheet = after.read("xl/worksheets/sheet1.xml").decode()
-        workbook = after.read("xl/workbook.xml").decode()
-    assert '<dataValidation type="list" sqref="B2:B3">' in sheet and 's="13"' in sheet and 's="14"' in sheet            # drop-down and cell styles survive
-    assert 'fullCalcOnLoad="1"' in workbook                                                                         # Summary counts refresh when Excel opens it
+    original = xlsx.read_bytes()
+    assert run(tool, xlsx, tmp_path, [{"id": "KW-05", "status": "Released"}]) == 2
+    assert "changelog_write.py" in capsys.readouterr().out
+    assert xlsx.read_bytes() == original                                                                          # the Change Log sheet is written only by tools/changelog_write.py
 
 
 def test_a_decision_is_recorded_on_the_open_decisions_sheet(tmp_path):
@@ -76,13 +67,12 @@ def test_a_decision_is_recorded_on_the_open_decisions_sheet(tmp_path):
     assert sheets(str(xlsx))["Open Decisions"][1] == ["KW-05", "N. Wrana (2026-10-19)", "Make optional"]
 
 
-def test_a_bad_status_or_unknown_id_changes_nothing(tmp_path, capsys):
+def test_a_bad_decision_changes_nothing(tmp_path, capsys):
     tool = load("update_backlog_xlsx")
     xlsx = tmp_path / "log.xlsx"
     make(xlsx)
     original = xlsx.read_bytes()
-    assert run(tool, xlsx, tmp_path, [{"id": "KW-05", "status": "Done"}]) == 2
-    assert run(tool, xlsx, tmp_path, [{"id": "KW-05", "notes": "ok"}, {"id": "KW-99", "status": "Released"}]) == 2          # one bad entry stops the whole run
+    assert run(tool, xlsx, tmp_path, [{"decision": "KW-05", "by": "x"}, {"decision": "KW-99", "text": "y"}]) == 2          # one bad entry stops the whole run
     assert xlsx.read_bytes() == original
     assert "KW-99" in capsys.readouterr().out
 
@@ -92,5 +82,5 @@ def test_a_dry_run_writes_nothing(tmp_path):
     xlsx = tmp_path / "log.xlsx"
     make(xlsx)
     original = xlsx.read_bytes()
-    assert run(tool, xlsx, tmp_path, [{"id": "KW-05", "status": "Released"}], extra=("--dry-run",)) == 0
+    assert run(tool, xlsx, tmp_path, [{"decision": "KW-05", "by": "N. Wrana", "text": "Make optional"}], extra=("--dry-run",)) == 0
     assert xlsx.read_bytes() == original

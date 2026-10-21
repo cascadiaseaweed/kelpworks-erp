@@ -683,7 +683,11 @@ step with any change to this process, and add the live commit to `tests/legacy_c
 
 ## Change log (KelpWorks_ChangeLog_2026-10-16.xlsx)
 - Location: C:\Users\nwran\OneDrive - Cascadia Seaweed Corp\Operations - Operations\Processing Operations\QAQC\KelpWorks ERP
-- Update it ONLY through tools/changelog_write.py (KW-61). Until that exists, follow the 'Workflow Rules' sheet in the workbook by hand.
+- Update it ONLY through tools/changelog_write.py (KW-61, built). Never edit the change log any other way: not with `tools/update_backlog_xlsx.py` (it now refuses Change Log items; it only records Open Decisions), not by hand, not with a spreadsheet library.
+  Usage: `python tools/changelog_write.py --id KW-46 Status=Released "PR #=75" "Released Date=2026-10-21" Notes="..."`, or `--batch updates.json` (`[{"id": "KW-46", "set": {"Status": "Released"}}]`, one wait and one check for the whole batch),
+  `--show KW-46` (read-only: Status, Approved to Start, PR #...), `--dry-run` (checks every rule, writes nothing). Exit 2 = refused by a rule, 3 = open in Excel, 4 = the file changed while it ran, 5 = a value did not stick (revert). The tool
+  enforces column ownership, Approved to Start, no Deferred / Won't do, Released needs a PR # and a Released Date, the lock-file / stale-file / 60-second checks below, and stamps Row Updated / Updated By itself (tests: `tests/test_changelog_write.py`).
+  Refresh the CSV snapshot afterwards with `python tools/export_backlog.py "<workbook>"` (it finds columns by header name and needs an ID, Status and Approved to Start column).
 - You own these columns: Status (never set Deferred or Won't do), Notes, PR #, Released Date, QM-001 Ref, Row Updated, Updated By. Never write any other column. Never add rows or new KW IDs.
 - Do not start an item unless Approved to Start is Y or Pre-rule.
 - Before writing: if a ~$KelpWorks_ChangeLog lock file exists, stop (the workbook is open in Excel). Read the file fresh, find rows by ID (never by row number), and check the file's modified time hasn't changed just before saving. About 60 s after saving, re-open the file and confirm your values stuck; if they didn't, stop and report a revert.
