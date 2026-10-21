@@ -168,6 +168,34 @@ SETTINGS_DEFAULTS = [
      "How long someone who has closed their browser (or lost power) still shows as having a run, batch or tote open. Browsers announce themselves about every third of this time; it only drives the 'someone else has this open' warning."),
     ("idle_timeout_minutes", 30, "Idle timeout (minutes)",
      "A signed-in person who has not used the screen for this long is signed out; the run and batch sections they have open are saved first. 0 turns it off. Takes effect for everyone within a minute, no deploy needed."),
+    ("run_card_show_volume_out", 1, "Run summary card: show Product volume out",
+     "1 shows product volume out on a finished run's summary card, 0 hides it (big number at the top)."),
+    ("run_card_show_final_ph", 1, "Run summary card: show Final pH",
+     "1 shows final ph on a finished run's summary card, 0 hides it (big number at the top)."),
+    ("run_card_show_final_tds", 1, "Run summary card: show Final TDS",
+     "1 shows final tds on a finished run's summary card, 0 hides it (big number at the top)."),
+    ("run_card_show_final_orp", 1, "Run summary card: show Final ORP",
+     "1 shows final orp on a finished run's summary card, 0 hides it (big number at the top)."),
+    ("run_card_show_extraction_eff", 1, "Run summary card: show Extraction efficiency",
+     "1 shows extraction efficiency on a finished run's summary card, 0 hides it (big number at the top)."),
+    ("run_card_show_run_date", 1, "Run summary card: show Run date",
+     "1 shows run date on a finished run's summary card, 0 hides it (line in the details list)."),
+    ("run_card_show_operators", 1, "Run summary card: show Operators",
+     "1 shows operators on a finished run's summary card, 0 hides it (line in the details list)."),
+    ("run_card_show_product", 1, "Run summary card: show Product",
+     "1 shows product on a finished run's summary card, 0 hides it (line in the details list)."),
+    ("run_card_show_farms", 1, "Run summary card: show Feedstock farms",
+     "1 shows feedstock farms on a finished run's summary card, 0 hides it (line in the details list)."),
+    ("run_card_show_ibcs", 1, "Run summary card: show IBCs consumed",
+     "1 shows ibcs consumed on a finished run's summary card, 0 hides it (line in the details list)."),
+    ("run_card_show_feedstock_weight", 1, "Run summary card: show Total feedstock weight",
+     "1 shows total feedstock weight on a finished run's summary card, 0 hides it (line in the details list)."),
+    ("run_card_show_packaged", 1, "Run summary card: show Packaged",
+     "1 shows packaged on a finished run's summary card, 0 hides it (line in the details list)."),
+    ("run_card_show_conv_process", 1, "Run summary card: show Conversion rate, process",
+     "1 shows conversion rate, process on a finished run's summary card, 0 hides it (line in the details list)."),
+    ("run_card_show_conv_harvest", 1, "Run summary card: show Conversion rate, harvest",
+     "1 shows conversion rate, harvest on a finished run's summary card, 0 hides it (line in the details list)."),
     ("image_archive_days", 30, "Photos: days on the server before they move to SharePoint",
      "A photo of a finalized run is removed from the server disk this many days after the run was finalized, once its copy in the SharePoint records library has been confirmed (a link to it stays on the record). Pictures only: documents and lab reports are never removed."),
     ("image_purge_enabled", 0, "Photos: remove archived photos from the server (1 = on, 0 = off)",
@@ -250,6 +278,7 @@ QC_FIELD_REGISTRY = [
     ("homog_ts_slurry_pct",   "homogenization", "Homogenization", "Lot characterization", "TSslurry (%)", "%"),
     ("homog_rho_slurry_g_ml", "homogenization", "Homogenization", "Lot characterization", "ρslurry (g/mL)", "g/mL"),
     ("homog_ts_solids_pct",   "homogenization", "Homogenization", "Lot characterization", "%Moisture<sub>solids</sub>", "%"),
+    ("homog_orp_mv",          "homogenization", "Homogenization", "Lot characterization", "ORP (mV)", "mV"),                       # KW-59
     ("homog_solids_loading_pct", "homogenization", "Homogenization", "Lot characterization", "Solids Loading (%)", "%"),
     # Extraction -- "Extraction Performance"
     ("extraction_qc_ph",           "extraction", "Extraction", "Extraction Performance", "pH", ""),
@@ -278,8 +307,11 @@ QC_FIELD_REGISTRY = [
     ("packaging_mannitol_pct",    "packaging", "Packaging", "LKE characterization", "Mannitol (%)", "%"),
     ("packaging_ts_liquid_pct",   "packaging", "Packaging", "LKE characterization", "TSliquid (%)", "%"),
     ("packaging_rho_liquid_g_ml", "packaging", "Packaging", "LKE characterization", "ρliquid (g/mL)", "g/mL"),
+    ("packaging_orp_mv",          "packaging", "Packaging", "LKE characterization", "ORP (mV)", "mV"),                           # KW-59
 ]
 
+
+ORP_QC_FIELDS = ("homog_orp_mv", "packaging_orp_mv")                # KW-59
 
 # Production-log required fields. A run cannot be finalized until every field
 # here has a value, and a section's progress dot only turns green once all of
@@ -310,6 +342,9 @@ NOTE_SECTION_LABELS = dict(NOTE_SECTIONS)
 NOTE_MAX_CHARS = 4000
 NOTE_MAX_IMAGES = 10
 EXTRACTION_BYPASS_DEFAULT = "Extraction not optimized"      # KW-15: the reason a bypassed extraction starts with (editable, never blank)
+# KW-59: ORP (mV) in the Homogenization and Packaging QC checks is required for every run still being logged and every run finalized after it was introduced
+# (production_runs.orp_required = 1, set at finalize); runs finalized before are not asked for it (their progress and amendments are unchanged).
+_orp_needed = lambda st: st.get("_meta", {}).get("orpRequired", True)
 _extracting = lambda st: not st["extraction"].get("bypassed")
 _bypassed = lambda st: bool(st["extraction"].get("bypassed"))
 _uses_6a = lambda st: (st["pasteurization"].get("receivingTanks") or "") in ("6A", "6AB")
@@ -332,7 +367,8 @@ PROGRESS_SECTIONS = [
         ("homogenization", "dilutionWaterL2b", "Dilution water added, Tank 2B (L)", _uses_2b),
         ("homogenization", "postDilutionTankL2b", "Post-Dilution Tank Level, Tank 2B (L)", _uses_2b)]
         + [("homogenization", k, l) for k, l in _QC_ALL]
-        + [("homogenization", "tsSlurryPct", "QC Check: TSslurry (%)"),
+        + [("homogenization", "orpMv", "QC Check: ORP (mV)", _orp_needed),
+           ("homogenization", "tsSlurryPct", "QC Check: TSslurry (%)"),
            ("homogenization", "rhoSlurryGMl", "QC Check: \u03c1slurry (g/mL)"),
            ("homogenization", "tsSolidsPct", "QC Check: %Moisture solids"),
            ("homogenization", "solidsLoadingPct", "QC Check: Solids Loading (%)")]},
@@ -375,6 +411,7 @@ PROGRESS_SECTIONS = [
         ("dilution", "nabenzoateAddedL6a", "Sodium benzoate added, Tank 6A (L)", _uses_6a),
         ("dilution", "nabenzoateAddedL6b", "Sodium benzoate added, Tank 6B (L)", _uses_6b)]
         + [("packaging", k, l.replace("QC Check", "LKE QC Check")) for k, l in _QC_ALL]
+        + [("packaging", "orpMv", "LKE QC Check: ORP (mV)", _orp_needed)]
         + [("packaging", "sampleCollectedAt", "LKE Sample Point: collection date and time")],
      "sample_rows": "LKE Sample Point: at least one sample"},
     {"key": "packaging", "label": "Packaging", "fields": [
@@ -3472,13 +3509,13 @@ QC_SECTIONS = {
 # QC_FIELD_REGISTRY label -> measurement key; measurement key -> (display name, unit, can only be >= 0)
 QC_MEASURE_KEYS = {
     "pH": "ph", "TDS (%)": "tds", "Brix (%)": "brix", "Mannitol (%)": "mannitol", "TSliquid (%)": "ts_liquid", "ρliquid (g/mL)": "rho_liquid",
-    "TSslurry (%)": "ts_slurry", "ρslurry (g/mL)": "rho_slurry", "%Moisture<sub>solids</sub>": "moisture_solids", "Solids Loading (%)": "solids_loading",
+    "ORP (mV)": "orp", "TSslurry (%)": "ts_slurry", "ρslurry (g/mL)": "rho_slurry", "%Moisture<sub>solids</sub>": "moisture_solids", "Solids Loading (%)": "solids_loading",
     "%Moisture<sub>centrifuge_solids</sub>": "moisture_centrifuge", "%Moisture<sub>screw_solids</sub>": "moisture_screw",
 }
 QC_MEASURE_INFO = {
     "ph": ("pH", "", True), "tds": ("TDS", "%", True), "brix": ("Brix", "%", True), "mannitol": ("Mannitol", "%", True),
     "ts_liquid": ("Total solids, liquid", "%", True), "rho_liquid": ("Density, liquid", "g/mL", True), "ts_slurry": ("Total solids, slurry", "%", True),
-    "rho_slurry": ("Density, slurry", "g/mL", True), "moisture_solids": ("Moisture, solids", "%", True), "solids_loading": ("Solids loading", "%", True),
+    "orp": ("ORP", "mV", False), "rho_slurry": ("Density, slurry", "g/mL", True), "moisture_solids": ("Moisture, solids", "%", True), "solids_loading": ("Solids loading", "%", True),
     "moisture_centrifuge": ("Moisture, centrifuge solids", "%", True), "moisture_screw": ("Moisture, screw solids", "%", True),
     "volume_variance": ("Dilution final volume variance", "%", False), "extraction_eff": ("Extraction efficiency (TDS gain)", "%", False),
 }
@@ -4194,7 +4231,7 @@ def build_run_summary_pdf(S, logo_path=None):
                ("variance " + _pf(di.get("finalVariancePct"), 1, "%", True)) if has(di.get("finalVariancePct")) else "",
                ("pH " + _pf(di.get("measuredPh"), 1)) if has(di.get("measuredPh")) else "",
                S["reagentLine"], ("%d extra dilution pass(es)" % S["extraPasses"]) if S["extraPasses"] else ""])],
-        ["Packaging", when(pk.get("packagedAt")), join([S["packagingLine"], ("QC pH " + _pf(pk.get("qcPh"), 2)) if has(pk.get("qcPh")) else "",
+        ["Packaging", when(pk.get("packagedAt")), join([S["packagingLine"], ("QC pH " + _pf(pk.get("qcPh"), 2)) if has(pk.get("qcPh")) else "", ("ORP " + _pf(pk.get("orpMv"), 0, " mV")) if has(pk.get("orpMv")) else "",
                                                        ("final odour " + pk["odour"] + ((", " + pk["odourIntensity"].lower()) if has(pk.get("odourIntensity")) else "")) if has(pk.get("odour")) else ""])],
     ]
     pdf.table(["Stage", "Started", "Key results"], rows, [92, 78, 362], ["l", "l", "l"], size=7.8, bold_first=True)
@@ -4229,6 +4266,7 @@ def build_run_summary_pdf(S, logo_path=None):
         metric("Brix", "%", [he.get("brixPct"), ex.get("brixPct"), sp.get("liquidBrixPct"), None, None, pk.get("brixPct")], None, 2),
         metric("Mannitol", "%", [he.get("mannitolPct"), ex.get("mannitolPct"), sp.get("liquidMannitolPct"), None, None, pk.get("mannitolPct")], None, 2),
         metric("Total solids, liquid", "%", [he.get("tsLiquidPct"), ex.get("tsLiquidPct"), sp.get("liquidTsLiquidPct"), None, None, pk.get("tsLiquidPct")], None, 2),
+        metric("ORP", "mV", [he.get("orpMv"), None, None, None, None, pk.get("orpMv")], None, 0),
         metric("Density, liquid", "g/mL", [he.get("rhoLiquidGMl"), ex.get("rhoLiquidGMl"), sp.get("liquidRhoLiquidGMl"), None, None, pk.get("rhoLiquidGMl")], None, 3),
         metric("Total solids, slurry", "%", [he.get("tsSlurryPct"), ex.get("tsSlurryPct"), None, None, None, None], None, 2),
         metric("Total solids, solids", "%", [he.get("tsSolidsPct"), ex.get("tsSolidsPct"), None, None, None, None], None, 2),
@@ -4505,6 +4543,8 @@ def migrate(conn):
         ("homog_ts_liquid_pct", "REAL"), ("homog_rho_liquid_g_ml", "REAL"),
         ("homog_ts_slurry_pct", "REAL"), ("homog_rho_slurry_g_ml", "REAL"), ("homog_ts_solids_pct", "REAL"),
         ("homog_solids_loading_pct", "REAL"),
+        ("homog_orp_mv", "REAL"), ("packaging_orp_mv", "REAL"),            # KW-59: ORP (mV) of the lot at homogenization and of the final product
+        ("orp_required", "INTEGER NOT NULL DEFAULT 0"),                    # KW-59: 1 = this run was finalized when ORP was required (set at finalize)
         ("homog_tanks", "TEXT"),            # KW-10: 2A | 2B | 2AB -- which homogenization tank(s) this run used
         ("homog_slurry_l_2a", "REAL"),
         ("homog_wet_solids_wt_g_2a", "REAL"),
@@ -5442,6 +5482,11 @@ def run_public(r):
             "tsLiquidPct": r["packaging_ts_liquid_pct"], "rhoLiquidGMl": r["packaging_rho_liquid_g_ml"],
             "sampleCollectedAt": r["packaging_sample_collected_at"]},
     }
+    # KW-59: ORP (mV) readings; only present when entered (an older run's signed log has no such key)
+    if r["homog_orp_mv"] is not None:
+        d["stages"]["homogenization"]["orpMv"] = r["homog_orp_mv"]
+    if r["packaging_orp_mv"] is not None:
+        d["stages"]["packaging"]["orpMv"] = r["packaging_orp_mv"]
     # KW-10 / KW-11: which homogenization tanks were used and each tank's own entries (the run-level homogenization values above are the totals)
     if r["homog_tanks"]:
         d["stages"]["homogenization"]["tanks"] = r["homog_tanks"]
@@ -11640,6 +11685,7 @@ class Handler(BaseHTTPRequestHandler):
             ("homog_mannitol_pct", "mannitolPct", "num"),
             ("homog_ts_liquid_pct", "tsLiquidPct", "num"),
             ("homog_rho_liquid_g_ml", "rhoLiquidGMl", "num"),
+            ("homog_orp_mv", "orpMv", "num"),
             ("homog_ts_slurry_pct", "tsSlurryPct", "num"),
             ("homog_rho_slurry_g_ml", "rhoSlurryGMl", "num"),
             ("homog_ts_solids_pct", "tsSolidsPct", "num"),
@@ -11736,6 +11782,7 @@ class Handler(BaseHTTPRequestHandler):
             ("packaging_mannitol_pct", "mannitolPct", "num"),
             ("packaging_ts_liquid_pct", "tsLiquidPct", "num"),
             ("packaging_rho_liquid_g_ml", "rhoLiquidGMl", "num"),
+            ("packaging_orp_mv", "orpMv", "num"),
             ("packaging_sample_collected_at", "sampleCollectedAt", "text"),
             ("packaging_odour", "odour", "text"),
             ("packaging_odour_intensity", "odourIntensity", "text"),
@@ -11801,9 +11848,11 @@ class Handler(BaseHTTPRequestHandler):
             "SELECT * FROM fg_lots WHERE run_id=? ORDER BY package_size", (r["id"],))]
         d["edits"] = self._run_edits(conn, r["id"])
         d["attachments"] = self._attachments(conn, r["id"])
+        # (the ORP fields of KW-59 count only for a run finalized under the ORP rule: this summary is part of the signed log, so an older run's must not change)
+        qc_fields = [f for f in QC_FIELD_REGISTRY if r["orp_required"] or f[0] not in ORP_QC_FIELDS]
         d["qcSummary"] = {
-            "recorded": sum(1 for f in QC_FIELD_REGISTRY if r[f[0]] is not None),
-            "total": len(QC_FIELD_REGISTRY),
+            "recorded": sum(1 for f in qc_fields if r[f[0]] is not None),
+            "total": len(qc_fields),
         }
         d["inputs"] = self._run_inputs_public(conn, r["id"])
         d["dilutions"] = self._dilutions_public(conn, r["id"])
@@ -11829,7 +11878,8 @@ class Handler(BaseHTTPRequestHandler):
         many required fields have a value and which are still missing. A
         section is `done` (green dot) only when none are missing."""
         rid = r["id"]
-        stages = run_public(r)["stages"]
+        stages = dict(run_public(r)["stages"])
+        stages["_meta"] = {"orpRequired": r["status"] == "draft" or bool(r["orp_required"])}      # KW-59 (read by the _orp_needed predicate only)
         sections = []
         for sec in PROGRESS_SECTIONS:
             items = []   # (label, filled?)
@@ -14262,6 +14312,7 @@ class Handler(BaseHTTPRequestHandler):
             run_id = cur.lastrowid
             lot = lot_number_for(ts, run_id)
             cur.execute("UPDATE production_runs SET processing_lot=? WHERE id=?", (lot, run_id))
+        cur.execute("UPDATE production_runs SET orp_required=? WHERE id=?", (0 if hist else 1, run_id))        # KW-59: a run finalized from now on is held to the ORP rule
 
         # Log every selected tote's receiving inspection, carrying over any
         # characterization staged while this was still a draft (photos already

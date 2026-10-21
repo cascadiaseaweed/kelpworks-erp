@@ -1091,33 +1091,41 @@ function runSummaryStats(run) {
   const tdsBefore = st.homogenization && st.homogenization.tdsPct, tdsAfter = st.extraction && st.extraction.tdsPct;
   return {
     farms, toteCount, measuredKg, out,
-    finalPh: st.packaging ? st.packaging.qcPh : null, finalTds: st.packaging ? st.packaging.tdsPct : null,
+    finalPh: st.packaging ? st.packaging.qcPh : null, finalTds: st.packaging ? st.packaging.tdsPct : null, finalOrp: st.packaging ? st.packaging.orpMv : null,
     extractionBypassed: !!(st.extraction && st.extraction.bypassed),
     extractionEff: (tdsBefore && tdsAfter != null && !(st.extraction && st.extraction.bypassed)) ? (tdsAfter - tdsBefore) / tdsBefore * 100 : null,
     processRate: measuredKg && out > 0 ? out / measuredKg : null,
     harvestRate: run.inputKg > 0 && out > 0 ? out / run.inputKg : null,
   };
 }
+// The finished-run summary card (KW-25): a centred row of headline numbers, then a quiet details list. Which of them show is configured per KPI by the settings
+// run_card_show_<key> (1 shows, 0 hides; Calculations page).
 function runSummaryGrid(run) {
   const x = runSummaryStats(run);
   const fgList = (run.fgLots || []).map(f => fmt(f.qty) + ' × ' + f.packageSize).join(', ') || '—';
-  const cell = (k, v, cls) => el('div', { class: 'rs' + (cls ? ' ' + cls : '') }, el('span', { class: 'rs-k' }, k), el('span', { class: 'rs-v' }, v));
   const dash = '—';
-  return el('div', { class: 'run-stats' },
-    cell('Run date', run.runDate || dash),
-    cell('Operators', run.operators || dash),
-    cell('Product', skuName(run.sku)),
-    cell('Feedstock farms', x.farms.join(', ') || dash, 'rs-wide'),
-    cell('IBCs consumed', x.toteCount ? fmt(x.toteCount) : dash),
-    cell('Total feedstock weight', x.measuredKg != null ? [fmt(x.measuredKg, 1) + ' kg', el('small', {}, 'measured')]
-      : (run.inputKg ? [fmt(run.inputKg, 1) + ' kg', el('small', {}, 'batch-average')] : dash)),
-    cell('Packaged', fgList, 'rs-wide'),
-    cell('Product volume out', x.out ? fmt(x.out, 0) + ' L' : dash),
-    cell('Final pH', x.finalPh != null ? fmt(x.finalPh, 2) : dash),
-    cell('Final TDS', x.finalTds != null ? fmt(x.finalTds, 2) + ' %' : dash),
-    cell('Extraction efficiency', x.extractionBypassed ? [el('span', { class: 'help' }, 'n/a'), el('small', {}, 'extraction bypassed')] : (x.extractionEff != null ? fmt(x.extractionEff, 1) + ' %' : dash)),
-    cell('Conversion rate — process', x.processRate != null ? [fmt(x.processRate, 3), el('small', {}, 'L/kg · measured weight')] : dash),
-    cell('Conversion rate — harvest', x.harvestRate != null ? [fmt(x.harvestRate, 3), el('small', {}, 'L/kg · batch-average weight')] : dash));
+  const kpis = [
+    ['volume_out', 'Product volume out', x.out ? fmt(x.out, 0) + ' L' : dash],
+    ['final_ph', 'Final pH', x.finalPh != null ? fmt(x.finalPh, 2) : dash],
+    ['final_tds', 'Final TDS', x.finalTds != null ? fmt(x.finalTds, 2) + ' %' : dash],
+    ['final_orp', 'Final ORP', x.finalOrp != null ? fmt(x.finalOrp, 0) + ' mV' : dash],
+    ['extraction_eff', 'Extraction efficiency', x.extractionBypassed ? 'n/a' : (x.extractionEff != null ? fmt(x.extractionEff, 1) + ' %' : dash)],
+    ['run_date', 'Run date', run.runDate || dash],
+    ['operators', 'Operators', run.operators || dash],
+    ['product', 'Product', skuName(run.sku)],
+    ['farms', 'Feedstock farms', x.farms.join(', ') || dash],
+    ['ibcs', 'IBCs consumed', x.toteCount ? fmt(x.toteCount) : dash],
+    ['feedstock_weight', 'Total feedstock weight', x.measuredKg != null ? [fmt(x.measuredKg, 1) + ' kg', el('small', {}, 'measured')]
+      : (run.inputKg ? [fmt(run.inputKg, 1) + ' kg', el('small', {}, 'batch-average')] : dash)],
+    ['packaged', 'Packaged', fgList],
+    ['conv_process', 'Conversion rate, process', x.processRate != null ? [fmt(x.processRate, 3) + ' L/kg', el('small', {}, 'measured weight')] : dash],
+    ['conv_harvest', 'Conversion rate, harvest', x.harvestRate != null ? [fmt(x.harvestRate, 3) + ' L/kg', el('small', {}, 'batch-average weight')] : dash],
+  ].filter(k => Number(settingValue('run_card_show_' + k[0], 1)) !== 0);
+  const head = kpis.filter(k => ['volume_out', 'final_ph', 'final_tds', 'final_orp', 'extraction_eff'].includes(k[0]));
+  const rest = kpis.filter(k => !head.includes(k));
+  return el('div', { class: 'run-card-summary' },
+    head.length ? el('div', { class: 'rs-headline' }, ...head.map(([, label, v]) => el('div', { class: 'rs-big' }, el('span', { class: 'rs-big-v' }, v), el('span', { class: 'rs-big-k' }, label)))) : null,
+    rest.length ? el('dl', { class: 'rs-details' }, ...rest.flatMap(([, label, v]) => [el('dt', {}, label), el('dd', {}, v)])) : null);
 }
 // Required-field marking. The server owns the list of required fields
 // (State.ref.requiredFields, from REQUIRED_FIELDS/PROGRESS_SECTIONS in
@@ -2424,6 +2432,12 @@ function buildQualityCheckBox(subtitle, values, opts) {
   const mannitolInp = pctInput(); if (values.mannitolPct != null) mannitolInp.value = formatQcValue(values.mannitolPct, 1);
   const tsLiquidInp = pctInput(); if (values.tsLiquidPct != null) tsLiquidInp.value = formatQcValue(values.tsLiquidPct, 1);
   const rhoLiquidInp = densityInput(); if (values.rhoLiquidGMl != null) rhoLiquidInp.value = formatQcValue(values.rhoLiquidGMl, 3);
+  // ORP (mV) of the lot at homogenization and of the final product (KW-59; opts.showOrp): it can be negative
+  let orpInp;
+  if (opts.showOrp) {
+    orpInp = el('input', { inputmode: 'decimal', placeholder: 'mV (can be negative)' }); attachNumericMask(orpInp, 0, true);
+    if (values.orpMv != null) orpInp.value = formatQcValue(values.orpMv, 0);
+  }
   let tsSlurryInp, rhoSlurryInp, tsSolidsInp;
   if (!opts.omitSlurrySolids) {
     tsSlurryInp = pctInput(); if (values.tsSlurryPct != null) tsSlurryInp.value = formatQcValue(values.tsSlurryPct, 1);
@@ -2455,7 +2469,7 @@ function buildQualityCheckBox(subtitle, values, opts) {
     el('div', { class: 'qc-check-section-title' }, 'Liquid'),
     el('div', { class: 'form-row-compact' },
       qf('qcPh', 'pH', qcPhInp), qf('tdsPct', 'TDS (%)', tdsInp), qf('brixPct', 'Brix (%)', brixInp),
-      qf('mannitolPct', 'Mannitol (%)', mannitolInp)),
+      qf('mannitolPct', 'Mannitol (%)', mannitolInp), ...(opts.showOrp ? [qf('orpMv', 'ORP (mV)', orpInp)] : [])),
     el('div', { class: 'qc-check-section-title' }, 'Total Solids'),
     el('div', { class: 'form-row-compact' },
       qf('tsLiquidPct', 'TSliquid (%)', tsLiquidInp),
@@ -2479,6 +2493,7 @@ function buildQualityCheckBox(subtitle, values, opts) {
       tsLiquidPct: tsLiquidInp.value.trim() === '' ? null : qcParseValue(tsLiquidInp.value),
       rhoLiquidGMl: rhoLiquidInp.value.trim() === '' ? null : qcParseValue(rhoLiquidInp.value),
     };
+    if (opts.showOrp) payload.orpMv = orpInp.value.trim() === '' ? null : qcParseValue(orpInp.value);
     if (!opts.omitSlurrySolids) {
       payload.tsSlurryPct = tsSlurryInp.value.trim() === '' ? null : qcParseValue(tsSlurryInp.value);
       payload.rhoSlurryGMl = rhoSlurryInp.value.trim() === '' ? null : qcParseValue(rhoSlurryInp.value);
@@ -2704,9 +2719,9 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot, o
       el('div', { class: 'qc-check-section-title' }, 'Solids Out'),
       rfield('separation', 'wetSolidsWtKg', 'Total wet-solids weight (kg)', wetSolidsWtInp),
       solidsQcBox,
-      solidsSamplePointBox,
       el('div', { class: 'qc-check-section-title' }, 'Liquid Out'),
       liquidQc.box,
+      solidsSamplePointBox,                      // KW-17: the sample can be solid, liquid or slurry, so it comes after both Solids Out and Liquid Out
       el('div', { style: 'margin-top:6px' }, saveBtn, status)));
 }
 // Homogenization: "Homogenization In" groups the input fields (start time,
@@ -2833,7 +2848,7 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
     tankA.processEl, tankB.processEl);
 
   // QC Check (lot characterization): liquid-phase and slurry/solids-phase readings, each its own compact wrapping row -- one composite set for the lot.
-  const qcCheck = buildQualityCheckBox('Lot characterization', values, { showSolidsLoading: true, reqStage: 'homogenization', spot: 'production.homogenization.qc_check' });
+  const qcCheck = buildQualityCheckBox('Lot characterization', values, { showSolidsLoading: true, showOrp: true, reqStage: 'homogenization', spot: 'production.homogenization.qc_check' });
   const qcCheckBox = qcCheck.box;
 
   // Sample Point (lot input): a repeatable table of samples taken at this point in the process -- see buildSamplePointsSection, below.
@@ -4395,7 +4410,7 @@ async function openRun(draftSummary, opts) {
   // Dilution & Preservation -- still packaging-stage columns/endpoints under
   // the hood (unchanged), just relocated in the UI, so they get their own
   // Save action separate from packagedAt's.
-  const packagingQcCheck = buildQualityCheckBox('LKE characterization', stages.packaging || {}, { omitSlurrySolids: true, showOdour: true, reqStage: 'packaging', spot: 'production.dilution.qc_check' });
+  const packagingQcCheck = buildQualityCheckBox('LKE characterization', stages.packaging || {}, { omitSlurrySolids: true, showOdour: true, showOrp: true, reqStage: 'packaging', spot: 'production.dilution.qc_check' });
   const packagingSampleCollectedInp = el('input', { type: 'datetime-local',
     value: stages.packaging?.sampleCollectedAt ? stages.packaging.sampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
   const packagingSamplePointBox = el('div', { class: 'qc-check-box theme-sample', 'data-sop-spot': 'production.dilution.sample_point' },
@@ -4645,7 +4660,7 @@ async function openProcessLog(run, section) {
   // Dilution & Preservation -- still packaging-stage columns/endpoints under
   // the hood (unchanged), just relocated in the UI, so they get their own
   // Save action separate from packagedAt's.
-  const packagingQcCheck = buildQualityCheckBox('LKE characterization', stages.packaging || {}, { omitSlurrySolids: true, showOdour: true, reqStage: 'packaging', spot: 'production.dilution.qc_check' });
+  const packagingQcCheck = buildQualityCheckBox('LKE characterization', stages.packaging || {}, { omitSlurrySolids: true, showOdour: true, showOrp: true, reqStage: 'packaging', spot: 'production.dilution.qc_check' });
   const packagingSampleCollectedInp = el('input', { type: 'datetime-local',
     value: stages.packaging?.sampleCollectedAt ? stages.packaging.sampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
   const packagingSamplePointBox = el('div', { class: 'qc-check-box theme-sample', 'data-sop-spot': 'production.dilution.sample_point' },
