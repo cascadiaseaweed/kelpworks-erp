@@ -239,6 +239,20 @@ function idleStop() { clearInterval(Idle.timer); Idle.timer = null; idleHideWarn
 
 /* ---------------- Auth / shell ---------------- */
 // Light / dark theme (KW-43): each person's own choice, kept on their account (users.theme) and mirrored in this browser so the page (and the sign-in screen) is drawn in it at once.
+// A photo that was moved to SharePoint (KW-04) answers its download address with 410 and a link: a picture that then fails to load is replaced by that link.
+document.addEventListener('error', async e => {
+  const img = e.target;
+  if (!img || img.tagName !== 'IMG' || !/\/attachments\/\d+\/download/.test(img.src || '') || img.dataset.archChecked) return;
+  img.dataset.archChecked = '1';
+  try {
+    const r = await fetch(img.src);
+    if (r.status !== 410) return;
+    const j = await r.json();
+    if (!j.archived) return;
+    img.replaceWith(j.archiveUrl ? el('a', { href: j.archiveUrl, target: '_blank', rel: 'noopener', class: 'archived-photo' }, '📁 Photo moved to SharePoint — open')
+      : el('span', { class: 'archived-photo', title: j.archivedPath || '' }, '📁 Photo moved to SharePoint' + (j.archivedPath ? ': ' + j.archivedPath : '')));
+  } catch (x) { /* leave the broken picture as it is */ }
+}, true);
 const THEME_KEY = 'kelp_theme';
 function applyTheme(theme) {
   const dark = theme === 'dark';
@@ -4587,7 +4601,7 @@ async function openProcessLog(run, section) {
       sopSpot: 'production.feedstock.characterization',
       markRequired: true,
       label: inp.toteLot + (inp.site ? '  ·  ' + inp.site : ''),
-      initial: inp,
+      initial: Object.assign({}, inp, { surfacePhotoId: inp.surfacePhoto, striationPhotoId: inp.striationPhoto }),      // (the card reads the photo ids under these names: without this a saved photo never showed here)
       mode: 'completed',
       onSave: async vals => { await api('PUT', '/production/' + run.id + '/inputs/' + inp.id, vals); },
       uploadPhoto: async (slot, file, b64) => {
@@ -9165,6 +9179,31 @@ async function showDocHistory(kind, id, title) {
   modal('History — ' + title, body, async () => {}, 'Close', { noCancel: true, wide: true });
 }
 
+// Photo archive (KW-04): photos of finalized runs move from the server disk to the SharePoint records library once the sync script has confirmed its copy; the server file is then deleted.
+function photoArchiveCard(v, im) {
+  if (!im) return;
+  const modeText = im.enabled ? 'ON: confirmed photos older than ' + im.days + ' days are removed from the server once a day' : 'OFF: nothing is removed from the server';
+  v.append(el('h3', { style: 'margin:18px 0 6px' }, 'Photo archive'),
+    el('div', { class: 'summary-line' }, sl('Removal', modeText), sl('Photos on the server', fmt(im.onDisk) + ' (' + fmtBytes(im.bytesOnDisk) + ')'),
+      sl('Copy confirmed in SharePoint', fmt(im.confirmed)), sl('Waiting for a confirmed copy', fmt(im.waiting)), sl('Moved to SharePoint', fmt(im.purged)),
+      sl('Library address', im.libraryUrlSet ? 'set' : 'NOT SET: moved photos cannot link to SharePoint')),
+    el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;margin:6px 0' },
+      el('button', { type: 'button', class: 'secondary', onclick: () => purgePhotos(true) }, 'Check what would be removed'),
+      im.enabled ? el('button', { type: 'button', class: 'danger', onclick: () => purgePhotos(false) }, 'Remove confirmed old photos now') : null),
+    el('div', { class: 'help' }, 'A photo is removed only after the sync script has saved it in the library and reported its checksum, KelpWorks has found that checksum equal to its own file, and its run was finalized more than '
+      + im.days + ' days ago. Switch it on with “Photos: remove archived photos from the server” and change the days with “Photos: days on the server before they move to SharePoint” (Calculations page), after checking '
+      + 'that the photos are in SharePoint. Documents and lab reports are never removed.'));
+}
+async function purgePhotos(dryRun) {
+  if (!dryRun && !confirm('Remove every confirmed photo that is old enough from the server now? Their copies stay in SharePoint and the records keep a link.')) return;
+  let r;
+  try { r = await api('POST', '/archive/images/purge', { dryRun }); } catch (e) { toast(e.message, true); return; }
+  const n = dryRun ? r.wouldPurge : r.purged;
+  const body = el('div', {}, el('div', { class: 'summary-line' }, sl(dryRun ? 'Would be removed' : 'Removed', fmt(n) + ' photo' + (n === 1 ? '' : 's') + ' (' + fmtBytes(r.bytes) + ')'), sl('Older than', r.days + ' days')),
+    r.files.length ? table(['Photo', 'Size', 'Library path'], r.files.map(f => [f.file, fmtBytes(f.size || 0), el('span', { class: 'muted' }, f.archivedPath)]), [false, true, false]) : el('div', { class: 'help' }, 'Nothing to remove.'),
+    r.skipped.length ? el('div', { class: 'help', style: 'margin-top:8px' }, el('b', {}, 'Left alone: '), r.skipped.map(s => s.file + ' (' + s.reason + ')').join('; ')) : null);
+  modal(dryRun ? 'Photos that would be removed' : 'Photos removed', body, async () => { if (!dryRun) render(); }, 'Close', { noCancel: true, wide: true });
+}
 // Records archive + nightly backups (batch 9): what the server keeps on its own disk and whether the sync script's key is set.
 async function adminArchiveSection(v) {
   v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Records archive & backups'),
@@ -9178,6 +9217,7 @@ async function adminArchiveSection(v) {
     sl('Sync key', st.archiveKeyConfigured ? 'set' : (st.archiveKeyTooShort ? 'too short (ignored)' : 'not set')),
     sl('Finalized runs in the archive', String(st.runsToArchive))));
   if (st.lastBackupError) v.append(el('div', { class: 'help', style: 'color:var(--danger,#b00020)' }, 'Last backup problem: ' + st.lastBackupError));
+  photoArchiveCard(v, st.images);
   if (!st.backups.length) v.append(el('div', { class: 'empty card' }, 'No backups on this server yet.'));
   else v.append(table(['Backup', 'Kind', 'Size', 'Written', ''],
     st.backups.map(b => [mono(b.name), b.kind === 'nightly' ? 'Nightly (database + documents)' : 'Before a software update (database)', fmtBytes(b.size), fmtWhen(b.modified),
