@@ -151,7 +151,8 @@ def sync_files(client, root, state, dry_run=False):
     if not dry_run:
         for d in manifest["skeleton"]:
             os.makedirs(safe_join(root, d), exist_ok=True)
-    counts = {"downloaded": 0, "current": 0, "superseded": 0, "failed": 0}
+    counts = {"downloaded": 0, "current": 0, "superseded": 0, "failed": 0, "confirmed": 0}
+    to_confirm = []                                         # pictures whose copy here is current and not yet confirmed to KelpWorks (KW-04)
     for p in manifest.get("problems", []):
         say("WARNING: %s - %s: %s" % (p.get("run"), p.get("what"), p.get("error")))
     for f in manifest["files"]:
@@ -161,6 +162,11 @@ def sync_files(client, root, state, dry_run=False):
                 say("WARNING: the path is %d characters long; SharePoint stops syncing at 400: %s" % (len(dest), dest))
             known = state["files"].get(f["path"])
             exists = os.path.isfile(dest)
+            if f.get("purged") and not exists:
+                # KelpWorks removed its own copy of this photo once the copy here was confirmed: this file is now the ONLY one
+                counts["failed"] += 1
+                say("FAILED: %s is missing here and KelpWorks no longer holds it. Restore it from the SharePoint recycle bin / version history." % f["path"])
+                continue
             if exists and known is None and f.get("size") is not None and os.path.getsize(dest) == f["size"]:
                 state["files"][f["path"]] = f["version"]                  # a copy made before the state file existed, same size: take it as current
                 known = f["version"]
@@ -187,6 +193,8 @@ def sync_files(client, root, state, dry_run=False):
                 os.replace(part, dest)
                 state["files"][f["path"]] = headers.get("x-archive-version") or f["version"]
                 counts["downloaded"] += 1
+            if f.get("confirmed") is False and not f.get("purged") and not dry_run and os.path.isfile(dest):
+                to_confirm.append({"path": f["path"], "src": f.get("src"), "runId": f.get("runId"), "sha256": sha256_file(dest)})
             for old in f.get("supersedes", []):
                 old_path = safe_join(root, old)
                 if os.path.isfile(old_path) and not dry_run:
@@ -195,8 +203,19 @@ def sync_files(client, root, state, dry_run=False):
         except (SyncError, OSError) as e:
             counts["failed"] += 1
             say("FAILED: %s: %s" % (f.get("path"), e))
-    say("Run archive: %d runs, %d files: %d downloaded, %d already current, %d earlier copies kept in _superseded, %d failed"
-        % (manifest.get("runs", 0), len(manifest["files"]), counts["downloaded"], counts["current"], counts["superseded"], counts["failed"]))
+    # tell KelpWorks which photos are safely here (it checks each checksum against its own file); only then may it ever remove its copy
+    for i in range(0, len(to_confirm), 200):
+        try:
+            reply = client.post_json("/api/archive/confirm", {"files": to_confirm[i:i + 200]})
+            counts["confirmed"] += reply.get("confirmed", 0)
+            for r in reply.get("rejected", []):
+                say("NOT CONFIRMED: %s: %s" % (r.get("path"), r.get("reason")))
+        except SyncError as e:
+            counts["failed"] += 1
+            say("FAILED: could not confirm photos to KelpWorks: %s" % e)
+            break
+    say("Run archive: %d runs, %d files: %d downloaded, %d already current, %d earlier copies kept in _superseded, %d photos confirmed, %d failed"
+        % (manifest.get("runs", 0), len(manifest["files"]), counts["downloaded"], counts["current"], counts["superseded"], counts["confirmed"], counts["failed"]))
     return counts
 
 

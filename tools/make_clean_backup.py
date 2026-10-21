@@ -29,7 +29,7 @@ KEEP = {
     "sds_items", "settings", "sites", "sop_document_edits", "sop_documents", "sop_links", "species", "user_permission_log", "users",
 }
 CLEAR = {
-    "archive_receipts", "archive_runs", "cip_event_chemicals", "cip_events", "consumable_lot_log", "consumable_lots", "consumable_txns", "customers", "deleted_records", "disposals", "fg_lots", "inventory_receipts", "lab_requisitions",
+    "image_purge_log", "archive_receipts", "archive_runs", "cip_event_chemicals", "cip_events", "consumable_lot_log", "consumable_lots", "consumable_txns", "customers", "deleted_records", "disposals", "fg_lots", "inventory_receipts", "lab_requisitions",
     "lab_results", "library_inbox", "library_scans", "location_moves", "lot_uses", "preproc_batches", "preproc_inputs", "preproc_packaging", "production_runs",
     "qc_field_log", "qc_logs", "receipt_attachments", "receipt_log", "release_events", "requisition_samples", "run_amendments", "run_attachments", "run_dilution_passes", "run_dilutions",
     "run_edits", "run_inputs", "run_label_commits", "run_note_images", "run_notes", "run_packaging_commits", "run_packaging_entries", "run_reagent_commits", "run_revisions",

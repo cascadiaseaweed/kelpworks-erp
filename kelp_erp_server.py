@@ -168,6 +168,10 @@ SETTINGS_DEFAULTS = [
      "How long someone who has closed their browser (or lost power) still shows as having a run, batch or tote open. Browsers announce themselves about every third of this time; it only drives the 'someone else has this open' warning."),
     ("idle_timeout_minutes", 30, "Idle timeout (minutes)",
      "A signed-in person who has not used the screen for this long is signed out; the run and batch sections they have open are saved first. 0 turns it off. Takes effect for everyone within a minute, no deploy needed."),
+    ("image_archive_days", 30, "Photos: days on the server before they move to SharePoint",
+     "A photo of a finalized run is removed from the server disk this many days after the run was finalized, once its copy in the SharePoint records library has been confirmed (a link to it stays on the record). Pictures only: documents and lab reports are never removed."),
+    ("image_purge_enabled", 0, "Photos: remove archived photos from the server (1 = on, 0 = off)",
+     "Off by default: nothing is ever deleted until an administrator switches this on, after checking that the photos are in SharePoint (Admin > Records archive & backups > Photo archive)."),
     ("sample_retention_months", 24, "Retention sample shelf life (months)",
      "How long a Retention sample is kept: its discard-by date is the collection date plus this many months (shown in the Samples tab's Retention inventory)."),
     ("preproc_target_solids_pct", 50, "Pre-processing target blend solids (%)",
@@ -621,6 +625,20 @@ CREATE TABLE IF NOT EXISTS run_attachments (
     uploaded_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_attach_run ON run_attachments(run_id);
+
+-- Every photo taken off the server disk because its confirmed copy is in SharePoint (KW-04). Append-only.
+CREATE TABLE IF NOT EXISTS image_purge_log (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_table   TEXT NOT NULL,            -- run_attachments | tote_attachments
+    attachment_id  INTEGER NOT NULL,
+    run_id         INTEGER,
+    filename       TEXT,
+    size           INTEGER,
+    sha256         TEXT NOT NULL,
+    archived_path  TEXT NOT NULL,
+    purged_at      TEXT NOT NULL,
+    purged_by      TEXT
+);
 
 -- Notes on a production run (KW-01): machine failures, process changes. Each carries the log section it belongs to; part of the signed production log (the images are not).
 CREATE TABLE IF NOT EXISTS run_notes (
@@ -4560,6 +4578,12 @@ def migrate(conn):
             conn.execute("ALTER TABLE consumable_lots ADD COLUMN %s %s" % (col, decl))
     if "active" not in {r["name"] for r in conn.execute("PRAGMA table_info(sites)")}:        # a site that is not active is not offered for a new tote; its old totes keep it
         conn.execute("ALTER TABLE sites ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+    # KW-04: a photo's copy in the SharePoint records library is confirmed (path + SHA-256 of what was saved), and later its file is taken off the server disk (purged_at)
+    for table in ("run_attachments", "tote_attachments"):
+        tcols = {r["name"] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+        for col in ("archived_at", "archived_path", "archived_sha256", "purged_at"):
+            if col not in tcols:
+                conn.execute("ALTER TABLE %s ADD COLUMN %s TEXT" % (table, col))
     spcols = {r["name"] for r in conn.execute("PRAGMA table_info(run_sample_points)")}
     if "stage" not in spcols:
         conn.execute("ALTER TABLE run_sample_points ADD COLUMN stage TEXT")
@@ -5562,31 +5586,50 @@ def archive_run_folder(conn, run):
     return folder
 
 
-def archive_run_entries(conn, run, handler=None):
+class _NoPdf(Exception):
+    pass
+
+
+def archive_image_flags(row):
+    """For a picture's archive entry: has its SharePoint copy been confirmed, and has the server file been removed (KW-04). Other files carry neither key."""
+    if archive_ext(row["filename"]) not in IMAGE_EXTS:
+        return {}
+    return {"confirmed": bool(row["archived_at"]), "purged": bool(row["purged_at"])}
+
+
+def archive_run_entries(conn, run, handler=None, with_pdfs=True):
     """(entries, problems) for one finalized run. An entry is {path, kind, version, size, runId, src, supersedes}; `version` changes when the file's
-    content does, `src` says where its bytes come from (see archive_file_bytes)."""
+    content does, `src` says where its bytes come from (see archive_file_bytes). `with_pdfs=False` leaves the two generated PDFs out (not needed to find a picture)."""
     handler = handler or archive_handler()
     rid, lot = run["id"], run["processing_lot"]
     folder = archive_run_folder(conn, run)
     entries, problems = [], []
 
-    def add(sub, name, kind, version, size, src, supersedes=()):
-        entries.append({"path": "%s/%s/%s" % (folder, sub, name), "kind": kind, "version": version, "size": size, "runId": rid, "src": src,
-                        "supersedes": ["%s/%s/%s" % (folder, sub, s) for s in supersedes]})
+    def add(sub, name, kind, version, size, src, supersedes=(), extra=None):
+        entries.append(dict({"path": "%s/%s/%s" % (folder, sub, name), "kind": kind, "version": version, "size": size, "runId": rid, "src": src,
+                             "supersedes": ["%s/%s/%s" % (folder, sub, s) for s in supersedes]}, **(extra or {})))
 
     rev = conn.execute("SELECT COALESCE(MAX(rev_no),1) n FROM run_revisions WHERE run_id=?", (rid,)).fetchone()["n"]
     pdf_user = {"name": ARCHIVE_PDF_AUTHOR}
     try:
+        if not with_pdfs:
+            raise _NoPdf()
         add("01_Report-and-CoA", "%s_Production-Summary_rev%d.pdf" % (lot, rev), "summary",
             archive_content_key(handler._run_summary_data(conn, rid, pdf_user)), None, "summary")
+    except _NoPdf:
+        pass
     except Exception as e:
         logger.warning("Archive: no production summary for %s: %s", lot, e)
         problems.append({"run": lot, "what": "production summary", "error": str(e)})
     try:
+        if not with_pdfs:
+            raise _NoPdf()
         S = handler._coa_data(conn, rid, pdf_user)
         label = "RELEASED" if S.get("released") else "PRELIMINARY"
         add("01_Report-and-CoA", "%s_CoA_%s.pdf" % (lot, label), "coa", archive_content_key(S) + "-" + label, None, "coa",
             supersedes=("%s_CoA_PRELIMINARY.pdf" % lot,) if label == "RELEASED" else ())
+    except _NoPdf:
+        pass
     except Exception as e:
         logger.warning("Archive: no certificate of analysis for %s: %s", lot, e)
         problems.append({"run": lot, "what": "certificate of analysis", "error": str(e)})
@@ -5620,7 +5663,7 @@ def archive_run_entries(conn, run, handler=None):
                 photo[int(v)] = (r["lot_number"], label)
 
     for a in conn.execute("SELECT * FROM run_attachments WHERE run_id=? ORDER BY id", (rid,)).fetchall():
-        if not os.path.isfile(os.path.join(UPLOAD_DIR, a["stored_name"])):
+        if not os.path.isfile(os.path.join(UPLOAD_DIR, a["stored_name"])) and not a["purged_at"]:        # (a picture taken off the disk on purpose stays listed)
             problems.append({"run": lot, "what": "document %s" % a["filename"], "error": "the file is missing on the server disk"})
             continue
         ext = archive_ext(a["filename"])
@@ -5640,12 +5683,12 @@ def archive_run_entries(conn, run, handler=None):
             sub, name, kind = "03_Photos", "%s_Photo_%s.%s" % (lot, stem, ext), "photo"
         else:
             sub, name, kind = "04_Other", "%s_Document_%s.%s" % (lot, stem, ext), "document"
-        add(sub, unique(sub, name, a["id"]), kind, "att-%d" % a["id"], a["size"], "att:%d" % a["id"])
+        add(sub, unique(sub, name, a["id"]), kind, "att-%d" % a["id"], a["size"], "att:%d" % a["id"], extra=archive_image_flags(a))
 
     totes = conn.execute("SELECT DISTINCT t.id, t.lot_number FROM run_inputs i JOIN tote_lots t ON t.id=i.tote_lot_id WHERE i.run_id=? ORDER BY t.id", (rid,)).fetchall()
     for t in totes:
         for a in conn.execute("SELECT * FROM tote_attachments WHERE tote_lot_id=? ORDER BY id", (t["id"],)).fetchall():
-            if not os.path.isfile(os.path.join(UPLOAD_DIR, a["stored_name"])):
+            if not os.path.isfile(os.path.join(UPLOAD_DIR, a["stored_name"])) and not a["purged_at"]:
                 continue
             ext = archive_ext(a["filename"])
             stem = archive_slug(os.path.splitext(a["filename"] or "")[0], 40, "file")
@@ -5653,7 +5696,7 @@ def archive_run_entries(conn, run, handler=None):
                 sub, name, kind = "03_Photos", "%s_Tote-Photo_%s_%s.%s" % (lot, archive_slug(t["lot_number"], 30), stem, ext), "photo"
             else:
                 sub, name, kind = "04_Other", "%s_Tote-Document_%s_%s.%s" % (lot, archive_slug(t["lot_number"], 30), stem, ext), "document"
-            add(sub, unique(sub, name, "t%d" % a["id"]), kind, "tote-att-%d" % a["id"], a["size"], "tote_att:%d" % a["id"])
+            add(sub, unique(sub, name, "t%d" % a["id"]), kind, "tote-att-%d" % a["id"], a["size"], "tote_att:%d" % a["id"], extra=archive_image_flags(a))
     return entries, problems
 
 
@@ -5802,6 +5845,169 @@ def archive_file_bytes(conn, run_id, path, handler=None):
         return f.read(), ent["version"], served_type(row["filename"])[0]
 
 
+# ---- photo archive (KW-04): photos move from the server disk to the SharePoint records library ------------------------------------------------------------------------
+# The sync script saves every finalized run's photos in the library (they are already part of the archive) and CONFIRMS each one: it reports the path and the SHA-256 of the copy it saved.
+# KelpWorks records the confirmation only when that SHA-256 is the one of the file it holds. Later (image_archive_days after the run was finalized, and only when an administrator has
+# switched image_purge_enabled on) the file is taken off the server disk; the row stays, with the library path, and the screen shows a link to it. Pictures only.
+SHAREPOINT_BASE_URL = os.environ.get("KELP_ERP_SHAREPOINT_BASE_URL", "").strip().rstrip("/")         # the web address of the KelpWorks-Records library
+
+
+def archive_link(path):
+    return (SHAREPOINT_BASE_URL + "/" + quote(path, safe="/")) if SHAREPOINT_BASE_URL and path else None
+
+
+def file_sha256(full):
+    h = hashlib.sha256()
+    with open(full, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def archive_confirm_images(conn, files):
+    """Record that the pictures in `files` ([{path, src, runId, sha256}]) are safely in the library. A confirmation is kept only when the path is the one KelpWorks would give the file
+    and the SHA-256 is the one of the file on the server right now. -> {confirmed, rejected: [{path, reason}]}"""
+    confirmed, rejected, by_run = 0, [], {}
+    for f in (files or [])[:5000]:
+        if isinstance(f, dict):
+            by_run.setdefault(f.get("runId"), []).append(f)
+    for rid, items in by_run.items():
+        run = conn.execute("SELECT * FROM production_runs WHERE id=? AND status='completed'", (rid,)).fetchone() if isinstance(rid, int) else None
+        if not run:
+            rejected += [{"path": str(f.get("path"))[:200], "reason": "not a finalized run"} for f in items]
+            continue
+        entries = {(e["path"], e["src"]): e for e in archive_run_entries(conn, run, with_pdfs=False)[0]}
+        for f in items:
+            path, src, sha = str(f.get("path") or ""), str(f.get("src") or ""), str(f.get("sha256") or "").lower()
+            m = re.fullmatch(r"(att|tote_att):(\d+)", src)
+            if (path, src) not in entries or not m or not re.fullmatch(r"[0-9a-f]{64}", sha):
+                rejected.append({"path": path[:200], "reason": "not a file of this run's archive"})
+                continue
+            table = "run_attachments" if m.group(1) == "att" else "tote_attachments"
+            row = conn.execute("SELECT * FROM %s WHERE id=?" % table, (int(m.group(2)),)).fetchone()
+            if not row or archive_ext(row["filename"]) not in IMAGE_EXTS:
+                rejected.append({"path": path[:200], "reason": "only pictures are confirmed"})
+                continue
+            if row["purged_at"]:
+                continue
+            full = os.path.join(UPLOAD_DIR, row["stored_name"])
+            if not os.path.isfile(full):
+                rejected.append({"path": path[:200], "reason": "the file is missing on the server"})
+                continue
+            if file_sha256(full) != sha:
+                rejected.append({"path": path[:200], "reason": "the copy in the library is not the same as the file on the server"})
+                continue
+            if row["archived_sha256"] != sha or row["archived_path"] != path:
+                conn.execute("UPDATE %s SET archived_at=?, archived_path=?, archived_sha256=? WHERE id=?" % table, (now_iso(), path, sha, row["id"]))
+            confirmed += 1
+    return {"confirmed": confirmed, "rejected": rejected[:50], "rejectedCount": len(rejected)}
+
+
+def image_purge_settings(conn):
+    days = max(0, int(float(get_setting_value(conn, "image_archive_days", 30) or 0)))
+    enabled = float(get_setting_value(conn, "image_purge_enabled", 0) or 0) == 1
+    return days, enabled
+
+
+def image_archive_rows(conn):
+    """The confirmed, not yet removed pictures of finalized runs: [(table, row)] -- the row carries the run's dates and release state."""
+    out = []
+    for r in conn.execute("SELECT a.*, p.finalized_at AS run_finalized, p.run_date AS run_day, p.release_state AS run_state FROM run_attachments a JOIN production_runs p ON p.id=a.run_id "
+                          "WHERE p.status='completed' AND a.archived_at IS NOT NULL AND a.purged_at IS NULL ORDER BY a.id"):
+        out.append(("run_attachments", r))
+    for r in conn.execute("SELECT a.*, p.id AS run_id, p.finalized_at AS run_finalized, p.run_date AS run_day, p.release_state AS run_state FROM tote_attachments a "
+                          "JOIN run_inputs i ON i.tote_lot_id=a.tote_lot_id JOIN production_runs p ON p.id=i.run_id "
+                          "WHERE p.status='completed' AND a.archived_at IS NOT NULL AND a.purged_at IS NULL GROUP BY a.id ORDER BY a.id"):
+        out.append(("tote_attachments", r))
+    return out
+
+
+def run_image_purge(conn, dry_run=False, who="system"):
+    """Take confirmed pictures off the server disk. A picture goes only when: purging is switched on (a dry run just lists), its run was finalized more than image_archive_days ago and is not open
+    for amendment, its confirmed SHA-256 equals the one of the file now on the disk. Every removal is written to the append-only image_purge_log. -> counts and what was (or would be) removed."""
+    days, enabled = image_purge_settings(conn)
+    if not dry_run and not enabled:
+        return {"enabled": False, "purged": 0, "skipped": [], "bytes": 0, "days": days, "files": []}
+    cutoff = (utcnow().date() - datetime.timedelta(days=days)).isoformat()          # (finalized_at is UTC, so the cut-off is a UTC date too)
+    todo, skipped = [], []
+    for table, r in image_archive_rows(conn):
+        if archive_ext(r["filename"]) not in IMAGE_EXTS:
+            continue
+        day = (r["run_finalized"] or r["run_day"] or "")[:10]
+        if not day or day > cutoff:
+            continue
+        if r["run_state"] == "amending":
+            skipped.append({"file": r["filename"], "reason": "the run is open for amendment"})
+            continue
+        full = os.path.join(UPLOAD_DIR, r["stored_name"])
+        if not os.path.isfile(full):
+            skipped.append({"file": r["filename"], "reason": "the file is already missing on the server"})
+            continue
+        if file_sha256(full) != r["archived_sha256"]:
+            skipped.append({"file": r["filename"], "reason": "the file changed after its copy was confirmed"})
+            continue
+        todo.append((table, r, full))
+    files = [{"table": t, "id": r["id"], "runId": r["run_id"], "file": r["filename"], "size": r["size"], "archivedPath": r["archived_path"]} for t, r, _f in todo]
+    if dry_run:
+        return {"enabled": enabled, "dryRun": True, "purged": 0, "wouldPurge": len(todo), "skipped": skipped[:50], "bytes": sum(f["size"] or 0 for f in files), "days": days, "files": files[:200]}
+    for table, r, _full in todo:
+        conn.execute("UPDATE %s SET purged_at=? WHERE id=?" % table, (now_iso(), r["id"]))
+        conn.execute("INSERT INTO image_purge_log (source_table, attachment_id, run_id, filename, size, sha256, archived_path, purged_at, purged_by) VALUES (?,?,?,?,?,?,?,?,?)",
+                     (table, r["id"], r["run_id"], r["filename"], r["size"], r["archived_sha256"], r["archived_path"], now_iso(), who))
+    conn.commit()                                              # the files go only once the record that they went is saved
+    for _t, _r, full in todo:
+        try:
+            os.remove(full)
+        except OSError:
+            logger.warning("Photo archive: could not delete %s after recording it as archived.", full)
+    if todo:
+        logger.info("Photo archive: %d photo(s) taken off the server disk (%d bytes).", len(todo), sum(f["size"] or 0 for f in files))
+    return {"enabled": True, "purged": len(todo), "skipped": skipped[:50], "bytes": sum(f["size"] or 0 for f in files), "days": days, "files": files[:200]}
+
+
+def image_archive_status(conn):
+    days, enabled = image_purge_settings(conn)
+    total = {"onDisk": 0, "bytesOnDisk": 0, "confirmed": 0, "purged": 0, "waiting": 0}
+    for table in ("run_attachments", "tote_attachments"):
+        for r in conn.execute("SELECT filename, size, archived_at, purged_at FROM %s" % table):
+            if archive_ext(r["filename"]) not in IMAGE_EXTS:
+                continue
+            if r["purged_at"]:
+                total["purged"] += 1
+            else:
+                total["onDisk"] += 1
+                total["bytesOnDisk"] += r["size"] or 0
+                total["confirmed" if r["archived_at"] else "waiting"] += 1
+    total.update({"enabled": enabled, "days": days, "libraryUrlSet": bool(SHAREPOINT_BASE_URL),
+                  "lastPurge": (conn.execute("SELECT value FROM app_flags WHERE key='image_purge_on'").fetchone() or {"value": None})["value"]})
+    return total
+
+
+def run_image_purge_daily():
+    """Once a day (when switched on) take the confirmed old pictures off the disk."""
+    conn = db()
+    try:
+        _days, enabled = image_purge_settings(conn)
+        today = datetime.date.today().isoformat()
+        done = conn.execute("SELECT value FROM app_flags WHERE key='image_purge_on'").fetchone()
+        if not enabled or (done and done["value"] == today):
+            return None
+        res = run_image_purge(conn, False, "system (daily)")
+        conn.execute("INSERT OR REPLACE INTO app_flags (key,value) VALUES ('image_purge_on', ?)", (today,))
+        conn.commit()
+        return res
+    finally:
+        conn.close()
+
+
+def image_purge_scheduler(stop, every):
+    while not stop.wait(every):
+        try:
+            run_image_purge_daily()
+        except Exception:
+            logger.error("The daily photo archive step failed.", exc_info=True)
+
+
 # ---- backups on the server disk ----
 
 def nightly_dir():
@@ -5914,6 +6120,7 @@ def archive_status(conn):
     return {"nightlyBackup": NIGHTLY_BACKUP, "backupHourUtc": BACKUP_HOUR_UTC, "backupKeep": BACKUP_KEEP,
             "archiveKeyConfigured": len(ARCHIVE_KEY) >= ARCHIVE_KEY_MIN, "archiveKeyTooShort": 0 < len(ARCHIVE_KEY) < ARCHIVE_KEY_MIN,
             "lastBackup": flag("last_backup"), "lastBackupError": flag("last_backup_error"), "backups": backups,
+            "images": image_archive_status(conn),
             "runsToArchive": conn.execute("SELECT COUNT(*) c FROM production_runs WHERE status='completed'").fetchone()["c"],
             "deliveriesToArchive": conn.execute("SELECT COUNT(DISTINCT receipt_id) c FROM receipt_attachments").fetchone()["c"]}
 
@@ -6764,6 +6971,8 @@ class Handler(BaseHTTPRequestHandler):
             if not r:
                 return self._send_json({"error": "Attachment not found"}, 404)
             full = os.path.join(UPLOAD_DIR, r["stored_name"])
+            if not os.path.isfile(full) and kind != "receipts" and r["purged_at"]:
+                return self._send_archived(r)                          # KW-04: moved to the SharePoint records library; say where
             if not os.path.isfile(full):
                 return self._send_json({"error": "File missing on disk"}, 404)
             with open(full, "rb") as f:
@@ -6779,6 +6988,18 @@ class Handler(BaseHTTPRequestHandler):
             self._server_error(e)
         finally:
             conn.close()
+
+    def _send_archived(self, row):
+        """The answer for a photo that was moved to SharePoint: a browser opening it is sent to the library; a picture tag / script gets 410 with the link."""
+        url = archive_link(row["archived_path"])
+        if url and "text/html" in (self.headers.get("Accept") or ""):
+            self.send_response(302)
+            self.send_header("Location", url)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        return self._send_json({"error": "This photo was moved to the SharePoint records library on " + (row["purged_at"] or "")[:10] + (": " + row["archived_path"] if row["archived_path"] else "") + ".",
+                                "archived": True, "archiveUrl": url, "archivedPath": row["archived_path"]}, 410)
 
     def _download_sop(self, path):
         """Stream a controlled document's bytes. Any signed-in user can open
@@ -7314,6 +7535,46 @@ class Handler(BaseHTTPRequestHandler):
         with open(match["path"], "rb") as f:
             shutil.copyfileobj(f, self.wfile, 1 << 20)
 
+    def _archive_confirm(self):
+        """POST /api/archive/confirm {files: [{path, src, runId, sha256}]} (archive key or an administrator): the sync script says these pictures are safely in the library."""
+        conn = db()
+        try:
+            try:
+                self._archive_auth(conn)
+                d = self._body_json(limit=4 * 1024 * 1024)
+                conn.execute("BEGIN IMMEDIATE")
+                res = archive_confirm_images(conn, d.get("files") or [])
+                conn.commit()
+                return self._send_json(res)
+            except ApiError as e:
+                conn.rollback()
+                return self._send_json({"error": e.message}, e.status)
+        except Exception as e:  # pragma: no cover
+            self._server_error(e)
+        finally:
+            conn.close()
+
+    def _archive_images_purge(self):
+        """POST /api/archive/images/purge {dryRun: bool} (administrators): list (dry run) or do the removal of confirmed old pictures. Real removal needs the switch on."""
+        conn = db()
+        try:
+            try:
+                user = self._token_user(conn)
+                self._require_admin(user)
+                d = self._body_json(limit=1024)
+                dry = bool(d.get("dryRun"))
+                conn.execute("BEGIN IMMEDIATE")
+                res = run_image_purge(conn, dry, user["name"])
+                conn.commit()
+                return self._send_json(res)
+            except ApiError as e:
+                conn.rollback()
+                return self._send_json({"error": e.message}, e.status)
+        except Exception as e:  # pragma: no cover
+            self._server_error(e)
+        finally:
+            conn.close()
+
     def _archive_backup_now(self):
         """POST /api/archive/backup (administrators): the nightly backup, now. It runs outside the request transaction on purpose -- the sqlite backup
         API cannot copy a database whose own connection holds an open write transaction (it would wait forever)."""
@@ -7372,6 +7633,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._admin_restore()
         if path == "/api/archive/backup":
             return self._archive_backup_now()
+        if path == "/api/archive/confirm":
+            return self._archive_confirm()
+        if path == "/api/archive/images/purge":
+            return self._archive_images_purge()
         if path == "/api/library/scan":
             return self._library_scan()
         if path == "/api/library/upload":
@@ -12662,7 +12927,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _check_storage_room(self, conn, nbytes):
         """Refuse an upload that would fill the document store or the disk (every user can upload, and the disk is shared with the database)."""
-        used = sum(conn.execute("SELECT COALESCE(SUM(size),0) FROM %s" % t).fetchone()[0] for t in ("run_attachments", "tote_attachments", "receipt_attachments", "sop_documents", "sds_documents", "document_revisions", "library_inbox"))
+        used = sum(conn.execute("SELECT COALESCE(SUM(size),0) FROM %s%s" % (t, " WHERE purged_at IS NULL" if t in ("run_attachments", "tote_attachments") else "")).fetchone()[0] for t in ("run_attachments", "tote_attachments", "receipt_attachments", "sop_documents", "sds_documents", "document_revisions", "library_inbox"))
         if used + nbytes > MAX_UPLOAD_TOTAL_BYTES:
             raise ApiError(507, "The document store is full (%d MB used of %d MB). Ask an administrator to remove old documents."
                            % (used // (1024 * 1024), MAX_UPLOAD_TOTAL_BYTES // (1024 * 1024)))
@@ -15877,6 +16142,7 @@ def main():
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     stop_backups = threading.Event()
     threading.Thread(target=grade_scheduler, args=(stop_backups, float(os.environ.get("KELP_ERP_GRADE_CHECK_SECONDS", "900"))), daemon=True, name="grade-check").start()
+    threading.Thread(target=image_purge_scheduler, args=(stop_backups, float(os.environ.get("KELP_ERP_IMAGE_PURGE_SECONDS", "3600"))), daemon=True, name="image-archive").start()
     if NIGHTLY_BACKUP:
         threading.Thread(target=backup_scheduler, args=(stop_backups,), daemon=True, name="nightly-backup").start()
         logger.info("Nightly backup is on: after %02d:00 UTC, keeping the newest %d on this disk.", BACKUP_HOUR_UTC, BACKUP_KEEP)
