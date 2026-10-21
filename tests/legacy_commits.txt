@@ -46,3 +46,4 @@ e9d2c03  2026-10-20  approved suppliers (KW-23), SOP icon and dark theme (KW-12,
 a8624e4  2026-10-20  dilution tweaks (KW-19, KW-20, KW-21), Samples / lab small changes (KW-33, KW-34, KW-35, KW-14, KW-27) (PRs 65, 66) merged to main and live
 d642c41  2026-10-20  lab results accept a JSON number and answer 400 for other wrong types (PR 68) merged to main and live
 a15c319  2026-10-21  photo archive (KW-04), ORP / run summary card / separation order (KW-59, KW-17, KW-25), review screen (KW-30), feedstock photo remove (KW-02) (PRs 70 to 73) merged to main and live
+77af4e3  2026-10-21  free a stuck tote (KW-51), organic grade of reagents (KW-46) (PR 75) merged to main and live
