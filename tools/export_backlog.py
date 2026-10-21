@@ -4,7 +4,8 @@
 Standard library only (an .xlsx is a zip of XML). The Excel file stays the master for STATUS, owner and notes; the CSV is a snapshot of the item definitions, so
 re-run this after the workbook changes:
 
-    python tools/export_backlog.py "C:\\path\\to\\KelpWorks_ChangeLog_2026-10-16.xlsx"
+    python tools/export_backlog.py                       # reads the change log itself (tools/changelog_path.py: LOG_KelpWorks_ChangeControl.xlsx in ...\\KelpWorks ERP\\Change_Control)
+    python tools/export_backlog.py "C:\\path\\to\\any copy.xlsx"   # or any copy of it (reading is harmless)
 
 Sheets exported: "Change Log" -> items.csv and "Open Decisions" -> open-decisions.csv. Every other sheet (Summary, Workflow Rules, the playbook ...) is ignored. Columns are found by
 their HEADER NAME in row 1, never by position, so columns can be added or moved (the workbook now also has Approved to Start, PR #, Released Date, Verified By (on live),
@@ -20,6 +21,9 @@ import re
 import sys
 import xml.etree.ElementTree as ET
 import zipfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import changelog_path                                                             # the ONE place that says where the change log is (KW-62)
 
 NS = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
       "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
@@ -69,13 +73,17 @@ def read_sheets(path):
 
 
 def main(argv):
-    if len(argv) < 2 or argv[1] in ("-h", "--help"):
+    if len(argv) > 1 and argv[1] in ("-h", "--help"):
         print(__doc__)
         return 1
+    path = argv[1] if len(argv) > 1 else changelog_path.configured_path()                     # no argument: the change log itself (one setting, KW-62)
+    if not os.path.isfile(path):
+        print("The workbook was not found: %s" % path)
+        return 2
     here = os.path.dirname(os.path.abspath(__file__))
     outdir = os.path.join(os.path.dirname(here), "docs", "backlog")
     os.makedirs(outdir, exist_ok=True)
-    sheets = read_sheets(argv[1])
+    sheets = read_sheets(path)
     for name, fname in SHEETS.items():
         rows = sheets.get(name)
         if not rows:

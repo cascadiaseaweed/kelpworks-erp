@@ -37,6 +37,6 @@ Follow these steps in order. Do not skip one; say so if one does not apply.
     Decision, and a note on the item) -- write it into the workbook ONLY with `python tools/changelog_write.py --id KW-nn Status=... "PR #=nn" "Released Date=YYYY-MM-DD" Notes="..."` (or `--batch`; standard library only; it
     writes just the columns Claude Code owns, refuses Deferred / Won't do and unapproved starts, stops if the workbook is open in Excel or changed while it ran, and re-checks 60 s after saving; use `--dry-run` first). A decision
     goes to the Open Decisions sheet with `tools/update_backlog_xlsx.py`. Then refresh the snapshot with `python tools/export_backlog.py "<workbook>"`. Keep a copy of the workbook outside
-    SharePoint before the first edit of a session. The workbook is `KelpWorks_ChangeLog_2026-10-16.xlsx` in `...\QAQC\KelpWorks ERP\` (OneDrive).
+    SharePoint before the first edit of a session. The workbook is `LOG_KelpWorks_ChangeControl.xlsx` in `...\QAQC\KelpWorks ERP\Change_Control\` (OneDrive).
 
 Keep it small: one item (or the bundle named in the arguments) per branch.

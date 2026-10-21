@@ -78,7 +78,9 @@ def cw():
 
 @pytest.fixture
 def wb(tmp_path):
-    p = tmp_path / "KelpWorks_ChangeLog_2026-10-16.xlsx"
+    folder = tmp_path / "Change_Control"
+    folder.mkdir()
+    p = folder / "LOG_KelpWorks_ChangeControl.xlsx"
     make(str(p))
     return str(p)
 
@@ -174,7 +176,7 @@ def test_a_dry_run_checks_the_rules_but_writes_nothing(cw, wb):
 
 def test_it_stops_when_excel_has_the_workbook_open(cw, wb, tmp_path, capsys):
     original = open(wb, "rb").read()
-    lock = tmp_path / "~$lpWorks_ChangeLog_2026-10-16.xlsx"
+    lock = tmp_path / "Change_Control" / "~$G_KelpWorks_ChangeControl.xlsx"
     lock.write_text("x")
     assert write(cw, wb, "--id", "KW-01", "Status=In progress") == 3 and "open in Excel" in capsys.readouterr().out
     assert open(wb, "rb").read() == original
@@ -234,7 +236,8 @@ def test_a_batch_is_checked_as_a_whole_and_written_once(cw, wb, tmp_path, capsys
 
 
 def test_a_workbook_without_the_approval_column_cannot_start_an_item(cw, tmp_path, capsys):
-    p = tmp_path / "KelpWorks_ChangeLog_old.xlsx"
+    (tmp_path / "Change_Control").mkdir()
+    p = tmp_path / "Change_Control" / "LOG_KelpWorks_ChangeControl.xlsx"
     make(str(p), headers=[h if h != "Approved to Start" else "Approval" for h in HEADERS])
     assert write(cw, str(p), "--id", "KW-01", "Status=In progress") == 2 and "Approved to Start" in capsys.readouterr().out
 
@@ -245,3 +248,49 @@ def test_show_prints_a_rows_workflow_cells_and_changes_nothing(cw, wb, capsys):
     out = capsys.readouterr().out
     assert "Approved to Start" in out and "70" in out and open(wb, "rb").read() == original
     assert write(cw, wb, "--show", "KW-99") == 2
+
+
+# ---- KW-62: one change log, one setting; a write never goes to any other file
+def test_a_write_to_a_copy_an_old_name_or_another_folder_is_refused_but_reading_and_dry_runs_are_not(cw, wb, tmp_path, capsys):
+    import shutil
+    others = {"copy": tmp_path / "Change_Control" / "LOG_KelpWorks_ChangeControl - Copy.xlsx",
+              "old name": tmp_path / "Change_Control" / "KelpWorks_ChangeLog_2026-10-16.xlsx",
+              "other folder": tmp_path / "Elsewhere" / "LOG_KelpWorks_ChangeControl.xlsx"}
+    for label, p in others.items():
+        p.parent.mkdir(exist_ok=True)
+        shutil.copy(wb, p)
+        before = p.read_bytes()
+        assert write(cw, str(p), "--id", "KW-01", "Status=In progress") == 2, label
+        out = capsys.readouterr().out
+        assert "is not the change log" in out and "LOG_KelpWorks_ChangeControl.xlsx" in out and "Nothing was written" in out, label
+        assert p.read_bytes() == before, label
+        assert write(cw, str(p), "--show", "KW-01") == 0                                                   # looking is harmless
+        assert write(cw, str(p), "--id", "KW-01", "Status=In progress", "--dry-run") == 0                  # so is a dry run
+        assert p.read_bytes() == before
+    assert write(cw, wb, "--id", "KW-01", "Status=In progress") == 0                                        # the real one is written
+
+
+def test_the_path_is_one_setting_shared_by_the_writer_the_old_writer_and_the_reader(cw, monkeypatch):
+    import changelog_path
+    assert changelog_path.CHANGE_LOG_NAME == "LOG_KelpWorks_ChangeControl.xlsx" and changelog_path.DEFAULT_PATH.endswith("\\Change_Control\\LOG_KelpWorks_ChangeControl.xlsx")
+    assert cw.DEFAULT_PATH == changelog_path.DEFAULT_PATH
+    monkeypatch.delenv("KELPWORKS_CHANGELOG", raising=False)
+    assert changelog_path.configured_path() == changelog_path.DEFAULT_PATH
+    monkeypatch.setenv("KELPWORKS_CHANGELOG", r"D:\OneDrive\Change_Control\LOG_KelpWorks_ChangeControl.xlsx")             # another PC: a different folder above, the same name and folder
+    assert changelog_path.configured_path().startswith("D:")
+    changelog_path.check_writable(changelog_path.configured_path())
+
+
+def test_no_file_in_the_repo_still_uses_the_old_name():
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent
+    old = "KelpWorks_ChangeLog"
+    skip = {".git", "__pycache__", "node_modules"}
+    hits = []
+    for p in root.rglob("*"):
+        if p.is_file() and not (set(p.relative_to(root).parts) & skip) and p.suffix.lower() in (".py", ".md", ".txt", ".yml", ".yaml", ".json", ".bat", ".html", ".js", ".toml", ".cfg"):
+            if p.name == "test_changelog_write.py":
+                continue                                                                                   # this test names the old name on purpose
+            if old in p.read_text(encoding="utf-8", errors="ignore"):
+                hits.append(str(p.relative_to(root)))
+    assert hits == [], hits

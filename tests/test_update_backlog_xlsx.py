@@ -43,6 +43,13 @@ def sheets(path):
     return load("export_backlog").read_sheets(path)
 
 
+def change_log(tmp_path):
+    """The change log itself: the right name in a folder called Change_Control (a write to any other file is refused, KW-62)."""
+    folder = tmp_path / "Change_Control"
+    folder.mkdir(exist_ok=True)
+    return folder / "LOG_KelpWorks_ChangeControl.xlsx"
+
+
 def run(tool, xlsx, tmp_path, updates, extra=()):
     spec = tmp_path / "u.json"
     spec.write_text(json.dumps(updates), encoding="utf-8")
@@ -51,7 +58,7 @@ def run(tool, xlsx, tmp_path, updates, extra=()):
 
 def test_a_change_log_item_is_refused_and_points_to_the_guarded_tool(tmp_path, capsys):
     tool = load("update_backlog_xlsx")
-    xlsx = tmp_path / "log.xlsx"
+    xlsx = change_log(tmp_path)
     make(xlsx)
     original = xlsx.read_bytes()
     assert run(tool, xlsx, tmp_path, [{"id": "KW-05", "status": "Released"}]) == 2
@@ -61,7 +68,7 @@ def test_a_change_log_item_is_refused_and_points_to_the_guarded_tool(tmp_path, c
 
 def test_a_decision_is_recorded_on_the_open_decisions_sheet(tmp_path):
     tool = load("update_backlog_xlsx")
-    xlsx = tmp_path / "log.xlsx"
+    xlsx = change_log(tmp_path)
     make(xlsx)
     assert run(tool, xlsx, tmp_path, [{"decision": "KW-05", "by": "N. Wrana (2026-10-19)", "text": "Make optional"}]) == 0
     assert sheets(str(xlsx))["Open Decisions"][1] == ["KW-05", "N. Wrana (2026-10-19)", "Make optional"]
@@ -69,7 +76,7 @@ def test_a_decision_is_recorded_on_the_open_decisions_sheet(tmp_path):
 
 def test_a_bad_decision_changes_nothing(tmp_path, capsys):
     tool = load("update_backlog_xlsx")
-    xlsx = tmp_path / "log.xlsx"
+    xlsx = change_log(tmp_path)
     make(xlsx)
     original = xlsx.read_bytes()
     assert run(tool, xlsx, tmp_path, [{"decision": "KW-05", "by": "x"}, {"decision": "KW-99", "text": "y"}]) == 2          # one bad entry stops the whole run
@@ -79,8 +86,19 @@ def test_a_bad_decision_changes_nothing(tmp_path, capsys):
 
 def test_a_dry_run_writes_nothing(tmp_path):
     tool = load("update_backlog_xlsx")
-    xlsx = tmp_path / "log.xlsx"
+    xlsx = change_log(tmp_path)
     make(xlsx)
     original = xlsx.read_bytes()
     assert run(tool, xlsx, tmp_path, [{"decision": "KW-05", "by": "N. Wrana", "text": "Make optional"}], extra=("--dry-run",)) == 0
     assert xlsx.read_bytes() == original
+
+
+def test_a_decision_is_not_written_to_a_copy_or_any_other_file(tmp_path, capsys):
+    tool = load("update_backlog_xlsx")
+    for name in ("log.xlsx", "LOG_KelpWorks_ChangeControl - Copy.xlsx"):
+        xlsx = tmp_path / name
+        make(xlsx)
+        original = xlsx.read_bytes()
+        assert run(tool, xlsx, tmp_path, [{"decision": "KW-05", "by": "x", "text": "y"}]) == 2
+        assert "is not the change log" in capsys.readouterr().out and xlsx.read_bytes() == original
+        assert run(tool, xlsx, tmp_path, [{"decision": "KW-05", "by": "x", "text": "y"}], extra=("--dry-run",)) == 0          # a dry run may look at any copy

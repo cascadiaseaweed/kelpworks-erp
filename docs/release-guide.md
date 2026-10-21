@@ -58,8 +58,8 @@ Switch to main and pull, then restart the dev server
 
 ## Working through the change log (KW items)
 
-The team's list of requested changes is the Excel workbook `KelpWorks_ChangeLog_<date>.xlsx` (SharePoint, QAQC > KelpWorks ERP); `docs/backlog/` holds a CSV snapshot of it that Claude Code reads
-(`python tools/export_backlog.py "<workbook>"` refreshes it; `python tools/changelog_write.py --id KW-nn Status=... ` is the ONLY way Claude Code writes an item's Status / Notes / PR # / Released Date / QM-001 Ref back (it checks column ownership, Approved to Start, stale and locked files and verifies after saving); `tools/update_backlog_xlsx.py` now records Open Decisions only). Work one item (or one bundle of related items) per branch with `/kw-item KW-24` (`.claude/commands/kw-item.md`): it reads the item,
+The team's list of requested changes is the Excel workbook `LOG_KelpWorks_ChangeControl.xlsx` (SharePoint, QAQC > KelpWorks ERP > Change_Control); `docs/backlog/` holds a CSV snapshot of it that Claude Code reads
+(`python tools/export_backlog.py` refreshes it (no argument: it reads the change log itself, the one path set in `tools/changelog_path.py`); `python tools/changelog_write.py --id KW-nn Status=... ` is the ONLY way Claude Code writes an item's Status / Notes / PR # / Released Date / QM-001 Ref back (it checks column ownership, Approved to Start, stale and locked files and verifies after saving); `tools/update_backlog_xlsx.py` now records Open Decisions only). Work one item (or one bundle of related items) per branch with `/kw-item KW-24` (`.claude/commands/kw-item.md`): it reads the item,
 asks you about any open decision, creates `updates/kw-<number>-<name>` from the latest `main`, plans (you approve the plan for "Plan mode" items), builds with tests and a browser check, and stops
 before committing. Everything after that is the normal flow below. Merge one branch before starting another that touches the same area, so conflicts stay small. When an item is live, set its
 Status in the workbook; the live commit goes into `tests/legacy_commits.txt`.
