@@ -3381,8 +3381,9 @@ function buildFeedstockCard(opts) {
     .forEach(inp => inp.addEventListener('change', notifyChange));
 
   function photoSlot(slotKey, label) {
-    const img = el('img', {});
+    const img = el('img', { title: 'Click to view full size', style: 'cursor:zoom-in' });
     if (v[slotKey] && opts.photoUrl) img.src = opts.photoUrl(v[slotKey]); else img.style.display = 'none';
+    img.addEventListener('click', () => { if (v[slotKey] && opts.photoUrl) window.open(opts.photoUrl(v[slotKey]), '_blank', 'noopener'); });      // KW-02: full size in its own tab
     const fileInput = el('input', { type: 'file', accept: 'image/*', style: 'display:none' });
     // capture="environment" hands off to the rear camera on phones/tablets.
     const cameraInput = el('input', { type: 'file', accept: 'image/*', capture: 'environment', style: 'display:none' });
@@ -3396,8 +3397,9 @@ function buildFeedstockCard(opts) {
         status.textContent = 'Uploading…';
         try {
           const b64 = String(reader.result).split(',')[1];
-          v[slotKey] = await opts.uploadPhoto(slotKey === 'surfacePhotoId' ? 'surface' : 'striation', file, b64);
+          v[slotKey] = await opts.uploadPhoto(slotKey === 'surfacePhotoId' ? 'surface' : 'striation', file, b64, v[slotKey]);      // the old photo (if any) is replaced, not left behind
           status.textContent = '';
+          refreshBtns();
           notifyChange();
         } catch (e) { status.textContent = e.message; }
       };
@@ -3406,11 +3408,24 @@ function buildFeedstockCard(opts) {
     fileInput.addEventListener('change', () => { handle(fileInput.files[0]); fileInput.value = ''; });
     cameraInput.addEventListener('change', () => { handle(cameraInput.files[0]); cameraInput.value = ''; });
     const photoKey = slotKey === 'surfacePhotoId' ? 'surfacePhoto' : 'striationPhoto';
+    const uploadBtn = el('button', { type: 'button', class: 'secondary', onclick: () => fileInput.click() }, 'Upload');
+    // Remove is offered only where the caller allows it (a run still being logged); a finalized run's photos are part of its signed log (KW-02)
+    const removeBtn = opts.removePhoto ? el('button', { type: 'button', class: 'secondary', onclick: async () => {
+      if (!v[slotKey] || !confirm('Remove this photo? The file is deleted.')) return;
+      status.textContent = 'Removing…';
+      try {
+        await opts.removePhoto(slotKey === 'surfacePhotoId' ? 'surface' : 'striation', v[slotKey]);
+        v[slotKey] = null; img.removeAttribute('src'); img.style.display = 'none'; status.textContent = ''; refreshBtns(); notifyChange();
+      } catch (e) { status.textContent = e.message; }
+    } }, 'Remove') : null;
+    function refreshBtns() { uploadBtn.textContent = v[slotKey] ? 'Replace' : 'Upload'; if (removeBtn) removeBtn.style.display = v[slotKey] ? '' : 'none'; }
+    refreshBtns();
     return el('div', { class: 'photo-slot', style: 'flex:1 1 160px' },
       el('div', { class: 'help' }, opts.markRequired && isReq('feedstock', photoKey) ? reqLabel(label) : label), img, fileInput, cameraInput,
-      el('div', { style: 'display:flex;gap:6px;margin-top:4px' },
-        el('button', { type: 'button', class: 'secondary', onclick: () => fileInput.click() }, 'Upload'),
-        el('button', { type: 'button', class: 'secondary', onclick: () => cameraInput.click() }, '📷 Photo')),
+      el('div', { style: 'display:flex;gap:6px;margin-top:4px;flex-wrap:wrap' },
+        uploadBtn,
+        el('button', { type: 'button', class: 'secondary', onclick: () => cameraInput.click() }, '📷 Photo'),
+        removeBtn),
       status);
   }
 
@@ -4322,12 +4337,13 @@ async function openRun(draftSummary, opts) {
             filterTotes();
           }
         },
-        uploadPhoto: async (slot, file, b64) => {
+        uploadPhoto: async (slot, file, b64, replaces) => {
           const rid = await ensureRunId();
           const r = await api('POST', '/production/' + rid + '/feedstock-photo',
-            { slot, filename: file.name, contentType: file.type || 'image/jpeg', dataB64: b64 });
+            { slot, filename: file.name, contentType: file.type || 'image/jpeg', dataB64: b64, replaces: replaces || null });
           return r.attachmentId;
         },
+        removePhoto: async (slot, attId) => { const rid = await ensureRunId(); await api('DELETE', '/production/' + rid + '/feedstock-photo/' + attId); },
         photoUrl: attId => attDownloadUrl(draftId, attId, false)
       }));
     }
