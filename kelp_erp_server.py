@@ -2958,6 +2958,22 @@ def coa_evaluate(conn, r):
 RELEASE_RULE_TEXT = {"pass": "Must pass", "min": "Must be at or above the lower limit"}
 
 
+def coa_rows_for_review(conn, r):
+    """What the Quality review checks: every test on the Certificate of Analysis (or with a release rule) with its specification, result, PASS / FAIL / REVIEW and whether a lab report is
+    on file -- one list, so the reviewer sees at a glance that everything passes and every result has its report (KW-30)."""
+    rules = {s["code"]: s["release_rule"] for s in conn.execute("SELECT code, release_rule FROM coa_specs")}
+    out = []
+    for row in coa_evaluate(conn, r)["rows"]:
+        if not (row["listed"] or row["tested"] or rules.get(row["code"])):
+            continue
+        res = row.get("result") or {}
+        out.append({"code": row["code"], "name": row["name"], "group": row["group"], "specText": row["specText"], "resultText": row["resultText"] or None,
+                    "status": row["status"], "note": row["note"], "basis": row["basis"], "mustPass": rules.get(row["code"]) in ("pass", "min"),
+                    "labName": res.get("labName"), "reportNumber": res.get("reportNumber"), "attachmentId": res.get("attachmentId"),
+                    "source": row.get("source")})
+    return out
+
+
 def release_gate(conn, r):
     """What stands between this run and Quality release: every specification with a release rule, judged now.
     -> [{code, name, group, rule, ruleText, spec, result, status, ok, reason}]. A run can be released only when every item is ok.
@@ -12233,7 +12249,7 @@ class Handler(BaseHTTPRequestHandler):
                 out.update({"run": self._run_full(conn, r), "events": self._release_events_public(conn, rid),
                             "me": me, "currentLogHash": now_hash, "reviewedLogHash": r["release_review_hash"],
                             "logMatchesReview": (r["release_review_hash"] == now_hash) if r["release_review_hash"] else None,
-                            "chain": release_verify_chain(conn), "gate": release_gate(conn, r),
+                            "chain": release_verify_chain(conn), "gate": release_gate(conn, r), "coaRows": coa_rows_for_review(conn, r),
                             "separateSigners": bool(float(get_setting_value(conn, "release_separate_signers", 0) or 0))})
                 return out
             if len(seg) == 5 and method == "POST" and seg[4] in ("review", "release", "reopen", "resubmit"):

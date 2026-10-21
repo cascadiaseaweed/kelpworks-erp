@@ -4900,21 +4900,33 @@ async function openReleaseRun(id) {
   const refresh = async () => { body.closest('.modal-bg')?.remove(); await openReleaseRun(id); if (State.tab === 'release') { /* list refreshes on next visit */ } };
   body.append(el('div', { class: 'summary-line' }, sl('Run', d.lot), sl('Product', skuName(d.sku)), el('span', {}, 'Status: ', releaseBadge(d.state)),
     sl('Finalized', fmtWhen(d.finalizedAt) + (d.finalizedBy ? ' by ' + d.finalizedBy : ''))));
-  body.append(runNotesPanel(d.run, d.events, { emptyText: 'No notes were written on this run.' }));
-  body.append(table(['FG lot', 'Pack', 'Units', 'Litres', 'Status'], d.lots.map(l => [mono(l.lot), l.packageSize, fmt(l.qty), num(fmt(l.litres, 0)), fgStatusBadge(l.status)]), [false, false, true, true, false]));
-  body.append(el('div', { class: 'sign-box' }, el('h4', {}, 'Laboratory results & Certificate of Analysis'),
-    el('div', { style: 'display:flex;gap:10px;align-items:center;flex-wrap:wrap' }, labBadge(d.lab), el('span', { class: 'help' }, labSummaryText(d.lab)),
-      el('button', { type: 'button', class: 'secondary', onclick: () => openLabResults(d.run) }, 'Lab results…'),
+  // KW-30: what QA checks first -- every result on the Certificate of Analysis passes and has its lab report -- then the sign-off; everything else is folded away below
+  const blockedGate = d.gate.filter(g => !g.ok);
+  const coa = d.coaRows || [];
+  const tested = coa.filter(x => x.status);
+  const passing = tested.filter(x => x.status === 'pass').length;
+  const noReport = coa.filter(x => x.status && x.basis !== 'run' && !x.attachmentId).length;
+  const statusBadge = x => !x.status ? badge('sold', 'No result') : x.status === 'pass' ? badge('on_hand', 'PASS') : x.status === 'fail' ? badge('hold', 'FAIL') : badge('low', x.status === 'review' ? 'REVIEW' : 'Not evaluated');
+  const gateByCode = Object.fromEntries(d.gate.map(g => [g.code, g]));
+  const waiting = coa.filter(x => !x.status && gateByCode[x.code]);          // no result yet, and a result is a release condition
+  body.append(el('div', { class: 'sign-box' }, el('h4', {}, 'Lab results — every result on the Certificate of Analysis must pass'),
+    el('div', { style: 'display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px' },
+      el('b', {}, passing + ' of ' + tested.length + ' results pass'),
+      blockedGate.length ? el('span', { style: 'color:var(--danger);font-weight:600' }, 'Release is blocked: ' + blockedGate.length + ' of ' + d.gate.length + ' required checks not met (no override)')
+        : el('span', { style: 'color:var(--accent-text);font-weight:600' }, '✓ All ' + d.gate.length + ' required checks are met'),
+      noReport ? el('span', { style: 'color:var(--fg-8a5a00);font-weight:600' }, noReport + ' result' + (noReport === 1 ? ' has' : 's have') + ' no lab report attached') : null),
+    tested.length ? table(['Test', 'Specification', 'Result', 'Lab report', 'Status'], tested.map(x => {
+      const g = gateByCode[x.code];
+      return [el('span', {}, x.name, x.note ? el('div', { class: 'muted' }, x.note) : null), x.specText || '—', x.resultText || '—',
+        x.basis === 'run' ? el('span', { class: 'muted' }, x.source || 'Production log') : (x.attachmentId ? el('a', { href: attDownloadUrl(id, x.attachmentId, false), target: '_blank', rel: 'noopener' }, '📎 ' + (x.reportNumber || 'report')) : el('span', { class: 'muted' }, 'none attached')),
+        el('span', {}, statusBadge(x), g ? el('div', { class: 'muted' }, g.ok ? 'release gate: met' : 'release gate: NOT met') : null)];
+    }), [false, false, false, false, false]) : el('div', { class: 'help' }, 'No lab results are on file yet.'),
+    waiting.length ? el('div', { class: 'help', style: 'margin-top:6px' }, el('b', {}, 'Still needed for release (' + waiting.length + '): '), waiting.map(x => x.name).join(', ')) : null,
+    el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;margin-top:8px' },
+      el('button', { type: 'button', onclick: () => openLabResults(d.run) }, 'Upload / enter lab results…'),
       el('button', { type: 'button', class: 'secondary', onclick: () => window.open(coaPdfUrl(id, false), '_blank') }, 'View CoA')),
     d.lab.failed.length ? el('div', { class: 'help', style: 'color:var(--danger);font-weight:600;margin-top:6px' },
       'Outside specification: ' + d.lab.failed.join(', ') + '. A comment is required to release this lot.') : null));
-  body.append(await materialsCard(id));
-  const blockedGate = d.gate.filter(g => !g.ok);
-  body.append(el('div', { class: 'sign-box' }, el('h4', {}, 'Release gate — must pass before this run can be released'),
-    el('div', { class: 'help', style: 'margin-bottom:6px;' + (blockedGate.length ? 'color:var(--danger);font-weight:600' : '') },
-      blockedGate.length ? 'Release is blocked: ' + blockedGate.length + ' of ' + d.gate.length + ' checks not met. There is no override.' : 'All ' + d.gate.length + ' checks are met.'),
-    table(['Test', 'Rule', 'Specification', 'Result', 'Check'], d.gate.map(g => [g.name, g.ruleText, g.spec, g.result || '—',
-      g.ok ? badge('on_hand', 'Met') : el('span', {}, badge('hold', 'Not met'), el('div', { class: 'muted' }, g.reason))]))));
   const integrity = [];
   if (d.logMatchesReview === true) integrity.push('Production log unchanged since review (hash ' + shortHash(d.reviewedLogHash) + ').');
   if (d.logMatchesReview === false) integrity.push('WARNING: the production log no longer matches the log that was reviewed.');
@@ -4922,8 +4934,8 @@ async function openReleaseRun(id) {
   body.append(el('div', { class: 'help', style: 'margin:8px 0;' + (d.logMatchesReview === false || !d.chain.ok ? 'color:var(--danger);font-weight:600' : '') }, integrity.join(' ')));
   body.append(el('div', { style: 'margin:6px 0' },
     el('button', { type: 'button', class: 'secondary', onclick: () => openProcessLog(d.run) }, '📋 Open full process log'), ' ',
-    el('span', { class: 'help' }, 'Review the log first, then sign below.')));
-  body.append(releaseLogSummary(d.run));
+    el('span', { class: 'help' }, 'Review the log and the lab results, then sign below.')));
+  const fold = (title, ...kids) => el('details', { class: 'accordion' }, el('summary', {}, title), el('div', { class: 'accordion-body' }, ...kids));
 
   function signBox(title, attest, decisions, endpoint, opts = {}) {
     const decSel = decisions.length > 1 ? selectFrom('', decisions) : null;
@@ -4969,6 +4981,11 @@ async function openReleaseRun(id) {
       el('div', { class: 'accordion-body' }, el('div', { class: 'help' }, 'Voids the existing review/release and returns unsold lots to Pending Release. Units already shipped are recorded in the trail.'),
         signBox('Reopen', 'By signing I confirm the prior review/release no longer stands and a new review is required.', [['reopen', 'Reopen']], 'reopen', { quality: true, button: 'Sign & reopen', commentHint: 'Reason for reopening (required)' }))));
   }
+  // the supporting detail, folded away so the lab results and the sign-off are what is in front of the reviewer
+  body.append(fold('Run notes', runNotesPanel(d.run, d.events, { emptyText: 'No notes were written on this run.' })));
+  body.append(fold('Finished goods lots (' + d.lots.length + ')', table(['FG lot', 'Pack', 'Units', 'Litres', 'Status'], d.lots.map(l => [mono(l.lot), l.packageSize, fmt(l.qty), num(fmt(l.litres, 0)), fgStatusBadge(l.status)]), [false, false, true, true, false])));
+  body.append(fold('Materials used and their lots', await materialsCard(id)));
+  body.append(fold('Production log summary', releaseLogSummary(d.run)));
   body.append(el('h3', { style: 'margin:14px 0 6px;font-size:14px' }, 'Audit trail'));
   body.append(el('div', { class: 'tablewrap' }, el('table', {},
     el('thead', {}, el('tr', {}, ...['#', 'When', 'Event', 'Signed by', 'Statement / comment', 'Log hash'].map(h => el('th', {}, h)))),
