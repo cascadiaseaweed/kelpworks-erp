@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Update the KelpWorks change-log workbook (the master list the team keeps in SharePoint): an item's Status / Owner / Notes on the Change Log sheet and a decision's
-Decided By / Decision on the Open Decisions sheet.
+"""Update the KelpWorks change-log workbook (the master list the team keeps in SharePoint): a decision's Decided By / Decision on the Open Decisions sheet.
+
+**The Change Log sheet is NOT written here any more** (KW-61): its columns have owners, items need approval before they start and the file must be written safely, all of which
+tools/changelog_write.py enforces. An update with an "id" is refused and points there.
 
 Standard library only. The workbook is edited INSIDE the .xlsx file (only the cells named below change), so its formatting, drop-down lists, formulas, filters and SharePoint
 properties are left exactly as they are; the Summary counts are recalculated the next time Excel opens it. Close the workbook in Excel first (an open file is locked).
 
     python tools/update_backlog_xlsx.py "<workbook>" updates.json [--dry-run]
 
-updates.json is a list; each entry is either an item or a decision:
+updates.json is a list of decisions:
 
-    [{"id": "KW-03", "status": "Released", "notes": "PR #46 merged 2026-10-19"},
-     {"decision": "KW-05", "by": "N. Wrana (2026-10-19)", "text": "Make optional (keep fields and history)"}]
+    [{"decision": "KW-05", "by": "N. Wrana (2026-10-19)", "text": "Make optional (keep fields and history)"}]
 
-Item fields: status (one of STATUSES, the workbook's drop-down), owner, notes. Leave a field out to keep what is there. Afterwards refresh the CSV snapshot with
-`python tools/export_backlog.py "<workbook>"`.
+Afterwards refresh the CSV snapshot with `python tools/export_backlog.py "<workbook>"`.
 """
 import json
 import os
@@ -23,9 +23,7 @@ import tempfile
 import zipfile
 from xml.sax.saxutils import escape
 
-STATUSES = ["Not started", "In progress", "On staging", "Released", "Blocked", "Won't do"]
 NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-ITEM_COLUMNS = {"status": "Status", "owner": "Owner", "notes": "Notes"}
 DECISION_COLUMNS = {"by": "Decided By", "text": "Decision"}
 
 
@@ -102,15 +100,12 @@ def apply_updates(files, updates):
     msgs, changed = [], {}
     for u in updates:
         if "id" in u:
-            sheet, key, cols = "Change Log", u["id"], ITEM_COLUMNS
-            fields = {k: u[k] for k in cols if k in u}
-            if "status" in fields and fields["status"] not in STATUSES:
-                raise ValueError("%s: status must be one of %s" % (key, ", ".join(STATUSES)))
+            raise ValueError("%s: the Change Log sheet is written only with tools/changelog_write.py (it checks column ownership, approval and stale files)" % u["id"])
         elif "decision" in u:
             sheet, key, cols = "Open Decisions", u["decision"], DECISION_COLUMNS
             fields = {k: u[k] for k in cols if k in u}
         else:
-            raise ValueError("an update needs an 'id' (item) or a 'decision' (Open Decisions row): %r" % (u,))
+            raise ValueError("an update needs a 'decision' (Open Decisions row): %r" % (u,))
         if sheet not in paths:
             raise ValueError("the workbook has no sheet called '%s'" % sheet)
         part = paths[sheet]
