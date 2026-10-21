@@ -680,3 +680,11 @@ initial staff roster are created on first boot via `ensure_users()`.
 **Process: read `docs/release-guide.md`.** Work on a branch (fixes: `hardening/<name>`), never push to `main`: open a pull request, wait for the green `test`
 check, and the user merges it (Render then auto-deploys live). Staging (a copy of live data, manual deploys) is in `docs/staging.md`. Keep the release guide in
 step with any change to this process, and add the live commit to `tests/legacy_commits.txt` after each release.
+
+## Change log (KelpWorks_ChangeLog_2026-10-16.xlsx)
+- Location: C:\Users\nwran\OneDrive - Cascadia Seaweed Corp\Operations - Operations\Processing Operations\QAQC\KelpWorks ERP
+- Update it ONLY through tools/changelog_write.py (KW-61). Until that exists, follow the 'Workflow Rules' sheet in the workbook by hand.
+- You own these columns: Status (never set Deferred or Won't do), Notes, PR #, Released Date, QM-001 Ref, Row Updated, Updated By. Never write any other column. Never add rows or new KW IDs.
+- Do not start an item unless Approved to Start is Y or Pre-rule.
+- Before writing: if a ~$KelpWorks_ChangeLog lock file exists, stop (the workbook is open in Excel). Read the file fresh, find rows by ID (never by row number), and check the file's modified time hasn't changed just before saving. About 60 s after saving, re-open the file and confirm your values stuck; if they didn't, stop and report a revert.
+- 'Released' is not 'done': a human fills Verified By / Verified Date after checking on live.
