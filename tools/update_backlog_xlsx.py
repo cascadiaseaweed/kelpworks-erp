@@ -23,6 +23,9 @@ import tempfile
 import zipfile
 from xml.sax.saxutils import escape
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import changelog_path                                                             # the ONE place that says where the change log is (KW-62)
+
 NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 DECISION_COLUMNS = {"by": "Decided By", "text": "Decision"}
 
@@ -134,6 +137,12 @@ def main(argv):
         print(__doc__)
         return 1
     path, spec = args
+    if not dry:                                                                           # a dry run may look at any copy; a write only goes to the change log itself
+        try:
+            changelog_path.check_writable(path)
+        except ValueError as e:
+            print("Nothing changed: %s" % e)
+            return 2
     with open(spec, encoding="utf-8") as f:
         updates = json.load(f)
     with zipfile.ZipFile(path) as z:

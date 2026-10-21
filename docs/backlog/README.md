@@ -1,6 +1,6 @@
 # KelpWorks change log (backlog)
 
-- **Master:** the Excel workbook `KelpWorks_ChangeLog_<date>.xlsx` in SharePoint (QAQC > KelpWorks ERP). Status, Owner and Notes are kept there.
+- **Master:** the Excel workbook `LOG_KelpWorks_ChangeControl.xlsx` in SharePoint (QAQC > KelpWorks ERP > Change_Control). Status, Owner and Notes are kept there.
 - **`items.csv`, `open-decisions.csv`:** a snapshot of the workbook's Change Log and Open Decisions sheets, so Claude Code can read an item by its ID. Refresh after the workbook changes:
   `python tools/export_backlog.py "<path to the workbook>"` (standard library only). The Status column in the CSV can be out of date; the workbook is right.
 - **Updating the master:** `python tools/update_backlog_xlsx.py "<workbook>" updates.json [--dry-run]` sets an item's Status / Owner / Notes and a decision's Decided By / Decision (see the tool's

@@ -681,14 +681,15 @@ initial staff roster are created on first boot via `ensure_users()`.
 check, and the user merges it (Render then auto-deploys live). Staging (a copy of live data, manual deploys) is in `docs/staging.md`. Keep the release guide in
 step with any change to this process, and add the live commit to `tests/legacy_commits.txt` after each release.
 
-## Change log (KelpWorks_ChangeLog_2026-10-16.xlsx)
-- Location: C:\Users\nwran\OneDrive - Cascadia Seaweed Corp\Operations - Operations\Processing Operations\QAQC\KelpWorks ERP
+## Change log (LOG_KelpWorks_ChangeControl.xlsx)
+- Location: C:\Users\nwran\OneDrive - Cascadia Seaweed Corp\Operations - Operations\Processing Operations\QAQC\KelpWorks ERP\Change_Control
+- ONE path setting (KW-62): the file name, folder and default path are defined only in `tools/changelog_path.py` and the three tools (`changelog_write.py`, `update_backlog_xlsx.py`, `export_backlog.py`) read it from there; `KELPWORKS_CHANGELOG` points them at the same file on another PC. A tool that WRITES refuses any file that is not `LOG_KelpWorks_ChangeControl.xlsx` in a folder called `Change_Control` (a "- Copy" file, the pre-rename dated file name, a file elsewhere): exit 2, nothing written. Reading (`--show`, `--dry-run`, the CSV export) may use any copy. `tests/test_changelog_write.py` fails if the old name reappears in a repo file.
 - Update it ONLY through tools/changelog_write.py (KW-61, built). Never edit the change log any other way: not with `tools/update_backlog_xlsx.py` (it now refuses Change Log items; it only records Open Decisions), not by hand, not with a spreadsheet library.
   Usage: `python tools/changelog_write.py --id KW-46 Status=Released "PR #=75" "Released Date=2026-10-21" Notes="..."`, or `--batch updates.json` (`[{"id": "KW-46", "set": {"Status": "Released"}}]`, one wait and one check for the whole batch),
   `--show KW-46` (read-only: Status, Approved to Start, PR #...), `--dry-run` (checks every rule, writes nothing). Exit 2 = refused by a rule, 3 = open in Excel, 4 = the file changed while it ran, 5 = a value did not stick (revert). The tool
   enforces column ownership, Approved to Start, no Deferred / Won't do, Released needs a PR # and a Released Date, the lock-file / stale-file / 60-second checks below, and stamps Row Updated / Updated By itself (tests: `tests/test_changelog_write.py`).
-  Refresh the CSV snapshot afterwards with `python tools/export_backlog.py "<workbook>"` (it finds columns by header name and needs an ID, Status and Approved to Start column).
+  Refresh the CSV snapshot afterwards with `python tools/export_backlog.py` (no argument = the change log itself; it finds columns by header name and needs an ID, Status and Approved to Start column).
 - You own these columns: Status (never set Deferred or Won't do), Notes, PR #, Released Date, QM-001 Ref, Row Updated, Updated By. Never write any other column. Never add rows or new KW IDs.
 - Do not start an item unless Approved to Start is Y or Pre-rule.
-- Before writing: if a ~$KelpWorks_ChangeLog lock file exists, stop (the workbook is open in Excel). Read the file fresh, find rows by ID (never by row number), and check the file's modified time hasn't changed just before saving. About 60 s after saving, re-open the file and confirm your values stuck; if they didn't, stop and report a revert.
+- Before writing: if a ~$ lock file for LOG_KelpWorks_ChangeControl.xlsx exists (Excel names it like ~$G_KelpWorks_ChangeControl.xlsx), stop (the workbook is open in Excel). Read the file fresh, find rows by ID (never by row number), and check the file's modified time hasn't changed just before saving. About 60 s after saving, re-open the file and confirm your values stuck; if they didn't, stop and report a revert.
 - 'Released' is not 'done': a human fills Verified By / Verified Date after checking on live.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The ONLY way Claude Code updates the KelpWorks change log (KelpWorks_ChangeLog_2026-10-16.xlsx, kept in SharePoint). Standard library only.
+"""The ONLY way Claude Code updates the KelpWorks change log (LOG_KelpWorks_ChangeControl.xlsx, kept in SharePoint: QAQC > KelpWorks ERP > Change_Control). Standard library only.
 
     python tools/changelog_write.py --id KW-46 Status=Released "PR #=75" "Released Date=2026-10-21" Notes="what changed" [--dry-run]
     python tools/changelog_write.py --batch updates.json          # [{"id": "KW-46", "set": {"Status": "Released", "PR #": "75"}}, ...]  (one wait, one check)
@@ -31,8 +31,9 @@ import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import update_backlog_xlsx as xl                                                  # the XML helpers (sheet lookup, cells, escaping)
+import changelog_path                                                             # the ONE place that says where the change log is (KW-62)
 
-DEFAULT_PATH = r"C:\Users\nwran\OneDrive - Cascadia Seaweed Corp\Operations - Operations\Processing Operations\QAQC\KelpWorks ERP\KelpWorks_ChangeLog_2026-10-16.xlsx"
+DEFAULT_PATH = changelog_path.DEFAULT_PATH
 SHEET = "Change Log"
 OWNED = ["Status", "Notes", "PR #", "Released Date", "QM-001 Ref"]
 STAMPS = {"Row Updated": lambda: datetime.date.today().isoformat(), "Updated By": lambda: "Claude Code"}
@@ -120,7 +121,7 @@ def lock_files(path):
         low = f.lower()
         if low.startswith("~$"):
             rest = f[2:]
-            if name.lower().endswith(rest.lower()) or rest.lower().startswith("kelpworks_changelog"):          # (Excel may shorten the name: ~$lpWorks_...; any KelpWorks_ChangeLog lock stops us)
+            if name.lower().endswith(rest.lower()) or "kelpworks_changecontrol" in rest.lower():          # (Excel may shorten the name: ~$lpWorks_...; any KelpWorks_ChangeControl lock stops us)
                 found.append(f)
         elif low.startswith(".~lock.") and name.lower() in low:
             found.append(f)
@@ -273,7 +274,7 @@ def parse_pairs(tokens):
 
 
 def parse_args(argv):
-    a = {"file": os.environ.get("KELPWORKS_CHANGELOG") or DEFAULT_PATH, "dry": False, "wait": 60.0, "id": None, "pairs": [], "batch": None, "show": None}
+    a = {"file": changelog_path.configured_path(), "dry": False, "wait": 60.0, "id": None, "pairs": [], "batch": None, "show": None}
     i = 0
     while i < len(argv):
         t = argv[i]
@@ -307,6 +308,12 @@ def main(argv=None):
     if not os.path.isfile(path):
         print("STOPPED: the workbook was not found: %s" % path)
         return 6
+    if not a["show"] and not a["dry"]:                                                                  # reading and dry runs may use any copy; a WRITE only ever goes to the change log itself
+        try:
+            changelog_path.check_writable(path)
+        except ValueError as e:
+            print("Refused: %s\nNothing was written." % e)
+            return 2
     locks = lock_files(path)
     try:
         snap = Snapshot(path)

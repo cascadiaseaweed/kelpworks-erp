@@ -97,3 +97,17 @@ def test_a_workbook_without_the_approval_column_or_with_a_strange_status_is_flag
     odd = str(tmp_path / "b.xlsx")
     make_xlsx(odd, {"Change Log": [["ID", "Status", "Approved to Start"], ["KW-01", "Finished", "Y"]], "Open Decisions": [["ID"], ["KW-05"]]})
     assert tool.main(["export_backlog.py", odd]) == 0 and "unknown Status value(s): Finished" in capsys.readouterr().out
+
+
+def test_with_no_argument_the_reader_loads_the_configured_change_log(tmp_path, monkeypatch, capsys):
+    tool = load_tool()
+    folder = tmp_path / "Change_Control"
+    folder.mkdir()
+    xlsx = folder / "LOG_KelpWorks_ChangeControl.xlsx"
+    make_xlsx(str(xlsx), {"Change Log": [["ID", "Status", "Approved to Start"], ["KW-01", "Released", "Y"]], "Open Decisions": [["ID", "Decision"]]})
+    monkeypatch.setenv("KELPWORKS_CHANGELOG", str(xlsx))
+    monkeypatch.setattr(tool.os.path, "dirname", lambda p, _d=os.path.dirname: str(tmp_path / "tools") if p.endswith("export_backlog.py") else _d(p))
+    assert tool.main(["export_backlog.py"]) == 0
+    assert (tmp_path / "docs" / "backlog" / "items.csv").exists()
+    monkeypatch.setenv("KELPWORKS_CHANGELOG", str(folder / "missing.xlsx"))
+    assert tool.main(["export_backlog.py"]) == 2 and "not found" in capsys.readouterr().out
