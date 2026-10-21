@@ -48,3 +48,4 @@ d642c41  2026-10-20  lab results accept a JSON number and answer 400 for other w
 a15c319  2026-10-21  photo archive (KW-04), ORP / run summary card / separation order (KW-59, KW-17, KW-25), review screen (KW-30), feedstock photo remove (KW-02) (PRs 70 to 73) merged to main and live
 77af4e3  2026-10-21  free a stuck tote (KW-51), organic grade of reagents (KW-46) (PR 75) merged to main and live
 89ad96a  2026-10-21  guarded change-log writer, header-name reader (KW-61) (PR 78) merged to main and live
+82caa84  2026-10-21  change log renamed, one path setting, writers refuse other files (KW-62) (PR 80) merged to main and live
