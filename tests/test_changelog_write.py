@@ -270,14 +270,15 @@ def test_a_write_to_a_copy_an_old_name_or_another_folder_is_refused_but_reading_
     assert write(cw, wb, "--id", "KW-01", "Status=In progress") == 0                                        # the real one is written
 
 
-def test_the_path_is_one_setting_shared_by_the_writer_the_old_writer_and_the_reader(cw, monkeypatch):
+def test_the_path_is_one_setting_shared_by_the_writer_the_old_writer_and_the_reader(cw, monkeypatch, tmp_path):
     import changelog_path
-    assert changelog_path.CHANGE_LOG_NAME == "LOG_KelpWorks_ChangeControl.xlsx" and changelog_path.DEFAULT_PATH.endswith("\\Change_Control\\LOG_KelpWorks_ChangeControl.xlsx")
+    assert changelog_path.CHANGE_LOG_NAME == "LOG_KelpWorks_ChangeControl.xlsx" and changelog_path.DEFAULT_PATH.endswith("Change_Control\\LOG_KelpWorks_ChangeControl.xlsx")
     assert cw.DEFAULT_PATH == changelog_path.DEFAULT_PATH
     monkeypatch.delenv("KELPWORKS_CHANGELOG", raising=False)
     assert changelog_path.configured_path() == changelog_path.DEFAULT_PATH
-    monkeypatch.setenv("KELPWORKS_CHANGELOG", r"D:\OneDrive\Change_Control\LOG_KelpWorks_ChangeControl.xlsx")             # another PC: a different folder above, the same name and folder
-    assert changelog_path.configured_path().startswith("D:")
+    other_pc = tmp_path / "SomeOtherOneDrive" / "Change_Control" / "LOG_KelpWorks_ChangeControl.xlsx"        # another PC: a different folder above, the same name and folder
+    monkeypatch.setenv("KELPWORKS_CHANGELOG", str(other_pc))
+    assert changelog_path.configured_path() == str(other_pc)
     changelog_path.check_writable(changelog_path.configured_path())
 
 
