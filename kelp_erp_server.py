@@ -2155,6 +2155,32 @@ def snapshot_before_migrating(conn, stamp=None, prefix="pre-migrate"):
         return None
 
 
+def sku_is_organic(name, code=""):
+    """An organic product: its name ends with ' - O' (FieldKelp - O) or says organic. (The same reading the product picker uses to group the SKUs.)"""
+    return bool(re.search(r"(^|[\s-])O$", (name or "").strip()) or re.search(r"organic", name or "", re.I) or re.search(r"-O$", code or "", re.I))
+
+
+def organic_conflicts(conn, run):
+    """For an organic product: the reagents this run used whose inventory item is not marked organic -> [{reagent, item}] (KW-46). Nothing for a non-organic product."""
+    sku = conn.execute("SELECT name, code FROM fg_skus WHERE code=?", (run["sku_code"],)).fetchone()
+    if not sku or not sku_is_organic(sku["name"], sku["code"]):
+        return []
+    out = []
+    for rc in conn.execute("SELECT reagent, committed_kg, consumable_id FROM run_reagent_commits WHERE run_id=? AND committed_kg>0 ORDER BY reagent", (run["id"],)):
+        item = conn.execute("SELECT name, organic FROM consumables WHERE id=?", (rc["consumable_id"],)).fetchone() if rc["consumable_id"] else None
+        if item and not item["organic"]:
+            out.append({"reagent": rc["reagent"], "item": item["name"]})
+    return out
+
+
+def submitted_detail(conn, run_id, fg_created):
+    detail = {"to": "pending_review", "fgLots": fg_created}
+    org = organic_conflicts(conn, conn.execute("SELECT * FROM production_runs WHERE id=?", (run_id,)).fetchone())
+    if org:                                                    # an organic product that used a reagent not marked organic: the reviewer sees it in the audit trail (KW-46)
+        detail["organicConflicts"] = org
+    return detail
+
+
 def ensure_reagent_types(conn):
     """The three standard reagents carry their reagent type. migrate() sets it when the column is added, which on a NEW database is before
     the reagents exist (seed() inserts them afterwards), so this runs again after seeding. Only fills a blank type."""
@@ -4666,6 +4692,8 @@ def migrate(conn):
     # Reagent type: groups inventory items that are the same reagent (e.g. several Citric Acid grades / suppliers)
     # so the production log can offer them all. Backfilled once, from the item names, when the column is added.
     rtcols = {r["name"] for r in conn.execute("PRAGMA table_info(consumables)")}
+    if "organic" not in rtcols:
+        conn.execute("ALTER TABLE consumables ADD COLUMN organic INTEGER NOT NULL DEFAULT 0")          # KW-46: this reagent item is organic grade (usable in an organic product)
     if "reagent_type" not in rtcols:
         conn.execute("ALTER TABLE consumables ADD COLUMN reagent_type TEXT")
         for t in ("Citric Acid", "Potassium Sorbate", "Sodium Benzoate"):
@@ -8132,7 +8160,8 @@ class Handler(BaseHTTPRequestHandler):
             sku_species.setdefault(r["sku_code"], []).append(r["species_code"])
         skus = [dict(code=r["code"], name=r["name"], species=sku_species.get(r["code"], []),
                     active=bool(r["active"]), tdsTarget=r["tds_target"], phTarget=r["ph_target"],
-                    ksorbateTarget=r["ksorbate_target"], nabenzoateTarget=r["nabenzoate_target"], usesLabels=bool(r["uses_labels"] is None or r["uses_labels"]))
+                    ksorbateTarget=r["ksorbate_target"], nabenzoateTarget=r["nabenzoate_target"], usesLabels=bool(r["uses_labels"] is None or r["uses_labels"]),
+                    organic=sku_is_organic(r["name"], r["code"]))
                 for r in conn.execute("SELECT * FROM fg_skus ORDER BY (active != 1), code")]
         customers = [self._customer_public(r) for r in conn.execute(
             "SELECT * FROM customers WHERE active=1 ORDER BY name")]
@@ -8754,6 +8783,10 @@ class Handler(BaseHTTPRequestHandler):
                         "moveLog": self._move_log(conn, "tote", tid)}
                 raise ApiError(405, "Method not allowed")
 
+            # /api/totes/:id/free {status: in_stock | hold, reason} (administrators, KW-51): a tote stuck as work in progress (locked to a run that does not use it any more, or to nothing) is
+            # freed. The change is attributed in the tote's Feedstock Stability log and written to the configuration change log.
+            if len(seg) == 4 and seg[3] == "free" and method == "POST":
+                return self._free_stuck_tote(conn, it, user)
             # /api/totes/:id/ph  — log a new pH and/or ORP reading, or read the
             # Feedstock Stability history (every field edit, not just pH/ORP).
             # /api/totes/:id/received-date -- correct or fill in when the tote was received (Update feedstock conditions). Changing a date that is already filled in needs a reason;
@@ -10476,7 +10509,7 @@ class Handler(BaseHTTPRequestHandler):
                     litresEach=r["litres_each"], isSampleContainer=bool(r["is_sample_container"]),
                     itemNumber=r["item_number"], labelSku=r["label_sku_code"],
                     labelPackage=r["label_package"], isCipAgent=bool(r["is_cip_agent"]),
-                    reagentType=r["reagent_type"], low=(r["on_hand"] <= r["reorder_level"]),
+                    reagentType=r["reagent_type"], organic=bool(r["organic"]), low=(r["on_hand"] <= r["reorder_level"]),
                     lastCountedAt=r["last_counted_at"], lastCountedBy=r["last_counted_by"])
 
     def _clean_item_number(self, conn, raw, exclude_id=None):
@@ -11044,6 +11077,8 @@ class Handler(BaseHTTPRequestHandler):
                      label_sku if is_label else None, label_package if is_label else None, is_cip))
                 if rtype:
                     conn.execute("UPDATE consumables SET reagent_type=? WHERE id=?", (rtype, cur.lastrowid))
+                if d.get("organic") in (True, 1, "1", "true") and not is_container and not is_label:
+                    conn.execute("UPDATE consumables SET organic=1 WHERE id=?", (cur.lastrowid,))
                 if not item_number:
                     assign_item_numbers(conn)
                 return {"ok": True, "itemNumber": conn.execute("SELECT item_number FROM consumables WHERE id=?", (cur.lastrowid,)).fetchone()["item_number"]}
@@ -11141,6 +11176,12 @@ class Handler(BaseHTTPRequestHandler):
             location = self._ensure_location(conn, d["location"]) if "location" in d else c["location"]
             item_number = ((self._clean_item_number(conn, d["itemNumber"], cid) or c["item_number"])
                            if "itemNumber" in d else c["item_number"])
+            if "organic" in d and not c["is_container"] and not c["label_sku_code"]:
+                new_org = 1 if d["organic"] in (True, 1, "1", "true") else 0
+                if new_org != (c["organic"] or 0):                   # organic status decides which products an item may go into: every change is attributed
+                    conn.execute("UPDATE consumables SET organic=? WHERE id=?", (new_org, cid))
+                    conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('inventory_item',?,?,?,?,?,?)",
+                                 (c["name"], "Organic grade", "yes" if c["organic"] else "no", "yes" if new_org else "no", user["name"] if user else None, now_iso()))
             if "reagentType" in d:
                 rtype = (d["reagentType"] or "").strip() or None
                 if rtype and rtype not in self.REAGENT_RUN_COLUMNS:
@@ -11511,7 +11552,7 @@ class Handler(BaseHTTPRequestHandler):
                 items = [legacy] if legacy else []
             types.append({"type": t, "defaultItemId": items[0]["id"] if items else None,
                           "items": [{"id": i["id"], "name": i["name"], "itemNumber": i["item_number"], "unit": i["unit"],
-                                     "onHand": i["on_hand"]} for i in items]})
+                                     "onHand": i["on_hand"], "organic": bool(i["organic"])} for i in items]})
         commits = {}
         rid = query.get("runId", [""])[0]
         if rid.isdigit():
@@ -12607,7 +12648,7 @@ class Handler(BaseHTTPRequestHandler):
                 out.update({"run": self._run_full(conn, r), "events": self._release_events_public(conn, rid),
                             "me": me, "currentLogHash": now_hash, "reviewedLogHash": r["release_review_hash"],
                             "logMatchesReview": (r["release_review_hash"] == now_hash) if r["release_review_hash"] else None,
-                            "chain": release_verify_chain(conn), "gate": release_gate(conn, r), "coaRows": coa_rows_for_review(conn, r),
+                            "chain": release_verify_chain(conn), "gate": release_gate(conn, r), "coaRows": coa_rows_for_review(conn, r), "organicConflicts": organic_conflicts(conn, r),
                             "separateSigners": bool(float(get_setting_value(conn, "release_separate_signers", 0) or 0))})
                 return out
             if len(seg) == 5 and method == "POST" and seg[4] in ("review", "release", "reopen", "resubmit"):
@@ -13330,6 +13371,37 @@ class Handler(BaseHTTPRequestHandler):
         orp_updated = today_iso() if orp is not None else tote["orp_updated"]
         return (ph if ph is not None else tote["ph"], ph_updated,
                 orp if orp is not None else tote["orp"], orp_updated)
+
+    def _free_stuck_tote(self, conn, tote, user):
+        self._require_admin(user)
+        d = self._body_json()
+        reason = (d.get("reason") or "").strip()
+        to = d.get("status") or "in_stock"
+        if to not in ("in_stock", "hold"):
+            raise ApiError(400, "Choose In stock or QAQC Hold")
+        if len(reason) < 5:
+            raise ApiError(400, "Enter the reason (what happened to the run or batch that held this tote)")
+        if tote["status"] != "wip":
+            raise ApiError(409, "Only a tote that is locked as work in progress can be freed here (this one is %s)" % tote["status"], "not_stuck")
+        batch = conn.execute("SELECT b.batch_lot FROM preproc_inputs pi JOIN preproc_batches b ON b.id=pi.batch_id WHERE pi.tote_lot_id=? AND b.status='draft'", (tote["id"],)).fetchone()
+        if batch:
+            raise ApiError(409, "This tote is in the Pre-Processing batch %s that is still being prepared: remove it from the batch there." % batch["batch_lot"], "in_batch")
+        run = conn.execute("SELECT * FROM production_runs WHERE id=?", (tote["run_id"],)).fetchone() if tote["run_id"] else None
+        held_by = ("production run %s" % run["processing_lot"]) if run else "nothing (its run is gone)"
+        if run and run["status"] == "draft":
+            self.release_feedstock_tote(conn, run["id"], tote["id"], user)           # the run's own picker release: its input row and saved selection go too
+        else:
+            conn.execute("UPDATE tote_lots SET status='in_stock', run_id=NULL WHERE id=?", (tote["id"],))
+            self._log_stability(conn, tote["id"], user, "Status", "wip", "in_stock", "Freed by an administrator (was held by %s)" % held_by)
+        if to == "hold":
+            conn.execute("UPDATE tote_lots SET status='hold', location=? WHERE id=?", (QAQC_HOLD_LOCATION, tote["id"]))
+            self._log_stability(conn, tote["id"], user, "Status", "in_stock", "hold", "Set to QAQC Hold by an administrator")
+            if tote["location"] != QAQC_HOLD_LOCATION:
+                self._log_stability(conn, tote["id"], user, "Location", tote["location"], QAQC_HOLD_LOCATION, "Set to QAQC Hold by an administrator")
+        self._log_stability(conn, tote["id"], user, "Admin note", None, reason, "Status change by an administrator: stuck as work in progress, held by %s" % held_by)
+        conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('tote_status',?,?,?,?,?,?)",
+                     (tote["lot_number"], "Status (freed: %s)" % reason[:200], "wip (%s)" % held_by, to, user["name"], now_iso()))
+        return {"tote": self._tote_with_last_updated(conn, conn.execute("SELECT * FROM tote_lots WHERE id=?", (tote["id"],)).fetchone())}
 
     @staticmethod
     def _tote_available_for_run(conn, tote, run_id):
@@ -14298,6 +14370,13 @@ class Handler(BaseHTTPRequestHandler):
         lot_status = "on_hand" if grandfather else "pending_release"
         run_state = "legacy" if grandfather else "pending_review"
 
+        # A tote that was rejected from THIS run is on QAQC Hold and no longer part of it: if the request still lists it, leave it out (KW-51) instead of failing the finalize.
+        if existing:
+            gone = [t for t in tote_ids if conn.execute("SELECT 1 FROM tote_lots WHERE id=? AND status='hold' AND run_id IS NULL", (t,)).fetchone()
+                    and conn.execute("SELECT 1 FROM tote_stability_log WHERE tote_lot_id=? AND run_id=? AND field='Decision' AND new_value='rejected'", (t, existing["id"])).fetchone()]
+            tote_ids = [t for t in tote_ids if t not in gone]
+            if not tote_ids:
+                raise ApiError(400, "Select at least one stabilized tote to process")
         # Validate totes are available -- either never touched yet (in_stock)
         # or already locked to this same draft as WIP by an earlier
         # per-tote/draft save.
@@ -14459,7 +14538,7 @@ class Handler(BaseHTTPRequestHandler):
             release_log(conn, run_id, "submitted", user, capacity=None,
                         meaning="Production run finalized; finished goods held pending release.",
                         log_hash=self._release_snapshot_hash(conn, run_id),
-                        detail={"to": "pending_review", "fgLots": fg_created})
+                        detail=submitted_detail(conn, run_id, fg_created))
         if hist:
             release_log(conn, run_id, "historical_entry", user, capacity="Administrator",
                         meaning=("Entered retrospectively as a historical run dated %s. " % run_date)
