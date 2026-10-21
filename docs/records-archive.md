@@ -78,6 +78,28 @@ A backup that could not be made (for example the disk is nearly full) shows ther
 Each nightly backup is about the size of the database plus all uploaded documents, and the server keeps the newest 2 on its 1 GB disk next to the live copies. The backup is skipped
 (and Admin shows why) when there is not room for it with 100 MB to spare. When documents pass roughly 200 MB, enlarge the disk in Render (or lower `KELP_ERP_BACKUP_KEEP` to 1).
 
+## Photos move to SharePoint (KW-04)
+
+Photos are the files that grow the server disk. Every finalized run's photos (feedstock photos, tote photos, note pictures) are already copied into the library by the script. Once a
+photo's copy is **confirmed**, KelpWorks can take its own copy off the disk after `image_archive_days` (default 30) days and keep a link on the record. Nothing is removed unless all of these hold:
+
+1. The script saved the photo in the library and sent KelpWorks its SHA-256 (`POST /api/archive/confirm`); KelpWorks keeps the confirmation only if that checksum equals the one of
+   **its own file** and the path is the one it would give the file.
+2. The run was finalized more than `image_archive_days` days ago and is not open for amendment.
+3. Just before deleting, the file on the server still has the confirmed checksum.
+4. An administrator has switched on **Photos: remove archived photos from the server** (`image_purge_enabled`, Calculations page). **It is off by default.** While it is off, nothing is deleted;
+   Admin > Records archive & backups > Photo archive shows how many photos are confirmed and what *Check what would be removed* lists.
+
+Every removal is written to the append-only `image_purge_log` (photo, size, checksum, library path, who, when). Documents, lab reports and certificates are never removed, only pictures.
+The record stays: where the photo was, KelpWorks shows "Photo moved to SharePoint - open", a link made from the library's web address. Set that address once in Render as
+`KELP_ERP_SHAREPOINT_BASE_URL` (for example `https://<tenant>.sharepoint.com/sites/<site>/KelpWorks-Records`, the address of the library folder that holds `00_README...`).
+
+**Switching it on, safely:** let the nightly sync run, open Admin > Photo archive and check that *Copy confirmed in SharePoint* is counting up; open a few of the confirmed photos in the
+library; click *Check what would be removed*; then set `image_purge_enabled` to 1. The check runs once a day after that (or *Remove confirmed old photos now*).
+
+**After it is on, the library copy is the only copy** of a moved photo. If the script ever finds a moved photo missing from the library it prints `FAILED ... Restore it from the SharePoint
+recycle bin / version history`. Nightly backups no longer contain moved photos; keep the library's own version history and recycle bin enabled.
+
 ## Retention (what the script removes)
 
 Daily 14, weekly 12 (the last backup of each week), monthly 24 (the last of each month), snapshots taken before a software update 6. Change them with `--keep-daily`,

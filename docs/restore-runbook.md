@@ -70,6 +70,8 @@ serving anyone, when you ask it to with two environment variables. A copy of the
 - A backup made by an **older** version of the code is migrated forward like any other upgrade. A backup from a **newer** version than the running code is not
   supported: deploy the matching version first.
 - Disk snapshots in Render are a separate, coarser safety net (they restore the whole disk): check in the dashboard that they are enabled.
+- Photos that were **moved to SharePoint** (`docs/records-archive.md`, "Photos move to SharePoint") are not in the backup: the records keep their link, and the library holds the file. A restore brings back
+  the database and the photos that were still on the disk when the backup was taken; a photo the database says was moved but whose file is back from an older backup is simply served from the disk.
 
 ## If the disk itself is missing
 

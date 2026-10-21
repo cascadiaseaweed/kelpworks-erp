@@ -44,3 +44,4 @@ efb4c50  2026-10-19  separation solids moisture, at least one required (KW-18) m
 b5feb52  2026-10-20  finished goods with no SKU yet, SKU assigned at shipping (KW-32) merged to main and live
 e9d2c03  2026-10-20  approved suppliers (KW-23), SOP icon and dark theme (KW-12, KW-43), released tote locks (PRs 61 to 63) merged to main and live
 a8624e4  2026-10-20  dilution tweaks (KW-19, KW-20, KW-21), Samples / lab small changes (KW-33, KW-34, KW-35, KW-14, KW-27) (PRs 65, 66) merged to main and live
+d642c41  2026-10-20  lab results accept a JSON number and answer 400 for other wrong types (PR 68) merged to main and live
