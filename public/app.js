@@ -55,7 +55,7 @@ const fgSkuText = f => skuName(f.sku) + (f.skuAssigned === false ? ' (no SKU yet
 // The product picker of a production run: grouped (1) no SKU yet (the products whose SKU is assigned when they ship), (2) non-organic, (3) organic. `selected` is the value
 // to start on (a new run starts on Sugar Kelp Extract). `placeholder` adds an empty first choice.
 const NEW_RUN_DEFAULT_SKU = 'SACC-LKE';
-const isOrganicSku = s => /(^|[\s-])O$/i.test((s.name || '').trim()) || /organic/i.test(s.name || '') || /-O$/i.test(s.code || '');
+const isOrganicSku = s => s.organic !== undefined ? !!s.organic : (/(^|[\s-])O$/i.test((s.name || '').trim()) || /organic/i.test(s.name || '') || /-O$/i.test(s.code || ''));
 function skuGroupedSelect(skus, selected, onchange, id, placeholder) {
   const opt = s => el('option', { value: s.code }, s.name);
   const noSku = skus.filter(s => !s.usesLabels).sort((a, b) => (b.code === NEW_RUN_DEFAULT_SKU) - (a.code === NEW_RUN_DEFAULT_SKU)), labelled = skus.filter(s => s.usesLabels);
@@ -629,7 +629,8 @@ async function pageStabilized(v) {
           movable ? ['Update', () => updateCondition(t)] : null,
           ['Label', () => printLabels([toteLabel(t)])],
           (t.grind === 'Fine' || (t.status === 'consumed' && !t.runId)) ? ['Trace', () => showPreprocTrace(t)] : null,
-          movable ? ['Delete', () => delTote(t), 'danger'] : null
+          movable ? ['Delete', () => delTote(t), 'danger'] : null,
+          t.status === 'wip' && State.user && State.user.role === 'admin' ? ['Free tote…', () => freeTote(t), 'danger'] : null
         ]))));
     });
 
@@ -729,6 +730,18 @@ function bulkSetTotes(ids) {
     const r = await api('POST', '/totes/set-bulk', { ids, avgWeightKg: kg === '' ? null : +kg, grind: grind || null, stabilizationMethod: stab || null, note: body.querySelector('#bs_note').value || null });
     toast('Updated ' + r.updated + ' tote' + (r.updated === 1 ? '' : 's') + (r.unchanged ? ' (' + r.unchanged + ' already had these values)' : '')); render();
   }, 'Set values');
+}
+// KW-51 (administrators): a tote stuck as work in progress -- its run or batch no longer uses it -- is freed, in stock or on QAQC Hold, with a reason that is logged.
+function freeTote(t) {
+  const status = selectFrom('', [['in_stock', 'Back in stock'], ['hold', 'QAQC Hold']]);
+  const reason = el('input', { placeholder: 'e.g. run PR-… was discarded, the tote was never released' });
+  modal('Free tote ' + t.lot, el('div', {},
+    el('div', { class: 'help' }, 'This tote is locked as work in progress. Free it only when the run or batch that held it no longer uses it. A tote in a run still being logged is removed from that run. '
+      + 'The change is written to the tote’s Feedstock Stability log and to the change log with your name.'),
+    field('Move it to', status), field('Reason (required)', reason)), async () => {
+    await api('POST', '/totes/' + t.id + '/free', { status: status.value, reason: reason.value });
+    toast(t.lot + ' freed'); render();
+  }, 'Free tote');
 }
 async function delTote(t) {
   if (!confirm('Delete tote ' + t.lot + '?')) return;
@@ -3521,7 +3534,13 @@ const REAGENT_TYPES = ['Citric Acid', 'Potassium Sorbate', 'Sodium Benzoate'];
 function buildReagentWatch(runId, selected) {
   const w = { runId: runId || null, types: {}, commits: {}, selected: Object.assign({}, selected), usage: {}, subs: [], loadSubs: [] };
   const items = t => (w.types[t] && w.types[t].items) || [];
-  w.item = t => items(t).find(i => i.id === w.selected[t]) || items(t).find(i => i.id === (w.types[t] || {}).defaultItemId) || null;
+  // KW-46: for an organic product (w.organicProduct, set by the production log from the chosen SKU) the pickers offer only organic items, and the default is the first organic one
+  w.organicProduct = () => false;
+  const offered = t => items(t).filter(i => !w.organicProduct() || i.organic || i.id === w.selected[t]);
+  w.item = t => items(t).find(i => i.id === w.selected[t]) || (w.organicProduct() ? items(t).find(i => i.organic) : items(t).find(i => i.id === (w.types[t] || {}).defaultItemId)) || null;
+  // the reagents this run uses that are not organic grade, when the product is organic
+  w.organicConflicts = () => !w.organicProduct() ? [] : Object.keys(w.types).filter(t => w.total(t) > 0 && w.item(t) && !w.item(t).organic).map(t => ({ reagent: t, item: w.item(t).name }));
+  w.refreshProduct = () => { Object.keys(w.selected).forEach(t => { const i = items(t).find(x => x.id === w.selected[t]); if (w.organicProduct() && i && !i.organic) { const o = items(t).find(x => x.organic); if (o) w.selected[t] = o.id; } }); w.loadSubs.forEach(f => f()); w.notify(); };
   w.itemId = t => { const i = w.item(t); return i ? i.id : null; };
   // what this run can still draw: the item's on-hand plus what this run already deducted from that same item
   w.available = t => { const i = w.item(t); if (!i) return null; const c = w.commits[t]; return i.onHand + (c && c.itemId === i.id ? c.kg : 0); };
@@ -3541,19 +3560,21 @@ function buildReagentWatch(runId, selected) {
     w.subs.push(() => {
       const it = w.item(t), avail = w.available(t), tot = w.total(t);
       const over = !!it && avail != null && tot > avail + 1e-6;
-      n.classList.toggle('hidden', !over);
-      n.textContent = over ? '⚠ Exceeds inventory: this run uses ' + fmt(tot, 2) + ' ' + it.unit + ' of ' + it.name + ' but only '
-        + fmt(Math.max(avail, 0), 2) + ' ' + it.unit + ' is in stock. The run can continue; inventory will go to ' + fmt(avail - tot, 2) + ' ' + it.unit + '.' : '';
+      const notOrganic = w.organicProduct() && !!it && !it.organic && tot > 0;
+      n.classList.toggle('hidden', !over && !notOrganic);
+      n.textContent = (notOrganic ? '⚠ This is an organic product but ' + it.name + ' is not marked Organic in Inventory Items. ' : '')
+        + (over ? '⚠ Exceeds inventory: this run uses ' + fmt(tot, 2) + ' ' + it.unit + ' of ' + it.name + ' but only '
+          + fmt(Math.max(avail, 0), 2) + ' ' + it.unit + ' is in stock. The run can continue; inventory will go to ' + fmt(avail - tot, 2) + ' ' + it.unit + '.' : '');
     });
     return n;
   };
   w.itemSelect = t => {
     const sel = el('select', {});
     const rebuild = () => {
-      const list = items(t), cur = w.itemId(t);
+      const list = offered(t), cur = w.itemId(t);
       sel.innerHTML = '';
-      if (!list.length) sel.append(el('option', { value: '' }, 'No ' + t + ' item in Inventory Items'));
-      list.forEach(i => sel.append(el('option', { value: i.id }, i.name + (i.itemNumber ? ' (#' + i.itemNumber + ')' : '') + ' — ' + fmt(i.onHand, 1) + ' ' + i.unit + ' on hand')));
+      if (!list.length) sel.append(el('option', { value: '' }, w.organicProduct() ? 'No organic ' + t + ' item: mark one as Organic in Inventory Items' : 'No ' + t + ' item in Inventory Items'));
+      list.forEach(i => sel.append(el('option', { value: i.id }, i.name + (i.organic ? ' — Organic' : '') + (i.itemNumber ? ' (#' + i.itemNumber + ')' : '') + ' — ' + fmt(i.onHand, 1) + ' ' + i.unit + ' on hand')));
       if (cur != null) sel.value = String(cur);
     };
     sel.addEventListener('change', () => { w.selected[t] = sel.value ? +sel.value : null; w.notify(); });
@@ -4405,6 +4426,8 @@ async function openRun(draftSummary, opts) {
     () => pasteurizationSection.getPlan(),
     () => skus.find(x => x.code === skuSel.value)?.nabenzoateTarget, draft && draft.id);
   pasteurizationSection.onPlanChange(() => dilutionSummary.refresh());
+  dilutionSummary.reagentWatch.organicProduct = () => { const s = skus.find(x => x.code === skuSel.value); return !!(s && isOrganicSku(s)); };         // KW-46
+  skuSel.addEventListener('change', () => dilutionSummary.reagentWatch.refreshProduct());
   dilutionSummary.refresh();
   const dilutionPasses = buildDilutionPassesSection(draft?.dilutionPasses || [], ensureRunId, {
     reagentWatch: dilutionSummary.reagentWatch,
@@ -4570,6 +4593,9 @@ async function openRun(draftSummary, opts) {
     const payload = buildPayload();
     if (!payload.toteIds.length) throw new Error('Select at least one tote.');
     if (!packagingEntriesSection.hasEntries()) throw new Error('Enter at least one packaged output quantity in the Packaging table.');
+    const organicBad = dilutionSummary.reagentWatch.organicConflicts();         // KW-46: an organic product that used a reagent not marked organic is finalized only on purpose
+    if (organicBad.length && !confirm('This is an organic product, but these reagents are not marked Organic:\n\n' + organicBad.map(x => '• ' + x.reagent + ': ' + x.item).join('\n')
+      + '\n\nFinalize anyway? The run is flagged for Quality in its review.')) throw new Error('Not finalized: choose organic-grade reagents, or confirm to finalize anyway.');
     // Required fields are checked server-side against what is saved, so first
     // save the run header + feedstock, then press every section's own Save
     // (so anything typed but not yet saved counts), and stop if one fails.
@@ -4946,6 +4972,8 @@ async function openReleaseRun(id) {
   body.append(el('div', { class: 'summary-line' }, sl('Run', d.lot), sl('Product', skuName(d.sku)), el('span', {}, 'Status: ', releaseBadge(d.state)),
     sl('Finalized', fmtWhen(d.finalizedAt) + (d.finalizedBy ? ' by ' + d.finalizedBy : ''))));
   // KW-30: what QA checks first -- every result on the Certificate of Analysis passes and has its lab report -- then the sign-off; everything else is folded away below
+  if ((d.organicConflicts || []).length) body.append(el('div', { class: 'sign-box', style: 'border-color:var(--danger,#b00020)' }, el('b', { style: 'color:var(--danger,#b00020)' }, '⚠ Organic product made with a reagent that is not marked Organic: '),
+    d.organicConflicts.map(x => x.reagent + ' (' + x.item + ')').join(', '), el('div', { class: 'help' }, 'Check this before signing: it may need a deviation record.')));
   const blockedGate = d.gate.filter(g => !g.ok);
   const coa = d.coaRows || [];
   const tested = coa.filter(x => x.status);
@@ -5586,7 +5614,7 @@ async function pageConsumables(v) {
       else if (lg === 'package') row.push(skuName(c.labelSku));
       else if (lg === 'none') row.push(skuName(c.labelSku), c.labelPackage || '—');
       else row.push(c.name);
-      if (opts.showType) row.push(c.reagentType || '—');
+      if (opts.showType) row.push(el('span', {}, c.reagentType || '—', c.organic ? el('span', { class: 'badge in_stock', style: 'margin-left:6px' }, 'Organic') : null));
       if (opts.showSds) row.push((c.sds || []).length ? el('span', {}, ...c.sds.flatMap((x, k) => [k ? ', ' : null,
         el('a', { href: docDownloadUrl('sds', x.id), target: '_blank', rel: 'noopener', title: x.chemical + ' — ' + x.supplier, onclick: e => e.stopPropagation() }, 'SDS')])) : '—');
       if (opts.showVolume) row.push(c.litresEach != null ? fmt(c.litresEach, c.litresEach % 1 ? 2 : 0) : '—');
@@ -6049,9 +6077,12 @@ function editC(c) {
   const isPlainReagent = !c.isContainer && !c.labelSku;
   const typeSel = isPlainReagent ? selectFrom('', [['', '— none —'], ...REAGENT_TYPES.map(t => [t, t])]) : null;
   if (typeSel) typeSel.value = c.reagentType || '';
+  const organicCb = isPlainReagent ? el('input', { type: 'checkbox' }) : null;          // KW-46
+  if (organicCb) organicCb.checked = !!c.organic;
   const body = el('div', {},
     field('Item #', el('input', { id: 'c_itemno', value: c.itemNumber ?? '', placeholder: 'Auto-assigned (e.g. RGT-008) — leave blank' })),
     typeSel ? field('Reagent type (items of one type are offered together in the production log)', typeSel) : null,
+    organicCb ? field('Organic grade (the only grade an organic product may use; changes are logged)', organicCb) : null,
     el('div', { class: 'form-row' },
       field('Reorder level', el('input', { type: 'number', id: 'c_re', value: c.reorderLevel, step: '0.1' })),
       field('Cost per unit', el('input', { type: 'number', id: 'c_cost', value: c.costPerUnit ?? '', step: '0.01' }))),
@@ -6069,6 +6100,7 @@ function editC(c) {
       payload.isSampleContainer = sampleCb.checked;
     }
     if (typeSel) payload.reagentType = typeSel.value || null;
+    if (organicCb) payload.organic = organicCb.checked;
     await api('PUT', '/consumables/' + c.id, payload);
     State.ref = await api('GET', '/refdata');
     toast('Updated'); render();
@@ -6105,9 +6137,11 @@ function addConsumable() {
   // Admin-only: a CIP cleaning agent is offered on CIP Log chemical lines.
   const cipCb = State.user.role === 'admin' ? el('input', { type: 'checkbox' }) : null;
   const typeSel = selectFrom('', [['', '— none —'], ...REAGENT_TYPES.map(t => [t, t])]);
+  const organicNew = el('input', { type: 'checkbox' });
   const body = el('div', {},
     el('div', { class: 'form-row' }, field('Name', el('input', { id: 'n_name' })), field('Stock unit', selectFrom('', STOCK_UNITS.map(u => [u, u]), null, 'n_unit'))),
     field('Reagent type (items of one type are offered together in the production log)', typeSel),
+    field('Organic grade (the only grade an organic product may use)', organicNew),
     field('Item #', el('input', { id: 'n_itemno', placeholder: 'Auto-assigned (e.g. RGT-008) — leave blank' })),
     el('div', { class: 'form-row' }, field('On hand', el('input', { type: 'number', id: 'n_oh', value: '0' })),
       field('Reorder level', el('input', { type: 'number', id: 'n_re', value: '0' }))),
@@ -6116,7 +6150,7 @@ function addConsumable() {
     cipCb ? field('CIP cleaning agent (offered on CIP Log lines)', cipCb) : null);
   modal('Add reagent', body, async () => {
     await api('POST', '/consumables', { name: body.querySelector('#n_name').value, unit: body.querySelector('#n_unit').value, onHand: +body.querySelector('#n_oh').value, reorderLevel: +body.querySelector('#n_re').value, costPerUnit: body.querySelector('#n_cost').value || null, location: body.querySelector('#n_loc').value,
-      itemNumber: body.querySelector('#n_itemno').value, isCipAgent: cipCb ? cipCb.checked : false, reagentType: typeSel.value || null });
+      itemNumber: body.querySelector('#n_itemno').value, isCipAgent: cipCb ? cipCb.checked : false, reagentType: typeSel.value || null, organic: organicNew.checked });
     State.ref = await api('GET', '/refdata');
     toast('Added'); render();
   }, 'Add');
