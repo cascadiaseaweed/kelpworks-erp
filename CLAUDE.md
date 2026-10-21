@@ -151,6 +151,10 @@ for `main` so a red run blocks the merge.
   shipped units recorded in the event). Runs finalized before this existed are `legacy`
   (grandfathered as released, one SYSTEM event each, via `migrate()`). Don't add a way to
   edit/delete `release_events` rows.
+- **Product release review screen** (KW-30; tests in `tests/test_release_review_screen.py`): what QA does is upload the lab results and check that every result on the Certificate of Analysis passes, so the window
+  (`openReleaseRun`) leads with "Lab results" -- one table of every tested CoA test with its specification, result, the lab report that backs it, PASS / FAIL / REVIEW and whether it is a release condition (`coaRows` from
+  `coa_rows_for_review`, built on `coa_evaluate`), the tests still waiting for a result as one line, the Upload / enter lab results and View CoA buttons -- then the sign-off. Notes, finished-goods lots, materials, the log summary and
+  the audit trail are folded below (`fold`). Nothing about who may sign or the release gate changed.
 - **Release-integrity rules** (risk review batch 1; tests in `tests/test_release_integrity.py`). *Lab results*: only a Quality Manager can add / void / scan them
   (everyone can read); after release, a voided required result or a new failure that the release did not accept puts the run's `on_hand` lots on HOLD and logs
   `lab_result_hold` (`_lab_regate`). *Finished-goods lots* (`PUT /api/fg/:id`, `_edit_fg_lot`): status is limited to on_hand / hold / sold and a lot that is
