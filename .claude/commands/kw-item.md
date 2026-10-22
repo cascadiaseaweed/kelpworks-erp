@@ -6,7 +6,8 @@ Work on KelpWorks change-log item(s): $ARGUMENTS
 
 Follow these steps in order. Do not skip one; say so if one does not apply.
 
-1. **Read the item.** Open `docs/backlog/items.csv` and find the row(s) for the ID(s) above (ID, module, section, change request, rationale, priority, mode, acceptance criteria).
+1. **Apply the inbox, then read the item.** First `python tools/changelog_write.py --apply-inbox` (notes Claude chat left for new / revised items; report anything it rejected), then `python tools/export_backlog.py`.
+   **Read the item.** Open `docs/backlog/items.csv` and find the row(s) for the ID(s) above (ID, module, section, change request, rationale, priority, mode, acceptance criteria).
    The Excel workbook is the master for Status / Owner / Notes; the CSV is a snapshot of the definitions. **Do not start an item unless its `Approved to Start` is Y or Pre-rule** (check with
    `python tools/changelog_write.py --show KW-nn`, which reads the workbook itself); if it is not, stop and tell the user. Also read `docs/backlog/open-decisions.csv`, `CLAUDE.md` (the sections for the area
    the item touches) and `docs/release-guide.md`.
@@ -34,9 +35,9 @@ Follow these steps in order. Do not skip one; say so if one does not apply.
 9. **After the user says it is live:** add the live commit to `tests/legacy_commits.txt` (a small follow-up pull request).
 10. **Keep the master workbook up to date** (the user asked for this, and gave permission): whenever an item changes state -- plan approved or work started (`In progress`), pull request open
     (`In progress`, note the PR number), merged (`Released`, note the PR number and the date), found not to be a bug / dropped (`Won't do`, say why), a decision made (Open Decisions: Decided By +
-    Decision, and a note on the item) -- write it into the workbook ONLY with `python tools/changelog_write.py --id KW-nn Status=... "PR #=nn" "Released Date=YYYY-MM-DD" Notes="..."` (or `--batch`; standard library only; it
-    writes just the columns Claude Code owns, refuses Deferred / Won't do and unapproved starts, stops if the workbook is open in Excel or changed while it ran, and re-checks 60 s after saving; use `--dry-run` first). A decision
-    goes to the Open Decisions sheet with `tools/update_backlog_xlsx.py`. Then refresh the snapshot with `python tools/export_backlog.py "<workbook>"`. Keep a copy of the workbook outside
-    SharePoint before the first edit of a session. The workbook is `LOG_KelpWorks_ChangeControl.xlsx` in `...\QAQC\KelpWorks ERP\Change_Control\` (OneDrive).
+    Decision, and a note on the item) -- write it into the workbook ONLY with `python tools/changelog_write.py --id KW-nn Status=... "PR #=nn" "Released Date=YYYY-MM-DD" Notes="..."` (or `--batch`; use `--dry-run` first). It writes
+    only the columns Claude Code owns, refuses Deferred / Won't do and unapproved starts, stops if the master is open in Excel or another run is writing, takes a backup first, re-checks after saving and refreshes the read-only
+    SharePoint copy. A decision goes to the Open Decisions sheet with `python tools/changelog_write.py --decision KW-nn --by "..." --text "..."` (`--needed "part of the question"` when the ID has several). Then refresh the
+    snapshot with `python tools/export_backlog.py`. The master is `C:\KelpWorks\ChangeControl\LOG_KelpWorks_ChangeControl.xlsx` (outside OneDrive; the SharePoint file is a read-only copy). Procedure for people: `docs/sop-change-requests.md`.
 
 Keep it small: one item (or the bundle named in the arguments) per branch.

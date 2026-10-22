@@ -1,10 +1,14 @@
 # KelpWorks change log (backlog)
 
-- **Master:** the Excel workbook `LOG_KelpWorks_ChangeControl.xlsx` in SharePoint (QAQC > KelpWorks ERP > Change_Control). Status, Owner and Notes are kept there.
-- **`items.csv`, `open-decisions.csv`:** a snapshot of the workbook's Change Log and Open Decisions sheets, so Claude Code can read an item by its ID. Refresh after the workbook changes:
-  `python tools/export_backlog.py "<path to the workbook>"` (standard library only). The Status column in the CSV can be out of date; the workbook is right.
-- **Updating the master:** `python tools/update_backlog_xlsx.py "<workbook>" updates.json [--dry-run]` sets an item's Status / Owner / Notes and a decision's Decided By / Decision (see the tool's
-  header for the JSON format). It edits only those cells inside the .xlsx, so the formatting, drop-downs, formulas and SharePoint properties stay as they are, and the Summary counts recalculate when
-  Excel opens the file (close the workbook in Excel first). Claude Code keeps the workbook current as items move (`/kw-item`, step 10); then re-run the export above.
-- **Working an item:** `/kw-item KW-24` (`.claude/commands/kw-item.md`): read the item, ask about any open decision, branch, plan, build with tests, report, and stop before committing.
+- **Master:** the Excel workbook `LOG_KelpWorks_ChangeControl.xlsx` in `C:\KelpWorks\ChangeControl\` (outside OneDrive). Edit it there in Excel (close it before Claude Code writes). Status, Owner, Approved to Start and Notes are kept there.
+- **SharePoint copy:** after every tool write, `tools/changelog_write.py` publishes a READ-ONLY copy to SharePoint (QAQC > KelpWorks ERP > Change_Control, same file name). Claude (chat) and everyone else read that copy. After you edit the master by hand,
+  run `python tools/changelog_write.py --publish` to refresh it.
+- **Backups:** every write is preceded by a backup in `C:\KelpWorks\ChangeControl\Backups` (newest 30) and a second copy in `Change_Control\Backups`. `python tools/changelog_write.py --backups` lists them; `--restore latest` (or a name) puts one back.
+- **Inbox:** Claude (chat) does not write the workbook. It leaves a note (new item or revision) in `Change_Control\Inbox`; `python tools/changelog_write.py --apply-inbox` validates and applies the notes. Format: `docs/backlog/inbox-note-format.md`.
+- **`items.csv`, `open-decisions.csv`:** a snapshot of the workbook's Change Log and Open Decisions sheets, so Claude Code can read an item by its ID. Refresh after the workbook changes: `python tools/export_backlog.py` (no argument: it reads the master;
+  standard library only). The Status column in the CSV can be out of date; the workbook is right.
+- **Updating the master:** only with `python tools/changelog_write.py` (item updates with `--id`, `--batch`; an Open Decisions answer with `--decision`; inbox notes with `--apply-inbox`). It edits only the cells it is allowed to, inside the .xlsx, so the formatting,
+  drop-downs, formulas and filters stay as they are, and the Summary counts recalculate when Excel opens the file. Claude Code keeps the workbook current as items move (`/kw-item`, step 10); then re-run the export above.
+- **Procedure:** `docs/sop-change-requests.md` (request -> approval -> build -> release -> verified on live). **Workflow Rules sheet text:** `docs/backlog/workflow-rules-text.md`.
+- **Working an item:** `/kw-item KW-24` (`.claude/commands/kw-item.md`): apply the inbox, read the item, ask about any open decision, branch, plan, build with tests, report, and stop before committing.
 - The workbook's "Claude Code Prompt" column is not exported: it was written for a Flask / SQLAlchemy stack, which KelpWorks is not.

@@ -71,6 +71,15 @@ def make(path, headers=HEADERS):
         z.writestr("customXml/item1.xml", "<keep/>")
 
 
+@pytest.fixture(autouse=True)
+def isolated(tmp_path, monkeypatch):
+    """No test may touch the real SharePoint copy, mirror or inbox: all three point into the test folder."""
+    for var, folder in (("KELPWORKS_SNAPSHOT", "sp/" + "LOG_KelpWorks_ChangeControl.xlsx"), ("KELPWORKS_BACKUP_MIRROR", "sp/Backups"), ("KELPWORKS_INBOX", "sp/Inbox")):
+        monkeypatch.setenv(var, str(tmp_path / folder))
+    (tmp_path / "sp").mkdir()
+    monkeypatch.delenv("KELPWORKS_CHANGELOG", raising=False)
+
+
 @pytest.fixture
 def cw():
     return load()
@@ -78,7 +87,7 @@ def cw():
 
 @pytest.fixture
 def wb(tmp_path):
-    folder = tmp_path / "Change_Control"
+    folder = tmp_path / "ChangeControl"
     folder.mkdir()
     p = folder / "LOG_KelpWorks_ChangeControl.xlsx"
     make(str(p))
@@ -147,7 +156,7 @@ def test_released_needs_a_pr_number_and_a_date_and_they_are_checked(cw, wb, caps
 
 
 def test_rows_are_found_by_id_and_an_unknown_or_repeated_id_is_refused(cw, wb, capsys):
-    assert write(cw, wb, "--id", "KW-99", "Notes=x") == 2 and "never adds rows" in capsys.readouterr().out
+    assert write(cw, wb, "--id", "KW-99", "Notes=x") == 2 and "inbox note" in capsys.readouterr().out
     assert write(cw, wb, "--id", "KW-06", "Notes=x") == 2 and "2 times" in capsys.readouterr().out
     assert write(cw, wb, "--id", "KW-01", "Status") == 2                                                 # not column=value
 
@@ -176,7 +185,7 @@ def test_a_dry_run_checks_the_rules_but_writes_nothing(cw, wb):
 
 def test_it_stops_when_excel_has_the_workbook_open(cw, wb, tmp_path, capsys):
     original = open(wb, "rb").read()
-    lock = tmp_path / "Change_Control" / "~$G_KelpWorks_ChangeControl.xlsx"
+    lock = tmp_path / "ChangeControl" / "~$G_KelpWorks_ChangeControl.xlsx"
     lock.write_text("x")
     assert write(cw, wb, "--id", "KW-01", "Status=In progress") == 3 and "open in Excel" in capsys.readouterr().out
     assert open(wb, "rb").read() == original
@@ -236,8 +245,8 @@ def test_a_batch_is_checked_as_a_whole_and_written_once(cw, wb, tmp_path, capsys
 
 
 def test_a_workbook_without_the_approval_column_cannot_start_an_item(cw, tmp_path, capsys):
-    (tmp_path / "Change_Control").mkdir()
-    p = tmp_path / "Change_Control" / "LOG_KelpWorks_ChangeControl.xlsx"
+    (tmp_path / "ChangeControl").mkdir()
+    p = tmp_path / "ChangeControl" / "LOG_KelpWorks_ChangeControl.xlsx"
     make(str(p), headers=[h if h != "Approved to Start" else "Approval" for h in HEADERS])
     assert write(cw, str(p), "--id", "KW-01", "Status=In progress") == 2 and "Approved to Start" in capsys.readouterr().out
 
@@ -253,8 +262,8 @@ def test_show_prints_a_rows_workflow_cells_and_changes_nothing(cw, wb, capsys):
 # ---- KW-62: one change log, one setting; a write never goes to any other file
 def test_a_write_to_a_copy_an_old_name_or_another_folder_is_refused_but_reading_and_dry_runs_are_not(cw, wb, tmp_path, capsys):
     import shutil
-    others = {"copy": tmp_path / "Change_Control" / "LOG_KelpWorks_ChangeControl - Copy.xlsx",
-              "old name": tmp_path / "Change_Control" / "KelpWorks_ChangeLog_2026-10-16.xlsx",
+    others = {"copy": tmp_path / "ChangeControl" / "LOG_KelpWorks_ChangeControl - Copy.xlsx",
+              "old name": tmp_path / "ChangeControl" / "KelpWorks_ChangeLog_2026-10-16.xlsx",
               "other folder": tmp_path / "Elsewhere" / "LOG_KelpWorks_ChangeControl.xlsx"}
     for label, p in others.items():
         p.parent.mkdir(exist_ok=True)
@@ -272,11 +281,11 @@ def test_a_write_to_a_copy_an_old_name_or_another_folder_is_refused_but_reading_
 
 def test_the_path_is_one_setting_shared_by_the_writer_the_old_writer_and_the_reader(cw, monkeypatch, tmp_path):
     import changelog_path
-    assert changelog_path.CHANGE_LOG_NAME == "LOG_KelpWorks_ChangeControl.xlsx" and changelog_path.DEFAULT_PATH.endswith("Change_Control\\LOG_KelpWorks_ChangeControl.xlsx")
+    assert changelog_path.CHANGE_LOG_NAME == "LOG_KelpWorks_ChangeControl.xlsx" and changelog_path.DEFAULT_PATH.endswith("ChangeControl\\LOG_KelpWorks_ChangeControl.xlsx")
     assert cw.DEFAULT_PATH == changelog_path.DEFAULT_PATH
     monkeypatch.delenv("KELPWORKS_CHANGELOG", raising=False)
     assert changelog_path.configured_path() == changelog_path.DEFAULT_PATH
-    other_pc = tmp_path / "SomeOtherOneDrive" / "Change_Control" / "LOG_KelpWorks_ChangeControl.xlsx"        # another PC: a different folder above, the same name and folder
+    other_pc = tmp_path / "SomeOtherPC" / "ChangeControl" / "LOG_KelpWorks_ChangeControl.xlsx"        # another PC: a different folder above, the same name and folder
     monkeypatch.setenv("KELPWORKS_CHANGELOG", str(other_pc))
     assert changelog_path.configured_path() == str(other_pc)
     changelog_path.check_writable(changelog_path.configured_path())
