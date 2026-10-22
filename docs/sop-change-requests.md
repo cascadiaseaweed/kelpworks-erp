@@ -58,7 +58,7 @@ Rules that apply at every step:
 
 - A backup is taken automatically before every write; a write without a backup is refused. Thirty are kept locally and thirty in SharePoint `Change_Control\Backups`.
 - **Something looks wrong or reverted:** stop writing. `python tools/changelog_write.py --backups` lists them; `python tools/changelog_write.py --restore latest` (or a backup name) puts one back after backing up the current file. Close Excel first. Tell the approver.
-- **SharePoint copy older than the master** (after a hand edit): `python tools/changelog_write.py --publish`.
+- **SharePoint copy older than the master** (after a hand edit, or the tool said it was not refreshed): `python tools/changelog_write.py --publish`. The tool already retries a busy copy (OneDrive syncing) 5 times over about 30 seconds before it reports a failure.
 - **Weekly check (5 minutes, the approver):** the SharePoint copy opens and is read-only; its Row Updated for the newest items matches the master; `--backups` shows recent backups in both folders; `Inbox\rejected` has no unexplained notes.
 - The master is on `C:` of one PC; the backups in SharePoint and the published copy are the protection against losing that disk.
 

@@ -27,7 +27,7 @@ What it enforces (the 'Workflow Rules' sheet of the workbook):
   named cells, waits (10 s, --verify-wait) and re-opens the file to confirm every value stuck, then refreshes the SharePoint copy. A revert is reported, never retried.
 
 Exit codes: 0 done, 1 usage, 2 refused by a rule (nothing written), 3 the master is open in Excel / locked / another run is writing, 4 the file changed while this ran (nothing written),
-5 a value did not stick (revert), 6 the workbook could not be read, 7 written but the SharePoint copy was NOT refreshed (run --publish), 8 some inbox notes were rejected (the valid
+5 a value did not stick (revert), 6 the workbook could not be read, 7 written but the SharePoint copy was NOT refreshed after 5 tries over about 30 s (run --publish), 8 some inbox notes were rejected (the valid
 ones were applied), 9 no backup could be made (nothing written).
 """
 import datetime
@@ -933,8 +933,17 @@ def sha_of(path):
         return hashlib.sha256(f.read()).hexdigest()
 
 
+PUBLISH_TRIES = 5                                                  # OneDrive briefly locks the file it has just synced: try again before giving up (KW-68)
+PUBLISH_DELAY = 6.0                                                # seconds between tries: about 30 s in all
+
+
+def busy(error):
+    """A lock that goes away by itself (access denied / sharing violation), not a missing folder or a full disk."""
+    return isinstance(error, PermissionError) or getattr(error, "winerror", None) in (5, 32)
+
+
 def publish(master, snapshot):
-    """Copy the master over the read-only SharePoint copy (temp file + replace), set it read-only and compare checksums. Raises OSError."""
+    """Copy the master over the read-only SharePoint copy (temp file + replace, retried while the file is busy), set it read-only and compare checksums. Raises OSError."""
     folder = os.path.dirname(os.path.abspath(snapshot))
     if not os.path.isdir(folder):
         raise OSError("the SharePoint folder was not found: %s" % folder)
@@ -942,13 +951,30 @@ def publish(master, snapshot):
     os.close(fd)
     try:
         shutil.copyfile(master, tmp)
-        if os.path.exists(snapshot):
-            os.chmod(snapshot, stat.S_IREAD | stat.S_IWRITE)
-        os.replace(tmp, snapshot)
+        tries = 0
+        while True:
+            tries += 1
+            try:
+                if os.path.exists(snapshot):
+                    os.chmod(snapshot, stat.S_IREAD | stat.S_IWRITE)
+                os.replace(tmp, snapshot)
+                break
+            except OSError as e:
+                if not busy(e):
+                    raise
+                if tries >= PUBLISH_TRIES:
+                    raise OSError("%s (still busy after %d tries over about %d s)" % (e, tries, PUBLISH_DELAY * (tries - 1)))
+                print("(the SharePoint copy is busy, probably OneDrive syncing: try %d of %d failed, trying again in %d s)" % (tries, PUBLISH_TRIES, PUBLISH_DELAY))
+                time.sleep(PUBLISH_DELAY)
         os.chmod(snapshot, stat.S_IREAD)
     except OSError:
         if os.path.exists(tmp):
             os.remove(tmp)
+        if os.path.exists(snapshot):
+            try:
+                os.chmod(snapshot, stat.S_IREAD)                       # never leave the read-only copy writable
+            except OSError:
+                pass
         raise
     if sha_of(snapshot) != sha_of(master):
         raise OSError("the SharePoint copy does not match the master after copying")
@@ -1105,6 +1131,31 @@ def commit(a, snap, parts, wb_xml, lines, expected, label, after=None):
     return finish_publish(path)
 
 
+def refresh_inbox_readme(inbox):
+    """Inbox/README_NOTE_FORMAT.txt is the tool's own text: write it when it is missing or differs. -> True if it was written. Raises OSError."""
+    target = os.path.join(inbox, "README_NOTE_FORMAT.txt")
+    try:
+        with open(target, encoding="utf-8") as f:
+            if f.read() == NOTE_FORMAT:
+                return False
+    except FileNotFoundError:
+        pass
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(NOTE_FORMAT)
+    return True
+
+
+def tidy_inbox_readme(master):
+    inbox = cp.inbox_for(master)
+    if not inbox or not os.path.isdir(inbox):
+        return
+    try:
+        if refresh_inbox_readme(inbox):
+            print("Inbox README_NOTE_FORMAT.txt updated to the tool's current text.")
+    except OSError as e:
+        print("WARNING: the inbox README could not be updated (%s)." % e)
+
+
 def finish_publish(path, wrote=True):
     snapshot = cp.snapshot_for(path)
     if not snapshot:
@@ -1116,6 +1167,7 @@ def finish_publish(path, wrote=True):
         print("%sthe SharePoint copy was NOT refreshed (%s). Fix that (close the SharePoint copy if it is open) and run: python tools/changelog_write.py --publish" % ("WRITTEN, but " if wrote else "", e))
         return 7
     print("SharePoint copy refreshed (read-only): %s" % snapshot)
+    tidy_inbox_readme(path)
     return 0
 
 
@@ -1236,9 +1288,8 @@ def run_write(a, path, writes):
                 raise Refused("no inbox is configured for %s (KELPWORKS_INBOX)" % path)
             if not os.path.isdir(inbox):
                 raise Refused("the inbox folder was not found: %s" % inbox)
-            if writes and not os.path.exists(os.path.join(inbox, "README_NOTE_FORMAT.txt")):
-                with open(os.path.join(inbox, "README_NOTE_FORMAT.txt"), "w", encoding="utf-8") as f:
-                    f.write(NOTE_FORMAT)
+            if writes:
+                tidy_inbox_readme(path)
             if not list_notes(inbox):
                 print("The inbox is empty (%s)." % inbox)
                 return 0
@@ -1362,8 +1413,7 @@ def run_migrate(a, source, master):
     if inbox and os.path.isdir(os.path.dirname(inbox)):
         try:
             os.makedirs(inbox, exist_ok=True)
-            with open(os.path.join(inbox, "README_NOTE_FORMAT.txt"), "w", encoding="utf-8") as f:
-                f.write(NOTE_FORMAT)
+            refresh_inbox_readme(inbox)
         except OSError as e:
             print("WARNING: the inbox could not be set up (%s)" % e)
     code = finish_publish(master)
