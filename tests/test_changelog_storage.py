@@ -660,3 +660,81 @@ def test_the_rules_the_repo_keeps_are_valid_and_describe_the_released_process(cw
     assert run(cw, "--rules-sheet", "--rules-file", path) == 0
     snap = cw.Snapshot(env.master)
     assert snap.cell_ref("Workflow Rules", "A1") == "Change Log Workflow Rules" and "C:\\KelpWorks\\ChangeControl" in snap.cell_ref("Workflow Rules", "B6")
+
+
+# ---- KW-68: a busy SharePoint copy is retried; the inbox README follows the tool's text ------------------------------------------------------------------------------------
+def make_busy(cw, monkeypatch, snapshot, failures, error=None):
+    """os.replace onto the SharePoint copy fails `failures` times (access denied, as when OneDrive has just touched the file), then works. -> the list of attempts."""
+    real, attempts = os.replace, []
+    make_busy.limit = failures
+
+    def replace(src, dst, *a, **k):
+        if os.path.abspath(dst) == os.path.abspath(snapshot):
+            attempts.append(1)
+            if len(attempts) <= make_busy.limit:
+                raise error or PermissionError(13, "Access is denied")
+        return real(src, dst, *a, **k)
+    monkeypatch.setattr(cw.os, "replace", replace)
+    sleeps = []
+    monkeypatch.setattr(cw.time, "sleep", lambda s: sleeps.append(s))
+    return attempts, sleeps
+
+
+def test_a_busy_sharepoint_copy_is_retried_and_the_write_then_reports_success(cw, env, monkeypatch, capsys):
+    run(cw, "--id", "KW-01", "Notes=first")                                                                   # the SharePoint copy exists (read-only)
+    attempts, sleeps = make_busy(cw, monkeypatch, env.snapshot, 2)
+    capsys.readouterr()
+    assert run(cw, "--id", "KW-01", "Notes=second") == 0
+    out = capsys.readouterr().out
+    assert len(attempts) == 3 and sleeps == [cw.PUBLISH_DELAY, cw.PUBLISH_DELAY] and "try 1 of 5 failed" in out and "try 2 of 5 failed" in out and "SharePoint copy refreshed" in out
+    assert open(env.snapshot, "rb").read() == open(env.master, "rb").read() and read_only(env.snapshot) and row(cw, env.snapshot, "KW-01")["Notes"] == "second"
+    assert not [f for f in os.listdir(env.sp) if f.startswith(".publish_")]                                    # no temp file left behind
+
+
+def test_a_snapshot_that_stays_busy_is_reported_after_five_tries_and_stays_read_only(cw, env, monkeypatch, capsys):
+    run(cw, "--id", "KW-01", "Notes=first")
+    before = open(env.snapshot, "rb").read()
+    attempts, sleeps = make_busy(cw, monkeypatch, env.snapshot, 99)
+    capsys.readouterr()
+    assert run(cw, "--id", "KW-01", "Notes=second") == 7
+    out = capsys.readouterr().out
+    assert len(attempts) == cw.PUBLISH_TRIES == 5 and len(sleeps) == 4 and "still busy after 5 tries" in out and "NOT refreshed" in out
+    assert row(cw, env.master, "KW-01")["Notes"] == "second"                                                   # the write itself stands
+    assert open(env.snapshot, "rb").read() == before and read_only(env.snapshot)                               # the old copy is intact and never left writable
+    assert not [f for f in os.listdir(env.sp) if f.startswith(".publish_")]
+    make_busy.limit = 0                                                                                        # OneDrive has finished: the next --publish goes through
+    assert run(cw, "--publish") == 0 and open(env.snapshot, "rb").read() == open(env.master, "rb").read()
+
+
+def test_a_problem_that_will_not_go_away_by_itself_is_not_retried(cw, env, monkeypatch, capsys):
+    run(cw, "--id", "KW-01", "Notes=first")
+    attempts, sleeps = make_busy(cw, monkeypatch, env.snapshot, 99, error=OSError(28, "No space left on device"))
+    capsys.readouterr()
+    assert run(cw, "--id", "KW-01", "Notes=second") == 7 and len(attempts) == 1 and sleeps == [] and "No space left" in capsys.readouterr().out
+
+
+def test_the_inbox_readme_is_rewritten_when_it_differs_and_left_alone_when_it_does_not(cw, env, capsys):
+    readme = env.inbox / "README_NOTE_FORMAT.txt"
+    assert not readme.exists()
+    assert run(cw, "--apply-inbox") == 0 and readme.read_text(encoding="utf-8") == cw.NOTE_FORMAT                  # missing: written (an empty inbox is enough)
+    readme.write_text("an old version of the format", encoding="utf-8")
+    assert run(cw, "--apply-inbox", "--dry-run") == 0 and readme.read_text(encoding="utf-8") == "an old version of the format"     # a dry run touches nothing
+    capsys.readouterr()
+    assert run(cw, "--apply-inbox") == 0 and readme.read_text(encoding="utf-8") == cw.NOTE_FORMAT and "README_NOTE_FORMAT.txt updated" in capsys.readouterr().out
+    stamp = os.stat(readme).st_mtime_ns
+    time.sleep(0.05)
+    assert run(cw, "--apply-inbox") == 0 and os.stat(readme).st_mtime_ns == stamp and "README_NOTE_FORMAT.txt updated" not in capsys.readouterr().out    # unchanged: not rewritten
+
+
+def test_the_inbox_readme_is_also_refreshed_by_publish_and_by_every_write(cw, env, capsys):
+    readme = env.inbox / "README_NOTE_FORMAT.txt"
+    readme.write_text("stale", encoding="utf-8")
+    assert run(cw, "--publish") == 0 and readme.read_text(encoding="utf-8") == cw.NOTE_FORMAT
+    readme.write_text("stale again", encoding="utf-8")
+    assert run(cw, "--id", "KW-01", "Notes=x") == 0 and readme.read_text(encoding="utf-8") == cw.NOTE_FORMAT
+
+
+def test_an_inbox_readme_that_cannot_be_written_is_a_warning_not_a_failure(cw, env, monkeypatch, capsys):
+    (env.inbox / "README_NOTE_FORMAT.txt").write_text("stale", encoding="utf-8")
+    monkeypatch.setattr(cw, "refresh_inbox_readme", lambda inbox: (_ for _ in ()).throw(PermissionError(13, "Access is denied")))
+    assert run(cw, "--id", "KW-01", "Notes=x") == 0 and "WARNING: the inbox README could not be updated" in capsys.readouterr().out
