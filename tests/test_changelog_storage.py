@@ -464,3 +464,14 @@ def test_publish_alone_does_not_claim_a_write_happened(cw, env, monkeypatch, cap
     assert run(cw, "--publish") == 7
     out = capsys.readouterr().out
     assert "NOT refreshed" in out and "WRITTEN" not in out
+
+
+def test_backups_made_in_the_same_second_keep_their_order_even_after_old_ones_are_pruned(cw, env, monkeypatch):
+    monkeypatch.setattr(cw, "utc_stamp", lambda: "20261022-120000")                                              # a fast machine: every backup in one second
+    for i in range(45):
+        before = open(env.master, "rb").read()
+        assert run(cw, "--id", "KW-01", "Notes=s%d" % i) == 0
+        newest = backups(env.local)[-1]
+        assert open(env.local / newest, "rb").read() == before                                                  # the newest sorts last, always
+    names = backups(env.local)
+    assert len(names) == 30 and names[-1].startswith("LOG_KelpWorks_ChangeControl_20261022-120000-45_")

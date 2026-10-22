@@ -633,10 +633,9 @@ def make_backup(master, action):
     folder = cp.backup_dir(master)
     os.makedirs(folder, exist_ok=True)
     label = re.sub(r"[^A-Za-z0-9]+", "-", action).strip("-")[:30] or "write"
-    stamp, n = utc_stamp(), 1                                          # <UTC second>-<nn>: names sort in the order the backups were made
-    taken = lambda k: any(f.startswith("LOG_KelpWorks_ChangeControl_%s-%02d_" % (stamp, k)) for f in os.listdir(folder))
-    while taken(n) and n < 99:
-        n += 1
+    stamp = utc_stamp()                                                # <UTC second>-<nn>: names sort in the order the backups were made
+    same_second = [int(m.group(1)[-2:]) for m in (BACKUP_RE.match(f) for f in os.listdir(folder)) if m and m.group(1).startswith(stamp + "-")]
+    n = min(max(same_second, default=0) + 1, 99)                       # one more than the highest taken, never a gap that pruning left (a reused low number would sort as the OLDEST)
     name = "LOG_KelpWorks_ChangeControl_%s-%02d_%s.xlsx" % (stamp, n, label)
     path = os.path.join(folder, name)
     shutil.copyfile(master, path)
