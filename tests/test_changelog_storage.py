@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 NAME = "LOG_KelpWorks_ChangeControl.xlsx"
 HEADERS = ["ID", "Module", "Section", "Type", "Change Request", "Context / Rationale", "Transcript Time", "Raised By", "Priority", "Lens", "Claude Code Mode", "Claude Code Prompt",
            "Acceptance Criteria", "Status", "Owner", "Notes", "Approved to Start", "PR #", "Released Date", "Verified By (on live)", "Verified Date", "QM-001 Ref", "Row Updated", "Updated By"]
-DEC_HEADERS = ["ID", "Decision Needed", "Options", "Recommendation", "Decided By", "Decision"]
+DEC_HEADERS = ["ID", "Decision Needed", "Options Discussed", "Recommendation (Claude)", "Decided By", "Decision"]
 NS = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
 LAST = "X"
 
@@ -66,15 +66,27 @@ def make(path, items=ITEMS):
     dec = '<row r="1">%s</row>' % cells(1, DEC_HEADERS, {h: h for h in DEC_HEADERS}, 1)
     for r, d in enumerate(DECISIONS, 2):
         dec += '<row r="%d">%s</row>' % (r, cells(r, DEC_HEADERS, d, 7))
+    rules_rows = ('<row r="1" spans="1:3" ht="17.25" customHeight="1"><c r="A1" s="1" t="inlineStr"><is><t>Old title</t></is></c></row>'
+                  '<row r="2" spans="1:3" ht="15" customHeight="1"><c r="A2" s="2" t="inlineStr"><is><t>Old subtitle</t></is></c></row>'
+                  '<row r="4" spans="1:3" ht="15" customHeight="1"><c r="A4" s="9" t="inlineStr"><is><t>1. Old heading</t></is></c></row>'
+                  '<row r="5" spans="1:3" ht="15" customHeight="1"><c r="A5" s="10" t="inlineStr"><is><t>Owner</t></is></c><c r="B5" s="10" t="inlineStr"><is><t>Columns</t></is></c><c r="C5" s="10" t="inlineStr"><is><t>Rules</t></is></c></row>'
+                  '<row r="6" spans="1:3" ht="15" customHeight="1"><c r="A6" s="11" t="inlineStr"><is><t>Old</t></is></c><c r="B6" s="11" t="inlineStr"><is><t>rule</t></is></c><c r="C6" s="11" t="inlineStr"><is><t>text</t></is></c></row>'
+                  '<row r="8" spans="1:3" ht="100" customHeight="1"><c r="A8" s="28" t="inlineStr"><is><t>Old pasted box</t></is></c><c r="B8" s="28"/><c r="C8" s="28"/></row>')
+    plan_rows = ""
+    for r, (a_, b_, c_) in enumerate([("Step", "Who", "Done"), ("0. Decide", "N. Wrana", ""), ("1. Freeze", "N. Wrana", "")], 1):
+        plan_rows += '<row r="%d">%s</row>' % (r, "".join('<c r="%s%d" t="inlineStr"><is><t>%s</t></is></c>' % (col_, r, escape(v)) if v else '<c r="%s%d"/>' % (col_, r) for col_, v in zip("ABC", (a_, b_, c_))))
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("xl/workbook.xml", '<?xml version="1.0"?><workbook %s><sheets><sheet name="Summary" sheetId="1" r:id="rId1"/><sheet name="Change Log" sheetId="2" r:id="rId2"/>'
-                   '<sheet name="Open Decisions" sheetId="3" r:id="rId3"/></sheets><definedNames><definedName name="_xlnm._FilterDatabase" localSheetId="1" hidden="1">\'Change Log\'!$A$1:$%s$%d</definedName></definedNames>'
+                   '<sheet name="Open Decisions" sheetId="3" r:id="rId3"/><sheet name="Workflow Rules" sheetId="4" r:id="rId4"/><sheet name="KW-60 Clean Start Plan" sheetId="5" r:id="rId5"/></sheets><definedNames><definedName name="_xlnm._FilterDatabase" localSheetId="1" hidden="1">\'Change Log\'!$A$1:$%s$%d</definedName></definedNames>'
                    '<calcPr calcId="1"/></workbook>' % (NS, LAST, last))
         z.writestr("xl/_rels/workbook.xml.rels", '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-                   + "".join('<Relationship Id="rId%d" Type="x" Target="worksheets/sheet%d.xml"/>' % (i, i) for i in (1, 2, 3)) + '</Relationships>')
+                   + "".join('<Relationship Id="rId%d" Type="x" Target="worksheets/sheet%d.xml"/>' % (i, i) for i in (1, 2, 3, 4, 5)) + '</Relationships>')
         z.writestr("xl/worksheets/sheet1.xml", '<?xml version="1.0"?><worksheet %s><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Summary</t></is></c></row></sheetData></worksheet>' % NS)
         z.writestr("xl/worksheets/sheet2.xml", log)
         z.writestr("xl/worksheets/sheet3.xml", '<?xml version="1.0"?><worksheet %s><sheetData>%s</sheetData></worksheet>' % (NS, dec))
+        z.writestr("xl/worksheets/sheet4.xml", '<?xml version="1.0"?><worksheet %s><dimension ref="A1:C8"/><cols><col min="1" max="1" width="20"/><col min="2" max="2" width="30"/><col min="3" max="3" width="60"/></cols>'
+                   '<sheetData>%s</sheetData><mergeCells count="1"><mergeCell ref="A8:C8"/></mergeCells><pageMargins left="0.75"/></worksheet>' % (NS, rules_rows))
+        z.writestr("xl/worksheets/sheet5.xml", '<?xml version="1.0"?><worksheet %s><dimension ref="A1:C3"/><sheetData>%s</sheetData></worksheet>' % (NS, plan_rows))
         z.writestr("customXml/item1.xml", "<keep/>")
 
 
@@ -337,15 +349,16 @@ def test_a_new_item_note_adds_a_row_with_the_next_id_and_keeps_the_sheet_consist
 
 def test_a_revision_note_changes_only_the_named_intake_cells(cw, env):
     note(env, "chat-rev-0001", note_id="chat-rev-0001", kind="revision", id="KW-02", based_on={"Row Updated": "2026-10-20"}, fields={"Acceptance Criteria": "It works", "Priority": "P1"},
-         **{"from": "Claude (chat)"})
+         revision_summary="Acceptance criteria written; priority raised", **{"from": "Claude (chat)"})
     before = row(cw, env.master, "KW-02")
     assert run(cw, "--apply-inbox") == 0
     after = row(cw, env.master, "KW-02")
     assert after["Acceptance Criteria"] == "It works" and after["Priority"] == "P1" and after["Updated By"] == "Claude (chat) (inbox)" and after["Row Updated"] != "2026-10-20"
-    assert {h: v for h, v in after.items() if h not in ("Acceptance Criteria", "Priority", "Row Updated", "Updated By")} == {h: v for h, v in before.items() if h not in ("Acceptance Criteria", "Priority", "Row Updated", "Updated By")}
+    assert re.fullmatch(r"Revised \d{4}-\d{2}-\d{2} \(Claude chat\): Acceptance criteria written; priority raised", after["Context / Rationale"])
+    assert {h: v for h, v in after.items() if h not in ("Acceptance Criteria", "Priority", "Row Updated", "Updated By", "Context / Rationale")} == {h: v for h, v in before.items() if h not in ("Acceptance Criteria", "Priority", "Row Updated", "Updated By", "Context / Rationale")}
     # the same note again (an older copy) is a duplicate; a new note built on the old Row Updated is stale
-    note(env, "chat-rev-0001", note_id="chat-rev-0001", kind="revision", id="KW-02", based_on={"Row Updated": after["Row Updated"]}, fields={"Lens": "x"})
-    note(env, "chat-rev-0002", note_id="chat-rev-0002", kind="revision", id="KW-02", based_on={"Row Updated": "2026-10-20"}, fields={"Lens": "x"})
+    note(env, "chat-rev-0001", note_id="chat-rev-0001", kind="revision", id="KW-02", based_on={"Row Updated": after["Row Updated"]}, fields={"Lens": "x"}, revision_summary="again")
+    note(env, "chat-rev-0002", note_id="chat-rev-0002", kind="revision", id="KW-02", based_on={"Row Updated": "2026-10-20"}, fields={"Lens": "x"}, revision_summary="again")
     assert run(cw, "--apply-inbox") == 8
     reasons = {f[:-len(".result.json")]: json.loads((env.inbox / "rejected" / f).read_text(encoding="utf-8"))["reason"] for f in os.listdir(env.inbox / "rejected") if f.endswith(".result.json")}
     assert "duplicate" in reasons["chat-rev-0001"] and "stale" in reasons["chat-rev-0002"]
@@ -368,11 +381,13 @@ BAD_NOTES = [
     ("priority", dict(new_item(Priority="P9"), note_id="chat-bad-0011"), "Priority 'P9'"),
     ("mode", dict(new_item(), note_id="chat-bad-0012", fields=dict(new_item()["fields"], **{"Claude Code Mode": "Whatever"})), "Claude Code Mode"),
     ("same request", dict(new_item(**{"Change Request": "  add a NOTES box "}), note_id="chat-bad-0013"), "duplicate: the same Change Request is already KW-01"),
-    ("unknown id", {"note_id": "chat-bad-0014", "kind": "revision", "id": "KW-77", "based_on": {"Row Updated": "x"}, "fields": {"Lens": "x"}}, "KW-77 is not on"),
-    ("released", {"note_id": "chat-bad-0015", "kind": "revision", "id": "KW-03", "based_on": {"Row Updated": "2026-10-20"}, "fields": {"Lens": "x"}}, "raise a new item"),
-    ("wont do", {"note_id": "chat-bad-0016", "kind": "revision", "id": "KW-04", "based_on": {"Row Updated": "2026-10-20"}, "fields": {"Lens": "x"}}, "raise a new item"),
-    ("no based_on", {"note_id": "chat-bad-0017", "kind": "revision", "id": "KW-01", "fields": {"Lens": "x"}}, "needs based_on"),
-    ("stale", {"note_id": "chat-bad-0018", "kind": "revision", "id": "KW-01", "based_on": {"Row Updated": "2026-01-01"}, "fields": {"Lens": "x"}}, "stale"),
+    ("unknown id", {"note_id": "chat-bad-0014", "kind": "revision", "id": "KW-77", "based_on": {"Row Updated": "x"}, "fields": {"Lens": "x"}, "revision_summary": "s"}, "KW-77 is not on"),
+    ("released", {"note_id": "chat-bad-0015", "kind": "revision", "id": "KW-03", "based_on": {"Row Updated": "2026-10-20"}, "fields": {"Lens": "x"}, "revision_summary": "s"}, "raise a new item"),
+    ("wont do", {"note_id": "chat-bad-0016", "kind": "revision", "id": "KW-04", "based_on": {"Row Updated": "2026-10-20"}, "fields": {"Lens": "x"}, "revision_summary": "s"}, "raise a new item"),
+    ("in progress", {"note_id": "chat-bad-0021", "kind": "revision", "id": "KW-05", "based_on": {"Row Updated": "2026-10-20"}, "fields": {"Lens": "x"}, "revision_summary": "s"}, "Not started, Deferred or Blocked"),
+    ("no summary", {"note_id": "chat-bad-0022", "kind": "revision", "id": "KW-01", "based_on": {"Row Updated": "2026-10-20"}, "fields": {"Lens": "x"}}, "needs revision_summary"),
+    ("no based_on", {"note_id": "chat-bad-0017", "kind": "revision", "id": "KW-01", "fields": {"Lens": "x"}, "revision_summary": "s"}, "needs based_on"),
+    ("stale", {"note_id": "chat-bad-0018", "kind": "revision", "id": "KW-01", "based_on": {"Row Updated": "2026-01-01"}, "fields": {"Lens": "x"}, "revision_summary": "s"}, "stale"),
     ("no fields", {"note_id": "chat-bad-0019", "kind": "revision", "id": "KW-01", "based_on": {"Row Updated": "2026-10-20"}}, "'fields' must be"),
     ("short id", dict(new_item(), note_id="a b"), "note_id is required"),
     ("sender", dict(new_item(), note_id="chat-bad-0020", **{"from": "x" * 80}), "'from' must be"),
@@ -475,3 +490,173 @@ def test_backups_made_in_the_same_second_keep_their_order_even_after_old_ones_ar
         assert open(env.local / newest, "rb").read() == before                                                  # the newest sorts last, always
     names = backups(env.local)
     assert len(names) == 30 and names[-1].startswith("LOG_KelpWorks_ChangeControl_20261022-120000-45_")
+
+
+# ---- KW-67: decisions and plan cells from the inbox, the revision rules, the Workflow Rules sheet -----------------------------------------------------------------------------
+def decision(**over):
+    fields = {"ID": "KW-02", "Decision Needed": "Rename to what?", "Options Discussed": "A / B", "Recommendation (Claude)": "Use A"}
+    fields.update(over)
+    return {"kind": "new_decision", "from": "Claude (chat)", "created": "2026-10-22T18:00:00Z", "fields": fields}
+
+
+def result_of(env, folder, name):
+    return json.loads((env.inbox / folder / (name + ".result.json")).read_text(encoding="utf-8"))
+
+
+def test_a_new_decision_note_adds_a_row_to_open_decisions_and_never_sets_the_human_columns(cw, env):
+    note(env, "d1", note_id="chat-dec-0001", **decision())
+    note(env, "d2", note_id="chat-dec-0002", **decision(**{"Decision Needed": "Second question"}))
+    assert run(cw, "--apply-inbox") == 0
+    snap = cw.Snapshot(env.master)
+    assert snap.cell("Open Decisions", 5, "ID") == "KW-02" and snap.cell("Open Decisions", 5, "Decision Needed") == "Rename to what?" and snap.cell("Open Decisions", 5, "Recommendation (Claude)") == "Use A"
+    assert snap.cell("Open Decisions", 5, "Decided By") == "" and snap.cell("Open Decisions", 5, "Decision") == "" and snap.cell("Open Decisions", 6, "Decision Needed") == "Second question"
+    dxml = snap.files[snap.paths["Open Decisions"]].decode()
+    assert re.search(r'<c r="A5" s="7"', dxml) and '<row r="6"' in dxml                                            # styles copied from the row above
+    assert snap.cell("Open Decisions", 3, "Decision Needed") == "Keep the old report?"                              # the other rows are untouched
+    assert len(backups(env.local)) == 1 and result_of(env, "processed", "d1")["id"] == "KW-02"
+
+
+BAD_DECISIONS = [
+    ("unknown id", decision(ID="KW-99"), "KW-99 is not an item"),
+    ("duplicate question", decision(ID="KW-05", **{"Decision Needed": "  make it OPTIONAL? "}), "duplicate"),
+    ("decided by", dict(decision(), fields=dict(decision()["fields"], **{"Decided By": "N. Wrana"})), "cannot be set from a note"),
+    ("decision", dict(decision(), fields=dict(decision()["fields"], Decision="Yes")), "cannot be set from a note"),
+    ("missing", dict(decision(), fields={"ID": "KW-02", "Decision Needed": "x"}), "a decision needs"),
+    ("not text", dict(decision(), fields=dict(decision()["fields"], **{"Options Discussed": 5})), "must be text"),
+    ("no fields", {"kind": "new_decision"}, "'fields' must be"),
+]
+
+
+@pytest.mark.parametrize("label,obj,reason", BAD_DECISIONS, ids=[b[0] for b in BAD_DECISIONS])
+def test_a_bad_decision_note_is_rejected_with_a_reason(cw, env, label, obj, reason):
+    note(env, "bad", note_id="chat-baddec-%s" % label.replace(" ", ""), **obj)
+    before = open(env.master, "rb").read()
+    assert run(cw, "--apply-inbox") == 8
+    assert open(env.master, "rb").read() == before and reason in result_of(env, "rejected", "bad")["reason"]
+    if label == "duplicate question":
+        note(env, "ok", note_id="chat-baddec-ok", **decision(ID="KW-05", **{"Decision Needed": "A different question"}))      # the same ID with another question is fine
+        assert run(cw, "--apply-inbox") == 0
+
+
+def test_an_existing_decision_question_is_a_duplicate_even_within_one_run(cw, env):
+    note(env, "a", note_id="chat-dd-0001", **decision())
+    note(env, "b", note_id="chat-dd-0002", **decision())
+    assert run(cw, "--apply-inbox") == 8
+    assert (env.inbox / "processed" / "a.json").exists() and "duplicate" in result_of(env, "rejected", "b")["reason"]
+
+
+def plan(cells, **over):
+    obj = {"kind": "plan_cells", "from": "Claude (chat)", "created": "2026-10-22T18:00:00Z", "sheet": "KW-60 Clean Start Plan", "cells": cells}
+    obj.update(over)
+    return obj
+
+
+def test_a_plan_cells_note_sets_named_cells_on_a_kw_plan_sheet(cw, env):
+    note(env, "p1", note_id="chat-plan-0001", **plan([{"cell": "C2", "was": "", "now": "2026-10-23 NW"}, {"cell": "d3", "was": "", "now": "a cell the row did not have"}, {"cell": "B2", "was": "N. Wrana", "now": "N. Wrana / D. Pedde"}]))
+    assert run(cw, "--apply-inbox") == 0
+    snap = cw.Snapshot(env.master)
+    assert snap.cell_ref("KW-60 Clean Start Plan", "C2") == "2026-10-23 NW" and snap.cell_ref("KW-60 Clean Start Plan", "D3") == "a cell the row did not have" and snap.cell_ref("KW-60 Clean Start Plan", "B2") == "N. Wrana / D. Pedde"
+    assert snap.cell_ref("KW-60 Clean Start Plan", "A2") == "0. Decide" and snap.cell_ref("KW-60 Clean Start Plan", "C3") == ""            # nothing else moved
+    assert re.search(r'<row r="3"><c r="A3"[^>]*>.*?<c r="D3" t="inlineStr">', snap.files[snap.paths["KW-60 Clean Start Plan"]].decode(), re.S)       # the new cell is in column order
+    assert [i for i, _r in snap.id_rows()] == ["KW-01", "KW-02", "KW-03", "KW-04", "KW-05"]                                     # the Change Log was not touched
+    assert result_of(env, "processed", "p1")["reason"].startswith("cells set: C2, D3, B2")
+
+
+BAD_PLANS = [
+    ("not a plan sheet", plan([{"cell": "C2", "was": "", "now": "x"}], sheet="Change Log"), "must be a KW plan sheet"),
+    ("another sheet", plan([{"cell": "C2", "was": "", "now": "x"}], sheet="Open Decisions"), "must be a KW plan sheet"),
+    ("no such sheet", plan([{"cell": "C2", "was": "", "now": "x"}], sheet="KW-61 Other Plan"), "no sheet called"),
+    ("stale", plan([{"cell": "B2", "was": "somebody else", "now": "x"}]), "stale"),
+    ("bad cell", plan([{"cell": "C2:D3", "was": "", "now": "x"}]), "not a single cell"),
+    ("twice", plan([{"cell": "C2", "was": "", "now": "x"}, {"cell": "c2", "was": "", "now": "y"}]), "named twice"),
+    ("missing row", plan([{"cell": "C40", "was": "", "now": "x"}]), "has no row 40"),
+    ("no was", plan([{"cell": "C2", "now": "x"}]), "needs cell, was and now"),
+    ("not text", plan([{"cell": "C2", "was": "", "now": 5}]), "must be text"),
+    ("too many", plan([{"cell": "C2", "was": "", "now": "x"}] * 51), "1-50"),
+    ("control", plan([{"cell": "C2", "was": "", "now": "a\x07"}]), "control characters"),
+]
+
+
+@pytest.mark.parametrize("label,obj,reason", BAD_PLANS, ids=[b[0] for b in BAD_PLANS])
+def test_a_bad_plan_cells_note_is_rejected_whole_and_nothing_is_written(cw, env, label, obj, reason):
+    note(env, "bad", note_id="chat-badplan-%s" % label.replace(" ", ""), **obj)
+    before = open(env.master, "rb").read()
+    assert run(cw, "--apply-inbox") == 8
+    assert open(env.master, "rb").read() == before and backups(env.local) == [] and reason in result_of(env, "rejected", "bad")["reason"]
+
+
+def test_a_plan_note_that_changes_nothing_is_filed_without_a_write(cw, env, capsys):
+    note(env, "p1", note_id="chat-plan-same", **plan([{"cell": "B2", "was": "N. Wrana", "now": "N. Wrana"}]))
+    assert run(cw, "--apply-inbox") == 0 and "UNCHANGED" in capsys.readouterr().out and backups(env.local) == []
+
+
+def test_a_revision_follows_the_intake_rules_status_summary_and_reapproval(cw, env):
+    items = [dict(i) for i in ITEMS] + [{"ID": "KW-06", "Change Request": "Deferred thing", "Priority": "P2", "Claude Code Mode": "Direct", "Status": "Deferred", "Approved to Start": "", "Row Updated": "2026-10-20", "Updated By": "x"},
+                                        {"ID": "KW-07", "Change Request": "Blocked thing", "Priority": "P2", "Claude Code Mode": "Direct", "Status": "Blocked", "Approved to Start": "", "Row Updated": "2026-10-20", "Updated By": "x"}]
+    make(env.master, items)
+    for i, kw in enumerate(("KW-06", "KW-07")):                                                                     # Deferred and Blocked may be revised
+        note(env, "r%d" % i, note_id="chat-revok-000%d" % i, kind="revision", id=kw, based_on={"Row Updated": "2026-10-20"}, fields={"Lens": "new lens"}, revision_summary="lens added")
+    note(env, "r9", note_id="chat-revok-0009", kind="revision", id="KW-01", based_on={"Row Updated": "2026-10-20"}, fields={"Acceptance Criteria": "A new scope", "Context / Rationale": "Why"},
+         revision_summary="scope changed")
+    assert run(cw, "--apply-inbox") == 0
+    assert row(cw, env.master, "KW-06")["Lens"] == "new lens" and row(cw, env.master, "KW-07")["Context / Rationale"].endswith("(Claude chat): lens added")
+    kw1 = row(cw, env.master, "KW-01")                                                                             # KW-01 is Approved to Start = Y: the summary is appended after the new text, and the result warns
+    assert kw1["Context / Rationale"].startswith("Why\nRevised ") and kw1["Context / Rationale"].endswith("(Claude chat): scope changed")
+    warn = result_of(env, "processed", "r9")["reason"]
+    assert "WARNING" in warn and "Approved to Start is Y" in warn and "approved again" in warn
+    assert "WARNING" not in result_of(env, "processed", "r0")["reason"]
+
+
+# ---- the Workflow Rules sheet --------------------------------------------------------------------------------------------------------------------------------------------------
+def rules_json(tmp, **over):
+    spec = {"title": "New title", "subtitle": "New subtitle", "sections": [
+        {"heading": "1. First", "columns": ["A", "B", "C"], "rows": [["x", "y", "z"], ["a long rule " * 20, "b", "c"]]},
+        {"heading": "2. Notes", "text": "One paragraph\nwith two lines."}]}
+    spec.update(over)
+    p = tmp / "rules.json"
+    p.write_text(json.dumps(spec), encoding="utf-8")
+    return str(p)
+
+
+def test_the_rules_sheet_is_rewritten_from_a_file_with_the_sheets_own_styles_and_nothing_else_changes(cw, env, capsys):
+    before = cw.Snapshot(env.master)
+    assert run(cw, "--rules-sheet", "--rules-file", rules_json(env.tmp)) == 0
+    snap = cw.Snapshot(env.master)
+    xml = snap.files[snap.paths["Workflow Rules"]].decode()
+    texts = [snap.cell_ref("Workflow Rules", r) for r in ("A1", "A2", "A4", "A5", "B5", "A6", "C6", "A7", "C7", "A9", "A10")]
+    assert texts[:7] == ["New title", "New subtitle", "1. First", "A", "B", "x", "z"] and texts[7].startswith("a long rule") and texts[9] == "2. Notes" and texts[10] == "One paragraph\nwith two lines."
+    assert re.search(r'<c r="A1" s="1"', xml) and re.search(r'<c r="A2" s="2"', xml) and re.search(r'<c r="A4" s="9"', xml) and re.search(r'<c r="A5" s="10"', xml) and re.search(r'<c r="B6" s="11"', xml)
+    assert '<dimension ref="A1:C10"/>' in xml and '<mergeCells count="1"><mergeCell ref="A10:C10"/></mergeCells>' in xml and "Old pasted box" not in xml and "<cols>" in xml and "<pageMargins" in xml
+    assert float(re.search(r'<row r="7"[^>]* ht="([\d.]+)"', xml).group(1)) > 30                                    # the long rule row is taller
+    for name in ("xl/worksheets/sheet1.xml", "xl/worksheets/sheet2.xml", "xl/worksheets/sheet3.xml", "xl/worksheets/sheet5.xml", "customXml/item1.xml"):
+        assert snap.files[name] == before.files[name], name                                                         # every other part is byte for byte
+    assert len(backups(env.local)) == 1 and open(env.snapshot, "rb").read() == open(env.master, "rb").read()
+    capsys.readouterr()
+    assert run(cw, "--rules-sheet", "--rules-file", rules_json(env.tmp)) == 0 and "Nothing to change" in capsys.readouterr().out and len(backups(env.local)) == 1
+
+
+def test_a_bad_rules_file_or_a_locked_workbook_is_refused(cw, env, capsys):
+    original = open(env.master, "rb").read()
+    bad = env.tmp / "bad.json"
+    for body in ("{not json", json.dumps({"title": "t"}), json.dumps({"title": "t", "subtitle": "s", "sections": [{"heading": "h", "columns": ["a", "b"], "rows": []}]}),
+                 json.dumps({"title": "t", "subtitle": "s", "sections": [{"heading": "h", "columns": ["a", "b", "c"], "rows": [["1", "2"]]}]}),
+                 json.dumps({"title": "t", "subtitle": "s", "sections": [{"heading": "h\x07", "text": "x"}]})):
+        bad.write_text(body, encoding="utf-8")
+        assert run(cw, "--rules-sheet", "--rules-file", str(bad)) == 2 and "Nothing was written" in capsys.readouterr().out
+        assert open(env.master, "rb").read() == original
+    assert run(cw, "--rules-sheet", "--rules-file", str(env.tmp / "missing.json")) == 2
+    lock = os.path.join(os.path.dirname(env.master), "~$G_KelpWorks_ChangeControl.xlsx")
+    open(lock, "w").write("x")
+    assert run(cw, "--rules-sheet", "--rules-file", rules_json(env.tmp)) == 3 and open(env.master, "rb").read() == original
+
+
+def test_the_rules_the_repo_keeps_are_valid_and_describe_the_released_process(cw, env):
+    path = os.path.join(ROOT, "docs", "backlog", "workflow-rules.json")
+    spec = cw.load_rules(path)
+    text = json.dumps(spec)
+    for needle in ("C:\\\\KelpWorks\\\\ChangeControl", "--publish", "--restore", "Inbox", "Revised <date> (Claude chat)", "Not started, Deferred or Blocked", "new_decision", "plan_cells", "Approved to Start", "READ-ONLY"):
+        assert needle in text, needle
+    assert "Claude (chat) writes the workbook" not in text and "only this chat allocates" not in text and "60 s" not in text
+    assert run(cw, "--rules-sheet", "--rules-file", path) == 0
+    snap = cw.Snapshot(env.master)
+    assert snap.cell_ref("Workflow Rules", "A1") == "Change Log Workflow Rules" and "C:\\KelpWorks\\ChangeControl" in snap.cell_ref("Workflow Rules", "B6")

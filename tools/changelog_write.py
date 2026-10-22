@@ -9,6 +9,7 @@ The MASTER is C:\\KelpWorks\\ChangeControl\\LOG_KelpWorks_ChangeControl.xlsx (ou
     python tools/changelog_write.py --decision KW-05 --by "N. Wrana (2026-10-22)" --text "Make optional" [--needed "part of the question"]   # an Open Decisions answer
     python tools/changelog_write.py --apply-inbox [--dry-run]     # apply the notes Claude (chat) left in Change_Control\\Inbox (new items and revisions)
     python tools/changelog_write.py --show KW-46                  # read-only: the row's Status, Approved to Start, PR #, ...
+    python tools/changelog_write.py --rules-sheet [--rules-file f.json]   # rewrite the Workflow Rules sheet from docs/backlog/workflow-rules.json
     python tools/changelog_write.py --publish                     # copy the master to SharePoint now (after a hand edit in Excel)
     python tools/changelog_write.py --backups                     # list the backups (local + SharePoint mirror)
     python tools/changelog_write.py --restore latest|<backup name># put a backup back as the master (backs the current one up first)
@@ -49,6 +50,8 @@ import changelog_path as cp                                                     
 DEFAULT_PATH = cp.DEFAULT_PATH
 SHEET = "Change Log"
 DECISIONS = "Open Decisions"
+RULES = "Workflow Rules"
+RULES_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "backlog", "workflow-rules.json")
 OWNED = ["Status", "Notes", "PR #", "Released Date", "QM-001 Ref"]
 STAMPS = {"Row Updated": lambda: datetime.date.today().isoformat(), "Updated By": lambda: "Claude Code"}
 STATUSES = ["Not started", "In progress", "On staging", "Released", "Blocked"]
@@ -67,26 +70,41 @@ VERIFY_WAIT = 10.0
 LOCK_STALE_SECONDS = 1800
 MAX_NOTE_BYTES = 1000000
 
-NOTE_FORMAT = """KelpWorks change log - how to leave a note here (Claude chat)
+NOTE_FORMAT = r"""KelpWorks change log - how to leave a note here (Claude chat)
 
 Write ONE file per note into this folder, named <note_id>.json (UTF-8). Do not edit the workbook. Claude Code applies the notes (tools/changelog_write.py --apply-inbox);
-applied notes move to processed\\, rejected ones to rejected\\, each with <note_id>.result.json saying what happened or why not. The workbook in Change_Control is a read-only copy.
+applied notes move to processed\, rejected ones to rejected\, each with <note_id>.result.json saying what happened or why not. The workbook in Change_Control is a read-only copy.
+note_id must be unique for ever (letters, digits, dot, dash, underscore; 6-80 characters). Four kinds of note:
 
-A NEW item:
+1. NEW ITEM
 {"note_id": "chat-20261022-001", "kind": "new_item", "from": "Claude (chat)", "created": "2026-10-22T18:00:00Z",
  "fields": {"Module": "...", "Section": "...", "Type": "...", "Change Request": "...", "Context / Rationale": "...", "Transcript Time": "...", "Raised By": "...",
             "Priority": "P2", "Lens": "...", "Claude Code Mode": "Direct", "Acceptance Criteria": "..."}}
 The writer gives it the next free KW number (Status Not started, Approved to Start blank: a human approves it). Required: Module, Section, Type, Change Request, Raised By,
 Priority, Claude Code Mode, Acceptance Criteria. Priority and Claude Code Mode must be values already used in the workbook.
 
-A REVISION of an item's intake columns (not allowed once the item is Released or Won't do - raise a new item instead):
+2. REVISION of an item's intake columns (A-M)
 {"note_id": "chat-20261022-002", "kind": "revision", "from": "Claude (chat)", "created": "...", "id": "KW-66",
- "based_on": {"Row Updated": "2026-10-22"}, "fields": {"Acceptance Criteria": "..."}}
-based_on is the item's Row Updated value you saw in the copy. If the item changed since, the note is rejected as stale: read the copy again and write a new note.
+ "based_on": {"Row Updated": "2026-10-22"}, "revision_summary": "Acceptance criteria now include the restore test",
+ "fields": {"Acceptance Criteria": "..."}}
+Allowed only while the item is Not started, Deferred or Blocked (never In progress or On staging; a Released or Won't do item needs a new item). based_on is the item's Row Updated
+value you saw in the copy: if the item changed since, the note is rejected as stale. The writer appends "Revised <date> (Claude chat): <revision_summary>" to Context / Rationale.
+If Approved to Start is Y and the scope changed, the result says so: the human must clear it so the item is approved again.
 
-Only these columns can be set: Module, Section, Type, Change Request, Context / Rationale, Transcript Time, Raised By, Priority, Lens, Claude Code Mode, Claude Code Prompt,
-Acceptance Criteria. Status, Notes, Approved to Start, PR # and every other column are refused. A note with the same note_id as an applied one, or a new item whose Change Request
-is already on the sheet, is rejected as a duplicate.
+3. NEW DECISION (a row on the Open Decisions sheet)
+{"note_id": "chat-20261022-003", "kind": "new_decision", "from": "Claude (chat)", "created": "...",
+ "fields": {"ID": "KW-67", "Decision Needed": "...", "Options Discussed": "A / B", "Recommendation (Claude)": "..."}}
+The ID must be an item on the Change Log. Decided By and Decision are a human's: a note cannot set them. The same ID with the same Decision Needed is a duplicate.
+
+4. PLAN CELLS (named cells on a KW plan sheet, for example "KW-60 Clean Start Plan")
+{"note_id": "chat-20261022-004", "kind": "plan_cells", "from": "Claude (chat)", "created": "...", "sheet": "KW-60 Clean Start Plan",
+ "cells": [{"cell": "C37", "was": "", "now": "2026-10-23 NW"}]}
+The sheet name must be KW-<number> <words> Plan. "was" is the text the cell holds in the copy you read; if it differs now, the note is rejected as stale. At most 50 cells per note,
+only cells in rows that exist.
+
+Only the intake columns Module, Section, Type, Change Request, Context / Rationale, Transcript Time, Raised By, Priority, Lens, Claude Code Mode, Claude Code Prompt and
+Acceptance Criteria can be set on an item. Status, Notes, Approved to Start, PR #, Owner and every other column are refused. A note with the same note_id as an applied one, or a
+new item whose Change Request is already on the sheet, is rejected as a duplicate.
 """
 
 
@@ -172,6 +190,14 @@ class Snapshot:
             if m and int(m.group(2)) == row and m.group(1) in letter_to_header:
                 out[letter_to_header[m.group(1)]] = xl.cell_text(c, self.sst).strip()
         return out
+
+    def cell_ref(self, sheet, ref):
+        """One cell of any sheet by its reference (C37)."""
+        xml = self.files[self.paths[sheet]].decode("utf-8")
+        for r, c in xl.cells_of(xml):
+            if r == ref:
+                return xl.cell_text(c, self.sst).strip()
+        return ""
 
     def cell(self, sheet, row, header):
         """One cell of any sheet, by row number and header text."""
@@ -374,7 +400,7 @@ def plan_decision(snap, kw, by, text, needed=None):
     return part, xml, [("%s %s" % (kw, h), o, n) for h, o, n in changes], expected
 
 
-# ---- adding a row (inbox: a new item) ------------------------------------------------------------------------------------------------------------------------------------
+# ---- adding a row (inbox: a new item, a new decision) --------------------------------------------------------------------------------------------------------------------
 def last_row_number(xml):
     nums = [int(n) for n in re.findall(r'<row r="(\d+)"', xml)]
     return max(nums) if nums else 1
@@ -388,33 +414,40 @@ def column_widths(xml):
     return out
 
 
-def add_row(snap, xml, values):
-    """Append one row below the last one (cell styles copied from the last row). -> (new xml, row number)."""
+def text_lines(text, width):
+    per_line = max(8.0, width * 1.1)
+    return sum(max(1, math.ceil(len(p) / per_line)) for p in str(text).split("\n"))
+
+
+def row_height(lines, minimum=15.0):
+    return ("%.1f" % min(409.5, max(minimum, 13.5 * lines + 3))).rstrip("0").rstrip(".")
+
+
+def add_row(xml, headers, values, what=SHEET):
+    """Append one row below the last one of a sheet (cell styles copied from the last row). headers = {header: column letters}. -> (new xml, row number)."""
     last = last_row_number(xml)
     lm = re.search(r'<row r="%d"((?:\s+[^>]*?)?)>(.*?)</row>' % last, xml, flags=re.S)
     if not lm:
-        raise Refused("the '%s' sheet has no row to copy the layout from" % SHEET)
+        raise Refused("the '%s' sheet has no row to copy the layout from" % what)
     styles = {m.group(1): m.group(2) for m in re.finditer(r'<c r="([A-Z]+)\d+"(?:[^>]*?\bs="(\d+)")?', lm.group(2))}
     attrs = re.sub(r'\s+(?:ht|customHeight)="[^"]*"', "", lm.group(1))
     widths, lines = column_widths(xml), 1
     row = last + 1
     cells = ""
-    for header, letters in sorted(snap.headers.items(), key=lambda kv: colnum(kv[1])):
+    for header, letters in sorted(headers.items(), key=lambda kv: colnum(kv[1])):
         text = values.get(header, "")
         style = styles.get(letters)
         s_attr = ' s="%s"' % style if style else ""
         if text:
             cells += '<c r="%s%d"%s t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>' % (letters, row, s_attr, xl.escape(text))
-            per_line = max(8.0, widths.get(colnum(letters), 12.0) * 1.1)
-            lines = max(lines, sum(max(1, math.ceil(len(p) / per_line)) for p in text.split("\n")))
+            lines = max(lines, text_lines(text, widths.get(colnum(letters), 12.0)))
         else:
             cells += '<c r="%s%d"%s/>' % (letters, row, s_attr)
-    height = min(409.5, max(30.0, 14.5 * lines + 4))
-    new_row = '<row r="%d"%s ht="%s" customHeight="1">%s</row>' % (row, attrs, ("%.1f" % height).rstrip("0").rstrip("."), cells)
+    new_row = '<row r="%d"%s ht="%s" customHeight="1">%s</row>' % (row, attrs, row_height(lines, 30.0), cells)
     return xml.replace("</sheetData>", new_row + "</sheetData>", 1), row
 
 
-def extend_ranges(xml, wb_xml, old_last, new_last):
+def extend_ranges(xml, wb_xml, old_last, new_last, sheet=SHEET):
     """Make every range that ended at the old last row (autofilter, data validation, conditional formatting, the filter name, the sheet dimension) end at the new one."""
     def bump_ref(m):
         return m.group(1) + (str(new_last) if int(m.group(2)) == old_last else m.group(2))
@@ -423,11 +456,100 @@ def extend_ranges(xml, wb_xml, old_last, new_last):
     def bump_sqref(m):
         return m.group(1) + re.sub(r"([A-Z]+\d+:[A-Z]+)(\d+)", bump_ref, m.group(2)) + '"'
     xml = re.sub(r'(<(?:dataValidation|conditionalFormatting)\b[^>]*?\bsqref=")([^"]*)"', bump_sqref, xml)
-    wb_xml = re.sub(r"(<definedName\b[^>]*>[^<]*'" + re.escape(SHEET) + r"'![$A-Z]+\$\d+:\$[A-Z]+\$)(\d+)", bump_ref, wb_xml)
+    wb_xml = re.sub(r"(<definedName\b[^>]*>[^<]*'" + re.escape(sheet) + r"'![$A-Z]+\$\d+:\$[A-Z]+\$)(\d+)", bump_ref, wb_xml)
     return xml, wb_xml
 
 
+# ---- the Workflow Rules sheet (written from docs/backlog/workflow-rules.json) -----------------------------------------------------------------------------------------------
+def sheet_sig(xml, sst):
+    texts = ["%s:%s" % (ref, xl.cell_text(c, sst).strip()) for ref, c in xl.cells_of(xml) if xl.cell_text(c, sst).strip()]
+    return hashlib.sha256("\n".join(texts).encode("utf-8")).hexdigest()
+
+
+def load_rules(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            spec = json.load(f)
+    except (OSError, ValueError) as e:
+        raise Refused("the rules file %s could not be read (%s)" % (path, e))
+    def need(cond, msg):
+        if not cond:
+            raise Refused("the rules file %s: %s" % (path, msg))
+    need(isinstance(spec, dict) and isinstance(spec.get("title"), str) and isinstance(spec.get("subtitle"), str) and isinstance(spec.get("sections"), list) and spec["sections"], "needs title, subtitle and sections")
+    for s in spec["sections"]:
+        need(isinstance(s, dict) and isinstance(s.get("heading"), str), "every section needs a heading")
+        if "text" in s:
+            need(isinstance(s["text"], str), "'text' must be text")
+        else:
+            need(isinstance(s.get("columns"), list) and len(s["columns"]) == 3 and all(isinstance(c, str) for c in s["columns"]), "'%s' needs 3 column names" % s["heading"])
+            need(isinstance(s.get("rows"), list) and all(isinstance(r, list) and len(r) == 3 and all(isinstance(c, str) for c in r) for r in s["rows"]), "'%s' rows must each have 3 texts" % s["heading"])
+    texts = [spec["title"], spec["subtitle"]] + [x for s in spec["sections"] for x in ([s["heading"], s.get("text", "")] + list(s.get("columns", [])) + [c for r in s.get("rows", []) for c in r])]
+    for t in texts:
+        check_text("rules text", t)
+    return spec
+
+
+def build_rules_sheet(snap, spec):
+    """The new XML of the Workflow Rules sheet: the existing cell styles are reused by role (title, subtitle, heading, table header, table body)."""
+    if RULES not in snap.paths:
+        raise Refused("the workbook has no sheet called '%s'" % RULES)
+    xml = snap.files[snap.paths[RULES]].decode("utf-8")
+    roles, three = {}, []
+    for m in re.finditer(r'<row r="(\d+)"[^>]*>(.*?)</row>', xml, flags=re.S):
+        cells = re.findall(r'<c r="([A-Z]+)\d+"((?:\s+[A-Za-z:]+="[^"]*")*)\s*(?:/>|>)', m.group(2))
+        style = lambda attrs: (re.search(r'\bs="(\d+)"', attrs) or [None, None])[1]
+        if len(cells) == 1:
+            roles.setdefault("title" if "title" not in roles else ("subtitle" if "subtitle" not in roles else "heading"), style(cells[0][1]))
+        elif len(cells) == 3:
+            three.append(style(cells[0][1]))
+    if len(three) < 2 or len(roles) < 3:
+        raise Refused("the '%s' sheet does not have the title / subtitle / heading / table rows this tool copies the styles from" % RULES)
+    roles["header"], roles["body"] = three[0], three[1]
+    widths = column_widths(xml)
+    w = [widths.get(i, 20.0) for i in (1, 2, 3)]
+    rows, merges, r = [], [], 0
+    def cell(col, row, text, role):
+        s = ' s="%s"' % roles[role] if roles.get(role) else ""
+        return '<c r="%s%d"%s t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>' % (col, row, s, xl.escape(text)) if text else '<c r="%s%d"%s/>' % (col, row, s)
+    def add(cells_text, role, merged=False):
+        nonlocal r
+        r += 1
+        if merged:
+            lines = text_lines(cells_text[0], sum(w))
+            body = cell("A", r, cells_text[0], role) + cell("B", r, "", role) + cell("C", r, "", role)
+            merges.append("A%d:C%d" % (r, r))
+        else:
+            lines = max(text_lines(t, w[i]) for i, t in enumerate(cells_text))
+            body = "".join(cell("ABC"[i], r, t, role) for i, t in enumerate(cells_text))
+        height = {"title": "17.25", "subtitle": "15"}.get(role) or row_height(lines)          # the title and the one-line subtitle keep the sheet's own heights (the subtitle runs across)
+        rows.append('<row r="%d" spans="1:3" ht="%s" customHeight="1" x14ac:dyDescent="0.25">%s</row>' % (r, height, body))
+    add([spec["title"]], "title")
+    add([spec["subtitle"]], "subtitle")
+    for s in spec["sections"]:
+        r += 1                                                         # one blank row before every section
+        add([s["heading"]], "heading")
+        if "text" in s:
+            add([s["text"]], "body", merged=True)
+        else:
+            add(s["columns"], "header")
+            for row in s["rows"]:
+                add(row, "body")
+    sheet = re.sub(r"<sheetData>.*?</sheetData>", lambda _m: "<sheetData>" + "".join(rows) + "</sheetData>", xml, flags=re.S)
+    sheet = re.sub(r'<dimension ref="[^"]*"/>', '<dimension ref="A1:C%d"/>' % r, sheet)
+    sheet = re.sub(r"<mergeCells\b.*?</mergeCells>", "", sheet, flags=re.S)
+    if merges:
+        sheet = sheet.replace("</sheetData>", '</sheetData><mergeCells count="%d">%s</mergeCells>' % (len(merges), "".join('<mergeCell ref="%s"/>' % m for m in merges)), 1)
+    return sheet, r
+
+
 # ---- the inbox (notes left by Claude chat) ------------------------------------------------------------------------------------------------------------------------------------
+REVISABLE = ("", "Not started", "Deferred", "Blocked")                 # the intake rule of 2026-10-22: never while In progress / On staging; a Released item gets a new row
+RESCOPE_COLUMNS = {"Module", "Section", "Type", "Change Request", "Acceptance Criteria", "Priority", "Claude Code Mode"}
+DECISION_FIELDS = {"id": "ID", "decision needed": "Decision Needed", "options discussed": "Options Discussed", "recommendation (claude)": "Recommendation (Claude)", "recommendation": "Recommendation (Claude)"}
+PLAN_SHEET_RE = re.compile(r"^KW-\d+ .*Plan$")
+CELL_RE = re.compile(r"^[A-Z]{1,2}[1-9]\d{0,3}$")
+
+
 def norm_text(s):
     return " ".join(str(s).lower().split())
 
@@ -468,7 +590,16 @@ def read_note(path):
     return note
 
 
-def note_fields(snap, note, kind):
+def note_text(label, value):
+    if not isinstance(value, str):
+        raise Reject("'%s' must be text" % label)
+    try:
+        return check_text(label, value)
+    except Refused as e:
+        raise Reject(str(e))
+
+
+def note_fields(snap, note):
     fields = note.get("fields")
     if not isinstance(fields, dict) or not fields:
         raise Reject("'fields' must be an object naming the columns to set")
@@ -482,12 +613,7 @@ def note_fields(snap, note, kind):
         if h not in INTAKE_COLUMNS:
             who = "a human" if h in HUMAN_COLUMNS else "Claude Code"
             raise Reject("'%s' is not an intake column (it belongs to %s); a note can set only: %s" % (h, who, ", ".join(sorted(INTAKE_COLUMNS - {"ID"}))))
-        if not isinstance(value, str):
-            raise Reject("'%s' must be text" % h)
-        try:
-            out[h] = check_text(h, value)
-        except Refused as e:
-            raise Reject(str(e))
+        out[h] = note_text(h, value)
     return out
 
 
@@ -502,20 +628,202 @@ def column_values(snap, xml, header):
     return vals
 
 
-def plan_inbox(snap, inbox, today):
-    """Judge every note against the sheet as it will be after the notes before it. -> (new xml, new workbook xml, results, lines, expected).
-    results = [{file, note_id, status applied|rejected|unchanged, id, reason}]"""
-    xml, wb_xml = snap.xml, snap.files["xl/workbook.xml"].decode("utf-8")
-    done = processed_ids(inbox)
-    seen, results, lines, expected = set(), [], [], {}
+class Work:
+    """The sheets of the workbook as the notes before this one left them."""
+
+    def __init__(self, snap):
+        self.snap, self.xml, self.wb = snap, {}, snap.files["xl/workbook.xml"].decode("utf-8")
+        self.xml[SHEET] = snap.xml
+
+    def sheet(self, name):
+        if name not in self.xml:
+            if name not in self.snap.paths:
+                raise Reject("the workbook has no sheet called '%s'" % name)
+            self.xml[name] = self.snap.files[self.snap.paths[name]].decode("utf-8")
+        return self.xml[name]
+
+    def parts(self):
+        out = {}
+        for name, xml in self.xml.items():
+            if xml != self.snap.files[self.snap.paths[name]].decode("utf-8"):
+                out[self.snap.paths[name]] = xml
+        return out
+
+
+class Ctx:
+    pass
+
+
+def do_new_item(c, note, sender):
+    snap, work = c.snap, c.work
+    fields = note_fields(snap, note)
+    missing = [h for h in NEW_ITEM_REQUIRED if not fields.get(h)]
+    if missing:
+        raise Reject("a new item needs %s" % ", ".join(missing))
+    if fields["Priority"] not in c.priorities:
+        raise Reject("Priority '%s' is not a value used in the workbook (%s)" % (fields["Priority"], ", ".join(sorted(c.priorities))))
+    if fields["Claude Code Mode"] not in c.modes:
+        raise Reject("Claude Code Mode '%s' is not a value used in the workbook (%s)" % (fields["Claude Code Mode"], ", ".join(sorted(c.modes))))
+    dup = c.requests.get(norm_text(fields["Change Request"]))
+    if dup:
+        raise Reject("duplicate: the same Change Request is already %s" % dup)
+    numbers = [int(m.group(1)) for m in (re.fullmatch(r"KW-(\d+)", i) for i in c.ids) if m]
+    new_id = "KW-%02d" % ((max(numbers) if numbers else 0) + 1)
+    values = dict(fields, ID=new_id, Status="Not started", **c.stamps)
+    xml, row = add_row(work.sheet(SHEET), snap.headers, values)
+    work.xml[SHEET] = xml
+    c.ids.add(new_id)
+    c.requests[norm_text(fields["Change Request"])] = new_id
+    for h in values:
+        c.expected[(SHEET, new_id, h)] = values[h]
+    c.lines.append("%s: new item (%s): %s" % (new_id, c.res["file"], fields["Change Request"][:70]))
+    c.res.update(status="applied", id=new_id, reason="new item added at row %d" % row)
+
+
+def do_revision(c, note, sender):
+    snap, work = c.snap, c.work
+    fields = note_fields(snap, note)
+    kw = note.get("id")
+    if not isinstance(kw, str) or not re.fullmatch(r"KW-\d+", kw):
+        raise Reject("a revision needs 'id' (for example KW-66)")
+    xml = work.sheet(SHEET)
+    try:
+        row = snap.row_of(kw, xml)
+    except Refused as e:
+        raise Reject(str(e))
+    current = snap.values(row, xml)
+    status = current.get("Status", "")
+    if status not in REVISABLE:
+        raise Reject("%s is '%s': an item can be revised only while it is Not started, Deferred or Blocked; %s" % (kw, status, "raise a new item instead" if status in ("Released", "Won't do") else "wait until it is finished or blocked"))
+    based = note.get("based_on")
+    if not isinstance(based, dict) or "Row Updated" not in based:
+        raise Reject("a revision needs based_on: {\"Row Updated\": \"<the value you saw>\"}")
+    if str(based["Row Updated"]).strip() != current.get("Row Updated", ""):
+        raise Reject("stale: %s was changed after your copy (Row Updated is '%s', your note saw '%s'); read the copy again" % (kw, current.get("Row Updated", ""), str(based["Row Updated"]).strip()))
+    changes = {h: v for h, v in fields.items() if current.get(h, "") != v}
+    if not changes:
+        c.res.update(status="unchanged", id=kw, reason="the sheet already says this")
+        return
+    summary = note_text("revision_summary", note.get("revision_summary", ""))
+    if not summary or len(summary) > 300:
+        raise Reject("a revision needs revision_summary: what changed, in up to 300 characters (it is appended to Context / Rationale)")
+    who = sender.replace("(", "").replace(")", "")
+    base = changes.get("Context / Rationale", current.get("Context / Rationale", ""))
+    changes["Context / Rationale"] = (base + "\n" if base else "") + "Revised %s (%s): %s" % (c.today, who, summary)
+    for h, v in dict(changes, **c.stamps).items():
+        xml = set_cell(xml, snap.headers[h], row, v)
+        c.expected[(SHEET, kw, h)] = v
+        if h in changes:
+            old = current.get(h, "")
+            c.lines.append("%s: %s: %s -> %s" % (kw, h, (old[:50] + "...") if len(old) > 50 else (old or "(blank)"), (v[:70] + "...") if len(v) > 70 else v))
+    work.xml[SHEET] = xml
+    warning = ""
+    if current.get("Approved to Start", "").strip().lower() in APPROVED and set(changes) & RESCOPE_COLUMNS:
+        warning = " | WARNING: Approved to Start is %s and the scope changed: the human must clear it so the item is approved again" % current["Approved to Start"]
+    c.res.update(status="applied", id=kw, reason="revised: %s%s" % (", ".join(h for h in changes), warning))
+
+
+def do_new_decision(c, note, sender):
+    snap, work = c.snap, c.work
+    fields = note.get("fields")
+    if not isinstance(fields, dict) or not fields:
+        raise Reject("'fields' must be an object with ID, Decision Needed, Options Discussed and Recommendation")
+    values = {}
+    for key, value in fields.items():
+        h = DECISION_FIELDS.get(str(key).strip().lower())
+        if not h:
+            raise Reject("'%s' cannot be set from a note: a decision row takes only ID, Decision Needed, Options Discussed and Recommendation (a human records Decided By and Decision)" % key)
+        values[h] = note_text(h, value)
+    missing = [h for h in ("ID", "Decision Needed", "Options Discussed", "Recommendation (Claude)") if not values.get(h)]
+    if missing:
+        raise Reject("a decision needs %s" % ", ".join(missing))
+    if values["ID"] not in c.ids:
+        raise Reject("%s is not an item on the '%s' sheet" % (values["ID"], SHEET))
+    key = (values["ID"], norm_text(values["Decision Needed"]))
+    if key in c.decisions:
+        raise Reject("duplicate: %s already has the decision '%s'" % (values["ID"], values["Decision Needed"][:60]))
+    xml = work.sheet(DECISIONS)
+    headers = xl.header_columns(xml, snap.sst)
+    for h in ("ID", "Decision Needed", "Options Discussed", "Recommendation (Claude)"):
+        if h not in headers:
+            raise Reject("'%s' has no '%s' column" % (DECISIONS, h))
     old_last = last_row_number(xml)
-    ids = {i for i, _r in snap.id_rows(xml)}
-    requests = {}
-    for i, r in snap.id_rows(xml):
-        requests.setdefault(norm_text(snap.values(r, xml).get("Change Request", "")), i)
-    priorities, modes = column_values(snap, xml, "Priority"), column_values(snap, xml, "Claude Code Mode")
+    xml, row = add_row(xml, headers, values, DECISIONS)
+    xml, work.wb = extend_ranges(xml, work.wb, old_last, row, DECISIONS)
+    work.xml[DECISIONS] = xml
+    c.decisions.add(key)
+    for h, v in values.items():
+        c.expected[(DECISIONS, row, h)] = v
+    c.lines.append("%s: new decision (%s): %s" % (values["ID"], c.res["file"], values["Decision Needed"][:70]))
+    c.res.update(status="applied", id=values["ID"], reason="decision added at row %d of '%s'" % (row, DECISIONS))
+
+
+def do_plan_cells(c, note, sender):
+    snap, work = c.snap, c.work
+    name = note.get("sheet")
+    if not isinstance(name, str) or not PLAN_SHEET_RE.match(name):
+        raise Reject("'sheet' must be a KW plan sheet: a name like 'KW-60 Clean Start Plan' (KW number, then words, ending in Plan)")
+    cells = note.get("cells")
+    if not isinstance(cells, list) or not cells or len(cells) > 50:
+        raise Reject("'cells' must be a list of 1-50 {\"cell\": \"C37\", \"was\": \"<text now>\", \"now\": \"<new text>\"}")
+    xml = work.sheet(name)
+    seen, new_xml, done, exp, lines = set(), xml, [], {}, []                  # collected locally: a rejected note leaves nothing behind
+    for item in cells:
+        if not isinstance(item, dict) or not isinstance(item.get("cell"), str) or "was" not in item or "now" not in item:
+            raise Reject("every cell needs cell, was and now")
+        ref = item["cell"].strip().upper()
+        if not CELL_RE.match(ref) or ref in seen:
+            raise Reject("'%s' is not a single cell like C37, or it is named twice" % item["cell"])
+        seen.add(ref)
+        was, now = note_text("was", item["was"]).strip(), note_text("now", item["now"])
+        m = re.fullmatch(r"([A-Z]+)(\d+)", ref)
+        if not re.search(r'<row r="%s"' % m.group(2), new_xml):
+            raise Reject("the sheet '%s' has no row %s" % (name, m.group(2)))
+        found = [xl.cell_text(cl, snap.sst).strip() for r2, cl in xl.cells_of(new_xml) if r2 == ref]
+        current = found[0] if found else ""
+        if current != was:
+            raise Reject("stale: %s!%s now says '%s', your note saw '%s'; read the copy again" % (name, ref, current[:60], was[:60]))
+        if current == now:
+            continue
+        new_xml = set_cell(new_xml, m.group(1), int(m.group(2)), now)
+        exp[(name, ref, "")] = now
+        done.append(ref)
+        lines.append("%s!%s: %s -> %s" % (name, ref, (current[:50] + "...") if len(current) > 50 else (current or "(blank)"), (now[:70] + "...") if len(now) > 70 else now))
+    if not done:
+        c.res.update(status="unchanged", id=name, reason="the sheet already says this")
+        return
+    work.xml[name] = new_xml
+    c.expected.update(exp)
+    c.lines.extend(lines)
+    c.res.update(status="applied", id=name, reason="cells set: %s" % ", ".join(done))
+
+
+def plan_inbox(snap, inbox, today):
+    """Judge every note against the workbook as it will be after the notes before it. -> (parts {part: xml}, workbook xml, results, lines, expected).
+    results = [{file, note_id, status applied|rejected|unchanged, id, reason}]"""
+    c = Ctx()
+    c.snap, c.work, c.today = snap, Work(snap), today
+    c.expected, c.lines = {}, []
+    done = processed_ids(inbox)
+    seen, results = set(), []
+    c.ids = {i for i, _r in snap.id_rows()}
+    c.requests = {}
+    for i, r in snap.id_rows():
+        c.requests.setdefault(norm_text(snap.values(r).get("Change Request", "")), i)
+    c.priorities, c.modes = column_values(snap, snap.xml, "Priority"), column_values(snap, snap.xml, "Claude Code Mode")
+    c.decisions = set()
+    if DECISIONS in snap.paths:
+        dxml = snap.files[snap.paths[DECISIONS]].decode("utf-8")
+        dh = xl.header_columns(dxml, snap.sst)
+        id_col, need_col = dh.get("ID"), dh.get("Decision Needed")
+        by_row = {}
+        for ref, cell in xl.cells_of(dxml):
+            m = re.fullmatch(r"([A-Z]+)(\d+)", ref)
+            if m and int(m.group(2)) > 1 and m.group(1) in (id_col, need_col):
+                by_row.setdefault(int(m.group(2)), {})[m.group(1)] = xl.cell_text(cell, snap.sst).strip()
+        c.decisions = {(v.get(id_col, ""), norm_text(v.get(need_col, ""))) for v in by_row.values()}
     for name in list_notes(inbox):
-        res = {"file": name, "note_id": name[:-5], "status": "rejected", "id": "", "reason": ""}
+        c.res = res = {"file": name, "note_id": name[:-5], "status": "rejected", "id": "", "reason": ""}
         results.append(res)
         try:
             note = read_note(os.path.join(inbox, name))
@@ -529,67 +837,24 @@ def plan_inbox(snap, inbox, today):
             sender = note.get("from", "Claude (chat)")
             if not isinstance(sender, str) or not sender.strip() or CTRL_RE.search(sender) or len(sender) > 60:
                 raise Reject("'from' must be a short text such as 'Claude (chat)'")
-            kind = note.get("kind")
-            if kind not in ("new_item", "revision"):
-                raise Reject("kind must be 'new_item' or 'revision'")
-            fields = note_fields(snap, note, kind)
-            stamps = {"Row Updated": today, "Updated By": "%s (inbox)" % sender.strip()}
-            for stamp in stamps:
+            sender = sender.strip()
+            c.stamps = {"Row Updated": today, "Updated By": "%s (inbox)" % sender}
+            for stamp in c.stamps:
                 if stamp not in snap.headers:
                     raise Reject("the workbook has no '%s' column to stamp" % stamp)
-            if kind == "new_item":
-                missing = [h for h in NEW_ITEM_REQUIRED if not fields.get(h)]
-                if missing:
-                    raise Reject("a new item needs %s" % ", ".join(missing))
-                if fields["Priority"] not in priorities:
-                    raise Reject("Priority '%s' is not a value used in the workbook (%s)" % (fields["Priority"], ", ".join(sorted(priorities))))
-                if fields["Claude Code Mode"] not in modes:
-                    raise Reject("Claude Code Mode '%s' is not a value used in the workbook (%s)" % (fields["Claude Code Mode"], ", ".join(sorted(modes))))
-                dup = requests.get(norm_text(fields["Change Request"]))
-                if dup:
-                    raise Reject("duplicate: the same Change Request is already %s" % dup)
-                numbers = [int(m.group(1)) for m in (re.fullmatch(r"KW-(\d+)", i) for i in ids) if m]
-                new_id = "KW-%02d" % ((max(numbers) if numbers else 0) + 1)
-                values = dict(fields, ID=new_id, Status="Not started", **stamps)
-                xml, row = add_row(snap, xml, values)
-                ids.add(new_id)
-                requests[norm_text(fields["Change Request"])] = new_id
-                for h in values:
-                    expected[(SHEET, new_id, h)] = values[h]
-                res.update(status="applied", id=new_id, reason="new item added at row %d" % row)
-                lines.append("%s: new item (%s): %s" % (new_id, name, fields["Change Request"][:70]))
-            else:
-                kw = note.get("id")
-                if not isinstance(kw, str) or not re.fullmatch(r"KW-\d+", kw):
-                    raise Reject("a revision needs 'id' (for example KW-66)")
-                try:
-                    row = snap.row_of(kw, xml)
-                except Refused as e:
-                    raise Reject(str(e))
-                current = snap.values(row, xml)
-                if current.get("Status", "") in ("Released", "Won't do"):
-                    raise Reject("%s is %s: raise a new item instead of changing a closed one" % (kw, current["Status"]))
-                based = note.get("based_on")
-                if not isinstance(based, dict) or "Row Updated" not in based:
-                    raise Reject("a revision needs based_on: {\"Row Updated\": \"<the value you saw>\"}")
-                if str(based["Row Updated"]).strip() != current.get("Row Updated", ""):
-                    raise Reject("stale: %s was changed after your copy (Row Updated is '%s', your note saw '%s'); read the copy again" % (kw, current.get("Row Updated", ""), str(based["Row Updated"]).strip()))
-                changes = {h: v for h, v in fields.items() if current.get(h, "") != v}
-                if not changes:
-                    res.update(status="unchanged", id=kw, reason="the sheet already says this")
-                    continue
-                for h, v in dict(changes, **stamps).items():
-                    xml = set_cell(xml, snap.headers[h], row, v)
-                    expected[(SHEET, kw, h)] = v
-                    if h in changes:
-                        lines.append("%s: %s: %s -> %s" % (kw, h, (current.get(h, "")[:50] + "...") if len(current.get(h, "")) > 50 else (current.get(h, "") or "(blank)"), (v[:70] + "...") if len(v) > 70 else v))
-                res.update(status="applied", id=kw, reason="revised: %s" % ", ".join(changes))
+            handler = {"new_item": do_new_item, "revision": do_revision, "new_decision": do_new_decision, "plan_cells": do_plan_cells}.get(note.get("kind"))
+            if not handler:
+                raise Reject("kind must be 'new_item', 'revision', 'new_decision' or 'plan_cells'")
+            handler(c, note, sender)
         except Reject as e:
             res["reason"] = str(e)
-    new_last = last_row_number(xml)
+    xml = c.work.xml[SHEET]
+    old_last, new_last = last_row_number(snap.xml), last_row_number(xml)
+    wb = c.work.wb
     if new_last != old_last:
-        xml, wb_xml = extend_ranges(xml, wb_xml, old_last, new_last)
-    return xml, wb_xml, results, lines, expected
+        xml, wb = extend_ranges(xml, wb, old_last, new_last)
+        c.work.xml[SHEET] = xml
+    return c.work.parts(), wb, results, c.lines, c.expected
 
 
 def file_notes(inbox, results, write=True):
@@ -731,7 +996,11 @@ def verify(path, expected):
     bad = []
     for (sheet, key, h), want in expected.items():
         try:
-            if sheet == SHEET:
+            if h == "#sig":                                                  # a whole sheet written from a file (the Workflow Rules sheet)
+                found = sheet_sig(snap.files[snap.paths[sheet]].decode("utf-8"), snap.sst)
+            elif h == "":                                                    # one cell by reference (a KW plan sheet)
+                found = snap.cell_ref(sheet, key)
+            elif sheet == SHEET:
                 found = snap.values(snap.row_of(key)).get(h, "")
             else:
                 found = snap.cell(sheet, key, h)
@@ -753,13 +1022,13 @@ def parse_pairs(tokens):
     return out
 
 
-VALUE_OPTIONS = ("--file", "--id", "--batch", "--show", "--verify-wait", "--decision", "--by", "--text", "--needed", "--restore")
-FLAG_OPTIONS = ("--dry-run", "--apply-inbox", "--publish", "--backups", "--migrate")
+VALUE_OPTIONS = ("--file", "--id", "--batch", "--show", "--verify-wait", "--decision", "--by", "--text", "--needed", "--restore", "--rules-file")
+FLAG_OPTIONS = ("--dry-run", "--apply-inbox", "--publish", "--backups", "--migrate", "--rules-sheet")
 
 
 def parse_args(argv):
     a = {"file": cp.configured_path(), "file_given": False, "dry": False, "wait": VERIFY_WAIT, "id": None, "pairs": [], "batch": None, "show": None, "decision": None, "by": None, "text": None,
-         "needed": None, "restore": None, "apply_inbox": False, "publish": False, "backups": False, "migrate": False}
+         "needed": None, "restore": None, "apply_inbox": False, "publish": False, "backups": False, "migrate": False, "rules_sheet": False, "rules_file": RULES_FILE}
     i = 0
     while i < len(argv):
         t = argv[i]
@@ -775,7 +1044,7 @@ def parse_args(argv):
             if t == "--verify-wait":
                 a["wait"] = float(v)
             else:
-                a[t[2:]] = v
+                a[t[2:].replace("-", "_")] = v
                 if t == "--file":
                     a["file_given"] = True
         elif t.startswith("--"):
@@ -891,7 +1160,7 @@ def find_backup(path, which):
 
 def main(argv=None):
     a = parse_args(list(sys.argv[1:] if argv is None else argv))
-    modes = [m for m in ("id", "batch", "show", "decision", "restore") if a and a[m]] + [m for m in ("apply_inbox", "publish", "backups", "migrate") if a and a[m]]
+    modes = [m for m in ("id", "batch", "show", "decision", "restore") if a and a[m]] + [m for m in ("apply_inbox", "publish", "backups", "migrate", "rules_sheet") if a and a[m]]
     if a is None or len(modes) != 1:
         print(__doc__)
         return 1
@@ -973,7 +1242,7 @@ def run_write(a, path, writes):
             if not list_notes(inbox):
                 print("The inbox is empty (%s)." % inbox)
                 return 0
-            xml, wb_xml, results, lines, expected = plan_inbox(snap, inbox, datetime.date.today().isoformat())
+            parts, wb_xml, results, lines, expected = plan_inbox(snap, inbox, datetime.date.today().isoformat())
             for res in results:
                 print("note %s: %s%s%s" % (res["file"], res["status"].upper(), (" " + res["id"]) if res["id"] else "", (" - " + res["reason"]) if res["reason"] else ""))
             rejected = any(r["status"] == "rejected" for r in results)
@@ -981,11 +1250,17 @@ def run_write(a, path, writes):
                 if writes and results:
                     file_notes(inbox, results)
                 return 8 if rejected else 0
-            parts = {snap.part: xml}
             label = "inbox"
             after = (lambda: file_notes(inbox, results)) if writes else None
             code = commit(a, snap, parts, wb_xml, lines, expected, label, after)
             return code if code else (8 if rejected else 0)
+        if a["rules_sheet"]:
+            spec = load_rules(a["rules_file"])
+            sheet_xml, last = build_rules_sheet(snap, spec)
+            old_sig = sheet_sig(snap.files[snap.paths[RULES]].decode("utf-8"), snap.sst)
+            new_sig = sheet_sig(sheet_xml, snap.sst)
+            lines = [] if old_sig == new_sig else ["%s sheet rewritten from %s (%d rows)" % (RULES, os.path.basename(a["rules_file"]), last)]
+            return commit(a, snap, {snap.paths[RULES]: sheet_xml}, None, lines, {(RULES, "sig", "#sig"): new_sig}, "rules-sheet")
         if a["decision"]:
             part, xml, lines, expected = plan_decision(snap, a["decision"], a["by"] or "", a["text"] or "", a["needed"])
             return commit(a, snap, {part: xml}, None, ["%s: %s -> %s" % (l[0], (l[1][:50] or "(blank)"), l[2][:70]) for l in lines], expected, "decision")
