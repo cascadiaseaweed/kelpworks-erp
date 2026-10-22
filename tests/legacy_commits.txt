@@ -49,3 +49,4 @@ a15c319  2026-10-21  photo archive (KW-04), ORP / run summary card / separation 
 77af4e3  2026-10-21  free a stuck tote (KW-51), organic grade of reagents (KW-46) (PR 75) merged to main and live
 89ad96a  2026-10-21  guarded change-log writer, header-name reader (KW-61) (PR 78) merged to main and live
 82caa84  2026-10-21  change log renamed, one path setting, writers refuse other files (KW-62) (PR 80) merged to main and live
+98fdbf6  2026-10-22  change log master outside OneDrive, one writer, read-only SharePoint copy, backups and restore, inbox (KW-66) (PR 83) merged to main and live
