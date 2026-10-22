@@ -37,7 +37,7 @@ Every change to the KelpWorks ERP software (screens, calculations, reports, labe
 | Step | Who | Action | Record left |
 |---|---|---|---|
 | 1 | Requester | Raise the request (what, why, who asked, how to tell it is done). | The request (meeting notes, chat). |
-| 2 | Claude (chat) | Write a `new_item` note (or a `revision` for an existing, not-yet-released item) into the Inbox in the agreed format (`docs/backlog/inbox-note-format.md`). | Note file. |
+| 2 | Claude (chat) | Write a `new_item` note (a `revision` of an item that is Not started, Deferred or Blocked; a `new_decision`; or `plan_cells` for a KW plan sheet) into the Inbox in the agreed format (`docs/backlog/inbox-note-format.md`). | Note file. |
 | 3 | Claude Code | Run `python tools/changelog_write.py --apply-inbox`. Valid notes become rows (next KW number, Status Not started, Approved to Start blank); invalid, stale or duplicate notes are rejected with a reason. | New row; result file; backup; SharePoint copy refreshed. |
 | 4 | Change approver | Open the master in Excel (close it afterwards). Review the new rows. Set **Approved to Start** = Y (or Pre-rule for work covered by an earlier rule), or Deferred / Won't do with a reason. Fill Owner. Answer Open Decisions. Run `--publish` so the SharePoint copy shows it. | Approved to Start, Owner, decisions. |
 | 5 | Claude Code | Check the item: `--show KW-nn` must say Approved to Start Y / Pre-rule, otherwise stop. Read open decisions; if one is unanswered, ask. | - |
