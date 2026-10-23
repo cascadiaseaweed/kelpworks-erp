@@ -642,6 +642,8 @@ button.stage-step:focus-visible { outline: 2px solid var(--teal); outline-offset
 .plan-status.ok { color: var(--accent-text); }
 .plan-status.warn { color: var(--fg-8a5a00); background: var(--bg-fff8ec); border: 1px solid var(--bd-f0c98a); border-radius: 8px; padding: 6px 10px; }
 .var-flag { color: var(--fg-8a5a00); }
+.check-row { display: flex; align-items: center; gap: 8px; margin: 8px 0 4px; font-size: 13px; font-weight: 600; }
+.check-row input { width: auto; margin: 0; }                          /* KW-63: 'the centrifuge was not used this run' */
 .tank-table td, .tank-table th { vertical-align: middle; }
 .tank-table input { width: 100%; min-width: 90px; }
 

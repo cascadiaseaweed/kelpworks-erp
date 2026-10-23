@@ -42,7 +42,7 @@ def stage_payloads():
                 for k in entry[1]:
                     out.setdefault(entry[0], {})[k] = 5
                 continue
-            if entry[1] == "bypassComment":          # only required when extraction is bypassed (KW-15); the helpers run a normal extraction
+            if entry[1] in ("bypassComment", "centrifugeUnusedReason", "screwUnusedReason"):          # only required when extraction is bypassed (KW-15) / a Separation unit is not used (KW-63); the helpers run a normal run
                 continue
             out.setdefault(entry[0], {})[entry[1]] = TEXT_VALUES.get(entry[1], 5)
     # Releases older than KW-10 (the upgrade tests boot them) still require the single-tank homogenization fields; the current server accepts them and then recalculates them from the tank entries

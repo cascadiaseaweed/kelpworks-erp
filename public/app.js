@@ -2662,8 +2662,12 @@ function buildExtractionSection(getRunId, values, onSaved) {
 // Check and a Sample Point box; "Liquid Out" is a QC Check with only the
 // Liquid fields (no Slurry/Solids section). Same one-accordion/section-
 // title/single-Save formatting as Extraction.
-function buildSeparationSection(getRunId, values, samplePoints, processingLot, onSaved) {
+// KW-63: `rules2` = this run is held to the newer rules (both moisture readings, each unless that unit was not used, and the weight of the recovered liquid); false for a run finalized
+// before them, which keeps the KW-18 rule (at least one of the two).
+function buildSeparationSection(getRunId, values, samplePoints, processingLot, onSaved, rules2) {
   values = values || {};
+  const v2 = rules2 !== false;
+  const ownNum = inp => inp.value.trim() === '' ? null : qcParseValue(inp.value);
   const startedAt = el('input', { type: 'datetime-local', value: values.startedAt || '' });
   const flowrateInp = el('input', { inputmode: 'decimal', placeholder: 'Flow rate (L/min)' }); attachNumericMask(flowrateInp, 2);
   flowrateInp.value = values.flowrateLpm != null ? formatQcValue(values.flowrateLpm, 2)
@@ -2683,12 +2687,32 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot, o
   // form-row-compact wrapper, so each stacks on its own row).
   const moistureScrewInp = el('input', { inputmode: 'decimal', placeholder: '%' }); attachNumericMask(moistureScrewInp, 1);
   if (values.pctMoistureScrew != null) moistureScrewInp.value = formatQcValue(values.pctMoistureScrew, 1);
+  // KW-63: each unit can be marked "not used this run" (broken or bypassed) with a reason; otherwise both readings are required. Not both units.
+  const unit = (stateKey, reasonKey, reasonLabel, name, inp, label) => {
+    const chk = el('input', { type: 'checkbox', 'aria-label': name + ' not used this run' }); chk.checked = !!values[stateKey];
+    const reasonInp = el('input', { value: values[reasonKey] || '', placeholder: 'Why was the ' + name + ' not used?' });
+    const reasonField = el('div', { class: 'hidden' }, rfield('separation', reasonKey, reasonLabel, reasonInp));
+    const valueField = v2 ? rfield('separation', stateKey === 'centrifugeUnused' ? 'pctMoisture' : 'pctMoistureScrew', label, inp) : field(label, inp);
+    const sync = () => { reasonField.classList.toggle('hidden', !chk.checked); valueField.classList.toggle('hidden', chk.checked); };
+    const row = el('label', { class: 'check-row' }, chk, ' The ' + name + ' was not used this run');
+    sync();
+    return { chk, reasonInp, reasonField, valueField, sync, row, on: () => chk.checked };
+  };
+  const cent = unit('centrifugeUnused', 'centrifugeUnusedReason', 'Reason the centrifuge was not used', 'centrifuge', moistureInp, el('span', { html: '%Moisture<sub>centrifuge_solids</sub>' }));
+  const screw = unit('screwUnused', 'screwUnusedReason', 'Reason the screw press was not used', 'screw press', moistureScrewInp, el('span', { html: '%Moisture<sub>screw_solids</sub>' }));
+  [[cent, screw, moistureInp, 'centrifuge'], [screw, cent, moistureScrewInp, 'screw press']].forEach(([me, other, inp, name]) => me.chk.addEventListener('change', () => {
+    if (me.chk.checked && other.chk.checked) { me.chk.checked = false; toast('The centrifuge and the screw press cannot both be marked not used.', true); return; }
+    if (me.chk.checked && inp.value.trim() !== '' && !confirm('Marking the ' + name + ' as not used removes the moisture reading already entered here when you save. Continue?')) { me.chk.checked = false; return; }
+    if (me.chk.checked) inp.value = '';
+    me.sync();
+  }));
   const solidsQcBox = el('div', { class: 'qc-check-box theme-quality', 'data-sop-spot': 'production.separation.solids_qc' },
     el('div', { class: 'qc-check-title' }, 'QC Check'),
     el('div', { class: 'qc-check-subtitle' }, 'Solids characterization'),
-    field(el('span', { html: '%Moisture<sub>centrifuge_solids</sub>' }), moistureInp),
-    field(el('span', { html: '%Moisture<sub>screw_solids</sub>' }), moistureScrewInp),
-    el('div', { class: 'help' }, reqLabel('Enter at least one of the two'), ' — each is optional on its own.'));
+    v2 ? cent.row : null, cent.valueField, cent.reasonField,
+    v2 ? screw.row : null, screw.valueField, screw.reasonField,
+    v2 ? el('div', { class: 'help' }, 'Both readings are required unless that unit was not used this run (then give the reason). At least one unit is used.')
+      : el('div', { class: 'help' }, reqLabel('Enter at least one of the two'), ' — each is optional on its own.'));
   const solidsCollectedInp = el('input', { type: 'datetime-local',
     value: values.solidsSampleCollectedAt ? values.solidsSampleCollectedAt.replace('Z', '').slice(0, 16) : '' });
   const solidsSamplePointBox = el('div', { class: 'qc-check-box theme-sample', 'data-sop-spot': 'production.separation.sample_point' },
@@ -2709,6 +2733,40 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot, o
   // before this section is saved (Save then makes it the stored value)
   liquidQc.box.addEventListener('input', () => { values.liveLiquidTdsPct = liquidQc.getPayload().tdsPct; if (onSaved) onSaved(); });
 
+  // KW-63: the measured mass balance of the liquid: weight of the recovered liquid (kg); its volume (L) = weight / rho_liquid (g/mL) from the Filtrate characterization above
+  // (1 g/mL = 1 kg/L, so kg / (g/mL) = L); an optional estimate cross-checks it. The server calculates and stores the same numbers when the section is saved.
+  const liquidWtInp = el('input', { inputmode: 'decimal', placeholder: 'kg' }); attachNumericMask(liquidWtInp, 2);
+  if (values.liquidWeightKg != null) liquidWtInp.value = formatQcValue(values.liquidWeightKg, 2);
+  const liquidEstInp = el('input', { inputmode: 'decimal', placeholder: 'L (optional)' }); attachNumericMask(liquidEstInp, 1);
+  if (values.liquidEstVolumeL != null) liquidEstInp.value = formatQcValue(values.liquidEstVolumeL, 1);
+  const liquidVolT = el('span', { class: 'help' }), liquidVarT = el('span', { class: 'help' });
+  const liquidTile = (span, text, cls) => { span.className = text != null ? (cls || 'qc-check-result-value') : 'help'; span.textContent = text != null ? text : '—'; };
+  const liquidRow = (label, node) => el('div', { class: 'qc-check-result' }, el('span', { class: 'qc-check-result-label' }, label), node);
+  function refreshRecoveredLiquid() {
+    const w = ownNum(liquidWtInp), rho = liquidQc.getPayload().rhoLiquidGMl, est = ownNum(liquidEstInp);
+    const vol = (w != null && rho != null && rho > 0) ? w / rho : null;
+    if (vol != null) liquidTile(liquidVolT, fmt(vol, 1) + ' L');
+    else if (w != null) liquidTile(liquidVolT, 'Needs ρliquid (enter it in the Filtrate characterization above)', 'help var-flag');
+    else liquidTile(liquidVolT, null);
+    const vp = (vol != null && est != null && est > 0) ? (vol - est) / est * 100 : null;
+    if (vp != null) {
+      const flag = settingValue('separation_liquid_variance_flag_pct', 5), over = Math.abs(vp) > flag;
+      liquidVarT.className = 'qc-check-result-value' + (over ? ' var-flag' : '');
+      liquidVarT.textContent = (vp > 0 ? '+' : '') + vp.toFixed(1) + '%' + (over ? '  ⚠ exceeds ' + flag + '%' : '  ✓ within ' + flag + '%');
+    } else liquidTile(liquidVarT, null);
+  }
+  const recoveredLiquidBox = el('div', { class: 'qc-check-box', 'data-sop-spot': 'production.separation.recovered_liquid' },       // the plain (grey) box of a Process Check, not the purple QC Check
+    el('div', { class: 'qc-check-title' }, 'Process Check'),
+    el('div', { class: 'qc-check-subtitle' }, 'Recovered liquid'),
+    v2 ? rfield('separation', 'liquidWeightKg', 'Total weight of recovered liquid (kg)', liquidWtInp) : field('Total weight of recovered liquid (kg)', liquidWtInp),
+    liquidRow('Total recovered liquid volume (L)', liquidVolT),
+    field('Estimated recovered liquid volume (L) (optional)', liquidEstInp),
+    liquidRow('Calculated vs estimate', liquidVarT),
+    el('div', { class: 'help' }, 'Volume = weight ÷ ρliquid (g/mL) from the Filtrate characterization above. The estimate is optional; it checks the calculation.'));
+  [liquidWtInp, liquidEstInp].forEach(i => i.addEventListener('input', refreshRecoveredLiquid));
+  liquidQc.box.addEventListener('input', refreshRecoveredLiquid);
+  refreshRecoveredLiquid();
+
   const status = el('span', { class: 'help' });
   const saveBtn = el('button', { type: 'button', class: 'secondary section-save', onclick: save }, 'Save');
   async function save() {
@@ -2721,13 +2779,18 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot, o
         flowrateLpm: flowrateInp.value.trim() === '' ? null : qcParseValue(flowrateInp.value),
         meshMicron: meshInp.value.trim() === '' ? null : qcParseValue(meshInp.value),
         wetSolidsWtKg: wetSolidsWtInp.value.trim() === '' ? null : qcParseValue(wetSolidsWtInp.value),
-        pctMoisture: moistureInp.value.trim() === '' ? null : qcParseValue(moistureInp.value),
-        pctMoistureScrew: moistureScrewInp.value.trim() === '' ? null : qcParseValue(moistureScrewInp.value),
+        pctMoisture: cent.on() || moistureInp.value.trim() === '' ? null : qcParseValue(moistureInp.value),
+        pctMoistureScrew: screw.on() || moistureScrewInp.value.trim() === '' ? null : qcParseValue(moistureScrewInp.value),
+        liquidWeightKg: ownNum(liquidWtInp), liquidEstVolumeL: ownNum(liquidEstInp),
         liquidQcPh: liquidPayload.qcPh, liquidTdsPct: liquidPayload.tdsPct,
         liquidBrixPct: liquidPayload.brixPct, liquidMannitolPct: liquidPayload.mannitolPct,
         liquidTsLiquidPct: liquidPayload.tsLiquidPct, liquidRhoLiquidGMl: liquidPayload.rhoLiquidGMl,
         solidsSampleCollectedAt: solidsCollectedInp.value || null,
       };
+      if (v2) {                                     // the unit toggles exist only for a run held to the newer rules; an older run keeps what it has
+        Object.assign(sepPayload, { centrifugeUnused: cent.on(), centrifugeUnusedReason: cent.on() ? cent.reasonInp.value : null,
+          screwUnused: screw.on(), screwUnusedReason: screw.on() ? screw.reasonInp.value : null });
+      }
       await api('PUT', '/production/' + rid + '/stages/separation', sepPayload);
       // keep the shared stages.separation object current and let Pasteurization's dilution plan
       // re-read the filtrate TDS right now, not just next time the window is opened
@@ -2749,6 +2812,7 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot, o
       rfield('separation', 'wetSolidsWtKg', 'Total wet-solids weight (kg)', wetSolidsWtInp),
       solidsQcBox,
       el('div', { class: 'qc-check-section-title' }, 'Liquid Out'),
+      recoveredLiquidBox,                        // KW-63: above the Filtrate characterization (its density is entered right below)
       liquidQc.box,
       solidsSamplePointBox,                      // KW-17: the sample can be solid, liquid or slurry, so it comes after both Solids Out and Liquid Out
       el('div', { style: 'margin-top:6px' }, saveBtn, status)));
@@ -4426,7 +4490,7 @@ async function openRun(draftSummary, opts) {
   const extractionSection = buildExtractionSection(ensureRunId, stages.extraction);
   const separationSection =
     buildSeparationSection(ensureRunId, stages.separation, draft?.samplePoints || [], draft?.processingLot,
-      () => pasteurizationSectionRef?.refreshTds());
+      () => pasteurizationSectionRef?.refreshTds(), true);
   // TDS/pH/Ksorbate targets follow the currently-selected SKU (which can
   // still change in this draft), so they're refreshed alongside the spec
   // panel below.
@@ -4682,7 +4746,7 @@ async function openProcessLog(run, section) {
   const extractionSection = buildExtractionSection(getRunId, stages.extraction);
   const separationSection =
     buildSeparationSection(getRunId, stages.separation, run.samplePoints || [], run.processingLot,
-      () => pasteurizationSectionRef?.refreshTds());
+      () => pasteurizationSectionRef?.refreshTds(), !(run.progress && run.progress.separationV2 === false));
   // SKU is fixed once a run is finalized, so TDS/pH/Ksorbate targets need no
   // refresh wiring here.
   const pasteurizationSection = buildPasteurizationSection(
@@ -6917,6 +6981,20 @@ const CALCULATIONS = [
     settings: [],
   },
   {
+    title: 'Separation: total recovered liquid volume',
+    formula: 'Volume (L) = Total weight of recovered liquid (kg) \u00f7 \u03c1liquid (g/mL)',
+    description: 'The volume of the liquid recovered in Separation, from its weight and the filtrate density measured in the Filtrate characterization (1 g/mL = 1 kg/L). It stays blank until both the weight and the density are entered. Shown live while typing and stored when the section is saved (and again if the density is corrected later).',
+    location: 'Production \u2192 Separation \u2192 Recovered liquid',
+    settings: [],
+  },
+  {
+    title: 'Separation: recovered liquid volume vs estimate',
+    formula: 'Difference (%) = (Calculated volume \u2212 Estimated volume) \u00f7 Estimated volume \u00d7 100',
+    description: 'Cross-checks the calculated recovered liquid volume against the optional estimate entered by the operator; the difference is flagged when it is larger than the limit (same sign convention as the 6A / 6B final-volume variance). Shown only when an estimate is entered.',
+    location: 'Production \u2192 Separation \u2192 Recovered liquid',
+    settings: ['separation_liquid_variance_flag_pct'],
+  },
+  {
     title: 'Ksorbate / Nabenzoate (w/v)',
     formula: 'Percent (w/v) = target ratio × 100',
     description: 'Displays a product SKU’s target preservative ratio (stored as a decimal ratio) as a percentage.',
@@ -6932,7 +7010,7 @@ const SETTING_GROUPS = [
     'pasteurization_default_product_setpoint_c', 'pasteurization_default_boiler_setpoint_c', 'ksorbate_stock_concentration_default_pct', 'nabenzoate_stock_concentration_default_pct',
     'preproc_target_solids_pct', 'preproc_target_ph'] },
   { title: 'Equipment & capacities', note: 'Tank working volumes.', keys: ['homog_tank_capacity_each_l', 'dilution_tank_capacity_each_l'] },
-  { title: 'Quality limits & tolerances', note: 'Thresholds that flag a reading or a volume.', keys: ['orp_spoiled_below', 'orp_spoilage_underway_below', 'orp_watch_closely_below', 'dilution_variance_flag_pct'] },
+  { title: 'Quality limits & tolerances', note: 'Thresholds that flag a reading or a volume.', keys: ['orp_spoiled_below', 'orp_spoilage_underway_below', 'orp_watch_closely_below', 'dilution_variance_flag_pct', 'separation_liquid_variance_flag_pct'] },
   { title: 'Certificate of Analysis & lab results', note: 'Heavy-metal loading and lab report rules.', keys: ['coa_application_rate_kg_ha', 'coa_application_periods', 'lab_result_require_report'] },
   { title: 'Quality Control charts & reports', note: 'Control-limit rules and the Yield & Usage report.', keys: [
     'qc_chart_sigma', 'qc_chart_min_n_provisional', 'qc_chart_min_n_established', 'qc_chart_run_length', 'qc_chart_trend_length', 'yield_report_min_runs'] },

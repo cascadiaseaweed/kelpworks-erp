@@ -99,7 +99,7 @@ def test_the_screens(srv):
     js = (PUBLIC / "app.js").read_text(encoding="utf-8")
     flat = " ".join(js.split())
     # KW-17: the separation sample point comes after Liquid Out
-    assert "liquidQc.box, solidsSamplePointBox," in flat
+    assert "liquidQc.box, solidsSamplePointBox," in flat and flat.index("recoveredLiquidBox,") < flat.index("liquidQc.box, solidsSamplePointBox,")
     # KW-25: the summary card is configured per KPI
     assert "run_card_show_" in js and "rs-headline" in js
     import kelp_erp_server as K
