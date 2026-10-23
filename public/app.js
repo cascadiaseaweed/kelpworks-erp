@@ -1111,8 +1111,16 @@ function runSummaryStats(run) {
     harvestRate: run.inputKg > 0 && out > 0 ? out / run.inputKg : null,
   };
 }
-// The finished-run summary card (KW-25): a centred row of headline numbers, then a quiet details list. Which of them show is configured per KPI by the settings
-// run_card_show_<key> (1 shows, 0 hides; Calculations page).
+// The finished-run summary card (KW-25): a centred row of headline numbers, then the details in headed columns (KW-65). Which of them show is configured per KPI by the settings
+// run_card_show_<key> (1 shows, 0 hides; Calculations page). RUN_CARD_HEADLINE = the big numbers on top; RUN_CARD_GROUPS = the ONE list that says which column every other KPI is in
+// (Lot details, then Input / Process / Output following the process flow left to right): every KPI key of runSummaryGrid is in exactly one of them (tests/test_run_card_layout.py).
+const RUN_CARD_HEADLINE = ['volume_out', 'final_ph', 'final_tds', 'final_orp', 'conv_harvest'];
+const RUN_CARD_GROUPS = [
+  ['Lot details', ['run_date', 'operators', 'farms']],
+  ['Input · feedstock', ['ibcs', 'feedstock_weight']],
+  ['Process · performance', ['conv_process', 'extraction_eff']],
+  ['Output · product', ['product', 'packaged']],
+];
 function runSummaryGrid(run) {
   const x = runSummaryStats(run);
   const fgList = (run.fgLots || []).map(f => fmt(f.qty) + ' × ' + f.packageSize).join(', ') || '—';
@@ -1131,14 +1139,22 @@ function runSummaryGrid(run) {
     ['feedstock_weight', 'Total feedstock weight', x.measuredKg != null ? [fmt(x.measuredKg, 1) + ' kg', el('small', {}, 'measured')]
       : (run.inputKg ? [fmt(run.inputKg, 1) + ' kg', el('small', {}, 'batch-average')] : dash)],
     ['packaged', 'Packaged', fgList],
-    ['conv_process', 'Conversion rate, process', x.processRate != null ? [fmt(x.processRate, 3) + ' L/kg', el('small', {}, 'measured weight')] : dash],
-    ['conv_harvest', 'Conversion rate, harvest', x.harvestRate != null ? [fmt(x.harvestRate, 3) + ' L/kg', el('small', {}, 'batch-average weight')] : dash],
+    ['conv_process', 'Conversion rate, process', x.processRate != null ? [fmt(x.processRate, 1) + ' L/kg', el('small', {}, 'measured weight')] : dash],
+    ['conv_harvest', 'Conversion rate, harvest', x.harvestRate != null ? [fmt(x.harvestRate, 1) + ' L/kg', el('small', {}, 'batch-average weight')] : dash],
   ].filter(k => Number(settingValue('run_card_show_' + k[0], 1)) !== 0);
-  const head = kpis.filter(k => ['volume_out', 'final_ph', 'final_tds', 'final_orp', 'extraction_eff'].includes(k[0]));
+  const head = kpis.filter(k => RUN_CARD_HEADLINE.includes(k[0]));
   const rest = kpis.filter(k => !head.includes(k));
+  // the smaller KPIs go in the headed columns of RUN_CARD_GROUPS; a column with nothing to show (all its KPIs hidden) is left out, so there are no gaps
+  const byKey = new Map(rest.map(k => [k[0], k]));
+  const columns = RUN_CARD_GROUPS.map(([title, keys]) => [title, keys.map(k => byKey.get(k)).filter(Boolean)]).filter(c => c[1].length);
+  const placed = new Set(columns.flatMap(c => c[1].map(k => k[0])));
+  const stray = rest.filter(k => !placed.has(k[0]));                       // a KPI nobody listed still shows (tests/test_run_card_layout.py makes sure that does not happen)
+  if (stray.length) { if (columns.length) columns[columns.length - 1][1].push(...stray); else columns.push(['Details', stray]); }
   return el('div', { class: 'run-card-summary' },
     head.length ? el('div', { class: 'rs-headline' }, ...head.map(([, label, v]) => el('div', { class: 'rs-big' }, el('span', { class: 'rs-big-v' }, v), el('span', { class: 'rs-big-k' }, label)))) : null,
-    rest.length ? el('dl', { class: 'rs-details' }, ...rest.flatMap(([, label, v]) => [el('dt', {}, label), el('dd', {}, v)])) : null);
+    columns.length ? el('div', { class: 'rs-cols n' + Math.min(columns.length, 4) },
+      ...columns.map(([title, items]) => el('div', { class: 'rs-col' }, el('h4', { class: 'rs-col-h' }, title),
+        el('dl', { class: 'rs-details' }, ...items.flatMap(([, label, v]) => [el('dt', {}, label), el('dd', {}, v)]))))) : null);
 }
 // Required-field marking. The server owns the list of required fields
 // (State.ref.requiredFields, from REQUIRED_FIELDS/PROGRESS_SECTIONS in
@@ -6908,6 +6924,30 @@ const CALCULATIONS = [
     settings: [],
   },
 ];
+// The Calculations page lists the settings in headed groups (KW-69), in this order. ONE list: every setting key is in exactly one group (tests/test_calculations_page.py fails
+// otherwise); a setting that is in no group still shows, under "Other settings", so it can never be lost. Layout only: no key, value or default is defined here.
+const SETTING_GROUPS = [
+  { title: 'Process defaults by section', note: 'Values pre-filled in a new production run or pre-processing batch.', keys: [
+    'homog_default_target_pct_wet_solids', 'extraction_default_amplitude_pct', 'extraction_default_flowrate_lpm', 'separation_default_flowrate_lpm', 'separation_default_mesh_micron',
+    'pasteurization_default_product_setpoint_c', 'pasteurization_default_boiler_setpoint_c', 'ksorbate_stock_concentration_default_pct', 'nabenzoate_stock_concentration_default_pct',
+    'preproc_target_solids_pct', 'preproc_target_ph'] },
+  { title: 'Equipment & capacities', note: 'Tank working volumes.', keys: ['homog_tank_capacity_each_l', 'dilution_tank_capacity_each_l'] },
+  { title: 'Quality limits & tolerances', note: 'Thresholds that flag a reading or a volume.', keys: ['orp_spoiled_below', 'orp_spoilage_underway_below', 'orp_watch_closely_below', 'dilution_variance_flag_pct'] },
+  { title: 'Certificate of Analysis & lab results', note: 'Heavy-metal loading and lab report rules.', keys: ['coa_application_rate_kg_ha', 'coa_application_periods', 'lab_result_require_report'] },
+  { title: 'Quality Control charts & reports', note: 'Control-limit rules and the Yield & Usage report.', keys: [
+    'qc_chart_sigma', 'qc_chart_min_n_provisional', 'qc_chart_min_n_established', 'qc_chart_run_length', 'qc_chart_trend_length', 'yield_report_min_runs'] },
+  { title: 'Release & sign-off', note: 'Who may review and release a run.', keys: ['release_separate_signers', 'review_not_by_finalizer'] },
+  { title: 'Samples, lots & inventory', note: 'Retention and expiry.', keys: ['sample_retention_months', 'lot_expiry_warning_days'] },
+  { title: 'Run summary card display', note: 'Which figures show on a finished run’s summary card (1 shows, 0 hides).', keys: [
+    'run_card_show_volume_out', 'run_card_show_final_ph', 'run_card_show_final_tds', 'run_card_show_final_orp', 'run_card_show_extraction_eff', 'run_card_show_run_date', 'run_card_show_operators',
+    'run_card_show_product', 'run_card_show_farms', 'run_card_show_ibcs', 'run_card_show_feedstock_weight', 'run_card_show_packaged', 'run_card_show_conv_process', 'run_card_show_conv_harvest'] },
+  { title: 'Documents (SOPs & safety data sheets)', note: 'Review intervals and the SharePoint folder check.', keys: ['sds_review_years', 'sds_review_warning_days', 'library_scan_stale_days'] },
+  { title: 'Users, sessions & uploads', note: 'Sign-out, presence and upload limits.', keys: ['idle_timeout_minutes', 'presence_timeout_seconds', 'upload_user_daily_mb'] },
+  { title: 'Files, photos & archive', note: 'Moving photos to SharePoint.', keys: ['image_archive_days', 'image_purge_enabled'] },
+  { title: 'Historical run entry', note: 'Entering past runs.', keys: ['historical_entry_enabled'] },
+];
+const OTHER_SETTINGS = 'Other settings';
+const settingChanged = s => s.default != null && s.value != null && Number(s.value) !== Number(s.default);
 function settingLabel(key) {
   const s = State.ref.settings && State.ref.settings[key];
   return s ? s.label + ' = ' + fmt(s.value, Number.isInteger(s.value) ? 0 : 3) : key;
@@ -6918,36 +6958,73 @@ async function pageCalculations(v) {
 
   const isAdmin = State.user.role === 'admin';
   const settingsHost = el('div', {});
+  State.calcOpen = State.calcOpen || {};
+  const search = el('input', { type: 'search', class: 'set-search', placeholder: 'Search the settings by name, key or description', value: State.calcSearch || '', 'aria-label': 'Search the settings',
+    oninput: () => { State.calcSearch = search.value; drawSettings(); } });
+  const allCount = Object.keys(State.ref.settings || {}).length;
   v.append(el('div', { class: 'card' },
     el('h3', {}, 'Variables and values'),
     el('div', { class: 'muted', style: 'font-size:12px;margin-bottom:10px' },
       isAdmin ? 'Edit a value and click Save — every calculation below using it picks up the change immediately.'
         : 'These constants feed the calculations below. Only an admin can edit them.'),
+    el('div', { class: 'set-tools' }, search,
+      el('button', { type: 'button', class: 'secondary', onclick: () => { SETTING_GROUPS.concat([{ title: OTHER_SETTINGS }]).forEach(g => { State.calcOpen[g.title] = true; }); drawSettings(); } }, 'Expand all'),
+      el('button', { type: 'button', class: 'secondary', onclick: () => { State.calcOpen = {}; drawSettings(); } }, 'Collapse all')),
     settingsHost));
+  function settingRow(key, s) {
+    const valInp = el('input', { type: 'number', step: 'any', value: s.value, style: 'width:110px', 'aria-label': s.label });
+    if (!isAdmin) valInp.disabled = true;
+    const rowStatus = el('span', { class: 'help' });
+    const control = isAdmin
+      ? el('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap' }, valInp,
+          el('button', {
+            type: 'button', class: 'secondary', onclick: async () => {
+              rowStatus.textContent = '';
+              try {
+                await api('PUT', '/settings/' + key, { value: valInp.value.trim() === '' ? null : +valInp.value });
+                State.ref = await api('GET', '/refdata');
+                rowStatus.textContent = 'Saved.';
+                render();
+              } catch (e) { rowStatus.textContent = e.message; }
+            }
+          }, 'Save'), rowStatus)
+      : valInp;
+    const changed = settingChanged(s);
+    return el('tr', { class: changed ? 'set-changed-row' : '' },
+      el('td', { class: 'set-name' }, el('div', {}, s.label), el('div', { class: 'mono set-key' }, key)),
+      el('td', { class: 'set-val' }, control,
+        s.default != null ? el('div', { class: 'help set-default' }, changed ? [el('span', { class: 'badge set-changed' }, 'Changed from default'), ' default ' + fmt(s.default, Number.isInteger(s.default) ? 0 : 3)]
+          : 'At the default (' + fmt(s.default, Number.isInteger(s.default) ? 0 : 3) + ')') : null),
+      el('td', { class: 'desc' }, s.description || '—'));
+  }
   function drawSettings() {
     settingsHost.innerHTML = '';
-    const entries = Object.entries(State.ref.settings || {}).sort((a, b) => a[1].label.localeCompare(b[1].label));
-    const rows = entries.map(([key, s]) => {
-      const valInp = el('input', { type: 'number', step: 'any', value: s.value, style: 'width:110px' });
-      if (!isAdmin) valInp.disabled = true;
-      const rowStatus = el('span', { class: 'help' });
-      const cell = isAdmin
-        ? el('div', { style: 'display:flex;gap:8px;align-items:center' }, valInp,
-            el('button', {
-              type: 'button', class: 'secondary', onclick: async () => {
-                rowStatus.textContent = '';
-                try {
-                  await api('PUT', '/settings/' + key, { value: valInp.value.trim() === '' ? null : +valInp.value });
-                  State.ref = await api('GET', '/refdata');
-                  rowStatus.textContent = 'Saved.';
-                  render();
-                } catch (e) { rowStatus.textContent = e.message; }
-              }
-            }, 'Save'), rowStatus)
-        : valInp;
-      return [s.label, cell, s.description || '—'];
+    const all = State.ref.settings || {};
+    const q = (State.calcSearch || '').trim().toLowerCase();
+    const hit = (key, s) => !q || (s.label + ' ' + key + ' ' + (s.description || '')).toLowerCase().includes(q);
+    const listed = new Set(SETTING_GROUPS.flatMap(g => g.keys));
+    const groups = SETTING_GROUPS.map(g => ({ title: g.title, note: g.note, keys: g.keys.filter(k => all[k]) }));
+    const others = Object.keys(all).filter(k => !listed.has(k)).sort();
+    if (others.length) groups.push({ title: OTHER_SETTINGS, note: 'Settings not yet placed in a group.', keys: others });
+    let shown = 0;
+    groups.forEach(g => {
+      const keys = g.keys.filter(k => hit(k, all[k]));
+      if (!keys.length) return;
+      shown += keys.length;
+      const changedCount = g.keys.filter(k => settingChanged(all[k])).length;
+      const box = el('details', { class: 'set-group' },
+        el('summary', {}, el('span', { class: 'set-group-title' }, g.title), el('span', { class: 'set-group-count' }, keys.length + (q ? ' of ' + g.keys.length : '') + ' setting' + (g.keys.length === 1 ? '' : 's')),
+          changedCount ? el('span', { class: 'badge set-changed' }, changedCount + ' changed from default') : null),
+        g.note ? el('div', { class: 'help set-group-note' }, g.note) : null,
+        el('div', { class: 'tablewrap' }, el('table', { class: 'settings-table' },
+          el('thead', {}, el('tr', {}, el('th', {}, 'Variable'), el('th', {}, 'Value'), el('th', {}, 'Description'))),
+          el('tbody', {}, ...keys.map(k => settingRow(k, all[k]))))));
+      box.open = !!q || !!State.calcOpen[g.title];
+      box.addEventListener('toggle', () => { if (!q) { if (box.open) State.calcOpen[g.title] = true; else delete State.calcOpen[g.title]; } });
+      settingsHost.append(box);
     });
-    settingsHost.append(table(['Variable', 'Value', 'Description'], rows, [false, false, false]));
+    if (!shown) settingsHost.append(el('div', { class: 'empty' }, 'No setting matches "' + (State.calcSearch || '') + '".'));
+    settingsHost.prepend(el('div', { class: 'help', style: 'margin-bottom:6px' }, q ? shown + ' of ' + allCount + ' settings match.' : allCount + ' settings in ' + groups.filter(g => g.keys.length).length + ' groups.'));
   }
   drawSettings();
 

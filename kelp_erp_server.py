@@ -177,7 +177,7 @@ SETTINGS_DEFAULTS = [
     ("run_card_show_final_orp", 1, "Run summary card: show Final ORP",
      "1 shows final orp on a finished run's summary card, 0 hides it (big number at the top)."),
     ("run_card_show_extraction_eff", 1, "Run summary card: show Extraction efficiency",
-     "1 shows extraction efficiency on a finished run's summary card, 0 hides it (big number at the top)."),
+     "1 shows extraction efficiency on a finished run's summary card, 0 hides it (line in the Process column)."),
     ("run_card_show_run_date", 1, "Run summary card: show Run date",
      "1 shows run date on a finished run's summary card, 0 hides it (line in the details list)."),
     ("run_card_show_operators", 1, "Run summary card: show Operators",
@@ -195,7 +195,7 @@ SETTINGS_DEFAULTS = [
     ("run_card_show_conv_process", 1, "Run summary card: show Conversion rate, process",
      "1 shows conversion rate, process on a finished run's summary card, 0 hides it (line in the details list)."),
     ("run_card_show_conv_harvest", 1, "Run summary card: show Conversion rate, harvest",
-     "1 shows conversion rate, harvest on a finished run's summary card, 0 hides it (line in the details list)."),
+     "1 shows conversion rate, harvest on a finished run's summary card, 0 hides it (big number at the top)."),
     ("image_archive_days", 30, "Photos: days on the server before they move to SharePoint",
      "A photo of a finalized run is removed from the server disk this many days after the run was finalized, once its copy in the SharePoint records library has been confirmed (a link to it stays on the record). Pictures only: documents and lab reports are never removed."),
     ("image_purge_enabled", 0, "Photos: remove archived photos from the server (1 = on, 0 = off)",
@@ -505,7 +505,9 @@ def _has_value(v):
 
 
 def get_settings(conn):
-    return {r["key"]: {"value": r["value"], "label": r["label"], "description": r["description"]}
+    """Every setting with its current value and (KW-69) its built-in default, so the Calculations page can mark a value that was changed."""
+    defaults = {k: v for k, v, _l, _d in SETTINGS_DEFAULTS}
+    return {r["key"]: {"value": r["value"], "label": r["label"], "description": r["description"], "default": defaults.get(r["key"])}
             for r in conn.execute("SELECT * FROM settings ORDER BY key")}
 
 
@@ -4906,6 +4908,10 @@ def migrate(conn):
         conn.execute(
             "INSERT OR IGNORE INTO settings (key,value,label,description,updated_at)"
             " VALUES (?,?,?,?,?)", (key, value, label, desc, now_iso()))
+    # KW-65: on the run summary card Extraction efficiency moved from the big numbers to the Process column and Conversion rate, harvest took its place: the stored
+    # descriptions of those two settings say where each shows, so they are corrected once (a description is not something an administrator edits).
+    run_once(conn, "run_card_swap_descriptions_kw65", lambda: [conn.execute("UPDATE settings SET description=? WHERE key=?", (d, k))
+                                                               for k, _v, _l, d in SETTINGS_DEFAULTS if k in ("run_card_show_extraction_eff", "run_card_show_conv_harvest")])
     # KW-33: the retention shelf life default went from 12 to 24 months. A database that still holds the old default (nobody changed it) moves to the new one, once;
     # a value an administrator set is left alone.
     run_once(conn, "retention_months_24", lambda: conn.execute("UPDATE settings SET value=24 WHERE key='sample_retention_months' AND value=12"))
