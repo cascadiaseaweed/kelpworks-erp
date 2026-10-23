@@ -168,6 +168,8 @@ SETTINGS_DEFAULTS = [
      "How long someone who has closed their browser (or lost power) still shows as having a run, batch or tote open. Browsers announce themselves about every third of this time; it only drives the 'someone else has this open' warning."),
     ("idle_timeout_minutes", 30, "Idle timeout (minutes)",
      "A signed-in person who has not used the screen for this long is signed out; the run and batch sections they have open are saved first. 0 turns it off. Takes effect for everyone within a minute, no deploy needed."),
+    ("separation_liquid_variance_flag_pct", 5, "Separation recovered-liquid volume check flag (%)",
+     "Flags a Separation when the calculated recovered liquid volume (weight / liquid density) differs from the optional estimate by more than this percentage."),
     ("run_card_show_volume_out", 1, "Run summary card: show Product volume out",
      "1 shows product volume out on a finished run's summary card, 0 hides it (big number at the top)."),
     ("run_card_show_final_ph", 1, "Run summary card: show Final pH",
@@ -345,6 +347,14 @@ EXTRACTION_BYPASS_DEFAULT = "Extraction not optimized"      # KW-15: the reason 
 # KW-59: ORP (mV) in the Homogenization and Packaging QC checks is required for every run still being logged and every run finalized after it was introduced
 # (production_runs.orp_required = 1, set at finalize); runs finalized before are not asked for it (their progress and amendments are unchanged).
 _orp_needed = lambda st: st.get("_meta", {}).get("orpRequired", True)
+# KW-63: from the release of this change both Separation moisture readings are required (each unless that unit was marked not used, with a reason) and so is the weight of
+# the recovered liquid; a run finalized before it keeps the KW-18 rule (at least one of the two). production_runs.separation_rules_v2 = 1 is stamped at finalize.
+_sep_v2 = lambda st: st.get("_meta", {}).get("separationV2", True)
+_sep_legacy = lambda st: not _sep_v2(st)
+_sep_cent_needed = lambda st: _sep_v2(st) and not st["separation"].get("centrifugeUnused")
+_sep_screw_needed = lambda st: _sep_v2(st) and not st["separation"].get("screwUnused")
+_sep_cent_unused = lambda st: _sep_v2(st) and bool(st["separation"].get("centrifugeUnused"))
+_sep_screw_unused = lambda st: _sep_v2(st) and bool(st["separation"].get("screwUnused"))
 _extracting = lambda st: not st["extraction"].get("bypassed")
 _bypassed = lambda st: bool(st["extraction"].get("bypassed"))
 _uses_6a = lambda st: (st["pasteurization"].get("receivingTanks") or "") in ("6A", "6AB")
@@ -383,8 +393,14 @@ PROGRESS_SECTIONS = [
     {"key": "separation", "label": "Separation", "fields": [
         ("separation", "startedAt", "Started at"), ("separation", "flowrateLpm", "Flow rate (L/min)"),
         ("separation", "meshMicron", "Mesh size (micron)"), ("separation", "wetSolidsWtKg", "Total wet-solids weight (kg)"),
-        # KW-18: at least ONE of the two solids moisture readings (a key that is a tuple = "any one of these keys has a value")
-        ("separation", ("pctMoisture", "pctMoistureScrew"), "%Moisture of the solids (centrifuge or screw press: at least one)"),
+        # KW-18: at least ONE of the two solids moisture readings (a key that is a tuple = "any one of these keys has a value") -- for a run finalized before KW-63
+        ("separation", ("pctMoisture", "pctMoistureScrew"), "%Moisture of the solids (centrifuge or screw press: at least one)", _sep_legacy),
+        # KW-63: both readings, each unless that unit was not used this run (then the reason is required)
+        ("separation", "pctMoisture", "%Moisture of the solids, centrifuge", _sep_cent_needed),
+        ("separation", "pctMoistureScrew", "%Moisture of the solids, screw press", _sep_screw_needed),
+        ("separation", "centrifugeUnusedReason", "Reason the centrifuge was not used", _sep_cent_unused),
+        ("separation", "screwUnusedReason", "Reason the screw press was not used", _sep_screw_unused),
+        ("separation", "liquidWeightKg", "Total weight of recovered liquid (kg)", _sep_v2),
         ("separation", "liquidQcPh", "Filtrate QC Check: pH"), ("separation", "liquidTdsPct", "Filtrate QC Check: TDS (%)"),
         ("separation", "liquidBrixPct", "Filtrate QC Check: Brix (%)"),
         ("separation", "liquidMannitolPct", "Filtrate QC Check: Mannitol (%)"),
@@ -464,6 +480,10 @@ _KEY_LABELS = {
     "postDilutionTankL2b": "Post-Dilution Tank Level, Tank 2B (L)",
     "lotPctSolids2b": "Lot %Solids Loading, (w/w), Tank 2B",
     "bypassed": "Extraction bypassed", "bypassComment": "Reason extraction was bypassed",
+    "centrifugeUnused": "Centrifuge not used this run", "centrifugeUnusedReason": "Reason the centrifuge was not used",
+    "screwUnused": "Screw press not used this run", "screwUnusedReason": "Reason the screw press was not used",
+    "liquidWeightKg": "Total weight of recovered liquid (kg)", "liquidVolumeL": "Total recovered liquid volume (L)",
+    "liquidEstVolumeL": "Estimated recovered liquid volume (L)", "liquidVariancePct": "Recovered liquid volume vs estimate (%)",
     "tank5aL": "Tank 5A level (L)", "tank5bL": "Tank 5B level (L)", "receivingTanks": "Receiving tanks",
     "tank6aStartL": "Tank 6A level before transfer (L)", "tank6bStartL": "Tank 6B level before transfer (L)",
     "maxTransferL": "Max product to transfer (L)", "recommendedTransferL": "Recommended product transfer (L)",
@@ -4244,8 +4264,14 @@ def build_run_summary_pdf(S, logo_path=None):
                ("power " + _pf(ex.get("startingPowerW"), 0, "W")) if has(ex.get("startingPowerW")) else ""])],
         ["Separation", when(sp.get("startedAt")),
          join([("wet solids " + _pf(sp.get("wetSolidsWtKg"), 1, "kg")) if has(sp.get("wetSolidsWtKg")) else "",
-               ("moisture " + _pf(sp.get("pctMoisture"), 1, "%")) if has(sp.get("pctMoisture")) else "",
-               ("screw moisture " + _pf(sp.get("pctMoistureScrew"), 1, "%")) if has(sp.get("pctMoistureScrew")) else "",
+               ("centrifuge not used: " + (sp.get("centrifugeUnusedReason") or "")) if sp.get("centrifugeUnused") else
+               (("moisture " + _pf(sp.get("pctMoisture"), 1, "%")) if has(sp.get("pctMoisture")) else ""),
+               ("screw press not used: " + (sp.get("screwUnusedReason") or "")) if sp.get("screwUnused") else
+               (("screw moisture " + _pf(sp.get("pctMoistureScrew"), 1, "%")) if has(sp.get("pctMoistureScrew")) else ""),
+               ("recovered liquid " + _pf(sp.get("liquidWeightKg"), 1, "kg")
+                + ((" = " + _pf(sp.get("liquidVolumeL"), 1, "L")) if has(sp.get("liquidVolumeL")) else "")
+                + ((", estimate " + _pf(sp.get("liquidEstVolumeL"), 1, "L") + " (" + _pf(sp.get("liquidVariancePct"), 1, "%", True) + ")") if has(sp.get("liquidEstVolumeL")) and has(sp.get("liquidVariancePct")) else "")
+                ) if has(sp.get("liquidWeightKg")) else "",
                ("flow " + _pf(sp.get("flowrateLpm"), 0, "L/min")) if has(sp.get("flowrateLpm")) else "",
                ("mesh " + _pf(sp.get("meshMicron"), 0, "µm")) if has(sp.get("meshMicron")) else ""])],
         ["Pasteurization", when(pa.get("startedAt")),
@@ -4610,6 +4636,11 @@ def migrate(conn):
         ("separation_liquid_brix_pct", "REAL"), ("separation_liquid_mannitol_pct", "REAL"),
         ("separation_liquid_ts_liquid_pct", "REAL"), ("separation_liquid_rho_liquid_g_ml", "REAL"),
         ("separation_solids_sample_collected_at", "TEXT"),
+        ("separation_centrifuge_unused", "INTEGER DEFAULT 0"), ("separation_centrifuge_unused_reason", "TEXT"),            # KW-63
+        ("separation_screw_unused", "INTEGER DEFAULT 0"), ("separation_screw_unused_reason", "TEXT"),
+        ("separation_liquid_weight_kg", "REAL"), ("separation_liquid_volume_l", "REAL"), ("separation_liquid_est_volume_l", "REAL"),
+        ("separation_liquid_variance_pct", "REAL"),
+        ("separation_rules_v2", "INTEGER NOT NULL DEFAULT 0"),                     # KW-63: 1 = finalized when both moisture readings and the recovered liquid weight were required
         ("pasteurization_product_setpoint_c", "REAL"), ("pasteurization_boiler_setpoint_c", "REAL"),
         ("pasteurization_total_volume_l", "REAL"), ("pasteurization_started_at", "TEXT"),
         ("pasteurization_pre_sample_collected_at", "TEXT"), ("pasteurization_post_sample_collected_at", "TEXT"),
@@ -5551,6 +5582,15 @@ def run_public(r):
     for key, col in (("odour", "packaging_odour"), ("odourIntensity", "packaging_odour_intensity")):
         if r[col]:
             d["stages"]["packaging"][key] = r[col]
+    # KW-63: a Separation unit that was not used (with its reason) and the recovered liquid figures -- in the log only when set
+    for flag, reason, key in (("separation_centrifuge_unused", "separation_centrifuge_unused_reason", "centrifuge"), ("separation_screw_unused", "separation_screw_unused_reason", "screw")):
+        if r[flag]:
+            d["stages"]["separation"][key + "Unused"] = True
+            d["stages"]["separation"][key + "UnusedReason"] = r[reason]
+    for key, col in (("liquidWeightKg", "separation_liquid_weight_kg"), ("liquidVolumeL", "separation_liquid_volume_l"), ("liquidEstVolumeL", "separation_liquid_est_volume_l"),
+                     ("liquidVariancePct", "separation_liquid_variance_pct")):
+        if r[col] is not None:
+            d["stages"]["separation"][key] = r[col]
     # KW-15: extraction bypassed (the product still flowed through the flow cell, nothing was optimized) -- in the log only when it is
     if r["extraction_bypassed"]:
         d["stages"]["extraction"]["bypassed"] = True
@@ -6248,6 +6288,7 @@ SOP_SPOTS = [
     ("production.separation", "Production log", "Separation", "Section", "Whole section"),
     ("production.separation.solids_qc", "Production log", "Separation", "QC Check", "Solids characterization"),
     ("production.separation.filtrate_qc", "Production log", "Separation", "QC Check", "Filtrate characterization"),
+    ("production.separation.recovered_liquid", "Production log", "Separation", "Other box", "Recovered liquid"),          # KW-63
     ("production.separation.sample_point", "Production log", "Separation", "Sample Point", "Solids"),
     ("production.pasteurization", "Production log", "Pasteurization", "Section", "Whole section"),
     ("production.pasteurization.process_check", "Production log", "Pasteurization", "Process Check", "Dilution plan, tanks 5A/5B to 6A/6B"),
@@ -11779,6 +11820,10 @@ class Handler(BaseHTTPRequestHandler):
             ("separation_liquid_ts_liquid_pct", "liquidTsLiquidPct", "num"),
             ("separation_liquid_rho_liquid_g_ml", "liquidRhoLiquidGMl", "num"),
             ("separation_solids_sample_collected_at", "solidsSampleCollectedAt", "text"),
+            ("separation_centrifuge_unused", "centrifugeUnused", "bool"), ("separation_centrifuge_unused_reason", "centrifugeUnusedReason", "text"),      # KW-63
+            ("separation_screw_unused", "screwUnused", "bool"), ("separation_screw_unused_reason", "screwUnusedReason", "text"),
+            ("separation_liquid_weight_kg", "liquidWeightKg", "num"), ("separation_liquid_est_volume_l", "liquidEstVolumeL", "num"),
+            # (the calculated volume and its % difference are stored by _recompute_separation_liquid, never typed)
             # separation_water_addition_l column stays (additive-only) but is
             # no longer collected -- "Water addition (L)" was removed.
         ],
@@ -11929,7 +11974,8 @@ class Handler(BaseHTTPRequestHandler):
         section is `done` (green dot) only when none are missing."""
         rid = r["id"]
         stages = dict(run_public(r)["stages"])
-        stages["_meta"] = {"orpRequired": r["status"] == "draft" or bool(r["orp_required"])}      # KW-59 (read by the _orp_needed predicate only)
+        stages["_meta"] = {"orpRequired": r["status"] == "draft" or bool(r["orp_required"]),      # KW-59 (read by the _orp_needed predicate only)
+                           "separationV2": r["status"] == "draft" or bool(r["separation_rules_v2"])}     # KW-63 (read by the _sep_* predicates only)
         sections = []
         for sec in PROGRESS_SECTIONS:
             items = []   # (label, filled?)
@@ -11990,7 +12036,7 @@ class Handler(BaseHTTPRequestHandler):
             filled = len(items) - len(missing)
             sections.append({"key": sec["key"], "label": sec["label"], "total": len(items), "filled": filled,
                              "missing": missing, "done": bool(items) and not missing, "started": filled > 0})
-        return {"sections": sections,
+        return {"sections": sections, "separationV2": stages["_meta"]["separationV2"],
                 "requiredTotal": sum(x["total"] for x in sections),
                 "requiredFilled": sum(x["filled"] for x in sections),
                 "complete": all(x["done"] for x in sections)}
@@ -13669,6 +13715,14 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "Homogenization tank(s) must be 2A, 2B or 2A + 2B")
         if stage == "extraction" and d.get("bypassed") and "bypassComment" in d and not (d.get("bypassComment") or "").strip():
             raise ApiError(400, "Enter the reason extraction was bypassed")
+        if stage == "separation":
+            cu = d["centrifugeUnused"] if "centrifugeUnused" in d else run["separation_centrifuge_unused"]
+            su = d["screwUnused"] if "screwUnused" in d else run["separation_screw_unused"]
+            if cu and su:
+                raise ApiError(400, "The centrifuge and the screw press cannot both be marked not used: a Separation uses at least one of them")
+            for flag, key, name in ((d.get("centrifugeUnused"), "centrifugeUnusedReason", "centrifuge"), (d.get("screwUnused"), "screwUnusedReason", "screw press")):
+                if flag and key in d and not str(d.get(key) or "").strip():
+                    raise ApiError(400, "Enter the reason the %s was not used" % name)
         updates = {}
         for col, key, kind in self.STAGE_FIELDS[stage]:
             if key not in d:
@@ -13687,6 +13741,9 @@ class Handler(BaseHTTPRequestHandler):
             self._recompute_homogenization(conn, rid)
         if stage == "extraction":
             self._apply_extraction_bypass(conn, rid)
+        if stage == "separation":
+            self._apply_separation_units(conn, rid)
+            self._recompute_separation_liquid(conn, rid)
         if stage == "packaging" and run["status"] == "completed":
             self._sync_fg_lot_quality(conn, rid)
         # The Packaging section's one Save button covers the packagedAt/QC/
@@ -13767,6 +13824,29 @@ class Handler(BaseHTTPRequestHandler):
         else:
             sets = {"extraction_bypass_comment": None}
         conn.execute("UPDATE production_runs SET %s WHERE id=?" % ", ".join("%s=?" % c for c in sets), (*sets.values(), rid))
+
+    # ---- Separation: units not used, recovered liquid (KW-63) ---------------#
+    def _apply_separation_units(self, conn, rid):
+        """A centrifuge or screw press that was not used this run has no moisture reading: whatever was typed there is cleared; a unit that was used carries no reason."""
+        r = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
+        sets = {}
+        for flag, reason, value in (("separation_centrifuge_unused", "separation_centrifuge_unused_reason", "separation_pct_moisture"),
+                                    ("separation_screw_unused", "separation_screw_unused_reason", "separation_pct_moisture_screw")):
+            if r[flag]:
+                sets[value] = None
+                sets[reason] = (r[reason] or "").strip() or None
+            else:
+                sets[reason] = None
+        conn.execute("UPDATE production_runs SET %s WHERE id=?" % ", ".join("%s=?" % c for c in sets), (*sets.values(), rid))
+
+    def _recompute_separation_liquid(self, conn, rid):
+        """Total recovered liquid volume (L) = weight (kg) / liquid density (g/mL) from the Filtrate characterization (1 g/mL = 1 kg/L); blank while either is missing. Its
+        % difference from the optional estimate = (calculated - estimate) / estimate x 100 (the sign of the 6A/6B variance). Called whenever the Separation section is saved, so
+        a density corrected later, in an amendment, moves the volume with it."""
+        r = conn.execute("SELECT separation_liquid_weight_kg w, separation_liquid_rho_liquid_g_ml rho, separation_liquid_est_volume_l est FROM production_runs WHERE id=?", (rid,)).fetchone()
+        vol = r["w"] / r["rho"] if (r["w"] is not None and r["rho"] is not None and r["rho"] > 0) else None
+        var = (vol - r["est"]) / r["est"] * 100.0 if (vol is not None and r["est"] is not None and r["est"] > 0) else None
+        conn.execute("UPDATE production_runs SET separation_liquid_volume_l=?, separation_liquid_variance_pct=? WHERE id=?", (vol, var, rid))
 
     # ---- Dilution & Preservation: repeatable tank entries ------------------#
     def _dilutions_public(self, conn, run_id):
@@ -14477,6 +14557,7 @@ class Handler(BaseHTTPRequestHandler):
             lot = lot_number_for(ts, run_id)
             cur.execute("UPDATE production_runs SET processing_lot=? WHERE id=?", (lot, run_id))
         cur.execute("UPDATE production_runs SET orp_required=? WHERE id=?", (0 if hist else 1, run_id))        # KW-59: a run finalized from now on is held to the ORP rule
+        cur.execute("UPDATE production_runs SET separation_rules_v2=? WHERE id=?", (0 if hist else 1, run_id))        # KW-63: ... and to both moisture readings and the recovered liquid weight
 
         # Log every selected tote's receiving inspection, carrying over any
         # characterization staged while this was still a draft (photos already
