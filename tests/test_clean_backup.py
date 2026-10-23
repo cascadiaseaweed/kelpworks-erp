@@ -303,3 +303,28 @@ def test_the_command_line_takes_by_and_prints_where_the_paper_is(source):
     assert os.path.exists(out[:-4] + ".report.txt") and os.path.exists(out[:-4] + ".cut-over-note.md")
     bad = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "make_clean_backup.py")], capture_output=True)
     assert bad.returncode == 2 and b"--dry-run" in bad.stdout
+
+
+def test_a_backup_from_an_older_release_with_fewer_tables_is_still_cleaned_and_a_much_older_one_is_refused_politely(source):
+    with zipfile.ZipFile(source["zip"]) as zf:
+        zf.extract("kelp_erp.db", str(source["folder"] / "older"))
+    db = str(source["folder"] / "older" / "kelp_erp.db")
+    conn = sqlite3.connect(db)
+    for t in ("consumable_pack_log", "consumable_packs", "consumable_supplier_log", "consumable_suppliers", "image_purge_log", "archive_receipts", "run_note_images", "run_notes"):
+        conn.execute('DROP TABLE "%s"' % t)                                                  # tables a release from before receiving / notes did not have yet
+    conn.commit()
+    conn.close()
+    r = M.clean_database(db, str(source["folder"] / "older" / "clean.db"))
+    assert "Real Citric Acid (Supplier B)" in r["itemsRemoved"] and r["suppliers"] == [] and r["kept"]["consumables"] == 4
+    verify = sqlite3.connect(str(source["folder"] / "older" / "clean.db"))
+    try:
+        assert [x[0] for x in verify.execute("SELECT name FROM consumables ORDER BY name")] == sorted(M.SYSTEM_ITEMS)
+    finally:
+        verify.close()
+    conn = sqlite3.connect(db)
+    conn.execute("DROP TABLE config_log")
+    conn.commit()
+    conn.close()
+    with pytest.raises(M.CleanError) as e:
+        M.clean_database(db, str(source["folder"] / "older" / "clean2.db"))
+    assert "much older release" in str(e.value) and not os.path.exists(str(source["folder"] / "older" / "clean2.db"))
