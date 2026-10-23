@@ -407,11 +407,49 @@ th.sortable:hover { background: var(--bg-e2ece9); }
 .rs-headline + .rs-details { border-top: 1px solid var(--line); padding-top: 12px; }
 .rs-big { display: flex; flex-direction: column; align-items: center; min-width: 92px; }
 .rs-big-v { font-size: 24px; font-weight: 700; line-height: 1.1; color: var(--accent-text-2); font-variant-numeric: tabular-nums; }
+.rs-big-v small { display: block; margin-top: 2px; font-size: 11px; font-weight: 400; line-height: 1.2; color: var(--muted); }   /* the note under a big number (batch-average weight) */
 .rs-big-k { margin-top: 3px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
 .rs-details { display: grid; grid-template-columns: max-content 1fr; gap: 5px 20px; margin: 0 auto; max-width: 560px; font-size: 13px; }
 .rs-details dt { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .03em; padding-top: 1px; }
 .rs-details dd { margin: 0; font-weight: 600; color: var(--accent-text-2); overflow-wrap: anywhere; }
 .rs-details dd small { font-weight: 400; color: var(--muted); margin-left: 6px; }
+/* KW-65: the details of a run's summary card in headed columns: 4 on a desktop, 2 on a tablet in landscape, 1 on a narrow screen; an empty column is not drawn */
+.rs-cols { display: grid; gap: 14px 32px; align-items: start; }
+.rs-cols.n1 { grid-template-columns: minmax(0, 1fr); }
+.rs-cols.n2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.rs-cols.n3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.rs-cols.n4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.rs-headline + .rs-cols { border-top: 1px solid var(--line); padding-top: 12px; }
+.rs-col-h { margin: 0 0 8px; padding-bottom: 4px; border-bottom: 1px solid var(--line); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--accent-text); }
+.rs-cols .rs-details { display: block; max-width: none; margin: 0; }
+.rs-cols .rs-details dt { margin-top: 8px; }
+.rs-cols .rs-details dt:first-child { margin-top: 0; }
+@media (max-width: 1100px) { .rs-cols.n4, .rs-cols.n3 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 700px) { .rs-cols.n4, .rs-cols.n3, .rs-cols.n2 { grid-template-columns: minmax(0, 1fr); } }
+/* KW-69: the Calculations page settings: headed collapsible groups, a search box, a Description that wraps (the global td rule keeps text on one line) */
+.set-tools { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.set-search { flex: 1 1 280px; min-width: 200px; max-width: 520px; }
+.set-group { border: 1px solid var(--line); border-radius: 10px; margin-bottom: 8px; background: var(--card); }
+.set-group > summary { cursor: pointer; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 9px 12px; font-weight: 600; color: var(--accent-text); list-style-position: inside; }
+.set-group[open] > summary { border-bottom: 1px solid var(--line); background: var(--bg-eef3f2); border-radius: 10px 10px 0 0; }
+.set-group-count { font-weight: 400; font-size: 12px; color: var(--muted); }
+.set-group-note { padding: 6px 12px 0; }
+.set-group .tablewrap { padding: 4px 8px 8px; }
+.settings-table th, .settings-table td { vertical-align: top; }
+.settings-table td.set-name { white-space: normal; min-width: 210px; max-width: 320px; font-weight: 600; }
+.settings-table td.set-name .set-key { font-weight: 400; font-size: 11px; color: var(--muted); margin-top: 2px; overflow-wrap: anywhere; }
+.settings-table td.set-val { white-space: normal; min-width: 190px; }
+.settings-table td.desc { white-space: normal; min-width: 260px; max-width: 560px; overflow-wrap: anywhere; line-height: 1.4; }
+.set-default { margin-top: 4px; }
+.badge.set-changed { background: var(--bg-fff1c2); color: var(--fg-8a5a00); }                       /* the same themed colours as the pending-release badge (light and dark) */
+tr.set-changed-row td.set-val input { border-color: var(--warn); }
+@media (max-width: 760px) {
+  .settings-table thead { display: none; }
+  .settings-table, .settings-table tbody, .settings-table tr, .settings-table td { display: block; width: 100%; box-sizing: border-box; }
+  .settings-table tr { border-bottom: 1px solid var(--line); padding: 6px 0; }
+  .settings-table td { border-bottom: none; padding: 3px 6px; }
+  .settings-table td.set-name, .settings-table td.set-val, .settings-table td.desc { min-width: 0; max-width: none; }
+}
 .sample-summary { margin-top: 10px; }
 .sample-summary-title { font-size: 12px; font-weight: 700; color: var(--accent-text); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px; }
 .sample-summary .tablewrap { display: inline-block; max-width: 100%; vertical-align: top; }        /* fit the table: no empty white space beside it */

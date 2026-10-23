@@ -31,6 +31,9 @@ labels, and an admin panel.
    bare literal — read it via `get_setting_value(conn, key, default)`
    server-side or `settingValue(key, fallback)` client-side, and list its key
    in the calculation's `settings` array so it shows up on that page.
+   The settings table itself is laid out in headed, collapsible, searchable groups (KW-69): put a NEW setting's key in exactly one group of `SETTING_GROUPS`
+   (`app.js`, just above `settingLabel`); `tests/test_calculations_run_card_layout.py` fails if a setting is in no group or in two (a setting nobody placed would
+   show under "Other settings"). `get_settings` also returns each setting's built-in `default`, which the page uses to mark a value "Changed from default".
 
 ## Run it
 
@@ -574,8 +577,9 @@ for `main` so a red run blocks the merge.
   `qc:orp` measure) and on the Production Log Summary PDF. **Required, but only from now on**: the `_orp_needed` predicate reads `stages["_meta"]["orpRequired"]` set by `_run_progress` = the run is still a draft OR
   `production_runs.orp_required = 1` (stamped at finalize, 0 for a historical run); a run finalized before this keeps `orp_required = 0`, is never asked for ORP and its progress / amendments are unchanged. `run_public`
   adds `orpMv` to a stage ONLY when a value is saved, and `qcSummary` (part of the signed log: how many QC fields are recorded of how many) counts the two ORP fields only for a run with `orp_required = 1`, so the signed snapshot of an older run is byte-for-byte what it was (no `RELEASE_SNAPSHOT_VERSION` bump needed). **Any new `QC_FIELD_REGISTRY` entry changes `qcSummary.total` and so every signed hash unless it is gated like this.**
-- **Run summary card** (KW-25): `runSummaryGrid` shows a centred row of headline numbers (volume out, final pH / TDS / ORP, extraction efficiency) and a quiet details list; each KPI is switched on or off by the setting
-  `run_card_show_<key>` (1 / 0, Calculations page). The Separation sample point is the last box of the section (KW-17).
+- **Run summary card** (KW-25): `runSummaryGrid` shows a centred row of headline numbers (volume out, final pH / TDS / ORP, conversion rate harvest = `RUN_CARD_HEADLINE`) and, below it (KW-65), the other KPIs in four headed
+  columns -- Lot details (run date, operators, feedstock farms), Input (feedstock), Process (performance: conversion rate process, extraction efficiency), Output (product) -- from the ONE list `RUN_CARD_GROUPS` (4 columns on a desktop, 2 on a tablet in landscape, 1 on a narrow screen; a column whose KPIs are all hidden is not drawn;
+  a new KPI goes in exactly one group: `tests/test_calculations_run_card_layout.py`); each KPI is switched on or off by the setting `run_card_show_<key>` (1 / 0, Calculations page). The Separation sample point is the last box of the section (KW-17).
 - **Packaging edits after finalize** re-derive everything computed from the packaging rows in the
   same transaction (`_sync_completed_packaging`): container + FG-label stock (net-change commit),
   the run's FG lots (`_adjust_fg_lot`, refuses to go below units already shipped/moved), and
