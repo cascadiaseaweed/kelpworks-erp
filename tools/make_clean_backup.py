@@ -114,7 +114,7 @@ def verify_clean(before, dst_path, tables):
         names = {r[0] for r in conn.execute("SELECT name FROM consumables")}
         if names - set(SYSTEM_ITEMS):
             problems.append("inventory items other than the system items remain: %s" % ", ".join(sorted(names - set(SYSTEM_ITEMS))[:5]))
-        for t in ITEM_DEPENDENTS:
+        for t in [d for d in ITEM_DEPENDENTS if d in tables]:
             if conn.execute('SELECT COUNT(*) FROM "%s"' % t).fetchone()[0]:
                 problems.append("%s still has rows" % t)
         for name in names:
@@ -151,19 +151,23 @@ def clean_database(src_path, dst_path, source_name="", source_sha="", by=""):
         if unknown:
             raise CleanError("This backup has tables this tool does not know how to treat: %s. Update tools/make_clean_backup.py (add each to KEEP or CLEAR) "
                              "so no record is kept by mistake; nothing was written." % ", ".join(unknown))
+        if "consumables" not in tables or "config_log" not in tables:
+            raise CleanError("This backup is from a much older release (it has no inventory or no change history table). Restore it on staging first, or take a fresh full backup, "
+                             "and make the clean file from that; nothing was written.")
+        deps = [t for t in ITEM_DEPENDENTS if t in tables]                    # an older release may not have every one of them yet
         before = baseline(work, tables)
         has_seq = "sqlite_sequence" in {r[0] for r in work.execute("SELECT name FROM sqlite_master")}
         item_names = [r[0] for r in work.execute("SELECT name FROM consumables ORDER BY name")]
         items_removed = [n for n in item_names if n not in SYSTEM_ITEMS]
         missing_system = [n for n in SYSTEM_ITEMS if n not in item_names]
-        suppliers = sorted({r[0] for r in work.execute("SELECT name FROM consumable_suppliers")}, key=str.lower)
+        suppliers = sorted({r[0] for r in work.execute("SELECT name FROM consumable_suppliers")}, key=str.lower) if "consumable_suppliers" in tables else []
         removed = {}
         work.execute("PRAGMA foreign_keys=OFF")
         work.execute("BEGIN")
         for t in sorted(CLEAR & tables):
             removed[t] = work.execute('SELECT COUNT(*) FROM "%s"' % t).fetchone()[0]
             work.execute('DELETE FROM "%s"' % t)
-        for t in ITEM_DEPENDENTS:                                              # children first
+        for t in deps:                                                         # children first
             removed[t] = work.execute('SELECT COUNT(*) FROM "%s"' % t).fetchone()[0]
             work.execute('DELETE FROM "%s"' % t)
         removed["consumables (items removed)"] = len(items_removed)
@@ -172,7 +176,7 @@ def clean_database(src_path, dst_path, source_name="", source_sha="", by=""):
         blank = {c: v for c, v in BLANK_ITEM.items() if c in cols}
         work.execute("UPDATE consumables SET %s" % ", ".join("%s=?" % c for c in blank), tuple(blank.values()))
         if has_seq:
-            for t in sorted((CLEAR & tables) | set(ITEM_DEPENDENTS)):          # numbering starts again from 1 for the cleared tables
+            for t in sorted((CLEAR & tables) | set(deps)):                      # numbering starts again from 1 for the cleared tables
                 work.execute("DELETE FROM sqlite_sequence WHERE name=?", (t,))
         work.execute("DELETE FROM app_flags WHERE key IN (%s)" % ",".join("?" * len(STALE_FLAGS)), STALE_FLAGS)
         total = sum(n for t, n in removed.items() if t in CLEAR)
