@@ -85,21 +85,34 @@ To clear ALL records from live (totes, runs, finished goods, shipments, customer
 configuration, restore a **clean backup** instead of a normal one. The same steps as above apply; only the file differs, so this doubles as a rehearsal.
 
 **Kept:** users and their roles and passwords, species, sites, products, locations, settings (including the application rate), Certificate of Analysis specifications,
-labs + analyses + requisition templates + contact details, quality-chart limits, the SOP and safety-data-sheet register with its links and files, inventory item
-definitions (stock set to 0), and the history of changes to those. **Cleared:** every record, every uploaded document and photo, and the release / audit history.
+labs + analyses + requisition templates + contact details, quality-chart limits, the SOP and safety-data-sheet register with its links and files, and the history of changes
+to those (the tool proves, row for row, that every one of these tables is identical afterwards). **Cleared:** every record, every uploaded document and photo, and the release /
+audit history. **Inventory items (KW-60):** every reagent, packaging and finished-good-label item is removed, with its suppliers, packs, safety-data-sheet links and history, so it
+can be added again with real quantities and documents; only the four items the program finds by their exact name (Citric Acid, Potassium Sorbate, New 1,000 L IBC Tote, Used 1,000 L
+IBC Tote) stay, as blank items (stock 0, no cost, no suppliers). The server recreates its other standard items (sodium benzoate, sample containers, CIP agents, finished-good labels) at
+every start. **One entry** (`system / clean_start`) is added to the change history of the clean database: who made the file, from which backup, how much was cleared.
 
 1. **Archive the old data.** Download a full backup (Admin > Download full backup) and keep it, named for what it is (for example `pre-wipe-2026-11-01`). The SharePoint
    archive and its backups stay as they are; do not restore an older nightly backup by mistake afterwards.
-2. **Make the clean file** (on any PC with Python; it only reads and writes files):
+2. **Make the clean file** (on any PC with Python; it only reads and writes files). First look at what it would do (writes nothing):
    ```bash
-   py tools/make_clean_backup.py pre-wipe-2026-11-01.zip kelpworks-CLEAN.zip
+   py tools/make_clean_backup.py pre-wipe-2026-11-01.zip --dry-run
+   py tools/make_clean_backup.py pre-wipe-2026-11-01.zip kelpworks-CLEAN.zip --by "Your Name"
    ```
-   It prints what it cleared and what it kept. It refuses a backup with a table it does not recognise (so no record is kept by mistake) and never overwrites a file.
+   It prints what it cleared (rows per table, the inventory items removed) and what it kept, and checks its own result before writing it. It refuses a backup with a table it does not
+   recognise (so no record is kept by mistake) and never overwrites a file. Next to the zip it writes `kelpworks-CLEAN.report.txt` (what changed, the proof that nothing else did, the supplier
+   names that were on the removed items) and `kelpworks-CLEAN.cut-over-note.md` (a draft cut-over note: give it to the Quality Manager, who completes and signs it as the QM-001 record).
+   The full backup of step 1, named `PRE-GO-LIVE ARCHIVE <date>`, is the controlled record of the old data: restore-test it on staging and store it OUTSIDE `01_System-Backups` (for example in
+   `00_Pre-Go-Live`) so no retention cleanup ever touches it.
 3. **Rehearse on staging:** Admin > Restore with `kelpworks-CLEAN.zip` (staging resets every password to the staging one). Check it opens empty, the people and settings are
    there, and a test harvest, run and shipment work.
-4. **Restore on live** with the steps above, using `kelpworks-CLEAN.zip`. Checks afterwards: Product Release lists no runs, Verify audit trail says the chain is intact, the
-   Calculations page still shows your settings, and the first harvest check-in works.
-5. **Tidy up:** delete `kelpworks-CLEAN.zip` and the temporary SharePoint link (both contain every user's password hash), and remove the two restore variables from Render.
+4. **Before the restore, clear the old records archive** so the restarted numbers cannot collide with old folders (the sync only adds, and skips a file whose path and version it already has).
+   In the SharePoint library `KelpWorks-Records` delete the contents of `02_Production-Runs`, `06_Receiving` and `01_System-Backups`, and delete `_sync-state.json` in the library root (it is only the sync
+   script's memory of what it copied: the files and backup days). **Do not** delete `03_SOPs` or `04_Safety-Data-Sheets` (the controlled masters KelpWorks mirrors), the pre-go-live backup, or anything
+   outside this library: the change log lives in `QAQC > KelpWorks ERP > Change_Control` and `C:\KelpWorks\ChangeControl` and is not involved. The first sync after the reset rebuilds the indexes.
+5. **Restore on live** with the steps above, using `kelpworks-CLEAN.zip`. Checks afterwards: Product Release lists no runs, Verify audit trail says the chain is intact, the
+   Calculations page still shows your settings, the change history shows the `clean_start` entry, and the first harvest check-in works. Then add the inventory items again (KW-64).
+6. **Tidy up:** delete `kelpworks-CLEAN.zip` and the temporary SharePoint link (both contain every user's password hash), and remove the two restore variables from Render.
 
 Lot and shipment numbers start again from 001 (for example `PR-<date>-001`). The old records remain in `pre-wipe-...zip` and in the SharePoint archive, so reusing a
 number does not overwrite anything there, but keep that in mind when looking things up by number.
