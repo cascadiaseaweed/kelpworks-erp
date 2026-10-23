@@ -54,3 +54,4 @@ a15c319  2026-10-21  photo archive (KW-04), ORP / run summary card / separation 
 384d69f  2026-10-22  retry a busy SharePoint copy, refresh the inbox README automatically (KW-68) (PR 87) merged to main and live
 8ba680c  2026-10-22  Calculations page settings in headed groups, run summary card details in four columns (KW-69, KW-65) (PR 89) merged to main and live
 44c1e47  2026-10-23  Separation: both % moisture values, recovered liquid weight, calculated volume and estimate (KW-63) (PR 91) merged to main and live
+92fff78  2026-10-23  clean-start tool: inventory items removed except the four system items, audit entry, proof, dry run, cut-over note (KW-60) (PR 93) merged to main and live
