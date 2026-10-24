@@ -30,13 +30,13 @@ def test_every_setting_is_in_exactly_one_group_and_none_is_left_over(admin):
     settings = set(admin.get("/api/refdata").json["settings"])
     assert len(placed) == len(set(placed)), "a setting is in two groups: %s" % sorted({k for k in placed if placed.count(k) > 1})
     assert set(placed) == settings, "not placed: %s; not a setting: %s" % (sorted(settings - set(placed)), sorted(set(placed) - settings))
-    assert len(settings) == 54 and len(groups) == 12                                                        # the list agreed for KW-69; a new setting must be placed (and this count raised)
+    assert len(settings) == 56 and len(groups) == 12                                                        # the list agreed for KW-69 (+2 supplier settings, KW-81); a new setting must be placed (and this count raised)
 
 
 def test_the_groups_are_in_the_agreed_order():
     assert [t for t, _k in setting_groups()] == [
         "Process defaults by section", "Equipment & capacities", "Quality limits & tolerances", "Certificate of Analysis & lab results", "Quality Control charts & reports",
-        "Release & sign-off", "Samples, lots & inventory", "Run summary card display", "Documents (SOPs & safety data sheets)", "Users, sessions & uploads",
+        "Release & sign-off", "Samples, lots & inventory", "Run summary card display", "Documents (SOPs, safety data sheets & suppliers)", "Users, sessions & uploads",
         "Files, photos & archive", "Historical run entry"]
 
 
