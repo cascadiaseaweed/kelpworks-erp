@@ -10,6 +10,9 @@ The MASTER is C:\\KelpWorks\\ChangeControl\\LOG_KelpWorks_ChangeControl.xlsx (ou
     python tools/changelog_write.py --apply-inbox [--dry-run]     # apply the notes Claude (chat) left in Change_Control\\Inbox (new items and revisions)
     python tools/changelog_write.py --show KW-46                  # read-only: the row's Status, Approved to Start, PR #, ...
     python tools/changelog_write.py --rules-sheet [--rules-file f.json]   # rewrite the Workflow Rules sheet from docs/backlog/workflow-rules.json
+    python tools/changelog_write.py --playbook-sheet [--playbook-file f.json]   # rewrite the Claude Code Playbook sheet from docs/backlog/claude-code-playbook.json
+    python tools/changelog_write.py --classify-setup              # one time (KW-79): add Touches after Type, remove the Claude Code Prompt column, a Type drop-down
+    python tools/changelog_write.py --default-owner               # one time (KW-79): Owner = N. Wrana where blank (and the spelling N.Wrana); no other name is changed
     python tools/changelog_write.py --publish                     # copy the master to SharePoint now (after a hand edit in Excel)
     python tools/changelog_write.py --backups                     # list the backups (local + SharePoint mirror)
     python tools/changelog_write.py --restore latest|<backup name># put a backup back as the master (backs the current one up first)
@@ -17,8 +20,9 @@ The MASTER is C:\\KelpWorks\\ChangeControl\\LOG_KelpWorks_ChangeControl.xlsx (ou
 
 What it enforces (the 'Workflow Rules' sheet of the workbook):
 
-* Ownership: item updates may write only Status, Notes, PR #, Released Date and QM-001 Ref (Row Updated and Updated By are stamped automatically). Every other column belongs to the
-  intake chat or to a human, and is refused. The intake columns change, and rows are added, ONLY from a valid inbox note.
+* Ownership: item updates may write only Status, Notes, PR #, Released Date, QM-001 Ref, Type and Touches (Row Updated and Updated By are stamped automatically, except when only Type /
+  Touches change: they classify a request and do not change it). Every other column belongs to the intake chat or to a human, and is refused. The intake columns change, and rows are added,
+  ONLY from a valid inbox note. A new item needs a Type (one value from a fixed list) and Touches (one or more areas) once the workbook has the Touches column, and gets Owner N. Wrana.
 * Status: Not started, In progress, On staging, Released or Blocked. Deferred and Won't do are a human's decision and are refused; so is moving an item OUT of them.
   In progress / On staging / Released need Approved to Start = Y or Pre-rule. Released also needs a PR # and a Released Date (given now or already in the row).
 * Only the master is written (the right file name in a folder called ChangeControl, never inside OneDrive, never the SharePoint copy). Reading (--show, --dry-run) may use any copy.
@@ -42,6 +46,7 @@ import sys
 import tempfile
 import time
 import zipfile
+from xml.etree import ElementTree
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import update_backlog_xlsx as xl                                                  # the XML helpers (sheet lookup, cells, escaping)
@@ -52,16 +57,27 @@ SHEET = "Change Log"
 DECISIONS = "Open Decisions"
 RULES = "Workflow Rules"
 RULES_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "backlog", "workflow-rules.json")
-OWNED = ["Status", "Notes", "PR #", "Released Date", "QM-001 Ref"]
+OWNED = ["Status", "Notes", "PR #", "Released Date", "QM-001 Ref", "Type", "Touches"]
 STAMPS = {"Row Updated": lambda: datetime.date.today().isoformat(), "Updated By": lambda: "Claude Code"}
 STATUSES = ["Not started", "In progress", "On staging", "Released", "Blocked"]
 HUMAN_STATUSES = ["Deferred", "Won't do"]
 NEEDS_APPROVAL = ("In progress", "On staging", "Released")
 APPROVED = ("y", "pre-rule")
 HUMAN_COLUMNS = {"Owner", "Approved to Start", "Verified By (on live)", "Verified Date"}
-INTAKE_COLUMNS = {"ID", "Module", "Section", "Type", "Change Request", "Context / Rationale", "Transcript Time", "Raised By", "Priority", "Lens", "Claude Code Mode",
-                  "Claude Code Prompt", "Acceptance Criteria"}
+INTAKE_COLUMNS = {"ID", "Module", "Section", "Type", "Touches", "Change Request", "Context / Rationale", "Transcript Time", "Raised By", "Priority", "Lens", "Claude Code Mode",
+                  "Acceptance Criteria"}
 NEW_ITEM_REQUIRED = ["Module", "Section", "Type", "Change Request", "Raised By", "Priority", "Claude Code Mode", "Acceptance Criteria"]
+# KW-79: every request is classified. Type = ONE value from this list (a drop-down in Excel: a typed list cannot hold a comma, so no name has one); Touches = one or more areas, written "A; B".
+TYPES = ["Security & hardening", "Data integrity & traceability", "Quality & compliance", "Production workflow", "Inventory & shipping", "Samples & lab", "Reporting & analytics",
+         "User experience", "Equipment & maintenance", "Process & tooling", "Operations (non-ERP)"]
+TOUCHES = ["Production log", "Feedstock inventory", "Pre-processing", "Inventory items", "CIP / SIP log", "Samples", "Product release", "Finished goods / shipping", "Documents / SOPs",
+           "Admin / users", "Settings / Calculations", "Reports / QC charts", "Records archive / backups", "Database / schema", "Change-log tooling", "Labels / printing", "New module",
+           "Whole app", "Outside KelpWorks"]
+METADATA = {"Type", "Touches"}                         # they describe a request, never change its scope: a change to only these is not stamped (Row Updated stays the last REAL change)
+DEFAULT_OWNER = "N. Wrana"                             # every task has an owner by default; a person changes the cell in Excel
+LAYOUT_INSERT, LAYOUT_AFTER, LAYOUT_DELETE, TOUCHES_WIDTH = "Touches", "Type", "Claude Code Prompt", 30
+PLAYBOOK = "Claude Code Playbook"
+PLAYBOOK_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "backlog", "claude-code-playbook.json")
 PR_RE = re.compile(r"^\d+(\s*(,|&|and|/)\s*\d+)*$")
 BACKUP_RE = re.compile(r"^LOG_KelpWorks_ChangeControl_(\d{8}-\d{6}-\d{2})_([A-Za-z0-9-]+)\.xlsx$")
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{6,80}$")
@@ -80,8 +96,11 @@ note_id must be unique for ever (letters, digits, dot, dash, underscore; 6-80 ch
 {"note_id": "chat-20261022-001", "kind": "new_item", "from": "Claude (chat)", "created": "2026-10-22T18:00:00Z",
  "fields": {"Module": "...", "Section": "...", "Type": "...", "Change Request": "...", "Context / Rationale": "...", "Transcript Time": "...", "Raised By": "...",
             "Priority": "P2", "Lens": "...", "Claude Code Mode": "Direct", "Acceptance Criteria": "..."}}
-The writer gives it the next free KW number (Status Not started, Approved to Start blank: a human approves it). Required: Module, Section, Type, Change Request, Raised By,
-Priority, Claude Code Mode, Acceptance Criteria. Priority and Claude Code Mode must be values already used in the workbook.
+The writer gives it the next free KW number (Status Not started, Owner N. Wrana, Approved to Start blank: a human approves it). Required: Module, Section, Type, Touches, Change Request,
+Raised By, Priority, Claude Code Mode, Acceptance Criteria. Priority and Claude Code Mode must be values already used in the workbook.
+Type is exactly ONE of: %(types)s.
+Touches is one or more of: %(touches)s (separated by semicolons, e.g. "Production log; Product release").
+A new item without a valid Type and Touches is rejected with this list in the message.
 
 2. REVISION of an item's intake columns (A-M)
 {"note_id": "chat-20261022-002", "kind": "revision", "from": "Claude (chat)", "created": "...", "id": "KW-66",
@@ -102,10 +121,10 @@ The ID must be an item on the Change Log. Decided By and Decision are a human's:
 The sheet name must be KW-<number> <words> Plan. "was" is the text the cell holds in the copy you read; if it differs now, the note is rejected as stale. At most 50 cells per note,
 only cells in rows that exist.
 
-Only the intake columns Module, Section, Type, Change Request, Context / Rationale, Transcript Time, Raised By, Priority, Lens, Claude Code Mode, Claude Code Prompt and
+Only the intake columns Module, Section, Type, Touches, Change Request, Context / Rationale, Transcript Time, Raised By, Priority, Lens, Claude Code Mode and
 Acceptance Criteria can be set on an item. Status, Notes, Approved to Start, PR #, Owner and every other column are refused. A note with the same note_id as an applied one, or a
 new item whose Change Request is already on the sheet, is rejected as a duplicate.
-"""
+""" % {"types": "; ".join(TYPES), "touches": "; ".join(TOUCHES)}
 
 
 class Refused(Exception):
@@ -271,7 +290,8 @@ def check_text(column, value):
     return value
 
 
-def check_value(column, value):
+def check_value(column, value, classified=False):
+    """classified = the workbook has the Touches column: then Type must be one of TYPES (an older layout keeps free-text Types)."""
     value = "" if value is None else str(value).strip()
     if column == "Status":
         if value in HUMAN_STATUSES:
@@ -287,6 +307,26 @@ def check_value(column, value):
         value = value.lstrip("#").strip()
         if not PR_RE.match(value):
             raise Refused("PR # must be the pull request number(s), for example 75 or 70, 71 (got '%s')" % value)
+    elif column == "Type" and classified:
+        value = check_text(column, value)
+        hit = {t.lower(): t for t in TYPES}.get(value.lower())
+        if not hit:
+            raise Refused("Type must be exactly one of: %s (got '%s')" % ("; ".join(TYPES), value or "blank"))
+        value = hit
+    elif column == "Touches":
+        value = check_text(column, value)
+        known, picked = {t.lower(): t for t in TOUCHES}, set()
+        for part in value.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            hit = known.get(part.lower())
+            if not hit:
+                raise Refused("Touches takes areas from this list, separated by semicolons: %s (got '%s')" % ("; ".join(TOUCHES), part))
+            picked.add(hit)
+        if not picked:
+            raise Refused("Touches needs at least one area from: %s" % "; ".join(TOUCHES))
+        value = "; ".join(t for t in TOUCHES if t in picked)
     else:
         value = check_text(column, value)
     return value
@@ -306,7 +346,7 @@ def plan_update(snap, xml, kw, setting):
         if h not in OWNED:
             who = "a human" if h in HUMAN_COLUMNS else ("the intake chat, through an inbox note" if h in INTAKE_COLUMNS else "someone else")
             raise Refused("'%s' belongs to %s: Claude Code may write only %s" % (h, who, ", ".join(OWNED)))
-        new[h] = check_value(h, value)
+        new[h] = check_value(h, value, "Touches" in snap.headers)
     status = new.get("Status")
     if status is not None:
         was = current.get("Status", "")
@@ -323,10 +363,11 @@ def plan_update(snap, xml, kw, setting):
                     raise Refused("%s cannot be Released without a %s (give it in the same call, or fill it in first)" % (kw, need))
     if all(current.get(h, "") == text for h, text in new.items()):
         return xml, [], {}                                               # already as asked: nothing is written, not even the stamps
-    for stamp, make in STAMPS.items():
-        if stamp not in snap.headers:
-            raise Refused("the workbook has no '%s' column to stamp" % stamp)
-        new[stamp] = make()
+    if not set(h for h, text in new.items() if current.get(h, "") != text) <= METADATA:
+        for stamp, make in STAMPS.items():
+            if stamp not in snap.headers:
+                raise Refused("the workbook has no '%s' column to stamp" % stamp)
+            new[stamp] = make()
     changes = []
     for h, text in new.items():
         old = current.get(h, "")
@@ -458,6 +499,246 @@ def extend_ranges(xml, wb_xml, old_last, new_last, sheet=SHEET):
     xml = re.sub(r'(<(?:dataValidation|conditionalFormatting)\b[^>]*?\bsqref=")([^"]*)"', bump_sqref, xml)
     wb_xml = re.sub(r"(<definedName\b[^>]*>[^<]*'" + re.escape(sheet) + r"'![$A-Z]+\$\d+:\$[A-Z]+\$)(\d+)", bump_ref, wb_xml)
     return xml, wb_xml
+
+
+# ---- the layout of the Change Log: Touches after Type, the Claude Code Prompt column removed (KW-79) -------------------------------------------------------------------------
+def letters(n):
+    out = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        out = chr(65 + r) + out
+    return out
+
+
+def split_ref(ref):
+    m = re.fullmatch(r"([A-Z]+)(\d+)", ref)
+    return m.group(1), int(m.group(2))
+
+
+def column_plan(headers):
+    """The new column order. -> (mapping {old letter: new letter or None for the removed column}, new letter of the inserted column, [header names in the new order])."""
+    named = sorted(((colnum(l), h) for h, l in headers.items() if h), key=lambda kv: kv[0])
+    if [n for n, _h in named] != list(range(1, len(named) + 1)):
+        raise Refused("the header row of '%s' has gaps (columns must run A, B, C ... without a blank header)" % SHEET)
+    order = [h for _n, h in named]
+    if LAYOUT_INSERT in order:
+        raise Refused("the '%s' sheet already has a '%s' column" % (SHEET, LAYOUT_INSERT))
+    for need in (LAYOUT_AFTER, LAYOUT_DELETE):
+        if need not in order:
+            raise Refused("the '%s' sheet has no '%s' column, so the layout change does not apply" % (SHEET, need))
+    kept = [h for h in order if h != LAYOUT_DELETE]
+    at = kept.index(LAYOUT_AFTER) + 1
+    new_order = kept[:at] + [LAYOUT_INSERT] + kept[at:]
+    new_letter = {h: letters(i + 1) for i, h in enumerate(new_order)}
+    mapping = {headers[h]: (None if h == LAYOUT_DELETE else new_letter[h]) for h in order}
+    return mapping, new_letter[LAYOUT_INSERT], new_order
+
+
+def remap_refs(text, mapping):
+    """Move the column letters of every cell or column reference in a formula / range; text inside quotes is left alone. A reference to the removed column is refused."""
+    def col(letter):
+        new = mapping.get(letter, letter)
+        if new is None:
+            raise Refused("a formula, rule or range refers to column %s, which is being removed" % letter)
+        return new
+
+    def cell(m):
+        return m.group(1) + col(m.group(2)) + m.group(3) + m.group(4)
+
+    def colrange(m):
+        return m.group(1) + col(m.group(2)) + ":" + m.group(3) + col(m.group(4))
+
+    parts = text.split('"')
+    for i in range(0, len(parts), 2):
+        s = re.sub(r"(\$?)([A-Z]{1,3})(\$?)(\d+)", cell, parts[i])
+        parts[i] = re.sub(r"(\$?)([A-Z]{1,3}):(\$?)([A-Z]{1,3})", colrange, s)
+    return '"'.join(parts)
+
+
+def remap_other_formulas(xml, mapping):
+    """Formulas on other sheets: only what follows 'Change Log'! is a reference into the Change Log."""
+    def inner(m):
+        return m.group(1) + re.sub(r"('Change Log'!)([^,)\s<]+)", lambda r: r.group(1) + remap_refs(r.group(2), mapping), m.group(2)) + m.group(3)
+    return re.sub(r"(<f\b[^>]*>)(.*?)(</f>)", inner, xml, flags=re.S)
+
+
+def add_list_validation(xml, column, values, last_row, title):
+    """A drop-down list on column rows 2..last_row (a typed list: no comma in a value, at most 255 characters in all)."""
+    joined = ",".join(values)
+    if any("," in v for v in values) or len(joined) > 255:
+        raise Refused("the drop-down list for %s cannot be written (a value contains a comma, or the list is longer than Excel's 255 characters)" % title)
+    m = re.search(r'<dataValidations count="(\d+)"', xml)
+    if not m:
+        raise Refused("the '%s' sheet has no data validations block to add a drop-down to" % SHEET)
+    rule = ('<dataValidation type="list" allowBlank="1" showErrorMessage="1" errorTitle="%s" error="Choose a %s from the list." sqref="%s2:%s%d"><formula1>"%s"</formula1></dataValidation>'
+            % (xl.escape(title), xl.escape(title), column, column, last_row, xl.escape(joined)))
+    xml = xml.replace(m.group(0), '<dataValidations count="%d"' % (int(m.group(1)) + 1), 1)
+    return xml.replace("</dataValidations>", rule + "</dataValidations>", 1)
+
+
+def remap_columns_xml(snap):
+    """Insert Touches after Type and remove the Claude Code Prompt column, moving every reference with it, so the old E to K move to F to L, the old M stays M and N to X do not move.
+    -> (sheet xml, workbook xml, {other part: xml}, [header names in the new order]). Refuses (nothing written) if anything does not fit; checks every cell moved intact before returning."""
+    headers = snap.headers
+    mapping, ins, new_order = column_plan(headers)
+    xml, wb = snap.xml, snap.files["xl/workbook.xml"].decode("utf-8")
+    type_letter, last_row = headers[LAYOUT_AFTER], last_row_number(snap.xml)
+    before = {}                                                                          # (row, header) -> text, to prove afterwards that nothing was lost
+    letter_to_header = {l: h for h, l in headers.items() if h}
+    for ref, c in xl.cells_of(xml):
+        col_, row_ = split_ref(ref)
+        if col_ in letter_to_header and letter_to_header[col_] != LAYOUT_DELETE:
+            before[(row_, letter_to_header[col_])] = xl.cell_text(c, snap.sst)
+
+    def do_row(m):
+        tag, row_no, body, end = m.group(1), int(m.group(2)), m.group(3), m.group(4)
+        cells = xl.cells_of(body)
+        if "".join(el for _r, el in cells) != body:
+            raise Refused("row %d of '%s' holds something other than cells; the layout change does not apply" % (row_no, SHEET))
+        out, style = [], None
+        for ref, el in cells:
+            col_, _r = split_ref(ref)
+            if col_ == type_letter:
+                style = (re.search(r'\bs="(\d+)"', el.split(">")[0]) or [None, None])[1]
+            new = mapping.get(col_, col_)
+            if new is None:
+                continue
+            out.append((colnum(new), el.replace('r="%s"' % ref, 'r="%s%d"' % (new, row_no), 1)))
+        s_attr = (' s="%s"' % style) if style else ""
+        if row_no == 1:
+            out.append((colnum(ins), '<c r="%s1"%s t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>' % (ins, s_attr, xl.escape(LAYOUT_INSERT))))
+        else:
+            out.append((colnum(ins), '<c r="%s%d"%s/>' % (ins, row_no, s_attr)))
+        tag = re.sub(r'\bspans="(\d+):(\d+)"', lambda sm: 'spans="%s:%d"' % (sm.group(1), len(new_order)), tag)
+        return tag + "".join(el for _n, el in sorted(out, key=lambda kv: kv[0])) + end
+
+    xml = re.sub(r'(<row r="(\d+)"[^>]*?(?<!/)>)(.*?)(</row>)', do_row, xml, flags=re.S)
+    block = re.search(r"<cols>(.*?)</cols>", xml, flags=re.S)
+    if not block:
+        raise Refused("the '%s' sheet has no <cols> block" % SHEET)
+    per = {}
+    for m in re.finditer(r"<col\b([^>]*?)/>", block.group(1)):
+        attrs = dict(re.findall(r'([\w:]+)="([^"]*)"', m.group(1)))
+        for i in range(int(attrs["min"]), int(attrs["max"]) + 1):
+            per[i] = {k: v for k, v in attrs.items() if k not in ("min", "max")}
+    moved = {}
+    for i, attrs in per.items():
+        new = mapping.get(letters(i), letters(i))
+        if new is not None:
+            moved[colnum(new)] = attrs
+    moved[colnum(ins)] = {"width": str(TOUCHES_WIDTH), "customWidth": "1"}
+    cols = "".join('<col min="%d" max="%d" %s/>' % (i, i, " ".join('%s="%s"' % kv for kv in a.items())) for i, a in sorted(moved.items()))
+    xml = xml.replace(block.group(0), "<cols>%s</cols>" % cols, 1)
+    xml = re.sub(r'(<(?:conditionalFormatting|dataValidation)\b[^>]*?\bsqref=")([^"]*)"', lambda m: m.group(1) + remap_refs(m.group(2), mapping) + '"', xml)
+    xml = re.sub(r"(<formula>)(.*?)(</formula>)", lambda m: m.group(1) + remap_refs(m.group(2), mapping) + m.group(3), xml, flags=re.S)
+    xml = re.sub(r'(<(?:dimension|autoFilter)\b[^>]*?\bref=")([^"]*)"', lambda m: m.group(1) + remap_refs(m.group(2), mapping) + '"', xml)
+    wb = re.sub(r"(<definedName\b[^>]*>)([^<]*)(</definedName>)", lambda m: m.group(1) + re.sub(r"('%s'!)([^,\s]+)" % re.escape(SHEET), lambda r: r.group(1) + remap_refs(r.group(2), mapping), m.group(2)) + m.group(3), wb)
+    xml = add_list_validation(xml, headers[LAYOUT_AFTER], TYPES, last_row, "Type")
+    others = {}
+    for name, part in snap.paths.items():
+        if name == SHEET:
+            continue
+        old = snap.files[part].decode("utf-8")
+        new = remap_other_formulas(old, mapping)
+        if new != old:
+            others[part] = new
+    for part in [xml, wb] + list(others.values()):                                       # never save what Excel could not read
+        try:
+            ElementTree.fromstring(part.encode("utf-8"))
+        except ElementTree.ParseError as e:
+            raise Refused("the edited XML is not well-formed (%s); nothing was written" % e)
+    new_headers = xl.header_columns(xml, snap.sst)
+    if list(sorted(new_headers, key=lambda h: colnum(new_headers[h]))) != new_order:
+        raise Refused("the header row does not have the planned order after the change; nothing was written")
+    after = {}
+    for ref, c in xl.cells_of(xml):
+        col_, row_ = split_ref(ref)
+        after[(row_, [h for h, l in new_headers.items() if l == col_][0])] = xl.cell_text(c, snap.sst)
+    bad = [k for k, v in before.items() if after.get(k) != v]
+    if bad or any(after.get((r, LAYOUT_INSERT), "") for r in range(2, last_row + 1)):
+        raise Refused("a cell did not move intact (%s ...); nothing was written" % (bad[:3],))
+    return xml, wb, others, new_order
+
+
+# ---- Owner: the default owner of every task (KW-79) -------------------------------------------------------------------------------------------------------------------------
+def plan_default_owner(snap):
+    """Fill every blank Owner with the default and write the default's own spelling ('N.Wrana' -> 'N. Wrana'); any other name is left as it is. Not stamped. -> (xml, lines, expected)."""
+    if "Owner" not in snap.headers:
+        raise Refused("the workbook has no 'Owner' column")
+    xml, lines, expected = snap.xml, [], {}
+    same_person = re.sub(r"[\s.]+", "", DEFAULT_OWNER).lower()
+    for kw, row in snap.id_rows():
+        cur = snap.values(row).get("Owner", "")
+        if cur == DEFAULT_OWNER or (cur and re.sub(r"[\s.]+", "", cur).lower() != same_person):
+            continue
+        xml = set_cell(xml, snap.headers["Owner"], row, DEFAULT_OWNER)
+        lines.append("%s: Owner: %s -> %s" % (kw, cur or "(blank)", DEFAULT_OWNER))
+        expected[(SHEET, kw, "Owner")] = DEFAULT_OWNER
+    return xml, lines, expected
+
+
+# ---- the Claude Code Playbook sheet (written from docs/backlog/claude-code-playbook.json, cell by cell) -----------------------------------------------------------------
+def load_playbook(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            spec = json.load(f)
+    except (OSError, ValueError) as e:
+        raise Refused("the playbook file %s could not be read (%s)" % (path, e))
+    ok = (isinstance(spec, dict) and isinstance(spec.get("steps"), list) and all(isinstance(r, list) and len(r) == 4 and all(isinstance(c, str) for c in r) for r in spec["steps"])
+          and isinstance(spec.get("assumptions"), list) and all(isinstance(t, str) for t in spec["assumptions"]) and isinstance(spec.get("note"), str))
+    if not ok:
+        raise Refused("the playbook file %s needs steps (rows of 4 texts), assumptions (texts) and note (text)" % path)
+    for t in [c for r in spec["steps"] for c in r] + spec["assumptions"] + [spec["note"]]:
+        check_text("playbook text", t)
+    return {"steps": [[c.strip() for c in r] for r in spec["steps"]], "assumptions": [t.strip() for t in spec["assumptions"]], "note": spec["note"].strip()}
+
+
+def plan_playbook(snap, spec):
+    """Write the steps, assumptions and note into the cells the sheet already has (the numbers of rows must match). -> (xml, lines, expected)."""
+    if PLAYBOOK not in snap.paths:
+        raise Refused("the workbook has no sheet called '%s'" % PLAYBOOK)
+    xml = snap.files[snap.paths[PLAYBOOK]].decode("utf-8")
+    text = {ref: xl.cell_text(c, snap.sst).strip() for ref, c in xl.cells_of(xml)}
+    rows = sorted({split_ref(r)[1] for r in text})
+
+    def cell(col_, row_):
+        return text.get("%s%d" % (col_, row_), "")
+
+    steps, r = [], 2
+    while cell("A", r) and not cell("A", r).startswith(("Assumptions", "Note")):
+        steps.append(r)
+        r += 1
+    head = [x for x in rows if cell("A", x) == "Assumptions"]
+    note = [x for x in rows if cell("A", x) == "Note"]
+    if not head or not note:
+        raise Refused("the '%s' sheet has no 'Assumptions' and 'Note' rows in column A" % PLAYBOOK)
+    assumptions, r = [], head[0] + 1
+    while cell("B", r):
+        assumptions.append(r)
+        r += 1
+    for what, have, want in (("steps", len(steps), len(spec["steps"])), ("assumptions", len(assumptions), len(spec["assumptions"]))):
+        if have != want:
+            raise Refused("the playbook file has %d %s but the sheet has %d rows for them (the numbers must match)" % (want, what, have))
+    widths = column_widths(xml)
+    writes = {}
+    for row_, values in zip(steps, spec["steps"]):
+        for col_, v in zip("ABCD", values):
+            writes["%s%d" % (col_, row_)] = v
+    for row_, v in zip(assumptions, spec["assumptions"]):
+        writes["B%d" % row_] = v
+    writes["B%d" % note[0]] = spec["note"]
+    lines, expected = [], {}
+    for ref, value in writes.items():
+        if text.get(ref, "") != value:
+            col_, row_ = split_ref(ref)
+            xml = set_cell(xml, col_, row_, value)
+            expected[(PLAYBOOK, ref, "")] = value
+            lines.append("%s!%s: %s -> %s" % (PLAYBOOK, ref, (text.get(ref, "")[:40] or "(blank)"), value[:60]))
+    for row_ in steps + assumptions + note:
+        cells = {split_ref(ref)[0]: (writes.get(ref) or text.get(ref, "")) for ref in set(writes) | set(text) if split_ref(ref)[1] == row_}
+        height = row_height(max([1] + [text_lines(v, widths.get(colnum(c), 12.0)) for c, v in cells.items()]))
+        xml = re.sub(r'(<row r="%d"[^>]*?)>' % row_, lambda m: re.sub(r'\s+(?:ht|customHeight)="[^"]*"', "", m.group(1)) + ' ht="%s" customHeight="1">' % height, xml, count=1)
+    return xml, lines, expected
 
 
 # ---- the Workflow Rules sheet (written from docs/backlog/workflow-rules.json) -----------------------------------------------------------------------------------------------
@@ -614,6 +895,11 @@ def note_fields(snap, note):
             who = "a human" if h in HUMAN_COLUMNS else "Claude Code"
             raise Reject("'%s' is not an intake column (it belongs to %s); a note can set only: %s" % (h, who, ", ".join(sorted(INTAKE_COLUMNS - {"ID"}))))
         out[h] = note_text(h, value)
+        if h in METADATA and out[h]:                                      # a blank value is reported as missing (with the lists), not as invalid
+            try:
+                out[h] = check_value(h, out[h], "Touches" in snap.headers)
+            except Refused as e:
+                raise Reject(str(e))
     return out
 
 
@@ -657,9 +943,12 @@ class Ctx:
 def do_new_item(c, note, sender):
     snap, work = c.snap, c.work
     fields = note_fields(snap, note)
-    missing = [h for h in NEW_ITEM_REQUIRED if not fields.get(h)]
+    missing = [h for h in NEW_ITEM_REQUIRED + (["Touches"] if "Touches" in snap.headers else []) if not fields.get(h)]
     if missing:
-        raise Reject("a new item needs %s" % ", ".join(missing))
+        hint = ""
+        if "Touches" in snap.headers and ("Type" in missing or "Touches" in missing):
+            hint = " (Type is exactly one of: %s. Touches is one or more of: %s, separated by semicolons)" % ("; ".join(TYPES), "; ".join(TOUCHES))
+        raise Reject("a new item needs %s%s" % (", ".join(missing), hint))
     if fields["Priority"] not in c.priorities:
         raise Reject("Priority '%s' is not a value used in the workbook (%s)" % (fields["Priority"], ", ".join(sorted(c.priorities))))
     if fields["Claude Code Mode"] not in c.modes:
@@ -670,6 +959,8 @@ def do_new_item(c, note, sender):
     numbers = [int(m.group(1)) for m in (re.fullmatch(r"KW-(\d+)", i) for i in c.ids) if m]
     new_id = "KW-%02d" % ((max(numbers) if numbers else 0) + 1)
     values = dict(fields, ID=new_id, Status="Not started", **c.stamps)
+    if "Owner" in snap.headers:
+        values["Owner"] = DEFAULT_OWNER
     xml, row = add_row(work.sheet(SHEET), snap.headers, values)
     work.xml[SHEET] = xml
     c.ids.add(new_id)
@@ -1048,13 +1339,14 @@ def parse_pairs(tokens):
     return out
 
 
-VALUE_OPTIONS = ("--file", "--id", "--batch", "--show", "--verify-wait", "--decision", "--by", "--text", "--needed", "--restore", "--rules-file")
-FLAG_OPTIONS = ("--dry-run", "--apply-inbox", "--publish", "--backups", "--migrate", "--rules-sheet")
+VALUE_OPTIONS = ("--file", "--id", "--batch", "--show", "--verify-wait", "--decision", "--by", "--text", "--needed", "--restore", "--rules-file", "--playbook-file")
+FLAG_OPTIONS = ("--dry-run", "--apply-inbox", "--publish", "--backups", "--migrate", "--rules-sheet", "--classify-setup", "--default-owner", "--playbook-sheet")
 
 
 def parse_args(argv):
     a = {"file": cp.configured_path(), "file_given": False, "dry": False, "wait": VERIFY_WAIT, "id": None, "pairs": [], "batch": None, "show": None, "decision": None, "by": None, "text": None,
-         "needed": None, "restore": None, "apply_inbox": False, "publish": False, "backups": False, "migrate": False, "rules_sheet": False, "rules_file": RULES_FILE}
+         "needed": None, "restore": None, "apply_inbox": False, "publish": False, "backups": False, "migrate": False, "rules_sheet": False, "rules_file": RULES_FILE,
+         "classify_setup": False, "default_owner": False, "playbook_sheet": False, "playbook_file": PLAYBOOK_FILE}
     i = 0
     while i < len(argv):
         t = argv[i]
@@ -1177,7 +1469,7 @@ def show(snap, kw):
     except Refused as e:
         print("Refused: %s" % e)
         return 2
-    for h in ("ID", "Status", "Owner", "Approved to Start", "PR #", "Released Date", "Verified By (on live)", "Verified Date", "QM-001 Ref", "Row Updated", "Updated By", "Notes"):
+    for h in ("ID", "Type", "Touches", "Status", "Owner", "Approved to Start", "PR #", "Released Date", "Verified By (on live)", "Verified Date", "QM-001 Ref", "Row Updated", "Updated By", "Notes"):
         if h in row:
             print("%-24s %s" % (h, (row[h][:200] + "...") if len(row[h]) > 200 else row[h]))
     return 0
@@ -1212,7 +1504,7 @@ def find_backup(path, which):
 
 def main(argv=None):
     a = parse_args(list(sys.argv[1:] if argv is None else argv))
-    modes = [m for m in ("id", "batch", "show", "decision", "restore") if a and a[m]] + [m for m in ("apply_inbox", "publish", "backups", "migrate", "rules_sheet") if a and a[m]]
+    modes = [m for m in ("id", "batch", "show", "decision", "restore") if a and a[m]] + [m for m in ("apply_inbox", "publish", "backups", "migrate", "rules_sheet", "classify_setup", "default_owner", "playbook_sheet") if a and a[m]]
     if a is None or len(modes) != 1:
         print(__doc__)
         return 1
@@ -1312,6 +1604,20 @@ def run_write(a, path, writes):
             new_sig = sheet_sig(sheet_xml, snap.sst)
             lines = [] if old_sig == new_sig else ["%s sheet rewritten from %s (%d rows)" % (RULES, os.path.basename(a["rules_file"]), last)]
             return commit(a, snap, {snap.paths[RULES]: sheet_xml}, None, lines, {(RULES, "sig", "#sig"): new_sig}, "rules-sheet")
+        if a["classify_setup"]:
+            xml, wb_xml, others, new_order = remap_columns_xml(snap)
+            parts = dict(others)
+            parts[snap.part] = xml
+            lines = ["%s sheet: '%s' added after '%s' (column %s), '%s' removed, the old columns E to K moved to F to L, a drop-down on '%s'; every cell, rule, drop-down and formula moved with them"
+                     % (SHEET, LAYOUT_INSERT, LAYOUT_AFTER, letters(new_order.index(LAYOUT_INSERT) + 1), LAYOUT_DELETE, LAYOUT_AFTER)]
+            expected = {(SHEET, "%s1" % letters(i + 1), ""): h for i, h in enumerate(new_order)}
+            return commit(a, snap, parts, wb_xml, lines, expected, "classify-setup")
+        if a["default_owner"]:
+            xml, lines, expected = plan_default_owner(snap)
+            return commit(a, snap, {snap.part: xml}, None, lines, expected, "default-owner")
+        if a["playbook_sheet"]:
+            xml, lines, expected = plan_playbook(snap, load_playbook(a["playbook_file"]))
+            return commit(a, snap, {snap.paths[PLAYBOOK]: xml}, None, lines, expected, "playbook-sheet")
         if a["decision"]:
             part, xml, lines, expected = plan_decision(snap, a["decision"], a["by"] or "", a["text"] or "", a["needed"])
             return commit(a, snap, {part: xml}, None, ["%s: %s -> %s" % (l[0], (l[1][:50] or "(blank)"), l[2][:70]) for l in lines], expected, "decision")

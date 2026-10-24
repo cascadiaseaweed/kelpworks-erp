@@ -7,12 +7,16 @@ Claude (chat) does not write the change-log workbook. To add or revise an item i
 
 ```json
 {"note_id": "chat-20261022-001", "kind": "new_item", "from": "Claude (chat)", "created": "2026-10-22T18:00:00Z",
- "fields": {"Module": "Production Log", "Section": "Separation", "Type": "Change", "Change Request": "...", "Context / Rationale": "...",
+ "fields": {"Module": "Production Log", "Section": "Separation", "Type": "Production workflow", "Touches": "Production log; Product release", "Change Request": "...", "Context / Rationale": "...",
             "Transcript Time": "...", "Raised By": "N. Wrana", "Priority": "P2", "Lens": "...", "Claude Code Mode": "Direct", "Acceptance Criteria": "..."}}
 ```
 
-The writer assigns the next free KW number, Status "Not started", Approved to Start blank (a human approves it), Row Updated = the day it was applied and Updated By = "Claude (chat) (inbox)".
-Required fields: Module, Section, Type, Change Request, Raised By, Priority, Claude Code Mode, Acceptance Criteria. Priority and Claude Code Mode must be values already used in the sheet (for example P1, P2, P3 and Direct, Plan mode).
+The writer assigns the next free KW number, Status "Not started", Owner "N. Wrana", Approved to Start blank (a human approves it), Row Updated = the day it was applied and Updated By = "Claude (chat) (inbox)".
+Required fields: Module, Section, Type, Touches, Change Request, Raised By, Priority, Claude Code Mode, Acceptance Criteria. Priority and Claude Code Mode must be values already used in the sheet (for example P1, P2, P3 and Direct, Plan mode).
+
+**Type** is exactly ONE of: Security & hardening; Data integrity & traceability; Quality & compliance; Production workflow; Inventory & shipping; Samples & lab; Reporting & analytics; User experience; Equipment & maintenance; Process & tooling; Operations (non-ERP).
+
+**Touches** is one or more of: Production log; Feedstock inventory; Pre-processing; Inventory items; CIP / SIP log; Samples; Product release; Finished goods / shipping; Documents / SOPs; Admin / users; Settings / Calculations; Reports / QC charts; Records archive / backups; Database / schema; Change-log tooling; Labels / printing; New module; Whole app; Outside KelpWorks (separated by semicolons). A new item without both, or with a value that is not on these lists, is rejected with the lists in the reason. The text for the Claude chat intake skill is in `docs/backlog/intake-skill-update.md`.
 
 ## Revision of an item
 
@@ -45,8 +49,8 @@ The sheet name must be `KW-<number> <words> Plan`. `was` is the text the cell ho
 
 ## What can be set, and what happens to a note
 
-- On an item, only the intake columns: Module, Section, Type, Change Request, Context / Rationale, Transcript Time, Raised By, Priority, Lens, Claude Code Mode, Claude Code Prompt, Acceptance Criteria. Everything else (Status, Notes, Owner, Approved to Start, PR #, dates, QM-001 Ref, ID) is refused.
+- On an item, only the intake columns: Module, Section, Type, Change Request, Context / Rationale, Transcript Time, Raised By, Priority, Lens, Claude Code Mode, Acceptance Criteria. Touches is one of them (Type and Touches are the classification). Everything else (Status, Notes, Owner, Approved to Start, PR #, dates, QM-001 Ref, ID) is refused.
 - Values must be text, without control characters, up to 30,000 characters.
 - Applied notes move to `Inbox\processed`, rejected ones to `Inbox\rejected`; each gets `<note_id>.result.json` with `result` (applied / rejected / unchanged), `id` and `reason`. Read it to know what happened.
-- Rejected for: invalid JSON; missing or reused `note_id` (note_ids are unique forever); unknown `kind`; a column that is not an intake column; missing required fields; a Priority / Claude Code Mode not used before; a Change Request equal to an existing item's;
+- Rejected for: invalid JSON; missing or reused `note_id` (note_ids are unique forever); unknown `kind`; a column that is not an intake column; missing required fields (including Type and Touches on a new item); a Type or Touches value that is not on the lists; a Priority / Claude Code Mode not used before; a Change Request equal to an existing item's;
   a stale revision; an unknown item.
