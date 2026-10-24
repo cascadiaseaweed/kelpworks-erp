@@ -290,6 +290,7 @@ $('#logout').addEventListener('click', logout);
 $('#changePw').addEventListener('click', () => changePasswordModal(false));
 $('#tabs').addEventListener('click', e => { const b = e.target.closest('button'); if (b) selectTab(b.dataset.tab); });
 function selectTab(tab) {
+  closeSidePanel();
   State.tab = tab;
   $('#tabs').querySelectorAll('button[data-tab]').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   render();
@@ -321,7 +322,7 @@ function render() {
   if (docTab) docTab.textContent = 'Documents' + (State.user && State.user.role === 'admin' && State.ref && State.ref.libraryPending ? ' (' + State.ref.libraryPending + ')' : '');
   v.classList.toggle('wrap-wide', State.tab === 'stabilized');   // scopes the Feedstock Inventory table styling (page width stays the standard .wrap, like Inventory Items)
   ({ dashboard: pageDashboard, stabilized: pageStabilized, preproc: pagePreproc, samples: pageSamples, production: pageProduction, cip: pageCIP,
-     qc: pageQC, fg: pageFG, shipping: pageShipping, consumables: pageConsumables, reports: pageReports,
+     qc: pageQC, fg: pageFG, shipping: pageShipping, consumables: pageConsumables, suppliers: pageSuppliers, reports: pageReports,
      yieldusage: pageYield, release: pageRelease, calculations: pageCalculations, admin: pageAdmin, documents: pageDocuments }[State.tab])(v);
 }
 
@@ -5842,6 +5843,163 @@ function adjustStock(c) {
     render();
   }, 'Save');
 }
+/* ---------------- Suppliers (KW-81) ---------------- */
+// A supplier's record: details, approval status with its review date, documents with expiry dates, history. It opens on the Suppliers page and from the Receive window, beside the
+// window you are working in (a side panel), so the delivery being entered is never lost. Only an administrator or Production Manager changes anything (as for the approved lists,
+// KW-23); everyone can read. A delivery or lot keeps the supplier name it was recorded with.
+const SUPPLIER_TYPES = ['Manufacturer', 'Distributor', 'Carrier', 'Lab', 'Service'];
+const SUPPLIER_STATUSES = ['Approved', 'Conditional', 'Not approved', 'Inactive'];
+const SUPPLIER_DOC_KINDS = ['Certificate', 'Organic certificate', 'SDS', 'Insurance', 'Other'];
+const SUPPLIER_FLAG_INFO = { docs_expired: ['low', 'Document expired'], docs_expiring: ['hold', 'Document expiring'], review_overdue: ['low', 'Review overdue'], no_review_date: ['hold', 'No review date'] };
+const supplierStatusBadge = st => badge(st === 'Approved' ? 'on_hand' : st === 'Conditional' ? 'hold' : st === 'Not approved' ? 'low' : 'consumed', st);
+const supplierFlagBadges = flags => el('span', {}, ...(flags || []).map(f => el('span', {}, badge(SUPPLIER_FLAG_INFO[f][0], SUPPLIER_FLAG_INFO[f][1]), ' ')));
+const supplierDocBadge = d => d.status === 'expired' ? badge('low', 'Expired') : d.status === 'expiring' ? badge('hold', 'Expiring soon') : null;
+const supplierDocUrl = (sid, did) => '/api/suppliers/' + sid + '/attachments/' + did + '/download?token=' + encodeURIComponent(dlToken());
+function closeSidePanel() { const r = $('#sidePanelRoot'); if (r) r.innerHTML = ''; }
+function addMonthsISO(iso, months) {                                // the same month arithmetic as the server: a month-end never overflows
+  const [y, m, d] = iso.split('-').map(Number);
+  const t = (m - 1) + Math.round(months), yy = y + Math.floor(t / 12), mm = ((t % 12) + 12) % 12;
+  const last = new Date(Date.UTC(yy, mm + 1, 0)).getUTCDate();
+  return new Date(Date.UTC(yy, mm, Math.min(d, last))).toISOString().slice(0, 10);
+}
+// ref = a supplier id, a supplier's name, or null (a new supplier). opts = { name, onSaved(supplier), onChange() }.
+async function openSupplierPanel(ref, opts = {}) {
+  const root = $('#sidePanelRoot');
+  if (!root) return;
+  const may = canMaintainSuppliers();
+  let s = null;
+  if (typeof ref === 'number') s = await api('GET', '/suppliers/' + ref);
+  else if (ref) {
+    s = (await api('GET', '/suppliers/by-name?name=' + encodeURIComponent(ref))).supplier;
+    if (!s) { toast('There is no supplier record called ' + ref + ' yet.', true); return; }
+  }
+  const changed = () => { if (opts.onChange) opts.onChange(); };
+  async function reload() { s = await api('GET', '/suppliers/' + s.id); changed(); draw(); }
+  function draw() {
+    root.innerHTML = '';
+    const err = el('div', { class: 'error' });
+    const val = k => s ? (s[k] == null ? '' : s[k]) : (k === 'approvalStatus' ? 'Conditional' : k === 'currency' ? 'CAD' : k === 'name' ? (opts.name || '') : '');
+    const lock = x => { if (!may) x.disabled = true; return x; };
+    const inp = (k, attrs) => lock(el('input', Object.assign({ value: val(k) }, attrs || {})));
+    const area = k => lock(el('textarea', { rows: '2' }, val(k)));
+    const pick = (k, list, blank) => { const x = selectFrom('', [...(blank ? [['', '—']] : []), ...list.map(v => [v, v])]); x.value = val(k); return lock(x); };
+    const F = { name: inp('name'), type: pick('type', SUPPLIER_TYPES, true), accountNumber: inp('accountNumber'), contactName: inp('contactName'), contactPhone: inp('contactPhone'),
+      contactEmail: inp('contactEmail', { type: 'email' }), address: area('address'), website: inp('website'), paymentTerms: inp('paymentTerms'), currency: inp('currency'),
+      taxNumber: inp('taxNumber'), approvalStatus: pick('approvalStatus', SUPPLIER_STATUSES), approvalDate: inp('approvalDate', { type: 'date' }),
+      nextReviewDate: inp('nextReviewDate', { type: 'date' }), notes: area('notes') };
+    const reason = lock(el('input', { placeholder: 'why the approval status is changing' }));
+    const reasonField = field('Reason for the status change', reason);
+    const syncReason = () => { reasonField.style.display = s && F.approvalStatus.value !== s.approvalStatus ? '' : 'none'; };
+    F.approvalStatus.addEventListener('change', syncReason); syncReason();
+    F.approvalDate.addEventListener('change', () => {              // the next review is suggested from the approval date (a person can change it)
+      if (F.approvalDate.value && !F.nextReviewDate.value) F.nextReviewDate.value = addMonthsISO(F.approvalDate.value, settingValue('supplier_review_interval_months', 12));
+    });
+    const save = el('button', { type: 'button', onclick: async () => {
+      err.textContent = '';
+      try {
+        const payload = {};
+        for (const k in F) payload[k] = F[k].value;
+        if (s) { payload.reason = reason.value; s = await api('PUT', '/suppliers/' + s.id, payload); }
+        else s = await api('POST', '/suppliers', payload);
+        toast('Supplier saved');
+        if (opts.onSaved) opts.onSaved(s);
+        changed(); draw();
+      } catch (e) { err.textContent = e.message; }
+    } }, s ? 'Save changes' : 'Add supplier');
+    const panel = el('div', { class: 'side-panel' },
+      el('button', { type: 'button', class: 'side-close', 'aria-label': 'Close', title: 'Close', onclick: closeSidePanel }, '×'),
+      el('h3', {}, s ? s.name : 'New supplier'),
+      s ? el('div', { class: 'side-badges' }, supplierStatusBadge(s.approvalStatus), ' ', supplierFlagBadges(s.flags)) : null,
+      el('div', { class: 'form-row' }, field('Name *', F.name), field('Supplier type *', F.type)),
+      el('div', { class: 'form-row' }, field('Our account / customer number', F.accountNumber), field('GST/HST number', F.taxNumber)),
+      el('div', { class: 'form-row' }, field('Main contact', F.contactName), field('Phone', F.contactPhone)),
+      el('div', { class: 'form-row' }, field('Email', F.contactEmail), field('Website', F.website)),
+      field('Remit-to / address', F.address),
+      el('div', { class: 'form-row' }, field('Payment terms', F.paymentTerms), field('Currency', F.currency)),
+      el('h4', {}, 'Approval'),
+      el('div', { class: 'form-row' }, field('Approval status', F.approvalStatus), field('Approval date', F.approvalDate)),
+      el('div', { class: 'form-row' }, field('Next review date', F.nextReviewDate), reasonField),
+      field('Notes', F.notes),
+      err,
+      may ? el('div', { class: 'side-actions' }, save) : el('div', { class: 'help' }, 'A Production Manager or administrator maintains supplier records.'));
+    if (s) {
+      panel.append(el('h4', {}, 'Items they supply'),
+        s.items.length ? el('div', {}, ...s.items.map(i => el('div', {}, (i.itemNumber ? i.itemNumber + '  ' : '') + i.name)))
+          : el('div', { class: 'help' }, 'Not on any item’s approved-supplier list yet (Inventory Items > Edit, or “+ Add a supplier…” while receiving).'));
+      panel.append(el('h4', {}, 'Documents'),
+        table(['Type', 'File', 'Expires', 'Note', ''], s.documents.map(d => [d.kind, el('a', { href: supplierDocUrl(s.id, d.id), target: '_blank', rel: 'noopener' }, d.filename),
+          el('span', {}, d.expiryDate || '—', ' ', supplierDocBadge(d)), d.note || '',
+          may ? rowActions([['Expiry', () => editDocExpiry(d)], ['Remove', () => removeDoc(d)]]) : null])));
+      if (may) {
+        const kind = selectFrom('', SUPPLIER_DOC_KINDS.map(k => [k, k])), exp = el('input', { type: 'date' }), file = el('input', { type: 'file' }), note = el('input', { placeholder: 'note (optional)' });
+        panel.append(el('div', { class: 'form-row' }, field('Add a document', kind), field('Expires', exp)),
+          el('div', { class: 'form-row' }, field('File', file), field('Note', note)),
+          el('div', { class: 'side-actions' }, el('button', { type: 'button', class: 'secondary', onclick: async () => {
+            err.textContent = '';
+            if (!file.files[0]) { err.textContent = 'Choose a file first.'; return; }
+            try {
+              const f = await prepareUpload(file.files[0]);
+              await api('POST', '/suppliers/' + s.id + '/documents', { filename: f.name, contentType: f.type || 'application/octet-stream', dataB64: await fileB64(f), kind: kind.value, expiryDate: exp.value || null, note: note.value });
+              toast('Document added'); await reload();
+            } catch (e) { err.textContent = e.message; }
+          } }, 'Add document')));
+      }
+      panel.append(el('details', {}, el('summary', {}, 'History (' + s.history.length + ')'),
+        table(['When', 'What', 'From', 'To', 'Reason', 'By'], s.history.map(h => [fmtWhen(h.at), h.field, h.old || '—', h.new || '—', h.reason || '', h.by || '']))));
+    }
+    root.append(panel);
+  }
+  function editDocExpiry(d) {
+    const exp = el('input', { type: 'date', value: d.expiryDate || '' }), note = el('input', { value: d.note || '' });
+    modal('Document: ' + d.filename, el('div', {}, field('Expiry date', exp), field('Note', note)), async () => {
+      await api('PUT', '/suppliers/' + s.id + '/documents/' + d.id, { expiryDate: exp.value || null, note: note.value }); await reload();
+    }, 'Save', { above: true });
+  }
+  function removeDoc(d) {
+    const why = el('input', { placeholder: 'for example: replaced by the 2026 certificate' });
+    modal('Remove ' + d.filename, el('div', {}, el('div', { class: 'help' }, 'The document disappears from the record; the file and this entry stay in the history.'), field('Reason *', why)), async () => {
+      if (!why.value.trim()) throw new Error('Give the reason for removing this document.');
+      await api('DELETE', '/suppliers/' + s.id + '/documents/' + d.id, { reason: why.value }); await reload();
+    }, 'Remove', { above: true });
+  }
+  draw();
+}
+async function pageSuppliers(v) {
+  const f = State.supplierFilters = State.supplierFilters || { q: '', type: '', status: '', flag: '' };
+  const may = canMaintainSuppliers();
+  v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Suppliers'),
+    el('div', { class: 'actions' }, may ? el('button', { onclick: () => openSupplierPanel(null, { onChange: load }).catch(e => toast(e.message, true)) }, '+ Add supplier') : null)));
+  const q = el('input', { placeholder: 'Search name, contact, account number', value: f.q });
+  const typeSel = selectFrom('', [['', 'All types'], ...SUPPLIER_TYPES.map(t => [t, t])]);
+  const statusSel = selectFrom('', [['', 'All statuses'], ...SUPPLIER_STATUSES.map(t => [t, t])]);
+  const flagSel = selectFrom('', [['', 'All suppliers'], ['any', 'Needs attention'], ['docs_expired', 'Documents expired'], ['docs_expiring', 'Documents expiring'], ['review_overdue', 'Review overdue'], ['no_review_date', 'No review date']]);
+  typeSel.value = f.type; statusSel.value = f.status; flagSel.value = f.flag;
+  v.append(el('div', { class: 'toolbar' }, q, typeSel, statusSel, flagSel));
+  const host = el('div', {}), dup = el('div', {});
+  v.append(host, dup);
+  let list = [], timer = null, seq = 0;
+  async function load() {
+    const mine = ++seq;                                            // quick filter changes: only the latest answer is drawn
+    f.q = q.value; f.type = typeSel.value; f.status = statusSel.value; f.flag = flagSel.value;
+    const r = await api('GET', '/suppliers?q=' + encodeURIComponent(f.q) + '&type=' + encodeURIComponent(f.type) + '&status=' + encodeURIComponent(f.status) + '&flag=' + encodeURIComponent(f.flag));
+    if (mine !== seq) return;
+    list = r.suppliers;
+    host.innerHTML = '';
+    host.append(table(['Supplier', 'Type', 'Status', 'Next review', 'Documents', 'Items', 'Contact'],
+      list.map(s => [s.name, s.type || '—', supplierStatusBadge(s.approvalStatus),
+        el('span', {}, s.nextReviewDate || '—', ' ', s.flags.includes('review_overdue') ? badge('low', 'Overdue') : (s.flags.includes('no_review_date') ? badge('hold', 'No date') : null)),
+        el('span', {}, String(s.nDocs), ' ', s.flags.includes('docs_expired') ? badge('low', 'Expired') : (s.flags.includes('docs_expiring') ? badge('hold', 'Expiring') : null)),
+        String(s.nItems), s.contactName || s.contactEmail || '—']), ['', '', '', '', '', 'num', ''],
+      i => openSupplierPanel(list[i].id, { onChange: load }).catch(e => toast(e.message, true))));
+    dup.innerHTML = '';
+    if (r.nearMatches.length) dup.append(el('div', { style: 'margin-top:16px' }, el('h4', { style: 'margin:0 0 4px' }, 'Possible duplicates'),
+      el('div', { class: 'help' }, 'These names look alike but were not merged (only exact matches were). Open each supplier and set the one you no longer use to Inactive.'),
+      el('ul', {}, ...r.nearMatches.map(p => el('li', {}, p.a + '  ≈  ' + p.b)))));
+  }
+  [typeSel, statusSel, flagSel].forEach(x => x.addEventListener('change', load));
+  q.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(load, 250); });
+  await load();
+}
 // KW-23: a delivery's supplier is chosen from the item's approved suppliers (never typed). An administrator or Production Manager maintains the list (Inventory Items > Edit, or
 // "+ Add a supplier…" while receiving).
 const canMaintainSuppliers = () => !!(State.user && (State.user.role === 'admin' || State.user.isProductionManager));
@@ -5855,16 +6013,49 @@ function supplierSelect(names, current, allowNew) {
   return s;
 }
 const supplierNames = list => (list || []).map(s => s.name);
-// Wires a "+ Add a supplier…" choice: shows a name box, and `resolve()` returns the supplier to use (adding it to the item's list first when it is new).
+// Wires the supplier choice of the Receive window. "Supplier details" opens the chosen supplier's record beside the window (the delivery being entered is untouched); a warning shows when the
+// supplier is Not approved or Inactive or has an expired document (it never blocks a receipt). "+ Add a supplier…" opens the same form in the side panel; the supplier it saves is chosen here and
+// `resolve()` returns the supplier to use (adding it to the item's approved list first when it is new).
 function supplierPicker(c, current) {
   const may = canMaintainSuppliers();
   const sel = supplierSelect(supplierNames(c.suppliers), current, may);
-  const nameBox = el('input', { placeholder: 'new supplier’s name', style: 'display:none;margin-top:4px' });
-  sel.addEventListener('change', () => { nameBox.style.display = sel.value === '__new__' ? '' : 'none'; if (sel.value === '__new__') nameBox.focus(); });
+  const nameBox = el('input', { placeholder: 'new supplier’s name', style: 'display:none;margin-top:4px', readonly: 'readonly' });
+  const notice = el('div', { style: 'margin-top:4px' });
+  let previous = sel.value;
+  const chosen = () => sel.value === '__new__' ? nameBox.value : sel.value;
+  const detailsBtn = el('button', { type: 'button', class: 'secondary', style: 'margin-top:4px', disabled: 'disabled',
+    onclick: () => openSupplierPanel(chosen()).catch(e => toast(e.message, true)) }, 'Supplier details');
+  async function refresh() {
+    const name = chosen();
+    detailsBtn.disabled = !name;
+    notice.innerHTML = '';
+    if (!name) return;
+    try {
+      const rec = (await api('GET', '/suppliers/by-name?name=' + encodeURIComponent(name))).supplier;
+      if (name !== chosen()) return;                                // another supplier was chosen meanwhile
+      if (!rec) { notice.append(el('div', { class: 'help' }, 'No supplier record for this name yet.')); return; }
+      const msgs = [];
+      if (rec.approvalStatus === 'Not approved' || rec.approvalStatus === 'Inactive') msgs.push(['low', 'This supplier is ' + rec.approvalStatus.toLowerCase() + '.']);
+      else if (rec.approvalStatus === 'Conditional') msgs.push(['hold', 'This supplier is Conditional (not fully approved yet).']);
+      if (rec.flags.includes('docs_expired')) msgs.push(['low', 'A supplier document has expired.']);
+      else if (rec.flags.includes('docs_expiring')) msgs.push(['hold', 'A supplier document expires soon.']);
+      if (rec.flags.includes('review_overdue')) msgs.push(['hold', 'The supplier review is overdue.']);
+      msgs.forEach(([cls, t]) => notice.append(el('div', { style: 'margin-top:2px' }, badge(cls, t))));
+    } catch (e) { /* the notice is a courtesy: the receipt does not depend on it */ }
+  }
+  sel.addEventListener('change', () => {
+    if (sel.value === '__new__') {
+      sel.value = previous;                                         // not chosen until the form has saved the new supplier
+      openSupplierPanel(null, { onSaved: s => { sel.value = '__new__'; previous = '__new__'; nameBox.value = s.name; nameBox.style.display = ''; refresh(); } }).catch(e => toast(e.message, true));
+      return;
+    }
+    previous = sel.value; nameBox.style.display = 'none'; refresh();
+  });
   const note = !c.suppliers.length ? el('div', { class: 'help' }, may ? 'No approved suppliers yet: choose “+ Add a supplier…”.' : 'No approved suppliers yet for this item. Ask a Production Manager or administrator to add one (Inventory Items > Edit).')
     : (may ? null : el('div', { class: 'help' }, 'Missing a supplier? A Production Manager or administrator adds it (Inventory Items > Edit).'));
+  refresh();
   return {
-    node: el('div', {}, sel, nameBox, note),
+    node: el('div', {}, sel, nameBox, el('div', {}, detailsBtn), notice, note),
     async resolve() {
       if (sel.value !== '__new__') return sel.value;
       const wanted = nameBox.value.trim().replace(/\s+/g, ' ');
@@ -5951,6 +6142,7 @@ async function receiveStock(c) {
       catch (e) { toast('Received, but a document could not be attached (' + e.message + '). Attach it from the lot’s Documents button.', true); }
     }
     State.ref = await api('GET', '/refdata');
+    closeSidePanel();                                              // KW-81: a supplier's record opened beside this window goes with it
     toast(msg); render();
   }, 'Receive', { wide: true });
 }
@@ -6834,6 +7026,20 @@ const CALCULATIONS = [
     settings: ['sds_review_years', 'sds_review_warning_days'],
   },
   {
+    title: 'Supplier: next review date and review overdue',
+    formula: 'Next review (suggested) = approval date + review interval (months).   Review overdue: the next review date is before today and the supplier is Approved or Conditional.   No review date: Approved or Conditional with none.',
+    description: 'When a supplier is approved the next review date is filled in from the approval date and the interval below; a person can change it. Inactive and Not approved suppliers are never flagged for review.',
+    location: 'Suppliers → Next review',
+    settings: ['supplier_review_interval_months'],
+  },
+  {
+    title: 'Supplier document: expired or expiring',
+    formula: 'Expired: the document’s expiry date is before today.   Expiring soon: the expiry date is today or within the warning days.   A supplier is flagged when any of its documents is expired or expiring.',
+    description: 'Each supplier document (certificate, organic certificate, safety data sheet, insurance) can carry an expiry date. The flags show on the Suppliers list and as a warning in the Receive window; they never block a receipt.',
+    location: 'Suppliers → Documents',
+    settings: ['supplier_doc_warning_days'],
+  },
+  {
     title: 'Retention sample discard-by date',
     formula: 'Discard-by = Collection date + Retention shelf life (months)',
     description: 'Each Retention sample in the Samples tab’s Retention inventory is flagged as expiring within 30 days, or expired, against this date. Only Retention samples have one.',
@@ -7019,7 +7225,7 @@ const SETTING_GROUPS = [
   { title: 'Run summary card display', note: 'Which figures show on a finished run’s summary card (1 shows, 0 hides).', keys: [
     'run_card_show_volume_out', 'run_card_show_final_ph', 'run_card_show_final_tds', 'run_card_show_final_orp', 'run_card_show_extraction_eff', 'run_card_show_run_date', 'run_card_show_operators',
     'run_card_show_product', 'run_card_show_farms', 'run_card_show_ibcs', 'run_card_show_feedstock_weight', 'run_card_show_packaged', 'run_card_show_conv_process', 'run_card_show_conv_harvest'] },
-  { title: 'Documents (SOPs & safety data sheets)', note: 'Review intervals and the SharePoint folder check.', keys: ['sds_review_years', 'sds_review_warning_days', 'library_scan_stale_days'] },
+  { title: 'Documents (SOPs, safety data sheets & suppliers)', note: 'Review intervals, supplier review and document warnings, and the SharePoint folder check.', keys: ['sds_review_years', 'sds_review_warning_days', 'library_scan_stale_days', 'supplier_review_interval_months', 'supplier_doc_warning_days'] },
   { title: 'Users, sessions & uploads', note: 'Sign-out, presence and upload limits.', keys: ['idle_timeout_minutes', 'presence_timeout_seconds', 'upload_user_daily_mb'] },
   { title: 'Files, photos & archive', note: 'Moving photos to SharePoint.', keys: ['image_archive_days', 'image_purge_enabled'] },
   { title: 'Historical run entry', note: 'Entering past runs.', keys: ['historical_entry_enabled'] },
@@ -8641,7 +8847,7 @@ function modal(title, body, onSubmit, submitLabel = 'Save', opts = {}) {
     el('h3', {}, title), body, errBox, actions);
   // Backdrop clicks do NOT close the dialog — only Cancel or completing the
   // action does, so a stray click off the popup can't discard your input.
-  const bg = el('div', { class: 'modal-bg' }, card);
+  const bg = el('div', { class: 'modal-bg', ...(opts.above ? { style: 'z-index:70' } : {}) }, card);          // opts.above: a dialog opened from the KW-81 side panel stays in front of it
   function close() { bg.remove(); }
   async function runExtra() {
     errBox.textContent = ''; submitBtn.disabled = true; extraBtn.disabled = true;

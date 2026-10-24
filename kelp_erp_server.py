@@ -61,6 +61,7 @@ import shutil
 import threading
 import datetime
 import statistics
+import difflib
 from xml.sax.saxutils import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
@@ -248,6 +249,10 @@ SETTINGS_DEFAULTS = [
      "A safety data sheet is due for review this many years after its issue date (shown on the Documents page)."),
     ("sds_review_warning_days", 60, "Safety data sheet review warning (days)",
      "A safety data sheet is flagged \"review soon\" when its review date is this many days away or less."),
+    ("supplier_review_interval_months", 12, "Supplier review interval (months)",
+     "A supplier's next review date is suggested as its approval date plus this many months (shown on the Suppliers page)."),
+    ("supplier_doc_warning_days", 30, "Supplier document expiry warning (days)",
+     "A supplier document is flagged \"expiring soon\" when its expiry date is this many days away or less (and \"expired\" once past)."),
     ("library_scan_stale_days", 3, "SharePoint folder check: warn after (days)",
      "The Documents page warns administrators when the SOP / safety data sheet folders have not been reported by the sync for longer than this."),
     ("historical_entry_enabled", 0, "Historical run entry: administrators may enter past runs (1 = on)",
@@ -1748,6 +1753,59 @@ CREATE TABLE IF NOT EXISTS consumable_supplier_log (
     created_at    TEXT NOT NULL
 );
 
+-- Suppliers (KW-81): one record per supplier -- details, approval status with its review date, documents with expiry dates. A delivery or lot keeps the supplier NAME it was recorded with (text);
+-- the approved-supplier lists of items (consumable_suppliers) point at the record. Never deleted: a supplier that stops being used is set Inactive.
+CREATE TABLE IF NOT EXISTS suppliers (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    name             TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    supplier_type    TEXT,                  -- Manufacturer | Distributor | Carrier | Lab | Service (blank on a record made from a bare name)
+    account_number   TEXT,                  -- our account / customer number with them
+    contact_name     TEXT,
+    contact_phone    TEXT,
+    contact_email    TEXT,
+    address          TEXT,                  -- remit-to / address
+    website          TEXT,
+    payment_terms    TEXT,
+    currency         TEXT,
+    tax_number       TEXT,                  -- GST / HST number
+    approval_status  TEXT NOT NULL DEFAULT 'Conditional',   -- Approved | Conditional | Not approved | Inactive
+    approval_date    TEXT,
+    next_review_date TEXT,
+    notes            TEXT,
+    created_by       TEXT,
+    created_at       TEXT NOT NULL,
+    updated_by       TEXT,
+    updated_at       TEXT
+);
+-- A supplier's documents (certificates, organic certificate, SDS, insurance ...) with an expiry date. Never deleted: "removed" hides it, with who, when and why; the file stays on disk.
+CREATE TABLE IF NOT EXISTS supplier_documents (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    supplier_id    INTEGER NOT NULL REFERENCES suppliers(id),
+    kind           TEXT NOT NULL DEFAULT 'Other',
+    filename       TEXT NOT NULL,
+    content_type   TEXT,
+    size           INTEGER,
+    stored_name    TEXT NOT NULL,
+    expiry_date    TEXT,
+    note           TEXT,
+    uploaded_by    TEXT,
+    uploaded_at    TEXT NOT NULL,
+    removed_at     TEXT,
+    removed_by     TEXT,
+    removed_reason TEXT
+);
+-- Append-only: every change to a supplier record or its documents (who, when, old -> new, and why where a reason is required).
+CREATE TABLE IF NOT EXISTS supplier_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    supplier_id INTEGER NOT NULL REFERENCES suppliers(id),
+    field       TEXT NOT NULL,
+    old_value   TEXT,
+    new_value   TEXT,
+    reason      TEXT,
+    user_name   TEXT,
+    created_at  TEXT NOT NULL
+);
+
 -- A delivery: the supplier's invoice, PO and order numbers, the carrier and delivery document, and the documents (invoice, bill of lading, certificate of analysis, freight invoice).
 -- Every lot received from it points here (consumable_lots.receipt_id); lots received with the same supplier + invoice number share one delivery.
 CREATE TABLE IF NOT EXISTS inventory_receipts (
@@ -2238,6 +2296,7 @@ def init_db():
             ensure_sgs_analyses(conn)
             ensure_reagent_types(conn)
             ensure_site_list(conn)
+            ensure_suppliers(conn)
             ensure_grade_rules(conn)
             soft_step(conn, "feedstock grades", lambda: sync_tote_grades(conn, None, "Start-up check", quiet=True))
             soft_step(conn, "foreign-key indexes", lambda: ensure_indexes(conn))
@@ -4517,6 +4576,8 @@ def _merge_consumable(conn, from_name, into_name):
 
 def migrate(conn):
     """Idempotent schema migrations for databases created before a column existed."""
+    if "supplier_id" not in {r["name"] for r in conn.execute("PRAGMA table_info(consumable_suppliers)")}:
+        conn.execute("ALTER TABLE consumable_suppliers ADD COLUMN supplier_id INTEGER REFERENCES suppliers(id)")        # KW-81: the item's approved-supplier link points at the supplier record
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(tote_lots)")}
     if "ph_updated" not in cols:
         conn.execute("ALTER TABLE tote_lots ADD COLUMN ph_updated TEXT")
@@ -5240,6 +5301,105 @@ def load_grade_rules(conn):
 
 # The sites a tote can come from (code = the site part of its lot number). Everything else stays in the table, inactive, so the totes that already carry it still show its name.
 SITE_LIST = [("CDV", "Cordova"), ("COR", "Cormorant"), ("DIP", "Diplock Island"), ("JAM", "James Island"), ("KOD", "Kodiak"), ("SGR", "Seagrove")]
+
+
+# ---- Suppliers (KW-81) ---------------------------------------------------------------------------------------------------------------------------------------------------
+# One record per supplier (details, approval status with its review date, documents with expiry dates). A delivery or lot keeps the supplier NAME it was recorded with (text); the approved-supplier
+# lists of items (consumable_suppliers, KW-23) point at the record through supplier_id. Records are never deleted: a supplier that stops being used is set Inactive.
+SUPPLIER_TYPES = ("Manufacturer", "Distributor", "Carrier", "Lab", "Service")
+SUPPLIER_STATUSES = ("Approved", "Conditional", "Not approved", "Inactive")
+SUPPLIER_DOC_KINDS = ("Certificate", "Organic certificate", "SDS", "Insurance", "Other")
+SUPPLIER_FIELDS = [        # (request key, column, label, longest)
+    ("name", "name", "name", 80), ("type", "supplier_type", "supplier type", 40), ("accountNumber", "account_number", "account number", 80),
+    ("contactName", "contact_name", "contact name", 120), ("contactPhone", "contact_phone", "contact phone", 60), ("contactEmail", "contact_email", "contact email", 160),
+    ("address", "address", "address", 500), ("website", "website", "website", 200), ("paymentTerms", "payment_terms", "payment terms", 120), ("currency", "currency", "currency", 20),
+    ("taxNumber", "tax_number", "GST/HST number", 40), ("approvalStatus", "approval_status", "approval status", 30), ("approvalDate", "approval_date", "approval date", 10),
+    ("nextReviewDate", "next_review_date", "next review date", 10), ("notes", "notes", "notes", 2000)]
+
+
+def clean_supplier_name(raw):
+    return re.sub(r"\s+", " ", "" if raw is None else str(raw)).strip()[:80]
+
+
+def supplier_name_key(name):
+    """Two names are the SAME supplier when they match ignoring case and spacing (nothing looser)."""
+    return clean_supplier_name(name).lower()
+
+
+def add_months(iso, months):
+    d = datetime.date.fromisoformat(iso)
+    m = d.month - 1 + int(round(float(months)))
+    y, m = d.year + m // 12, m % 12 + 1
+    last = (31, 29 if y % 4 == 0 and (y % 100 != 0 or y % 400 == 0) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)[m - 1]
+    return datetime.date(y, m, min(d.day, last)).isoformat()
+
+
+def supplier_flags(status, next_review, expiries, today, warn_days):
+    """What needs attention on a supplier: docs_expired / docs_expiring (an active document), review_overdue / no_review_date (only while Approved or Conditional).
+    expiries = the expiry dates (or None) of its active documents; dates are YYYY-MM-DD, so they compare as text."""
+    flags = []
+    soon = (datetime.date.fromisoformat(today) + datetime.timedelta(days=int(round(float(warn_days))))).isoformat()
+    if any(e and e < today for e in expiries):
+        flags.append("docs_expired")
+    if any(e and today <= e <= soon for e in expiries):
+        flags.append("docs_expiring")
+    if status in ("Approved", "Conditional"):
+        if next_review and next_review < today:
+            flags.append("review_overdue")
+        if not next_review:
+            flags.append("no_review_date")
+    return flags
+
+
+def supplier_near_matches(names):
+    """Pairs of supplier names that probably are the same supplier but do not match exactly (punctuation, 'Inc', a missing word): listed for a person to decide, never merged."""
+    keys = [(n, re.sub(r"[^a-z0-9]", "", n.lower())) for n in names]
+    out = []
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            (a, ka), (b, kb) = keys[i], keys[j]
+            if not ka or not kb:
+                continue
+            if ka == kb or difflib.SequenceMatcher(None, ka, kb).ratio() >= 0.85 or (min(len(ka), len(kb)) >= 5 and (ka in kb or kb in ka)):
+                out.append((a, b))
+    return out
+
+
+def supplier_record(conn, name, status="Conditional", by="System"):
+    """The supplier record of this name (case-insensitive), made when there is none. -> (row, created)"""
+    row = conn.execute("SELECT * FROM suppliers WHERE name=? COLLATE NOCASE", (name,)).fetchone()
+    if row:
+        return row, False
+    cur = conn.execute("INSERT INTO suppliers (name,approval_status,created_by,created_at) VALUES (?,?,?,?)", (name, status, by, now_iso()))
+    conn.execute("INSERT INTO supplier_log (supplier_id,field,old_value,new_value,reason,user_name,created_at) VALUES (?,?,?,?,?,?,?)",
+                 (cur.lastrowid, "record", None, "created (%s)" % status, None, by, now_iso()))
+    return conn.execute("SELECT * FROM suppliers WHERE id=?", (cur.lastrowid,)).fetchone(), True
+
+
+def link_supplier_records(conn, status):
+    """Point every approved-supplier link that has no supplier record yet at one (made from the name when needed; exact matches share one). -> the names of the records made."""
+    made = []
+    for r in conn.execute("SELECT id, name FROM consumable_suppliers WHERE supplier_id IS NULL ORDER BY id").fetchall():
+        rec, created = supplier_record(conn, clean_supplier_name(r["name"]), status, "System")
+        if created:
+            made.append(rec["name"])
+        conn.execute("UPDATE consumable_suppliers SET supplier_id=? WHERE id=?", (rec["id"], r["id"]))
+    return made
+
+
+def ensure_suppliers(conn):
+    """Once: one supplier record for every name on an item's approved-supplier list (exact matches merged; status Approved, because KW-23 already approved them for those items). Near-matches
+    are NOT merged: they are written to the configuration log for the administrator to decide (shown on the Suppliers page). Every start: a link made by older code gets its record (Conditional)."""
+    def apply():
+        made = link_supplier_records(conn, "Approved")
+        near = supplier_near_matches(sorted(made, key=str.lower))
+        for a, b in near:
+            conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('supplier','near_match','Possible duplicate suppliers',?,?,?,?)", (a, b, "System", now_iso()))
+        if made:
+            conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('supplier','suppliers','Supplier records made from the approved-supplier lists of items',?,?,?,?)",
+                         (None, "%d records (%s); %d possible duplicates listed" % (len(made), "; ".join(made), len(near)), "System", now_iso()))
+    run_once(conn, "suppliers_from_item_lists_kw81", apply)
+    soft_step(conn, "link approved-supplier lists to supplier records", lambda: link_supplier_records(conn, "Conditional"))
 
 
 def ensure_site_list(conn):
@@ -7101,6 +7261,8 @@ class Handler(BaseHTTPRequestHandler):
             kind, rid, aid = seg[1], int(seg[2]), int(seg[4])
             if kind == "receipts":
                 r = conn.execute("SELECT * FROM receipt_attachments WHERE id=? AND receipt_id=?", (aid, rid)).fetchone()
+            elif kind == "suppliers":                                  # KW-81: a document of a supplier (a removed one is not served; its file stays on disk)
+                r = conn.execute("SELECT * FROM supplier_documents WHERE id=? AND supplier_id=? AND removed_at IS NULL", (aid, rid)).fetchone()
             elif kind == "totes":
                 r = conn.execute("SELECT * FROM tote_attachments WHERE id=? AND tote_lot_id=?",
                                  (aid, rid)).fetchone()
@@ -7110,7 +7272,7 @@ class Handler(BaseHTTPRequestHandler):
             if not r:
                 return self._send_json({"error": "Attachment not found"}, 404)
             full = os.path.join(UPLOAD_DIR, r["stored_name"])
-            if not os.path.isfile(full) and kind != "receipts" and r["purged_at"]:
+            if not os.path.isfile(full) and kind not in ("receipts", "suppliers") and r["purged_at"]:
                 return self._send_archived(r)                          # KW-04: moved to the SharePoint records library; say where
             if not os.path.isfile(full):
                 return self._send_json({"error": "File missing on disk"}, 404)
@@ -7975,6 +8137,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.route_lots(method, seg, query, conn, user)
         if seg[:2] == ["api", "receipts"]:
             return self.route_receipts(method, seg, query, conn, user)
+        if seg[:2] == ["api", "suppliers"]:
+            return self.route_suppliers(method, seg, query, conn, user)
         if seg[:2] == ["api", "consumables"]:
             return self.route_consumables(method, seg, conn, user)
         if seg[:2] == ["api", "cip"]:
@@ -10648,11 +10812,210 @@ class Handler(BaseHTTPRequestHandler):
         name = re.sub(r"\s+", " ", ("" if raw is None else str(raw))).strip()[:80]
         if not name:
             raise ApiError(400, "Enter the supplier's name")
+        rec = conn.execute("SELECT * FROM suppliers WHERE name=? COLLATE NOCASE", (name,)).fetchone()
+        if rec:
+            name = rec["name"]                      # KW-81: an existing supplier record keeps its own spelling
         if conn.execute("SELECT 1 FROM consumable_suppliers WHERE consumable_id=? AND name=? COLLATE NOCASE", (cid, name)).fetchone():
             raise ApiError(409, "%s is already an approved supplier of this item" % name)
-        cur = conn.execute("INSERT INTO consumable_suppliers (consumable_id,name,created_by,created_at) VALUES (?,?,?,?)", (cid, name, user["name"], now_iso()))
+        if not rec:
+            rec, _made = supplier_record(conn, name, "Conditional", user["name"])      # a name typed on an item becomes a supplier record, to be reviewed
+        cur = conn.execute("INSERT INTO consumable_suppliers (consumable_id,name,created_by,created_at,supplier_id) VALUES (?,?,?,?,?)", (cid, name, user["name"], now_iso(), rec["id"]))
         conn.execute("INSERT INTO consumable_supplier_log (consumable_id,supplier,action,user_name,created_at) VALUES (?,?,?,?,?)", (cid, name, "added", user["name"], now_iso()))
         return {"id": cur.lastrowid, "name": name}
+
+    # ---- the Suppliers page (KW-81) ------------------------------------------#
+    def _supplier_log(self, conn, sid, field, old, new, reason, user):
+        conn.execute("INSERT INTO supplier_log (supplier_id,field,old_value,new_value,reason,user_name,created_at) VALUES (?,?,?,?,?,?,?)",
+                     (sid, field, old, new, reason or None, user["name"] if user else None, now_iso()))
+
+    def _supplier_today(self, conn):
+        return utcnow().date().isoformat(), float(get_setting_value(conn, "supplier_doc_warning_days", 30) or 30)
+
+    @staticmethod
+    def _supplier_doc_public(d, today, warn):
+        exp, status = d["expiry_date"], "none"
+        if exp:
+            soon = (datetime.date.fromisoformat(today) + datetime.timedelta(days=int(round(warn)))).isoformat()
+            status = "expired" if exp < today else ("expiring" if exp <= soon else "ok")
+        return {"id": d["id"], "kind": d["kind"], "filename": d["filename"], "size": d["size"], "expiryDate": exp, "note": d["note"], "status": status,
+                "uploadedBy": d["uploaded_by"], "uploadedAt": d["uploaded_at"]}
+
+    def _supplier_public(self, conn, r, detail=False):
+        today, warn = self._supplier_today(conn)
+        docs = conn.execute("SELECT * FROM supplier_documents WHERE supplier_id=? AND removed_at IS NULL ORDER BY id", (r["id"],)).fetchall()
+        out = {"id": r["id"], "name": r["name"], "type": r["supplier_type"] or "", "accountNumber": r["account_number"] or "", "contactName": r["contact_name"] or "",
+               "contactPhone": r["contact_phone"] or "", "contactEmail": r["contact_email"] or "", "address": r["address"] or "", "website": r["website"] or "",
+               "paymentTerms": r["payment_terms"] or "", "currency": r["currency"] or "", "taxNumber": r["tax_number"] or "", "approvalStatus": r["approval_status"],
+               "approvalDate": r["approval_date"] or "", "nextReviewDate": r["next_review_date"] or "", "notes": r["notes"] or "",
+               "createdBy": r["created_by"], "createdAt": r["created_at"], "updatedBy": r["updated_by"], "updatedAt": r["updated_at"],
+               "flags": supplier_flags(r["approval_status"], r["next_review_date"], [d["expiry_date"] for d in docs], today, warn), "nDocs": len(docs),
+               "nItems": conn.execute("SELECT COUNT(*) FROM consumable_suppliers WHERE supplier_id=?", (r["id"],)).fetchone()[0]}
+        if detail:
+            out["items"] = [{"id": c["id"], "itemNumber": c["item_number"], "name": c["name"]} for c in conn.execute(
+                "SELECT c.id, c.item_number, c.name FROM consumable_suppliers s JOIN consumables c ON c.id=s.consumable_id WHERE s.supplier_id=? ORDER BY c.name COLLATE NOCASE", (r["id"],))]
+            out["documents"] = [self._supplier_doc_public(d, today, warn) for d in docs]
+            out["history"] = [{"field": l["field"], "old": l["old_value"], "new": l["new_value"], "reason": l["reason"], "by": l["user_name"], "at": l["created_at"]}
+                              for l in conn.execute("SELECT * FROM supplier_log WHERE supplier_id=? ORDER BY id DESC LIMIT 200", (r["id"],))]
+        return out
+
+    def _supplier_clean(self, d, creating):
+        """The supplier fields present in a request body, cleaned and checked ({column: value or None}); a field that is left out is not touched."""
+        vals = {}
+        for key, col, label, longest in SUPPLIER_FIELDS:
+            if key not in d:
+                continue
+            v = ("" if d[key] is None else str(d[key])).strip()
+            if col == "name":
+                v = clean_supplier_name(v)
+                if not v:
+                    raise ApiError(400, "Enter the supplier's name")
+            elif col in ("approval_date", "next_review_date"):
+                v = self._iso_date(v, label) or ""
+            elif col == "supplier_type":
+                if v and v not in SUPPLIER_TYPES:
+                    raise ApiError(400, "The supplier type must be one of: %s" % ", ".join(SUPPLIER_TYPES))
+            elif col == "approval_status":
+                if v not in SUPPLIER_STATUSES:
+                    raise ApiError(400, "The approval status must be one of: %s" % ", ".join(SUPPLIER_STATUSES))
+            elif col == "contact_email":
+                if v and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", v):
+                    raise ApiError(400, "Enter a valid contact email address")
+                v = v[:longest]
+            else:
+                v = v[:longest]
+            vals[col] = v or None
+        if creating:
+            if "name" not in vals:
+                raise ApiError(400, "Enter the supplier's name")
+            if not vals.get("supplier_type"):
+                raise ApiError(400, "Choose the supplier type (%s)" % ", ".join(SUPPLIER_TYPES))
+            vals.setdefault("approval_status", "Conditional")
+        return vals
+
+    def _store_supplier_document(self, conn, sid, d, user):
+        """One document on a supplier (certificate, organic certificate, SDS, insurance ...): same file rules, storage room and daily quota as every other upload."""
+        filename = (d.get("filename") or "document").strip().replace("\\", "/").split("/")[-1] or "document"
+        data_b64 = d.get("dataB64") or ""
+        if data_b64.startswith("data:") and "," in data_b64:
+            data_b64 = data_b64.split(",", 1)[1]
+        try:
+            raw = base64.b64decode(data_b64)
+        except Exception:
+            raise ApiError(400, "Could not decode file data")
+        if not raw:
+            raise ApiError(400, "The file is empty")
+        if len(raw) > MAX_UPLOAD_BYTES:
+            raise ApiError(400, "File exceeds the %d MB limit" % (MAX_UPLOAD_BYTES // (1024 * 1024)))
+        check_upload_filename(filename)
+        expiry = self._iso_date(d.get("expiryDate"), "expiry date")
+        self._check_storage_room(conn, len(raw))
+        self._check_user_quota(conn, user["name"], len(raw))
+        kind = d.get("kind") if d.get("kind") in SUPPLIER_DOC_KINDS else "Other"
+        note = (d.get("note") or "").strip()[:300] or None
+        stored = self._write_upload(UPLOAD_DIR, raw, os.path.splitext(filename)[1][:12])
+        cur = conn.execute("INSERT INTO supplier_documents (supplier_id,kind,filename,content_type,size,stored_name,expiry_date,note,uploaded_by,uploaded_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                           (sid, kind, filename, served_type(filename)[0], len(raw), stored, expiry, note, user["name"], now_iso()))
+        self._supplier_log(conn, sid, "document added", None, "%s (%s%s)" % (filename, kind, ", expires " + expiry if expiry else ""), None, user)
+        return cur.lastrowid
+
+    def route_suppliers(self, method, seg, query, conn, user):
+        can = self._may_maintain_suppliers(user)
+
+        def need():
+            if not can:
+                raise ApiError(403, "Only an administrator or Production Manager can change suppliers")
+
+        def detail(row):
+            return dict(self._supplier_public(conn, conn.execute("SELECT * FROM suppliers WHERE id=?", (row["id"],)).fetchone(), True), canEdit=can)
+
+        if seg == ["api", "suppliers"] and method == "GET":
+            q, typ = (query.get("q", [""])[0] or "").strip().lower(), query.get("type", [""])[0]
+            status, flag = query.get("status", [""])[0], query.get("flag", [""])[0]
+            out = []
+            for r in conn.execute("SELECT * FROM suppliers ORDER BY name COLLATE NOCASE"):
+                if typ and (r["supplier_type"] or "") != typ:
+                    continue
+                if status and r["approval_status"] != status:
+                    continue
+                if q and not any(q in (r[c] or "").lower() for c in ("name", "contact_name", "account_number", "contact_email")):
+                    continue
+                p = self._supplier_public(conn, r)
+                if flag and not (p["flags"] if flag == "any" else flag in p["flags"]):
+                    continue
+                out.append(p)
+            near = [{"a": x["old_value"], "b": x["new_value"]} for x in conn.execute("SELECT old_value, new_value FROM config_log WHERE area='supplier' AND key='near_match' ORDER BY id")]
+            return {"suppliers": out, "nearMatches": near, "canEdit": can, "types": list(SUPPLIER_TYPES), "statuses": list(SUPPLIER_STATUSES), "docKinds": list(SUPPLIER_DOC_KINDS)}
+        if seg == ["api", "suppliers", "by-name"] and method == "GET":
+            name = clean_supplier_name(query.get("name", [""])[0])
+            row = conn.execute("SELECT * FROM suppliers WHERE name=? COLLATE NOCASE", (name,)).fetchone() if name else None
+            return {"supplier": detail(row) if row else None}
+        if seg == ["api", "suppliers"] and method == "POST":
+            need()
+            vals = self._supplier_clean(self._body_json(), True)
+            if conn.execute("SELECT 1 FROM suppliers WHERE name=? COLLATE NOCASE", (vals["name"],)).fetchone():
+                raise ApiError(409, "%s is already a supplier" % vals["name"])
+            if vals.get("approval_date") and not vals.get("next_review_date"):
+                vals["next_review_date"] = add_months(vals["approval_date"], get_setting_value(conn, "supplier_review_interval_months", 12) or 12)
+            cols = list(vals)
+            cur = conn.execute("INSERT INTO suppliers (%s,created_by,created_at) VALUES (%s)" % (",".join(cols), ",".join("?" * (len(cols) + 2))), [vals[c] for c in cols] + [user["name"], now_iso()])
+            self._supplier_log(conn, cur.lastrowid, "record", None, "created (%s)" % vals["approval_status"], None, user)
+            return detail({"id": cur.lastrowid})
+        if len(seg) >= 3 and seg[2].isdigit():
+            r = conn.execute("SELECT * FROM suppliers WHERE id=?", (int(seg[2]),)).fetchone()
+            if not r:
+                raise ApiError(404, "Supplier not found")
+            if len(seg) == 3 and method == "GET":
+                return detail(r)
+            if len(seg) == 3 and method == "PUT":
+                need()
+                d = self._body_json()
+                vals = self._supplier_clean(d, False)
+                reason = (d.get("reason") or "").strip()[:300]
+                changes = [(col, r[col], v) for col, v in vals.items() if (r[col] or None) != (v or None)]
+                if not changes:
+                    return detail(r)
+                if any(c == "approval_status" for c, _o, _n in changes) and not reason:
+                    raise ApiError(400, "Give the reason for changing the approval status")
+                new_name = vals.get("name")
+                if new_name and new_name.lower() != r["name"].lower() and conn.execute("SELECT 1 FROM suppliers WHERE name=? COLLATE NOCASE AND id<>?", (new_name, r["id"])).fetchone():
+                    raise ApiError(409, "%s is already a supplier" % new_name)
+                labels = {col: label for _k, col, label, _l in SUPPLIER_FIELDS}
+                for col, old, new in changes:
+                    conn.execute("UPDATE suppliers SET %s=? WHERE id=?" % col, (new, r["id"]))
+                    self._supplier_log(conn, r["id"], labels[col][0].upper() + labels[col][1:], old, new, reason if col == "approval_status" or reason else None, user)
+                conn.execute("UPDATE suppliers SET updated_by=?, updated_at=? WHERE id=?", (user["name"], now_iso(), r["id"]))
+                if any(c == "name" for c, _o, _n in changes):                 # the item lists follow the new spelling; deliveries and lots keep the name they were recorded with
+                    conn.execute("UPDATE consumable_suppliers SET name=? WHERE supplier_id=?", (new_name, r["id"]))
+                return detail(r)
+            if len(seg) == 4 and seg[3] == "documents" and method == "POST":
+                need()
+                self._store_supplier_document(conn, r["id"], self._body_json(), user)
+                return detail(r)
+            if len(seg) == 5 and seg[3] == "documents" and seg[4].isdigit() and method in ("PUT", "DELETE"):
+                need()
+                doc = conn.execute("SELECT * FROM supplier_documents WHERE id=? AND supplier_id=? AND removed_at IS NULL", (int(seg[4]), r["id"])).fetchone()
+                if not doc:
+                    raise ApiError(404, "Document not found")
+                d = self._body_json()
+                if method == "DELETE":
+                    reason = (d.get("reason") or "").strip()[:300]
+                    if not reason:
+                        raise ApiError(400, "Give the reason for removing this document")
+                    conn.execute("UPDATE supplier_documents SET removed_at=?, removed_by=?, removed_reason=? WHERE id=?", (now_iso(), user["name"], reason, doc["id"]))
+                    self._supplier_log(conn, r["id"], "document removed", doc["filename"], None, reason, user)
+                else:
+                    if "expiryDate" in d:
+                        new = self._iso_date(d.get("expiryDate"), "expiry date")
+                        if (doc["expiry_date"] or None) != new:
+                            conn.execute("UPDATE supplier_documents SET expiry_date=? WHERE id=?", (new, doc["id"]))
+                            self._supplier_log(conn, r["id"], "document expiry (%s)" % doc["filename"], doc["expiry_date"], new, None, user)
+                    if "note" in d:
+                        new = (d.get("note") or "").strip()[:300] or None
+                        if (doc["note"] or None) != new:
+                            conn.execute("UPDATE supplier_documents SET note=? WHERE id=?", (new, doc["id"]))
+                            self._supplier_log(conn, r["id"], "document note (%s)" % doc["filename"], doc["note"], new, None, user)
+                return detail(r)
+        raise ApiError(404, "Unknown supplier endpoint")
 
     def _receipt_clean(self, d):
         """The delivery fields present in a request body, cleaned ({column: value or None}); a field that is left out is not touched."""
@@ -13091,7 +13454,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _check_storage_room(self, conn, nbytes):
         """Refuse an upload that would fill the document store or the disk (every user can upload, and the disk is shared with the database)."""
-        used = sum(conn.execute("SELECT COALESCE(SUM(size),0) FROM %s%s" % (t, " WHERE purged_at IS NULL" if t in ("run_attachments", "tote_attachments") else "")).fetchone()[0] for t in ("run_attachments", "tote_attachments", "receipt_attachments", "sop_documents", "sds_documents", "document_revisions", "library_inbox"))
+        used = sum(conn.execute("SELECT COALESCE(SUM(size),0) FROM %s%s" % (t, " WHERE purged_at IS NULL" if t in ("run_attachments", "tote_attachments") else "")).fetchone()[0] for t in ("run_attachments", "tote_attachments", "receipt_attachments", "supplier_documents", "sop_documents", "sds_documents", "document_revisions", "library_inbox"))
         if used + nbytes > MAX_UPLOAD_TOTAL_BYTES:
             raise ApiError(507, "The document store is full (%d MB used of %d MB). Ask an administrator to remove old documents."
                            % (used // (1024 * 1024), MAX_UPLOAD_TOTAL_BYTES // (1024 * 1024)))
@@ -13109,7 +13472,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         since = (utcnow() - datetime.timedelta(hours=24)).replace(microsecond=0).isoformat() + "Z"
         used = sum(conn.execute("SELECT COALESCE(SUM(size),0) FROM %s WHERE uploaded_by=? AND uploaded_at>=?" % t, (uploaded_by, since)).fetchone()[0]
-                   for t in ("run_attachments", "tote_attachments", "receipt_attachments"))
+                   for t in ("run_attachments", "tote_attachments", "receipt_attachments", "supplier_documents"))
         if used + nbytes > limit_mb * 1024 * 1024:
             raise ApiError(429, "You have reached the upload limit for today (%d MB in 24 hours). Try again later, or ask an administrator to raise it." % limit_mb, "upload_quota")
 
