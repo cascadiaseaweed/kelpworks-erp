@@ -337,7 +337,7 @@ def test_a_new_item_note_adds_a_row_with_the_next_id_and_keeps_the_sheet_consist
     assert '<dimension ref="A1:X7"/>' in xml and '<autoFilter ref="A1:X7"/>' in xml                            # every range follows the new last row
     assert 'sqref="I2:I7"' in xml and 'sqref="A2:M7"' in xml and 'sqref="N2:N7"' in xml and "I2:I6" not in xml
     assert "'Change Log'!$A$1:$X$7" in snap.files["xl/workbook.xml"].decode() and 'fullCalcOnLoad="1"' in snap.files["xl/workbook.xml"].decode()
-    assert re.search(r'<c r="E7" s="\d+" t="inlineStr">', xml) and re.search(r'<c r="O7" s="\d+"/>', xml)         # the cell styles of the row above
+    assert re.search(r'<c r="E7" s="\d+" t="inlineStr">', xml) and re.search(r'<c r="O7" s="\d+" t="inlineStr"><is><t xml:space="preserve">N\. Wrana</t>', xml) and item["Owner"] == "N. Wrana"         # the cell styles of the row above
     assert re.search(r'<row r="7"[^>]* ht="[\d.]+" customHeight="1">', xml)
     assert snap.files["customXml/item1.xml"] == b"<keep/>"                                                     # the rest of the workbook is byte for byte
     assert not (env.inbox / "chat-20261022-001.json").exists()

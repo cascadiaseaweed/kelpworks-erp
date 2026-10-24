@@ -1,0 +1,20 @@
+{
+  "steps": [
+    ["1", "Check the item is approved and read it", "py tools/changelog_write.py --show KW-nn", "Approved to Start must be Y or Pre-rule, otherwise stop. Read the item's Change Request, Acceptance Criteria and any open decision (docs/backlog/items.csv and open-decisions.csv); ask if a decision is blank."],
+    ["2", "Start the item on its own branch", "/kw-item KW-nn", "Applies the inbox, reads the item, checks open pull requests, then makes updates/kw-nn-short-name from the latest origin/main. One item (or one bundle) per branch; never work on main."],
+    ["3", "Plan before editing", "Plan mode items: write the plan and wait for approval.\nDirect items: 3-5 bullets, then go.", "The approver approves the plan of a Plan-mode item. A risk flag (step 4) turns a Direct item into a Plan-mode one."],
+    ["4", "Check the risk flags", "CLAUDE.md golden rules and the flags in .claude/commands/kw-item.md", "Standard library only; additive, idempotent schema changes; keep the Calculations page in sync; stock only through _consume; tell the Quality Manager about release, CoA, specification, required-field, records or document-control changes (QM-001)."],
+    ["5", "Build with tests", "py -m pytest tests/<file>.py\nthen py -m pytest (the full suite)", "Add tests that fail without the change. The suite boots the real server on a temporary database; the full run takes about 15 minutes."],
+    ["6", "Check it in the browser", "Restart the server (run.bat), use the preview, read the console", "Never against live data. Look for console errors as well as the visible change."],
+    ["7", "Stop and report", "Summary: files changed, each acceptance criterion, tests run, decisions made, what needs the approver", "Nothing is committed, pushed or opened as a pull request until the approver says so."],
+    ["8", "Commit, push, pull request", "The approver says: commit, push and open a pull request", "The title starts with the KW number; the body is the acceptance-criteria checklist. Wait for the green 'test' check. The approver merges and Render deploys; Claude Code never merges."],
+    ["9", "After it is live", "py tools/changelog_write.py --id KW-nn Status=Released \"PR #=nn\" \"Released Date=YYYY-MM-DD\"", "Then a small pull request adds the live commit to tests/legacy_commits.txt and refreshes the CSV snapshot (py tools/export_backlog.py); delete merged branches. The approver fills Verified By and Verified Date after checking on live."],
+    ["10", "Between items", "/clear, or start a new session", "Stops one item's context leaking into the next. Project memory lives in CLAUDE.md and the memory folder."]
+  ],
+  "assumptions": [
+    "Stack: Python standard library only (http.server, sqlite3, hashlib), a vanilla-JavaScript single-page app in public/, SQLite on the Render persistent disk. No Flask, SQLAlchemy, Jinja, Flask-Migrate or pip packages; schema changes are additive and run at start-up (CLAUDE.md golden rules).",
+    "Items with a Transcript Time came from the meeting transcript: their priorities, recommendations and acceptance criteria were Claude's proposals until the approver set Approved to Start. Items marked 'Direct request' were raised by the requester in chat or in Claude Code.",
+    "The meeting transcript was auto-generated and some words were garbled (for example 'Cal Works' = KelpWorks). Ambiguous items were put on the Open Decisions sheet."
+  ],
+  "note": "2026-10-24: before any step that writes the change log, follow the 'Workflow Rules' sheet (ownership, approval, safe-write protocol). This sheet is written from docs/backlog/claude-code-playbook.json with py tools/changelog_write.py --playbook-sheet: edit the JSON, not the cells."
+}

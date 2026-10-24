@@ -18,8 +18,8 @@
       "columns": ["Owner", "Columns", "Rules"],
       "rows": [
         ["Intake - Claude (chat), only through inbox notes", "A-M: ID ... Acceptance Criteria; Open Decisions columns A-D; KW plan sheets", "Never writes the workbook. Leaves a note (new item, revision, new decision, plan cells); Claude Code applies it with --apply-inbox. New rows get the next free ID from the tool. A revision is accepted only while Status is Not started, Deferred or Blocked (never In progress or On staging; for a Released item raise a new item), must say what changed (appended to Context / Rationale as 'Revised <date> (Claude chat): <what changed>') and is rejected if the item changed since the note was written. If the scope changes while Approved to Start is Y, the human clears it so the item is approved again. Never edits Status, Notes, Claude Code columns or human columns."],
-        ["Claude Code (blue)", "N Status, P Notes, R PR #, S Released Date, V QM-001 Ref", "Through python tools/changelog_write.py only. Status: Not started -> In progress -> On staging -> Released, or Blocked. Never sets Deferred / Won't do. Never starts an item unless Approved to Start = Y (or Pre-rule). Released needs a PR # and a Released Date."],
-        ["Human (orange)", "O Owner, Q Approved to Start, T Verified By, U Verified Date; Open Decisions Decided By and Decision", "Approves work before it starts. Verifies on live after Released. Sets Deferred / Won't do (Claude Code records the reason in Notes). Answers decisions (Claude Code can record an answer given in chat: --decision)."],
+        ["Claude Code (blue)", "N Status, P Notes, R PR #, S Released Date, V QM-001 Ref; D Type and E Touches (classification)", "Through python tools/changelog_write.py only. Status: Not started -> In progress -> On staging -> Released, or Blocked. Never sets Deferred / Won't do. Never starts an item unless Approved to Start = Y (or Pre-rule). Released needs a PR # and a Released Date. Type (one value from a fixed list) and Touches (one or more areas) may be set on an item in any status, to fix a classification; a change to only those two is not stamped in Row Updated (section 6)."],
+        ["Human (orange)", "O Owner, Q Approved to Start, T Verified By, U Verified Date; Open Decisions Decided By and Decision", "Owner is N. Wrana by default: the tool fills it on every new item and filled the existing blanks once; change any cell in Excel. Approves work before it starts. Verifies on live after Released. Sets Deferred / Won't do (Claude Code records the reason in Notes). Answers decisions (Claude Code can record an answer given in chat: --decision)."],
         ["Every writer (grey)", "W Row Updated, X Updated By", "Stamped by the tool on every write."],
         ["KelpWorks ERP", "Read only", "Looks up columns by header name; must not write to this file."]
       ]
@@ -49,14 +49,22 @@
       "heading": "5. Inbox notes (Claude chat)",
       "columns": ["Note kind", "What it does", "Rejected when"],
       "rows": [
-        ["new_item", "Adds a row (Status Not started, Approved to Start blank).", "A required field is missing; Priority or Claude Code Mode is not a value already used; the Change Request is already on the sheet; the note_id was used before."],
+        ["new_item", "Adds a row (Status Not started, Approved to Start blank).", "A required field is missing (Type and Touches are required on every new item); Type or Touches is not from the lists in section 6; Priority or Claude Code Mode is not a value already used; the Change Request is already on the sheet; the note_id was used before."],
         ["revision", "Changes named intake columns (A-M) of an existing item and appends a 'Revised' line to Context / Rationale.", "The item is In progress, On staging, Released or Won't do; the item changed since based_on.Row Updated (stale); no revision_summary; a column that is not an intake column is named."],
         ["new_decision", "Adds a row to Open Decisions (ID, Decision Needed, Options Discussed, Recommendation).", "The ID is not an item; the same ID and question exist; Decided By or Decision is named (a human records those)."],
         ["plan_cells", "Sets named cells on a sheet called 'KW-<number> ... Plan' (cell, was, now).", "The sheet name is not a KW plan sheet; a cell's text is not 'was' now (stale); the row does not exist; more than 50 cells."]
       ]
     },
     {
-      "heading": "6. If something looks wrong",
+      "heading": "6. Classification (Type and Touches, columns D and E of Change Log)",
+      "columns": ["Column", "Values", "Rules"],
+      "rows": [
+        ["Type (drop-down)", "Security & hardening; Data integrity & traceability; Quality & compliance; Production workflow; Inventory & shipping; Samples & lab; Reporting & analytics; User experience; Equipment & maintenance; Process & tooling; Operations (non-ERP)", "Exactly one value per item. Required on every new item. Says what kind of change it is, to help decide what to build (it replaced the older free-text types). A person may change it in Excel; Claude Code and the inbox accept only these values."],
+        ["Touches", "Production log; Feedstock inventory; Pre-processing; Inventory items; CIP / SIP log; Samples; Product release; Finished goods / shipping; Documents / SOPs; Admin / users; Settings / Calculations; Reports / QC charts; Records archive / backups; Database / schema; Change-log tooling; Labels / printing; New module; Whole app; Outside KelpWorks", "One or more areas the change reaches, separated by semicolons (stored in this order). Required on every new item. 'Outside KelpWorks' is for work that does not change the software."]
+      ]
+    },
+    {
+      "heading": "7. If something looks wrong",
       "text": "Stop writing. Run 'python tools/changelog_write.py --backups', then '--restore <name>' (close Excel first; the current file is backed up before it is replaced), and tell the approver. If the SharePoint copy is older than the master, run '--publish'."
     }
   ]

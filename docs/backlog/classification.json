@@ -1,0 +1,555 @@
+[
+ {
+  "id": "KW-01",
+  "set": {
+   "Type": "Production workflow",
+   "Touches": "Production log"
+  }
+ },
+ {
+  "id": "KW-02",
+  "set": {
+   "Type": "User experience",
+   "Touches": "Production log"
+  }
+ },
+ {
+  "id": "KW-03",
+  "set": {
+   "Type": "User experience",
+   "Touches": "Production log"
+  }
+ },
+ {
+  "id": "KW-04",
+  "set": {
+   "Type": "Security & hardening",
+   "Touches": "Production log; Records archive / backups"
+  }
+ },
+ {
+  "id": "KW-05",
+  "set": {
+   "Type": "Production workflow",
+   "Touches": "Production log; Feedstock inventory"
+  }
+ },
+ {
+  "id": "KW-06",
+  "set": {
+   "Type": "Production workflow",
+   "Touches": "Production log"
+  }
+ },
+ {
+  "id": "KW-07",
+  "set": {
+   "Type": "User experience",
+   "Touches": "Production log; Admin / users"
+  }
+ },
+ {
+  "id": "KW-08",
+  "set": {
+   "Type": "Security & hardening",
+   "Touches": "Admin / users; Settings / Calculations"
+  }
+ },
+ {
+  "id": "KW-09",
+  "set": {
+   "Type": "User experience",
+   "Touches": "Whole app"
+  }
+ },
+ {
+  "id": "KW-10",
+  "set": {
+   "Type": "Production workflow",
+   "Touches": "Production log"
+  }
+ },
+ {
+  "id": "KW-11",
+  "set": {
+   "Type": "Production workflow",
+   "Touches": "Production log"
+  }
+ },
+ {
+  "id": "KW-12",
+  "set": {
+   "Type": "Quality & compliance",
+   "Touches": "Production log; Documents / SOPs"
+  }
+ },
+ {
+  "id": "KW-13",
+  "set": {
+   "Type": "Quality & compliance",
+   "Touches": "Production log; Samples"
+  }
+ },
+ {
+  "id": "KW-14",
+  "set": {
+   "Type": "User experience",
+   "Touches": "Production log; Samples"
+  }
+ },
+ {
+  "id": "KW-15",
+  "set": {
+   "Type": "Production workflow",
+   "Touches": "Production log"
+  }
+ },
+ {
+  "id": "KW-16",
+  "set": {
+   "Type": "Production workflow",
+   "Touches": "Production log; Settings / Calculations"
+  }
+ },
+ {
+  "id": "KW-17",
+  "set": {
+   "Type": "User experience",
+   "Touches": "Production log"
+  }
+ },
+ {
+  "id": "KW-18",
+  "set": {
+   "Type": "Quality & compliance",
+   "Touches": "Production log"
+  }
+ },
+ {
+  "id": "KW-19",
+  "set": {
+   "Type": "Production workflow",
+   "Touches": "Production log"
+  }
+ },
+ {
+  "id": "KW-20",
+  "set": {
+   "Type": "User experience",
+   "Touches": "Production log"
+  }
+ },
+ {
+  "id": "KW-21",
+  "set": {
+   "Type": "Production workflow",
+   "Touches": "Production log"
+  }
+ },
+ {
+  "id": "KW-22",
+  "set": {
+   "Type": "Production workflow",
+   "Touches": "Production log"
+  }
+ },
+ {
+  "id": "KW-23",
+  "set": {
+   "Type": "Quality & compliance",
+   "Touches": "Inventory items"
+  }
+ },
+ {
+  "id": "KW-24",
+  "set": {
+   "Type": "Inventory & shipping",
+   "Touches": "Production log; Pre-processing; Inventory items"
+  }
+ },
+ {
+  "id": "KW-25",
+  "set": {
+   "Type": "User experience",
+   "Touches": "Production log"
+  }
+ },
+ {
+  "id": "KW-26",
+  "set": {
+   "Type": "Reporting & analytics",
+   "Touches": "Production log; Settings / Calculations"
+  }
+ },
+ {
+  "id": "KW-27",
+  "set": {
+   "Type": "User experience",
+   "Touches": "Production log; Samples"
+  }
+ },
+ {
+  "id": "KW-28",
+  "set": {
+   "Type": "Quality & compliance",
+   "Touches": "Product release"
+  }
+ },
+ {
+  "id": "KW-29",
+  "set": {
+   "Type": "Quality & compliance",
+   "Touches": "Production log; Product release"
+  }
+ },
+ {
+  "id": "KW-30",
+  "set": {
+   "Type": "User experience",
+   "Touches": "Product release"
+  }
+ },
+ {
+  "id": "KW-31",
+  "set": {
+   "Type": "Data integrity & traceability",
+   "Touches": "Finished goods / shipping"
+  }
+ },
+ {
+  "id": "KW-32",
+  "set": {
+   "Type": "Production workflow",
+   "Touches": "Production log; Finished goods / shipping"
+  }
+ },
+ {
+  "id": "KW-33",
+  "set": {
+   "Type": "Samples & lab",
+   "Touches": "Samples; Settings / Calculations"
+  }
+ },
+ {
+  "id": "KW-34",
+  "set": {
+   "Type": "User experience",
+   "Touches": "Samples"
+  }
+ },
+ {
+  "id": "KW-35",
+  "set": {
+   "Type": "User experience",
+   "Touches": "Samples"
+  }
+ },
+ {
+  "id": "KW-36",
+  "set": {
+   "Type": "Samples & lab",
+   "Touches": "Samples"
+  }
+ },
+ {
+  "id": "KW-37",
+  "set": {
+   "Type": "Samples & lab",
+   "Touches": "Samples"
+  }
+ },
+ {
+  "id": "KW-38",
+  "set": {
+   "Type": "Samples & lab",
+   "Touches": "Samples"
+  }
+ },
+ {
+  "id": "KW-39",
+  "set": {
+   "Type": "Samples & lab",
+   "Touches": "Production log; Samples"
+  }
+ },
+ {
+  "id": "KW-40",
+  "set": {
+   "Type": "Equipment & maintenance",
+   "Touches": "CIP / SIP log"
+  }
+ },
+ {
+  "id": "KW-41",
+  "set": {
+   "Type": "Equipment & maintenance",
+   "Touches": "New module"
+  }
+ },
+ {
+  "id": "KW-42",
+  "set": {
+   "Type": "Equipment & maintenance",
+   "Touches": "Samples; New module"
+  }
+ },
+ {
+  "id": "KW-43",
+  "set": {
+   "Type": "User experience",
+   "Touches": "Whole app"
+  }
+ },
+ {
+  "id": "KW-44",
+  "set": {
+   "Type": "Operations (non-ERP)",
+   "Touches": "Outside KelpWorks"
+  }
+ },
+ {
+  "id": "KW-45",
+  "set": {
+   "Type": "Operations (non-ERP)",
+   "Touches": "Outside KelpWorks"
+  }
+ },
+ {
+  "id": "KW-46",
+  "set": {
+   "Type": "Inventory & shipping",
+   "Touches": "Production log; Inventory items"
+  }
+ },
+ {
+  "id": "KW-47",
+  "set": {
+   "Type": "Production workflow",
+   "Touches": "Feedstock inventory"
+  }
+ },
+ {
+  "id": "KW-48",
+  "set": {
+   "Type": "Production workflow",
+   "Touches": "Feedstock inventory; New module"
+  }
+ },
+ {
+  "id": "KW-49",
+  "set": {
+   "Type": "User experience",
+   "Touches": "Feedstock inventory; Labels / printing"
+  }
+ },
+ {
+  "id": "KW-50",
+  "set": {
+   "Type": "Production workflow",
+   "Touches": "Production log; Settings / Calculations"
+  }
+ },
+ {
+  "id": "KW-51",
+  "set": {
+   "Type": "Data integrity & traceability",
+   "Touches": "Production log; Feedstock inventory; Admin / users"
+  }
+ },
+ {
+  "id": "KW-52",
+  "set": {
+   "Type": "Production workflow",
+   "Touches": "Production log; Finished goods / shipping"
+  }
+ },
+ {
+  "id": "KW-53",
+  "set": {
+   "Type": "Inventory & shipping",
+   "Touches": "Inventory items; Reports / QC charts"
+  }
+ },
+ {
+  "id": "KW-54",
+  "set": {
+   "Type": "Inventory & shipping",
+   "Touches": "Inventory items"
+  }
+ },
+ {
+  "id": "KW-55",
+  "set": {
+   "Type": "Process & tooling",
+   "Touches": "Outside KelpWorks"
+  }
+ },
+ {
+  "id": "KW-56",
+  "set": {
+   "Type": "Operations (non-ERP)",
+   "Touches": "Outside KelpWorks"
+  }
+ },
+ {
+  "id": "KW-57",
+  "set": {
+   "Type": "Operations (non-ERP)",
+   "Touches": "Outside KelpWorks"
+  }
+ },
+ {
+  "id": "KW-58",
+  "set": {
+   "Type": "Operations (non-ERP)",
+   "Touches": "Outside KelpWorks"
+  }
+ },
+ {
+  "id": "KW-59",
+  "set": {
+   "Type": "Quality & compliance",
+   "Touches": "Production log"
+  }
+ },
+ {
+  "id": "KW-60",
+  "set": {
+   "Type": "Data integrity & traceability",
+   "Touches": "Inventory items; Records archive / backups; Database / schema"
+  }
+ },
+ {
+  "id": "KW-61",
+  "set": {
+   "Type": "Process & tooling",
+   "Touches": "Change-log tooling"
+  }
+ },
+ {
+  "id": "KW-62",
+  "set": {
+   "Type": "Process & tooling",
+   "Touches": "Change-log tooling"
+  }
+ },
+ {
+  "id": "KW-63",
+  "set": {
+   "Type": "Production workflow",
+   "Touches": "Production log; Settings / Calculations"
+  }
+ },
+ {
+  "id": "KW-64",
+  "set": {
+   "Type": "Data integrity & traceability",
+   "Touches": "Production log; Product release; Database / schema"
+  }
+ },
+ {
+  "id": "KW-65",
+  "set": {
+   "Type": "User experience",
+   "Touches": "Production log"
+  }
+ },
+ {
+  "id": "KW-66",
+  "set": {
+   "Type": "Process & tooling",
+   "Touches": "Change-log tooling"
+  }
+ },
+ {
+  "id": "KW-67",
+  "set": {
+   "Type": "Process & tooling",
+   "Touches": "Change-log tooling"
+  }
+ },
+ {
+  "id": "KW-68",
+  "set": {
+   "Type": "Process & tooling",
+   "Touches": "Change-log tooling"
+  }
+ },
+ {
+  "id": "KW-69",
+  "set": {
+   "Type": "User experience",
+   "Touches": "Admin / users; Settings / Calculations"
+  }
+ },
+ {
+  "id": "KW-70",
+  "set": {
+   "Type": "Process & tooling",
+   "Touches": "Outside KelpWorks"
+  }
+ },
+ {
+  "id": "KW-71",
+  "set": {
+   "Type": "Quality & compliance",
+   "Touches": "Change-log tooling"
+  }
+ },
+ {
+  "id": "KW-72",
+  "set": {
+   "Type": "Security & hardening",
+   "Touches": "Admin / users; Settings / Calculations; Records archive / backups"
+  }
+ },
+ {
+  "id": "KW-73",
+  "set": {
+   "Type": "Data integrity & traceability",
+   "Touches": "Product release; Records archive / backups; Database / schema"
+  }
+ },
+ {
+  "id": "KW-74",
+  "set": {
+   "Type": "Security & hardening",
+   "Touches": "Product release; Admin / users; Settings / Calculations"
+  }
+ },
+ {
+  "id": "KW-75",
+  "set": {
+   "Type": "Data integrity & traceability",
+   "Touches": "Pre-processing; Product release"
+  }
+ },
+ {
+  "id": "KW-76",
+  "set": {
+   "Type": "Data integrity & traceability",
+   "Touches": "Database / schema"
+  }
+ },
+ {
+  "id": "KW-77",
+  "set": {
+   "Type": "Process & tooling",
+   "Touches": "Whole app"
+  }
+ },
+ {
+  "id": "KW-78",
+  "set": {
+   "Type": "Security & hardening",
+   "Touches": "Admin / users; Records archive / backups"
+  }
+ },
+ {
+  "id": "KW-79",
+  "set": {
+   "Type": "Process & tooling",
+   "Touches": "Change-log tooling"
+  }
+ }
+]
