@@ -56,3 +56,4 @@ a15c319  2026-10-21  photo archive (KW-04), ORP / run summary card / separation 
 44c1e47  2026-10-23  Separation: both % moisture values, recovered liquid weight, calculated volume and estimate (KW-63) (PR 91) merged to main and live
 92fff78  2026-10-23  clean-start tool: inventory items removed except the four system items, audit entry, proof, dry run, cut-over note (KW-60) (PR 93) merged to main and live
 67bf547  2026-10-24  Change log: Type and Touches classification, tidier layout, default owner, corrected Playbook (KW-79) (PR 96) merged to main and live
+0a44fcf  2026-10-24  Suppliers page: supplier records with approval status, review dates, documents with expiry dates and history, opened from Receive; items linked from the supplier's record; new pack size fields fixed (KW-81) (PR 98, 99) merged to main and live
