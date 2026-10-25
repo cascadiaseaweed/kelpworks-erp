@@ -151,6 +151,37 @@ def test_receipts_and_lots_keep_the_name_they_were_recorded_with_after_a_rename(
     assert history(srv, s["id"])[-1][:3] == ("Name", "Old Name Ltd", "New Name Corp")
 
 
+def test_items_are_linked_to_a_supplier_from_its_own_record_so_receiving_offers_it(srv, people):
+    a, pm, plain, qm = people["admin"], people["pm"], people["plain"], people["qm"]
+    s = make(a, name="Linkable Co")
+    sid = s["id"]
+    c1, c2 = new_item(a, "Link Item 1"), new_item(a, "Link Item 2")
+    assert a.get("/api/consumables/%d/suppliers" % c1).json["suppliers"] == []                                 # a new supplier is on no item's list yet
+    for who in (plain, qm):
+        assert who.post("/api/suppliers/%d/items" % sid, {"consumableId": c1}).status == 403
+    r = pm.post("/api/suppliers/%d/items" % sid, {"consumableId": c1})
+    assert r.status == 200 and [i["name"] for i in r.json["items"]] == ["Link Item 1"] and r.json["nItems"] == 1
+    assert [x["name"] for x in a.get("/api/consumables/%d/suppliers" % c1).json["suppliers"]] == ["Linkable Co"]       # the Receive dropdown for that item
+    assert a.post("/api/consumables/%d/receive" % c1, {"qty": 1, "supplierLot": "LK-1", "supplier": "Linkable Co"}).status == 200
+    assert pm.post("/api/suppliers/%d/items" % sid, {"consumableId": c1}).status == 409                         # already on the list
+    assert pm.post("/api/suppliers/%d/items" % sid, {"consumableId": 99999}).status == 404
+    assert pm.post("/api/suppliers/%d/items" % sid, {"consumableId": "x"}).status == 404
+    assert plain.delete("/api/suppliers/%d/items/%d" % (sid, c1)).status == 403
+    assert pm.delete("/api/suppliers/%d/items/%d" % (sid, c1)).status == 200
+    assert a.get("/api/consumables/%d/suppliers" % c1).json["suppliers"] == [] and a.get("/api/suppliers/%d" % sid).json["items"] == []
+    assert pm.delete("/api/suppliers/%d/items/%d" % (sid, c1)).status == 404
+    rows = [r for r in history(srv, sid) if r[0] == "Items they supply"]
+    assert [(r[1] is None, r[2] is None) for r in rows] == [(True, False), (False, True)] and "Link Item 1" in (rows[0][2] or "") and "Link Item 1" in (rows[1][1] or "")
+    log = sql(srv, "SELECT supplier, action FROM consumable_supplier_log WHERE consumable_id=? ORDER BY id", (c1,))
+    assert log == [("Linkable Co", "added"), ("Linkable Co", "removed")]                                         # the item-side log (KW-23) is kept too
+    # the item's own list (Inventory Items > Edit) also leaves a line in the supplier's history
+    assert a.post("/api/consumables/%d/suppliers" % c2, {"name": "Linkable Co"}).status == 200
+    assert "Link Item 2" in history(srv, sid)[-1][2] and history(srv, sid)[-1][0] == "Items they supply"
+    link_id = a.get("/api/consumables/%d/suppliers" % c2).json["suppliers"][0]["id"]
+    assert a.delete("/api/consumables/%d/suppliers/%d" % (c2, link_id)).status == 200
+    assert "Link Item 2" in history(srv, sid)[-1][1]
+
+
 # ---- documents -------------------------------------------------------------------------------------------------------------------------------------------------------------------
 def test_a_document_with_an_expiry_date_is_stored_served_and_flagged(srv, people):
     a, pm = people["admin"], people["pm"]

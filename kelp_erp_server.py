@@ -10821,7 +10821,14 @@ class Handler(BaseHTTPRequestHandler):
             rec, _made = supplier_record(conn, name, "Conditional", user["name"])      # a name typed on an item becomes a supplier record, to be reviewed
         cur = conn.execute("INSERT INTO consumable_suppliers (consumable_id,name,created_by,created_at,supplier_id) VALUES (?,?,?,?,?)", (cid, name, user["name"], now_iso(), rec["id"]))
         conn.execute("INSERT INTO consumable_supplier_log (consumable_id,supplier,action,user_name,created_at) VALUES (?,?,?,?,?)", (cid, name, "added", user["name"], now_iso()))
+        self._supplier_item_log(conn, rec["id"], cid, True, user)
         return {"id": cur.lastrowid, "name": name}
+
+    def _supplier_item_log(self, conn, sid, cid, added, user):
+        """A line in the supplier's history when an item is added to or removed from what it supplies (from either side: the item's list or the supplier's record)."""
+        c = conn.execute("SELECT item_number, name FROM consumables WHERE id=?", (cid,)).fetchone()
+        label = ("%s  %s" % (c["item_number"] or "", c["name"])).strip() if c else "item %d" % cid
+        self._supplier_log(conn, sid, "Items they supply", None if added else label, label if added else None, None, user)
 
     # ---- the Suppliers page (KW-81) ------------------------------------------#
     def _supplier_log(self, conn, sid, field, old, new, reason, user):
@@ -10990,6 +10997,22 @@ class Handler(BaseHTTPRequestHandler):
             if len(seg) == 4 and seg[3] == "documents" and method == "POST":
                 need()
                 self._store_supplier_document(conn, r["id"], self._body_json(), user)
+                return detail(r)
+            if len(seg) == 4 and seg[3] == "items" and method == "POST":      # the item's approved-supplier list gets this supplier (so it is offered when receiving that item)
+                need()
+                cid = self._body_json().get("consumableId")
+                if not isinstance(cid, int) or isinstance(cid, bool) or not conn.execute("SELECT 1 FROM consumables WHERE id=?", (cid,)).fetchone():
+                    raise ApiError(404, "Item not found")
+                self._supplier_add(conn, user, cid, r["name"])
+                return detail(r)
+            if len(seg) == 5 and seg[3] == "items" and seg[4].isdigit() and method == "DELETE":
+                need()
+                link = conn.execute("SELECT * FROM consumable_suppliers WHERE consumable_id=? AND supplier_id=?", (int(seg[4]), r["id"])).fetchone()
+                if not link:
+                    raise ApiError(404, "This supplier is not on that item's approved list")
+                conn.execute("DELETE FROM consumable_suppliers WHERE id=?", (link["id"],))
+                conn.execute("INSERT INTO consumable_supplier_log (consumable_id,supplier,action,user_name,created_at) VALUES (?,?,?,?,?)", (link["consumable_id"], link["name"], "removed", user["name"], now_iso()))
+                self._supplier_item_log(conn, r["id"], link["consumable_id"], False, user)
                 return detail(r)
             if len(seg) == 5 and seg[3] == "documents" and seg[4].isdigit() and method in ("PUT", "DELETE"):
                 need()
@@ -11519,6 +11542,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(404, "Supplier not found on this item")
                 conn.execute("DELETE FROM consumable_suppliers WHERE id=?", (s["id"],))
                 conn.execute("INSERT INTO consumable_supplier_log (consumable_id,supplier,action,user_name,created_at) VALUES (?,?,?,?,?)", (cid, s["name"], "removed", user["name"], now_iso()))
+                if s["supplier_id"]:
+                    self._supplier_item_log(conn, s["supplier_id"], cid, False, user)
                 return {"suppliers": self._supplier_list(conn, cid)}
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "packs":
             cid = int(seg[2])
