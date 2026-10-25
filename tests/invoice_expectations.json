@@ -1,0 +1,53 @@
+{
+  "_about": "What each of the 8 real test invoices (KelpWorks ERP > Invoices, scans) shows, transcribed by eye from the page images on 2026-10-24. null = the document does not show it, so it must stay blank. A list = any of those values is acceptable (an ambiguous date may be read or left blank). 'skip' = not judged. Used by tools/check_invoice_reading.py (run by hand with a real key) and by tests/test_invoice_expectations.py (the amounts must add up).",
+  "invoices": {
+    "2026-03-06_DuBois_IN-60116119.pdf": {
+      "header": {"supplier": "DuBois Chemicals Canada, Inc.", "invoiceNo": "IN-60116119", "invoiceDate": ["2026-03-06", null], "poNumber": "1083", "orderNo": "SO-70105496", "deliveryDoc": [null, "PP"],
+                 "carrier": "OVERLAND WEST", "shipDate": "2026-03-06", "currency": "CAD", "subtotal": 2383.56, "freight": [null, 0.0], "tax": 119.18, "otherCharges": [null, 0.0], "invoiceTotal": 2502.74},
+      "lines": [
+        {"itemCode": "12002100", "description": "DICASAN PAA 18.9L/5G (CAN)", "qty": 2.0, "unit": "EA", "unitPrice": 216.19, "lineTotal": 432.38, "lots": ["H35-112125-1B"]},
+        {"itemCode": "12390470", "description": "QUEL ACID CIP 208L/55G DRUM", "qty": 1.0, "unit": "EA", "unitPrice": 850.5, "lineTotal": 850.5, "lots": ["25269SV176"]},
+        {"itemCode": "12388470", "description": "QUEL CIP HD 208L/55G", "qty": 2.0, "unit": "EA", "unitPrice": 550.34, "lineTotal": 1100.68, "lots": ["25321SV548"]}]
+    },
+    "2026-08-20_DuBois_IN-60132097.pdf": {
+      "header": {"supplier": "DuBois Chemicals Canada, Inc.", "invoiceNo": "IN-60132097", "invoiceDate": "2026-08-20", "poNumber": "1092", "orderNo": "SO-70121576", "deliveryDoc": "989600960",
+                 "carrier": "KINDERSLEY TRANSPORT", "shipDate": "2026-08-18", "currency": "CAD", "subtotal": 3140.38, "freight": [null, 0.0], "tax": 157.02, "otherCharges": [null, 0.0], "invoiceTotal": 3297.4},
+      "lines": [
+        {"itemCode": "12002470", "description": "DICASAN PAA 202L/53.5G (CAN)", "qty": 2.0, "unit": "ea", "unitPrice": 1570.19, "lineTotal": 3140.38, "lots": ["H35-062325-1"]}]
+    },
+    "2026-08-31_DuBois_IN-60133189.pdf": {
+      "header": {"supplier": "DuBois Chemicals Canada, Inc.", "invoiceNo": "IN-60133189", "invoiceDate": "2026-08-31", "poNumber": "1092", "orderNo": "SO-70121302", "deliveryDoc": [null, "PP"],
+                 "carrier": "MANITOULIN TRANSPORT", "shipDate": "2026-08-19", "currency": "CAD", "subtotal": 6016.26, "freight": [null, 0.0], "tax": 300.81, "otherCharges": [null, 0.0], "invoiceTotal": 6317.07},
+      "lines": [
+        {"itemCode": "12388300", "description": "QUEL CIP HD 1134L/300G", "qty": 2.0, "unit": "ea", "unitPrice": 3008.13, "lineTotal": 6016.26, "lots": ["26138SV577", "26183SV612"]}]
+    },
+    "2026-06-16_Univar_53959279.pdf": {
+      "header": {"supplier": "Univar Solutions Canada Ltd.", "invoiceNo": "53959279", "invoiceDate": "2026-06-16", "poNumber": "DANIEL 05/29/2026", "orderNo": "16317914", "deliveryDoc": "6503210704",
+                 "carrier": null, "shipDate": null, "currency": "CAD", "subtotal": null, "freight": 1415.31, "tax": 445.46, "otherCharges": 1113.5, "invoiceTotal": 9354.65},
+      "lines": [
+        {"itemCode": "16160435", "description": "POT SORBATE NANTONG BX200", "qty": 1020.6, "unit": "KG", "unitPrice": 6.2516, "lineTotal": 6380.38, "lots": ["26011608A"]}]
+    },
+    "2026-05-11_IslandBarrelsTotes_300.pdf": {
+      "header": {"supplier": "Island Barrels & Totes", "invoiceNo": "300", "invoiceDate": "2026-05-11", "poNumber": "Daniel", "orderNo": null, "deliveryDoc": null, "carrier": null, "shipDate": null,
+                 "currency": null, "subtotal": 17500.0, "freight": 3100.0, "tax": 875.0, "otherCharges": [null, 0.0], "invoiceTotal": 18375.0},
+      "lines": [
+        {"itemCode": null, "description": "Food Grade IBC Totes 1000 litre", "qty": 60.0, "unit": null, "unitPrice": 240.0, "lineTotal": 14400.0, "lots": []}]
+    },
+    "2026-05-19_IslandBarrelsTotes_304.pdf": {
+      "header": {"supplier": "Island Barrels & Totes", "invoiceNo": "304", "invoiceDate": "2026-05-19", "poNumber": "Daniel", "orderNo": null, "deliveryDoc": null, "carrier": null, "shipDate": null,
+                 "currency": null, "subtotal": 14400.0, "freight": [null, 0.0], "tax": 720.0, "otherCharges": [null, 0.0], "invoiceTotal": 15120.0},
+      "lines": [
+        {"itemCode": null, "description": "Food Grade IBC Totes 1000 litre", "qty": 60.0, "unit": null, "unitPrice": 240.0, "lineTotal": 14400.0, "lots": []}]
+    },
+    "2026-04-13_Bandstra_L035030.pdf": {
+      "header": {"supplier": "Bandstra Transportation Systems Ltd", "invoiceNo": "L035030", "invoiceDate": "2026-04-13", "poNumber": null, "orderNo": null, "deliveryDoc": "5473606",
+                 "carrier": "skip", "shipDate": null, "currency": [null, "CAD"], "subtotal": "skip", "freight": "skip", "tax": [null, 0.0], "otherCharges": "skip", "invoiceTotal": 3055.24},
+      "lines": "skip"
+    },
+    "2026-05-20_Bandstra_L035693.pdf": {
+      "header": {"supplier": "Bandstra Transportation Systems Ltd", "invoiceNo": "L035693", "invoiceDate": "2026-05-20", "poNumber": "2607", "orderNo": null, "deliveryDoc": "1984558",
+                 "carrier": "skip", "shipDate": null, "currency": [null, "CAD"], "subtotal": 5300.0, "freight": "skip", "tax": 265.0, "otherCharges": "skip", "invoiceTotal": 5565.0},
+      "lines": "skip"
+    }
+  }
+}

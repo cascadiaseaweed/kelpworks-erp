@@ -6082,6 +6082,13 @@ function supplierPicker(c, current) {
   refresh();
   return {
     node: el('div', {}, sel, nameBox, el('div', {}, detailsBtn), notice, note),
+    select: sel,
+    set(name) {                                                     // KW-82: choose a supplier read from a document; only one already on the approved list
+      const o = [...sel.options].find(x => x.value && x.value !== '__new__' && x.value.toLowerCase() === String(name || '').toLowerCase());
+      if (!o) return null;
+      sel.value = o.value; previous = sel.value; nameBox.style.display = 'none'; refresh();
+      return sel;
+    },
     async resolve() {
       if (sel.value !== '__new__') return sel.value;
       const wanted = nameBox.value.trim().replace(/\s+/g, ' ');
@@ -6107,7 +6114,80 @@ async function receiveStock(c) {
   const code = inp({ placeholder: 'supplier product code (optional)' }, last && last.supplierItemCode || '');
   const cond = selectFrom('', [['', '—'], ['ok', 'OK'], ['issue', 'Problem found']]), condNote = inp({ placeholder: 'what was wrong' });
   const nt = inp({ placeholder: 'optional' });
+  const cur = inp({ placeholder: 'CAD', maxlength: '3', style: 'text-transform:uppercase' }), frt = inp({ type: 'number', min: '0', step: 'any', placeholder: 'freight' });
+  const tax = inp({ type: 'number', min: '0', step: 'any', placeholder: 'tax' }), tot = inp({ type: 'number', min: '0', step: 'any', placeholder: 'invoice total' });
   const kind = selectFrom('', DOC_KINDS), files = el('input', { type: 'file', multiple: true });
+  // ---- KW-82: fill the window from a document. It only PROPOSES: every value it fills is tagged "from document" until you edit it, and nothing is saved until you press Receive. ----
+  let readId = null, readFile0 = null;
+  const marked = new Map();                                       // input -> its "from document" tag
+  const unmark = x => { const t = marked.get(x); if (t) { t.remove(); marked.delete(x); } };
+  function tag(x) {
+    unmark(x);
+    const t = badge('pending_release', 'from document'); t.style.marginLeft = '6px';
+    x.insertAdjacentElement('afterend', t); marked.set(x, t);
+    const gone = () => { unmark(x); x.removeEventListener('input', gone); x.removeEventListener('change', gone); };
+    x.addEventListener('input', gone); x.addEventListener('change', gone);
+  }
+  function mark(x, v) { x.value = v; tag(x); }
+  const readFile = el('input', { type: 'file', accept: '.pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png' });
+  const readStatus = el('div', { class: 'help' }), readWarn = el('div', {}), readSaid = el('div', {}), linePick = el('div', {});
+  const readBtn = el('button', { type: 'button', class: 'secondary', onclick: () => readDocument().catch(e => { readStatus.textContent = ''; readBtn.disabled = false; toast(e.message, true); }) }, 'Read document');
+  api('GET', '/invoice-reading').then(s => {
+    if (!readStatus.textContent) readStatus.textContent = 'Text PDFs are read here. Scans and photos: ' + (s.ready ? 'read by the Claude service (switched on).' : 'not read (an administrator can switch this on); they are attached and you enter the values by hand.');
+  }).catch(() => { /* a courtesy line */ });
+  async function readDocument() {
+    const f0 = readFile.files[0];
+    if (!f0) { toast('Choose the document first.', true); return; }
+    readBtn.disabled = true; readStatus.textContent = 'Reading… (a scan can take up to a minute)';
+    const f = await prepareUpload(f0);
+    const r = await api('POST', '/consumables/' + c.id + '/read-document', { filename: f.name, dataB64: await fileB64(f) });
+    readBtn.disabled = false;
+    applyReading(r, f0);
+  }
+  function applyReading(r, f0) {
+    readId = r.readId; readFile0 = f0;
+    [...marked.keys()].forEach(unmark);
+    readWarn.innerHTML = ''; readSaid.innerHTML = ''; linePick.innerHTML = '';
+    const p = r.proposal;
+    if (!p) { readStatus.textContent = r.message || 'Nothing could be read from this document.'; return; }
+    readStatus.textContent = (r.reader === 'ai' ? 'Read by the Claude service from the page image. ' : 'Read from the text of the PDF. ')
+      + 'Check every value marked “from document”, then press Receive. Nothing is saved until you do.';
+    (r.warnings || []).forEach(w => readWarn.append(el('div', { class: 'help', style: 'color:var(--danger)' }, '⚠ ' + w)));
+    const F = p.fill, said = [];
+    if (F.supplier) { const s = supPick.set(F.supplier); if (s) tag(s); }
+    if (p.said && p.said.supplier) said.push('Supplier on the document: ' + p.said.supplier + ' (it is not on this item’s approved list: choose a supplier yourself)');
+    const setIf = (x, v) => { if (v != null && v !== '') mark(x, v); };
+    setIf(inv, F.invoiceNo); setIf(invDate, F.invoiceDate); setIf(po, F.poNumber); setIf(ord, F.orderNo); setIf(doc, F.deliveryDoc); setIf(car, F.carrier); setIf(ship, F.shipDate);
+    setIf(cur, F.currency); setIf(frt, F.freight); setIf(tax, F.tax); setIf(tot, F.invoiceTotal);
+    if (p.lines.length) {
+      const lineSel = selectFrom('', [['', '— choose the line for ' + c.name + ' —'], ...p.lines.map(l => [String(l.index),
+        (l.itemCode ? l.itemCode + '  ' : '') + (l.description || '(no description)') + (l.qty != null ? ' — ' + fmt(l.qty, 3) + ' ' + (l.unit || '') : '')])]);
+      lineSel.addEventListener('change', () => applyLine(lineSel.value === '' ? null : p.lines[+lineSel.value]));
+      linePick.append(field('Document line for this item', lineSel), el('div', { class: 'help' }, p.chosen != null
+        ? 'Chosen because ' + p.chosenHow + '. Choose another if it is the wrong line.' : 'The document has ' + p.lines.length + ' line' + (p.lines.length === 1 ? '' : 's')
+          + ': choose the one for this item. Choosing a line replaces the lot rows below.'));
+      if (p.chosen != null) { lineSel.value = String(p.chosen); applyLine(p.lines[p.chosen]); }
+    } else said.push('No product line was recognised on the document: enter the lots by hand.');
+    said.forEach(t => readSaid.append(el('div', { class: 'help' }, t)));
+  }
+  function applyLine(l) {
+    readSaid.innerHTML = '';
+    rows.splice(0).forEach(r => r.tr.remove());                     // the lot rows become what the chosen line shows
+    if (!l) { addRow(); return; }
+    const F = l.fill, lots = F.supplierLots.length ? F.supplierLots : [''];
+    lots.forEach(lot => {
+      addRow();
+      const r = rows[rows.length - 1];
+      if (lot) mark(r.lot, lot);
+      if (F.qty != null && lots.length === 1) mark(r.qty, F.qty);
+      if (F.unitPrice != null) mark(r.price, F.unitPrice);
+      if (F.expiryDate) mark(r.exp, F.expiryDate);
+      r.upd();
+      r.desc = F.invoiceDescription; r.lineTotal = lots.length === 1 ? F.lineTotal : null;
+    });
+    if (F.supplierItemCode) mark(code, F.supplierItemCode);
+    (l.said || []).forEach(t => readSaid.append(el('div', { class: 'help' }, 'Document says: ' + t)));
+  }
   const packOpts = () => [['', '— type the quantity in ' + c.unit + ' —'], ...(c.packs || []).map(p => [String(p.id), p.name + ' (' + fmt(p.qtyPerPack, 2) + ' ' + c.unit + ')']), ['new', '+ New pack size…']];
   const rows = [], tbody = el('tbody', {});
   function addRow() {
@@ -6120,6 +6200,7 @@ async function receiveStock(c) {
     r.exp = inp({ type: 'date' });
     r.price = inp({ type: 'number', min: '0', step: 'any', placeholder: 'price' });
     r.total = el('div', { class: 'help', style: 'margin:2px 0 0' });
+    r.desc = null; r.lineTotal = null;                              // as printed on the invoice (KW-82), set when a document line is chosen
     const upd = () => {
       const isNew = r.pack.value === 'new', p = (c.packs || []).find(x => String(x.id) === r.pack.value);
       r.newName.style.display = r.newQty.style.display = isNew ? 'block' : 'none';          // block: stacked under the pack choice (table cells do not wrap, so inline inputs spilled over the Quantity and Supplier lot columns)
@@ -6128,6 +6209,7 @@ async function receiveStock(c) {
       const per = isNew ? +r.newQty.value : (p ? p.qtyPerPack : null);
       r.total.textContent = per && +r.qty.value ? '= ' + fmt(per * +r.qty.value, 3) + ' ' + c.unit : '';
     };
+    r.upd = upd;
     [r.pack, r.qty, r.newQty].forEach(x => { x.addEventListener('input', upd); x.addEventListener('change', upd); });
     r.tr = el('tr', {}, el('td', {}, r.pack, r.newName, r.newQty), el('td', {}, r.qty, r.total), el('td', {}, r.lot), el('td', {}, r.exp), el('td', {}, r.price),
       el('td', {}, el('button', { type: 'button', class: 'secondary', onclick: () => { if (rows.length > 1) { rows.splice(rows.indexOf(r), 1); r.tr.remove(); } } }, '✕')));
@@ -6136,12 +6218,16 @@ async function receiveStock(c) {
   }
   addRow();
   const body = el('div', {},
+    el('div', { class: 'card', style: 'margin:0 0 10px;padding:10px' }, el('h4', { style: 'margin:0 0 4px' }, 'Fill from a document (optional)'),
+      el('div', { class: 'form-row' }, field('Invoice or delivery document (PDF, JPG or PNG)', readFile), el('div', { class: 'field' }, el('label', {}, ' '), readBtn)),
+      readStatus, readWarn, linePick, readSaid),
     el('h4', { style: 'margin:0 0 4px' }, 'Delivery'),
     el('div', { class: 'form-row' }, field('Supplier', supPick.node), field('Received date', rec)),
     el('div', { class: 'form-row' }, field('Invoice number', inv), field('Invoice date', invDate)),
     el('div', { class: 'form-row' }, field('PO number', po), field('Supplier order number', ord)),
     el('div', { class: 'form-row' }, field('Delivery document no.', doc), field('Carrier', car), field('Ship date', ship)),
     el('div', { class: 'form-row' }, field('Condition on arrival', cond), field('If a problem, what', condNote)),
+    el('div', { class: 'form-row' }, field('Currency', cur), field('Freight', frt), field('Tax', tax), field('Invoice total', tot)),
     el('h4', { style: 'margin:10px 0 4px' }, 'Lots received (' + c.unit + ')'),
     el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {}, el('th', {}, 'Pack'), el('th', {}, 'Quantity'), el('th', {}, packaging ? 'Supplier lot' : 'Supplier lot *'), el('th', {}, 'Expiry'), el('th', {}, 'Price (excl. tax)'), el('th', {}, ''))), tbody)),
     el('div', { style: 'margin:6px 0' }, el('button', { type: 'button', class: 'secondary', onclick: addRow }, '+ Another supplier lot')),
@@ -6154,18 +6240,24 @@ async function receiveStock(c) {
   modal('Receive ' + c.name, body, async () => {
     const lines = rows.map(r => {
       const isNew = r.pack.value === 'new', p = (c.packs || []).find(x => String(x.id) === r.pack.value);
-      const base = { supplierLot: r.lot.value, expiryDate: r.exp.value || null, unitPrice: r.price.value === '' ? null : +r.price.value, supplierItemCode: code.value };
+      const base = { supplierLot: r.lot.value, expiryDate: r.exp.value || null, unitPrice: r.price.value === '' ? null : +r.price.value, supplierItemCode: code.value,
+        invoiceDescription: r.desc, lineTotal: r.lineTotal };
       if (isNew) return Object.assign(base, { packs: +r.qty.value, newPack: { name: r.newName.value, qtyPerPack: +r.newQty.value }, priceBasis: 'pack' });
       if (p) return Object.assign(base, { packs: +r.qty.value, packId: p.id, priceBasis: 'pack' });
       return Object.assign(base, { qty: +r.qty.value, priceBasis: 'unit' });
     });
     const supplier = await supPick.resolve();
     const r = await api('POST', '/consumables/' + c.id + '/receive', { supplier, receivedDate: rec.value, invoiceNo: inv.value, invoiceDate: invDate.value, poNumber: po.value, orderNo: ord.value,
-      deliveryDoc: doc.value, carrier: car.value, shipDate: ship.value, arrivalCondition: cond.value, conditionNote: condNote.value, notes: nt.value, lines });
+      deliveryDoc: doc.value, carrier: car.value, shipDate: ship.value, arrivalCondition: cond.value, conditionNote: condNote.value, notes: nt.value, lines,
+      currency: cur.value, freight: frt.value, tax: tax.value, invoiceTotal: tot.value, readId });
     let msg = 'Received as ' + (r.lots.length > 1 ? r.lots.length + ' lots' : 'lot ' + r.lot.lotCode);
     if (files.files.length) {
       try { await uploadReceiptDocs(r.receiptId, [...files.files], kind.value); msg += ' with ' + files.files.length + ' document' + (files.files.length === 1 ? '' : 's'); }
       catch (e) { toast('Received, but a document could not be attached (' + e.message + '). Attach it from the lot’s Documents button.', true); }
+    }
+    if (readFile0 && !(files.files.length && [...files.files].some(x => x.name === readFile0.name && x.size === readFile0.size))) {       // the document that was read stays attached (once)
+      try { await uploadReceiptDocs(r.receiptId, [readFile0], 'invoice'); msg += ' with the document that was read'; }
+      catch (e) { toast('Received, but the document could not be attached (' + e.message + '). Attach it from the lot’s Documents button.', true); }
     }
     State.ref = await api('GET', '/refdata');
     closeSidePanel();                                              // KW-81: a supplier's record opened beside this window goes with it
@@ -6204,18 +6296,21 @@ async function openDelivery(lot) {
     el('div', { class: 'form-row' }, field('Supplier', f.supplier), mk('invoiceNo', 'Invoice number'), mk('invoiceDate', 'Invoice date', { type: 'date' })),
     el('div', { class: 'form-row' }, mk('poNumber', 'PO number'), mk('orderNo', 'Supplier order number'), mk('deliveryDoc', 'Delivery document no.')),
     el('div', { class: 'form-row' }, mk('carrier', 'Carrier'), mk('shipDate', 'Ship date', { type: 'date' }), field('Condition on arrival', cond)),
+    el('div', { class: 'form-row' }, mk('currency', 'Currency', { maxlength: '3' }), mk('freight', 'Freight', { type: 'number', min: '0', step: 'any' }),
+      mk('tax', 'Tax', { type: 'number', min: '0', step: 'any' }), mk('invoiceTotal', 'Invoice total', { type: 'number', min: '0', step: 'any' })),
     el('div', { class: 'form-row' }, mk('conditionNote', 'If a problem, what'), mk('notes', 'Notes')),
     field('Reason for a correction', reason),
     el('h4', { style: 'margin:12px 0 4px' }, 'Documents'), docsHost,
     el('div', { class: 'form-row' }, field('Type', kind), field('Add files', files), el('div', { class: 'field' }, el('label', {}, ' '), upload)),
     el('h4', { style: 'margin:12px 0 4px' }, 'Lots in this delivery'),
-    table(['Lot', 'Item', 'Supplier lot', 'Received', 'Price / unit', 'Received as'], d.lots.map(l => [mono(l.lotCode), l.item, l.supplierLot, num(fmt(l.qtyReceived, 2) + ' ' + l.unit),
-      l.unitPrice != null ? '$' + fmt(l.unitPrice, 4) : '—', l.receivedAs || '—']), [false, false, false, true, true, false]),
+    table(['Lot', 'Item', 'Supplier lot', 'Received', 'Price / unit', 'Received as', 'On the invoice'], d.lots.map(l => [mono(l.lotCode), l.item, l.supplierLot, num(fmt(l.qtyReceived, 2) + ' ' + l.unit),
+      l.unitPrice != null ? '$' + fmt(l.unitPrice, 4) : '—', l.receivedAs || '—', [l.invoiceDescription, l.lineTotal != null ? 'amount ' + fmt(l.lineTotal, 2) : null].filter(Boolean).join(' · ') || '—']),
+      [false, false, false, true, true, false, false]),
     d.log.length ? el('details', { class: 'accordion' }, el('summary', {}, 'History (' + d.log.length + ')'), el('div', { class: 'accordion-body' },
       table(['When', 'By', 'What', 'From', 'To', 'Reason'], d.log.map(g => [fmtWhen(g.at), g.by || '—', g.field, g.oldValue || '—', g.newValue || '—', g.reason || '—'])))) : null);
   modal('Delivery' + (d.invoiceNo ? ' — invoice ' + d.invoiceNo : ''), body, async () => {
     const payload = { reason: reason.value, arrivalCondition: cond.value };
-    ['supplier', 'invoiceNo', 'invoiceDate', 'poNumber', 'orderNo', 'deliveryDoc', 'carrier', 'shipDate', 'conditionNote', 'notes'].forEach(k => { payload[k] = f[k].value; });
+    ['supplier', 'invoiceNo', 'invoiceDate', 'poNumber', 'orderNo', 'deliveryDoc', 'carrier', 'shipDate', 'currency', 'freight', 'tax', 'invoiceTotal', 'conditionNote', 'notes'].forEach(k => { payload[k] = f[k].value; });
     await api('PUT', '/receipts/' + d.id, payload);
     toast('Saved');
   }, 'Save details', { wide: true });
@@ -7066,6 +7161,13 @@ const CALCULATIONS = [
     settings: ['supplier_doc_warning_days'],
   },
   {
+    title: 'Invoice reading: line and total check',
+    formula: 'Line check: quantity x unit price should equal the line amount.   Total check: lines (or the subtotal) + freight + tax + other charges should equal the invoice total.   A difference above the tolerance (and 5 cents) gives a warning.',
+    description: 'When the Receive window reads an invoice, it compares what it read. A warning means a number may have been misread or an amount is missing; nothing is changed or blocked, and you check and confirm every value before it is saved.',
+    location: 'Inventory Items → Receive → Fill from a document',
+    settings: ['invoice_check_tolerance_pct'],
+  },
+  {
     title: 'Retention sample discard-by date',
     formula: 'Discard-by = Collection date + Retention shelf life (months)',
     description: 'Each Retention sample in the Samples tab’s Retention inventory is flagged as expiring within 30 days, or expired, against this date. Only Retention samples have one.',
@@ -7248,6 +7350,7 @@ const SETTING_GROUPS = [
     'qc_chart_sigma', 'qc_chart_min_n_provisional', 'qc_chart_min_n_established', 'qc_chart_run_length', 'qc_chart_trend_length', 'yield_report_min_runs'] },
   { title: 'Release & sign-off', note: 'Who may review and release a run.', keys: ['release_separate_signers', 'review_not_by_finalizer'] },
   { title: 'Samples, lots & inventory', note: 'Retention and expiry.', keys: ['sample_retention_months', 'lot_expiry_warning_days'] },
+  { title: 'Receiving: reading invoices', note: 'Whether scans and photos of invoices are read, the daily limit and the arithmetic check.', keys: ['invoice_ai_enabled', 'invoice_read_daily_limit', 'invoice_check_tolerance_pct'] },
   { title: 'Run summary card display', note: 'Which figures show on a finished run’s summary card (1 shows, 0 hides).', keys: [
     'run_card_show_volume_out', 'run_card_show_final_ph', 'run_card_show_final_tds', 'run_card_show_final_orp', 'run_card_show_extraction_eff', 'run_card_show_run_date', 'run_card_show_operators',
     'run_card_show_product', 'run_card_show_farms', 'run_card_show_ibcs', 'run_card_show_feedstock_weight', 'run_card_show_packaged', 'run_card_show_conv_process', 'run_card_show_conv_harvest'] },
