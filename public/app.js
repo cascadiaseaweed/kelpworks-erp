@@ -7071,7 +7071,7 @@ const CALCULATIONS = [
   {
     title: 'Supplier document: expired or expiring',
     formula: 'Expired: the document’s expiry date is before today.   Expiring soon: the expiry date is today or within the warning days.   A supplier is flagged when any of its documents is expired or expiring.',
-    description: 'Each supplier document (certificate, organic certificate, safety data sheet, insurance) can carry an expiry date. The flags show on the Suppliers list and as a warning in the Receive window; they never block a receipt.',
+    description: 'Each supplier document (certificate, organic certificate, insurance) can carry an expiry date. The flags show on the Suppliers list and as a warning in the Receive window; they never block a receipt. Safety data sheets are not supplier documents: they come from the Documents tab and raise their own flag when a linked sheet is overdue for review.',
     location: 'Suppliers → Documents',
     settings: ['supplier_doc_warning_days'],
   },
