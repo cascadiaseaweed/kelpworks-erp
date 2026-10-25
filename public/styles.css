@@ -330,6 +330,10 @@ th.sortable:hover { background: var(--bg-e2ece9); }
 .side-panel .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .side-panel .side-actions { display: flex; justify-content: flex-end; gap: 8px; margin: 10px 0; }
 .side-panel details { margin-top: 14px; }
+.side-panel .item-row { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0; border-bottom: 1px solid var(--line); }
+.side-panel .item-checks { max-height: 170px; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
+.side-panel .check-row { display: block; padding: 2px 0; font-size: 13px; }
+.side-panel .check-row input { width: auto; margin-right: 4px; }
 .side-panel summary { cursor: pointer; color: var(--accent-text); font-weight: 600; }
 .modal .form-row { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .modal .modal-actions { display:flex; justify-content:flex-end; gap: 8px; margin-top: 18px; }

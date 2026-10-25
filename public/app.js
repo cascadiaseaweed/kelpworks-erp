@@ -5873,6 +5873,11 @@ async function openSupplierPanel(ref, opts = {}) {
     s = (await api('GET', '/suppliers/by-name?name=' + encodeURIComponent(ref))).supplier;
     if (!s) { toast('There is no supplier record called ' + ref + ' yet.', true); return; }
   }
+  let allItems = [];                                              // every inventory item, to pick what the supplier supplies (administrator / Production Manager only)
+  if (may) {
+    try { allItems = ((await api('GET', '/consumables')).consumables || []).map(c => ({ id: c.id, label: (c.itemNumber ? c.itemNumber + '  ' : '') + c.name })).sort((a, b) => a.label.localeCompare(b.label)); }
+    catch (e) { allItems = []; }
+  }
   const changed = () => { if (opts.onChange) opts.onChange(); };
   async function reload() { s = await api('GET', '/suppliers/' + s.id); changed(); draw(); }
   function draw() {
@@ -5894,13 +5899,21 @@ async function openSupplierPanel(ref, opts = {}) {
     F.approvalDate.addEventListener('change', () => {              // the next review is suggested from the approval date (a person can change it)
       if (F.approvalDate.value && !F.nextReviewDate.value) F.nextReviewDate.value = addMonthsISO(F.approvalDate.value, settingValue('supplier_review_interval_months', 12));
     });
+    const itemChecks = new Map();
+    const checkList = el('div', { class: 'item-checks' }, ...allItems.map(i => { const cb = el('input', { type: 'checkbox' }); itemChecks.set(i.id, cb); return el('label', { class: 'check-row' }, cb, ' ' + i.label); }));
     const save = el('button', { type: 'button', onclick: async () => {
       err.textContent = '';
       try {
         const payload = {};
         for (const k in F) payload[k] = F[k].value;
         if (s) { payload.reason = reason.value; s = await api('PUT', '/suppliers/' + s.id, payload); }
-        else s = await api('POST', '/suppliers', payload);
+        else {
+          s = await api('POST', '/suppliers', payload);
+          const ids = [...itemChecks.entries()].filter(([, cb]) => cb.checked).map(([id]) => id), failed = [];
+          for (const id of ids) { try { await api('POST', '/suppliers/' + s.id + '/items', { consumableId: id }); } catch (e) { failed.push(e.message); } }
+          if (ids.length) s = await api('GET', '/suppliers/' + s.id);
+          if (failed.length) toast('The supplier was saved, but some items could not be added: ' + failed.join('; '), true);
+        }
         toast('Supplier saved');
         if (opts.onSaved) opts.onSaved(s);
         changed(); draw();
@@ -5920,12 +5933,25 @@ async function openSupplierPanel(ref, opts = {}) {
       el('div', { class: 'form-row' }, field('Approval status', F.approvalStatus), field('Approval date', F.approvalDate)),
       el('div', { class: 'form-row' }, field('Next review date', F.nextReviewDate), reasonField),
       field('Notes', F.notes),
+      !s && may && allItems.length ? [el('h4', {}, 'Items they supply (optional)'),
+        el('div', { class: 'help' }, 'Tick the items this supplier may deliver: it is then offered when you receive them. You can change this later.'), checkList] : null,
       err,
       may ? el('div', { class: 'side-actions' }, save) : el('div', { class: 'help' }, 'A Production Manager or administrator maintains supplier records.'));
     if (s) {
+      const linked = new Set(s.items.map(i => i.id)), free = allItems.filter(i => !linked.has(i.id));
+      const itemSel = selectFrom('', [['', '— choose an item —'], ...free.map(i => [String(i.id), i.label])]);
       panel.append(el('h4', {}, 'Items they supply'),
-        s.items.length ? el('div', {}, ...s.items.map(i => el('div', {}, (i.itemNumber ? i.itemNumber + '  ' : '') + i.name)))
-          : el('div', { class: 'help' }, 'Not on any item’s approved-supplier list yet (Inventory Items > Edit, or “+ Add a supplier…” while receiving).'));
+        s.items.length ? el('div', {}, ...s.items.map(i => el('div', { class: 'item-row' }, el('span', {}, (i.itemNumber ? i.itemNumber + '  ' : '') + i.name),
+          may ? el('a', { href: '#', title: 'Remove this supplier from the item’s approved list', onclick: async e => {
+            e.preventDefault(); err.textContent = '';
+            try { await api('DELETE', '/suppliers/' + s.id + '/items/' + i.id); toast('Item removed'); await reload(); } catch (x) { err.textContent = x.message; }
+          } }, 'remove') : null)))
+          : el('div', { class: 'help' }, 'Not on any item’s approved-supplier list yet, so it is not offered when receiving.'),
+        may && free.length ? el('div', { class: 'form-row' }, field('Add an item', itemSel), el('div', { class: 'side-actions', style: 'align-self:end' }, el('button', { type: 'button', class: 'secondary', onclick: async () => {
+          err.textContent = '';
+          if (!itemSel.value) { err.textContent = 'Choose an item first.'; return; }
+          try { await api('POST', '/suppliers/' + s.id + '/items', { consumableId: +itemSel.value }); toast('Item added: this supplier is now offered when receiving it'); await reload(); } catch (x) { err.textContent = x.message; }
+        } }, 'Add item'))) : null);
       panel.append(el('h4', {}, 'Documents'),
         table(['Type', 'File', 'Expires', 'Note', ''], s.documents.map(d => [d.kind, el('a', { href: supplierDocUrl(s.id, d.id), target: '_blank', rel: 'noopener' }, d.filename),
           el('span', {}, d.expiryDate || '—', ' ', supplierDocBadge(d)), d.note || '',
@@ -6096,7 +6122,7 @@ async function receiveStock(c) {
     r.total = el('div', { class: 'help', style: 'margin:2px 0 0' });
     const upd = () => {
       const isNew = r.pack.value === 'new', p = (c.packs || []).find(x => String(x.id) === r.pack.value);
-      r.newName.style.display = r.newQty.style.display = isNew ? '' : 'none';
+      r.newName.style.display = r.newQty.style.display = isNew ? 'block' : 'none';          // block: stacked under the pack choice (table cells do not wrap, so inline inputs spilled over the Quantity and Supplier lot columns)
       r.qty.placeholder = (p || isNew) ? 'number of packs' : 'quantity (' + c.unit + ')';
       r.price.placeholder = p || isNew ? 'price per pack' : 'price per ' + c.unit;
       const per = isNew ? +r.newQty.value : (p ? p.qtyPerPack : null);
