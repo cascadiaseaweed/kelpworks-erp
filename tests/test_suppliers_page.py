@@ -188,11 +188,11 @@ def test_a_document_with_an_expiry_date_is_stored_served_and_flagged(srv, people
     s = make(a, approvalStatus="Approved", approvalDate=today(), nextReviewDate=today(300))
     sid = s["id"]
     soon, past, far = today(10), today(-5), today(200)
-    for name, kind, exp in (("organic.pdf", "Organic certificate", soon), ("insurance.pdf", "Insurance", far), ("sds.pdf", "SDS", None)):
+    for name, kind, exp in (("organic.pdf", "Organic certificate", soon), ("insurance.pdf", "Insurance", far), ("other.pdf", "Other", None)):
         r = pm.post("/api/suppliers/%d/documents" % sid, {"filename": name, "dataB64": PDF, "kind": kind, "expiryDate": exp, "note": "scan"})
         assert r.status == 200, r.text
     docs = {d["filename"]: d for d in a.get("/api/suppliers/%d" % sid).json["documents"]}
-    assert docs["organic.pdf"]["status"] == "expiring" and docs["insurance.pdf"]["status"] == "ok" and docs["sds.pdf"]["status"] == "none"
+    assert docs["organic.pdf"]["status"] == "expiring" and docs["insurance.pdf"]["status"] == "ok" and docs["other.pdf"]["status"] == "none"
     assert docs["organic.pdf"]["kind"] == "Organic certificate" and docs["organic.pdf"]["uploadedBy"]
     assert a.get("/api/suppliers/%d" % sid).json["flags"] == ["docs_expiring"]
     did = docs["organic.pdf"]["id"]
