@@ -338,6 +338,14 @@ th.sortable:hover { background: var(--bg-e2ece9); }
 .modal .form-row { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .modal .modal-actions { display:flex; justify-content:flex-end; gap: 8px; margin-top: 18px; }
 .field { margin-bottom: 6px; }
+/* A tidy checkbox: the box beside its label (KW-86), help text under the label. */
+.check-group { margin: 4px 0 8px; }
+.check-line { display: flex; align-items: flex-start; gap: 10px; margin: 6px 0; font-weight: normal; cursor: pointer; }
+.check-line input[type=checkbox] { width: 18px; height: 18px; flex: none; margin: 1px 0 0; padding: 0; accent-color: var(--teal); }
+.check-line > span { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.check-line .check-text { font-size: 13.5px; color: var(--ink); }
+.check-line .help { margin: 0; }
+.qc-loc-option input[type=checkbox] { width: 16px; height: 16px; flex: none; margin: 0; padding: 0; accent-color: var(--teal); }
 .help { font-size: 11px; color: var(--muted); margin-top: 2px; }
 
 /* QC Check read-only log rows (openQcForRun): one row per field, label +

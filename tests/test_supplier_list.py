@@ -20,7 +20,7 @@ def people(srv):
 
 
 def new_item(admin, name):
-    r = admin.post("/api/consumables", {"name": name, "unit": "kg", "onHand": 0})
+    r = admin.post("/api/consumables", {"name": name, "unit": "kg", "onHand": 0, "manufacturer": "Test Maker", "grade": "Food"})
     assert r.ok, r.text
     return [c["id"] for c in admin.get("/api/consumables").json["consumables"] if c["name"] == name][0]
 

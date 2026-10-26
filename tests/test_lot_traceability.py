@@ -31,7 +31,7 @@ def item_id(admin, name):
 
 
 def new_item(srv, admin, name):
-    r = admin.post("/api/consumables", {"name": name, "unit": "kg", "onHand": 0})
+    r = admin.post("/api/consumables", {"name": name, "unit": "kg", "onHand": 0, "manufacturer": "Test Maker", "grade": "Food"})
     r.raise_for_status()
     cid = item_id(admin, name)
     approve_suppliers(admin, cid)

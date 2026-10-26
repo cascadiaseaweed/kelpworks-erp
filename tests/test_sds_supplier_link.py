@@ -166,7 +166,7 @@ def test_the_supplier_lists_its_sheets_current_and_withdrawn_and_flags_an_overdu
     sid = supplier(a, name, approvalStatus="Approved", approvalDate=datetime.date.today().isoformat(), nextReviewDate=(datetime.date.today() + datetime.timedelta(days=300)).isoformat())
     fresh = uniq("Freshchem")
     old = uniq("Oldchem")
-    item = a.post("/api/consumables", {"name": uniq("Sdsitem"), "unit": "kg", "onHand": 0})
+    item = a.post("/api/consumables", {"name": uniq("Sdsitem"), "unit": "kg", "onHand": 0, "manufacturer": "Test Maker", "grade": "Food"})
     assert item.ok
     cid = [c["id"] for c in a.get("/api/consumables").json["consumables"] if c["name"].startswith("Sdsitem")][-1]
     _, f = add_sheet(srv, a, fresh, name, datetime.date.today().replace(day=1).isoformat())
