@@ -12,17 +12,19 @@ Date: 2026-10-09. Code reviewed: `main` at `c1e5343` (after PRs #4 to #7). Scope
 
 ## Remediation status
 
+This table records what was fixed and when. **Work that is still open is tracked in the change log (`LOG_KelpWorks_ChangeControl.xlsx`), not here:** a row below that has work left names the KW item and keeps no status text of its own, so there is one place to look for what is open, who approved it and when it was done (KW-72 to KW-78, raised 2026-10-24).
+
 | Finding | Status |
 |---|---|
 | R-01 finished-goods edits | **Fixed** (batch 1): permissions, status whitelist, reason, audit event |
 | R-02 lab results | **Fixed** (batches 1 and 6): Quality Manager only; a failed result must be voided before a retest; the lab report must be attached for tests that decide release; released product is held when a gated result is voided or fails |
 | R-11 release gate | **Fixed** (batch 6): heavy metals and microbial tests must pass and TDS must be at or above its lower limit; no override |
 | R-18 change control | **Fixed** (batch 6): spec and setting changes are logged (who, field, old, new) |
-| R-19 audit | **Partly fixed** (batch 6): the hash-mismatch void is committed; password resets, role and active changes are logged. Still open: keyed chain / external anchor |
-| R-20 separation of duties | **Partly fixed** (batch 6): the review is Production Manager only, the release Quality Manager only; optional settings forbid the same person doing both or reviewing their own finalized run; role / password changes are logged |
+| R-19 audit | **Partly fixed** (batch 6): the hash-mismatch void is committed; password resets, role and active changes are logged. Remaining work: KW-73 (external anchor of the chain, an administrator warning, wider coverage) |
+| R-20 separation of duties | **Partly fixed** (batch 6): the review is Production Manager only, the release Quality Manager only; optional settings forbid the same person doing both or reviewing their own finalized run; role / password changes are logged. Remaining work: KW-74 (decide the optional settings and who may grant roles) |
 | R-21 recall | **Fixed** (batches 6 and 8b): a lot-to-customers recall report, and inventory lots (supplier lot number, receipt, expiry) with every use assigned to a lot, so a supplier lot traces forward to runs, products and customers and a run traces back to its materials. Stock received before lots were recorded is flagged as untraced |
 | R-03 tote reuse | **Fixed** (batch 1): ownership check at draft save and finalize; tote status/weight edits restricted |
-| R-04 secrets and defaults | **Fixed** (batch 2): no public secret (generated key file), no default passwords outside development, must-change enforced by the server, no prefilled login. Still to do in Render: confirm `KELP_ERP_SECRET` / `KELP_ERP_ADMIN_PASSWORD` are set on live and staging |
+| R-04 secrets and defaults | **Fixed** (batch 2): no public secret (generated key file), no default passwords outside development, must-change enforced by the server, no prefilled login. Render checks: KW-78 (secret and admin password confirmed on live 2026-10-24) |
 | R-12 token revocation | **Fixed** (batches 2 and 8): token versions end sessions on password change / reset / deactivation; downloads use the same authentication as the API; a file link carries a 15-minute download-only token, never the session token |
 | R-13 login | **Fixed** (batch 2): throttling and no timing difference for unknown emails |
 | R-05 stored XSS | **Fixed** (batch 3): files are served by their name's type only (non-PDF/image = download), script-capable types refused, print windows escape their data, a Content-Security-Policy on the app page |
@@ -38,14 +40,16 @@ Date: 2026-10-09. Code reviewed: `main` at `c1e5343` (after PRs #4 to #7). Scope
 | R-27 drifting totals | **Mostly fixed** (batch 7): the accepted / rejected decision is locked after finalize, `edit_run` no longer changes reagent totals, finalize refuses a draft whose locked totes are missing from the request, NaN / infinity / negative quantities are refused. |
 | R-28 tote delete | **Fixed** (batches 7 and 8): a tote that appears in a run or pre-processing record cannot be deleted (409); deleting any other tote leaves an append-only record of what it was (including its stability log and file list) and who removed it |
 | R-30 indexes | **Fixed** (batch 7): every foreign-key column is indexed (automatically, including future tables), plus `consumable_txns(ref)` and the status columns used by the lists |
-| R-31 bad data | **Partly fixed** (batch 7): triggers refuse an unknown status on totes / finished goods / runs / pre-processing batches and negative finished-goods units. Still open: `*_id` columns without foreign keys (cannot be added to existing tables without a rebuild) |
-| R-32 volume drift | **Partly fixed** (batch 7): a run's output litres follow the litres each finished-goods lot was created with, and the IBC count works with the real container name. Still open: pre-processing pack-out is not reconciled; the re-hash of signed logs does not record what changed |
-| R-23 backups | **Mostly fixed** (batches 9 and 8): nightly full backup on the server disk with rotation, a free-space check and an admin "Back up now"; an office PC copies the backups (daily / weekly / monthly tiers) and every run's documents to SharePoint; `docs/restore-runbook.md` + a safe start-up restore for live. Still to do: confirm Render disk snapshots are enabled, and rehearse the runbook once |
+| R-31 bad data | **Partly fixed** (batch 7): triggers refuse an unknown status on totes / finished goods / runs / pre-processing batches and negative finished-goods units. Remaining work: KW-76 (`*_id` columns without foreign keys need a table rebuild) |
+| R-32 volume drift | **Partly fixed** (batch 7): a run's output litres follow the litres each finished-goods lot was created with, and the IBC count works with the real container name. Remaining work: KW-75 (pack-out reconciliation; record what a re-hash changed) |
+| R-23 backups | **Mostly fixed** (batches 9 and 8): nightly full backup on the server disk with rotation, a free-space check and an admin "Back up now"; an office PC copies the backups (daily / weekly / monthly tiers) and every run's documents to SharePoint; `docs/restore-runbook.md` + a safe start-up restore for live. Remaining work: KW-72 (warn when no backup has been copied off the server) and KW-78 (disk snapshots confirmed 2026-10-24; the restore itself was exercised for real on live 2026-10-23, KW-60, see `docs/clean-cut-over.md`) |
 | R-22 missing disk | **Fixed** (batch 8, once switched on): `KELP_ERP_REQUIRE_MOUNT=/var/data` makes the server refuse to start when the disk is not mounted |
 | R-33 rebaseline | **Fixed** (batch 8): the rebaseline event records the hash it replaced and the previous version; starting older code on a newer database logs a warning |
 | R-06 shipments | **Fixed** (batch 1): duplicate lines, un-cancel, disposed-lot return, conditional deduction, write lock |
 | R-14 edit under amendment | **Fixed** (batch 1) |
 | R-15 concurrency | **Fixed** (batches 1 and 7): writes take the lock up front and wait up to 30 s; a unique-number collision is a 409 |
+| R-34 small items | **Mostly fixed** (batches 3, 4 and 7: no CORS headers, security headers, `seed()` raises on an unreadable `seed.json`, Sample Point quantity validated, `ibc_used` from `_run_output`); the boot-housekeeping part was not re-checked |
+| R-35 maintainability | Open: KW-77 |
 | all others | Open |
 
 ## Executive summary
