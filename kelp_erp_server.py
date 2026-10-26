@@ -4606,6 +4606,9 @@ def migrate(conn):
             conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (tbl, col, ddl))
     if "supplier_id" not in {r["name"] for r in conn.execute("PRAGMA table_info(sds_documents)")}:
         conn.execute("ALTER TABLE sds_documents ADD COLUMN supplier_id INTEGER REFERENCES suppliers(id)")              # KW-83: the sheet's supplier record
+    for col in ("last_reviewed_on", "last_reviewed_by", "last_review_note"):                                          # KW-88: the current review (every review is also in document_edits)
+        if col not in {r["name"] for r in conn.execute("PRAGMA table_info(sds_documents)")}:
+            conn.execute("ALTER TABLE sds_documents ADD COLUMN %s TEXT" % col)
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(tote_lots)")}
     if "ph_updated" not in cols:
         conn.execute("ALTER TABLE tote_lots ADD COLUMN ph_updated TEXT")
@@ -7250,11 +7253,11 @@ def library_scan_info(conn):
     return {"scans": out, "staleDays": stale_days}
 
 
-def sds_review(issue_date, years, warn_days, today=None):
-    """(review due date, 'ok' | 'soon' | 'overdue') for a safety data sheet issued on `issue_date`: due = issue date + `years` years."""
+def sds_review(issue_date, years, warn_days, today=None, reviewed_on=None):
+    """(review due date, 'ok' | 'soon' | 'overdue') for a safety data sheet issued on `issue_date`: due = the later of the issue date and the last review (KW-88) + `years` years."""
     if not issue_date:
         return None, None
-    due = add_months(issue_date, int(round(float(years) * 12)))
+    due = add_months(max(issue_date, reviewed_on) if reviewed_on else issue_date, int(round(float(years) * 12)))
     if not due:
         return None, None
     today = today or datetime.date.today()
@@ -8144,6 +8147,9 @@ class Handler(BaseHTTPRequestHandler):
             conn.execute("UPDATE sds_documents SET %s WHERE id=?" % ", ".join("%s=?" % c for c in sets), (*sets.values(), doc["id"]))
             library_log_edit(conn, "sds", doc["id"], who, "Issue date", doc["issue_date"] or "-", issue)
             library_log_edit(conn, "sds", doc["id"], who, "File", doc["filename"] or "-", row["filename"])
+            if issue != (doc["issue_date"] or "") and doc["last_reviewed_on"]:          # KW-88: a review applies to the issue that was reviewed; the earlier lines stay in the history
+                conn.execute("UPDATE sds_documents SET last_reviewed_on=NULL, last_reviewed_by=NULL, last_review_note=NULL WHERE id=?", (doc["id"],))
+                library_log_edit(conn, "sds", doc["id"], who, "Review cleared (new issue)", "reviewed %s" % doc["last_reviewed_on"], "issue dated %s" % issue)
             return doc["id"], "New issue dated %s accepted" % issue
         chemical = (parsed.get("chemical") or "").strip()                  # all three come from the file name: SharePoint is the single source
         supplier = (parsed.get("supplier") or "").strip()
@@ -8173,7 +8179,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "The issue date must be a real date, year-month-day")
 
     def _sds_public(self, conn, r, items, years, warn, suppliers=None):
-        due, review = sds_review(r["issue_date"], years, warn)
+        due, review = sds_review(r["issue_date"], years, warn, None, r["last_reviewed_on"])
         if r["status"] != "current":
             review = None                                   # a withdrawn sheet is not due for review
         if suppliers is None:
@@ -8183,7 +8189,8 @@ class Handler(BaseHTTPRequestHandler):
         return {"id": r["id"], "chemical": r["chemical"], "supplier": r["supplier"], "issueDate": r["issue_date"], "reviewDue": due, "reviewStatus": review,
                 "status": r["status"], "filename": r["filename"], "hasFile": bool(r["stored_name"]), "size": r["size"], "uploadedAt": r["uploaded_at"],
                 "notes": r["notes"], "items": items.get(r["id"], []), "supplierId": linked["id"] if linked else None, "supplierName": linked["name"] if linked else None,
-                "supplierSuggestion": {"id": hint["id"], "name": hint["name"]} if hint else None}
+                "supplierSuggestion": {"id": hint["id"], "name": hint["name"]} if hint else None,
+                "lastReviewedOn": r["last_reviewed_on"], "lastReviewedBy": r["last_reviewed_by"], "lastReviewNote": r["last_review_note"]}
 
     def _sds_items_map(self, conn):
         out = {}
@@ -8220,7 +8227,48 @@ class Handler(BaseHTTPRequestHandler):
             return {"revisions": revs, "edits": edits}
         raise ApiError(404, "Unknown documents endpoint")
 
+    def _sds_review_record(self, conn, user, did):
+        """POST /api/sds-documents/<id>/review {reviewedOn, note} (KW-88): record that KelpWorks reviewed this sheet and found it current. An administrator or a Quality Manager; the issue date is the
+        manufacturer's and is never changed. Review due = the later of the issue date and the last review + the interval. Append-only: each review is three History lines."""
+        if not (user["role"] == "admin" or self._is_quality_manager(user)):
+            raise ApiError(403, "Only an administrator or a Quality Manager can record a review of a safety data sheet")
+        doc = conn.execute("SELECT * FROM sds_documents WHERE id=?", (did,)).fetchone()
+        if not doc:
+            raise ApiError(404, "Safety data sheet not found")
+        if doc["status"] != "current":
+            raise ApiError(409, "A withdrawn safety data sheet cannot be reviewed")
+        d = self._body_json()
+        on = (str(d.get("reviewedOn") or "")).strip()
+        try:
+            datetime.date.fromisoformat(on)
+        except ValueError:
+            raise ApiError(400, "The review date must be a real date, year-month-day")
+        if on > today_iso():
+            raise ApiError(400, "The review date cannot be in the future")
+        if doc["issue_date"] and on < doc["issue_date"]:
+            raise ApiError(400, "The review date cannot be before the sheet's issue date (%s)" % doc["issue_date"])
+        note = (str(d.get("note") or "")).strip()[:500] or None
+        if on == doc["last_reviewed_on"] and note == doc["last_review_note"]:
+            return self._sds_review_answer(conn, did)                              # nothing new to record
+        years = float(get_setting_value(conn, "sds_review_years", 3) or 3)
+        warn = float(get_setting_value(conn, "sds_review_warning_days", 60) or 60)
+        old_due = sds_review(doc["issue_date"], years, warn, None, doc["last_reviewed_on"])[0]
+        new_due = sds_review(doc["issue_date"], years, warn, None, on)[0]
+        conn.execute("UPDATE sds_documents SET last_reviewed_on=?, last_reviewed_by=?, last_review_note=?, updated_at=? WHERE id=?", (on, user["name"], note, now_iso(), did))
+        library_log_edit(conn, "sds", did, user["name"], "Reviewed on", doc["last_reviewed_on"] or "-", on)
+        library_log_edit(conn, "sds", did, user["name"], "Review due", old_due or "-", new_due or "-")
+        if note:
+            library_log_edit(conn, "sds", did, user["name"], "Review note", "-", note)
+        return self._sds_review_answer(conn, did)
+
+    def _sds_review_answer(self, conn, did):
+        years = float(get_setting_value(conn, "sds_review_years", 3) or 3)
+        warn = float(get_setting_value(conn, "sds_review_warning_days", 60) or 60)
+        return {"sds": self._sds_public(conn, conn.execute("SELECT * FROM sds_documents WHERE id=?", (did,)).fetchone(), self._sds_items_map(conn), years, warn)}
+
     def route_sds(self, method, seg, conn, user):
+        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "review" and method == "POST":          # KW-88: an administrator or a Quality Manager (checked inside)
+            return self._sds_review_record(conn, user, int(seg[2]))
         self._require_admin(user)
         if len(seg) == 3 and seg[2].isdigit() and method == "PUT":
             did = int(seg[2])
@@ -11473,7 +11521,7 @@ class Handler(BaseHTTPRequestHandler):
         docs = conn.execute("SELECT * FROM supplier_documents WHERE supplier_id=? AND removed_at IS NULL ORDER BY id", (r["id"],)).fetchall()
         years = float(get_setting_value(conn, "sds_review_years", 3) or 3)
         sds_warn = float(get_setting_value(conn, "sds_review_warning_days", 60) or 60)
-        sheets = [(s,) + sds_review(s["issue_date"], years, sds_warn) for s in conn.execute("SELECT * FROM sds_documents WHERE supplier_id=? ORDER BY status, chemical", (r["id"],))]       # KW-83
+        sheets = [(s,) + sds_review(s["issue_date"], years, sds_warn, None, s["last_reviewed_on"]) for s in conn.execute("SELECT * FROM sds_documents WHERE supplier_id=? ORDER BY status, chemical", (r["id"],))]       # KW-83
         out = {"id": r["id"], "name": r["name"], "type": r["supplier_type"] or "", "accountNumber": r["account_number"] or "", "contactName": r["contact_name"] or "",
                "contactPhone": r["contact_phone"] or "", "contactEmail": r["contact_email"] or "", "address": r["address"] or "", "website": r["website"] or "",
                "paymentTerms": r["payment_terms"] or "", "currency": r["currency"] or "", "taxNumber": r["tax_number"] or "", "approvalStatus": r["approval_status"],
@@ -11481,6 +11529,7 @@ class Handler(BaseHTTPRequestHandler):
                "createdBy": r["created_by"], "createdAt": r["created_at"], "updatedBy": r["updated_by"], "updatedAt": r["updated_at"],
                "flags": supplier_flags(r["approval_status"], r["next_review_date"], [d["expiry_date"] for d in docs], today, warn,
                                        any(s["status"] == "current" and review == "overdue" for s, _due, review in sheets)), "nDocs": len(docs),
+               "nSds": sum(1 for s, _due, _review in sheets if s["status"] == "current"),                       # KW-88: current linked safety data sheets (withdrawn ones are not counted)
                "nItems": conn.execute("SELECT COUNT(*) FROM consumable_suppliers WHERE supplier_id=?", (r["id"],)).fetchone()[0]}
         if detail:
             out["items"] = [{"id": c["id"], "itemNumber": c["item_number"], "name": c["name"]} for c in conn.execute(
@@ -11488,7 +11537,8 @@ class Handler(BaseHTTPRequestHandler):
             out["documents"] = [self._supplier_doc_public(d, today, warn) for d in docs]
             items = self._sds_items_map(conn)
             out["sds"] = [{"id": s["id"], "chemical": s["chemical"], "issueDate": s["issue_date"], "reviewDue": due, "reviewStatus": review if s["status"] == "current" else None,
-                           "status": s["status"], "filename": s["filename"], "hasFile": bool(s["stored_name"]), "items": items.get(s["id"], [])} for s, due, review in sheets]
+                           "status": s["status"], "filename": s["filename"], "hasFile": bool(s["stored_name"]), "items": items.get(s["id"], []),
+                           "lastReviewedOn": s["last_reviewed_on"], "lastReviewedBy": s["last_reviewed_by"]} for s, due, review in sheets]
             out["history"] = [{"field": l["field"], "old": l["old_value"], "new": l["new_value"], "reason": l["reason"], "by": l["user_name"], "at": l["created_at"]}
                               for l in conn.execute("SELECT * FROM supplier_log WHERE supplier_id=? ORDER BY id DESC LIMIT 200", (r["id"],))]
         return out

@@ -94,14 +94,20 @@ Everything an administrator accepts or ignores is recorded with their name, and 
 
 The page also shows when each folder was last reported. If that is more than 3 days ago (setting `library_scan_stale_days`) a red note says the nightly sync on the office PC may have stopped.
 
-**Safety data sheets** show a **Review due** date = issue date + 3 years (settings `sds_review_years` and `sds_review_warning_days`, which an administrator can change on the Calculations page):
+**Safety data sheets** show a **Review due** date = the later of the issue date and the last review, + 3 years (settings `sds_review_years` and `sds_review_warning_days`, which an administrator can change on the Calculations page):
 OK / Review soon / Overdue. **Used for...** links a sheet to the inventory items it covers; those items then show an **SDS** link on the Inventory Items page.
+
+**Recording a review.** The issue date is the manufacturer's (read from the file name) and never changes in KelpWorks. When you have checked a sheet and found it current, an **administrator or a Quality Manager** presses
+**Record review...** on its row in Documents > Safety data sheets, chooses the date (not in the future, not before the issue date) and may add a note. The sheet then shows **Last reviewed** and its Review due restarts from that date.
+Every review is kept in the sheet's History with who, when, the date, the new review due and the note, and cannot be edited or deleted; if a date was entered wrongly, record the right one (both stay in the history).
+A **new issue** from the manufacturer (a different issue date) starts again from its own date and clears the last review (the earlier reviews stay in the history); the same issue coming back after a withdrawal keeps its review.
 
 **Safety data sheets and suppliers.** This library is the only way an SDS is loaded: it is no longer a document kind on a supplier. Each sheet can be **linked to a supplier record** (Suppliers tab):
 - **Automatically**, when the supplier in the file name is the same name as one supplier record (case, spaces and punctuation do not matter): when the sheet is accepted, and also when a matching supplier is added or renamed later.
 - **By an administrator**, in all other cases ("Univar" in the file name, "Univar Solutions Canada" on the record): Documents lists the sheets that are **not linked** with the record KelpWorks suggests; **Link...** (or **Used for...** on the sheet) opens a window with a Supplier record drop-down. Nothing is linked on a guess.
 - The link follows the supplier's record, not the file name: renaming the supplier in KelpWorks keeps it, and a new revision or a withdrawn sheet coming back keeps it. The link is logged on the sheet (History) and on the supplier (History: "Safety data sheet").
-- The supplier's panel then lists its sheets (current and withdrawn, review date, items covered, download), and a **Safety data sheet overdue** flag appears on the supplier, in the Suppliers list filter and as a warning when receiving from it.
+- The Suppliers list's **Documents** number counts the supplier's own documents plus its current linked safety data sheets and shows the split, for example "3 (1 SDS)". A withdrawn sheet is not counted.
+- The supplier's panel then lists its sheets (current and withdrawn, review date, last review, items covered, download), and a **Safety data sheet overdue** flag appears on the supplier, in the Suppliers list filter and as a warning when receiving from it.
 - Changing the supplier part of a file name is a different sheet by design (the sheet's identity is chemical + supplier).
 
 ## Safeguards
