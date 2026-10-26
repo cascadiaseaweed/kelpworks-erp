@@ -81,6 +81,8 @@ the disk is not mounted.
 
 ## Wipe everything and start fresh
 
+The order of work, who does what and the records to keep are in `docs/clean-cut-over.md` (the KW-60 reset of 2026-10-23); the details are below.
+
 To clear ALL records from live (totes, runs, finished goods, shipments, customers, samples, lab results, documents, the audit history) and keep only the
 configuration, restore a **clean backup** instead of a normal one. The same steps as above apply; only the file differs, so this doubles as a rehearsal.
 
