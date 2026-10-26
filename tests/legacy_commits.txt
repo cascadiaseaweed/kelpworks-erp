@@ -60,3 +60,4 @@ a15c319  2026-10-21  photo archive (KW-04), ORP / run summary card / separation 
 47f2439  2026-10-25  SDS library linked to supplier records (KW-83) (PR 101); Receive window filled from an uploaded invoice or document (KW-82) (PR 102); date inputs default to the local day (PR 103) merged to main and live
 26703d3  2026-10-25  Reagent items are one specific product: chemical, manufacturer, grade, form, duplicate warning, required fields (KW-86) (PR 105) merged to main and live
 464d039  2026-10-26  Safety data sheet review recorded by an administrator or Quality Manager, linked SDS counted in the supplier Documents number (KW-88) (PR 109) merged to main and live
+a06f4a3  2026-10-26  Standard items found by a stable key, locked Used IBC pool, rename of reagent / CIP items by an administrator, default item per reagent type (KW-89 phase 1) (PR 111) merged to main and live
