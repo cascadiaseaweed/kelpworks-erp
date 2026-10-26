@@ -831,13 +831,13 @@ async function updateCondition(t) {
     el('div', { class: 'form-row' },
       field('New pH reading', el('input', { type: 'number', step: '0.1', id: 'p_ph', placeholder: 'e.g. 3.7' })),
       field('New ORP reading', el('input', { type: 'number', step: '1', id: 'p_orp', placeholder: 'e.g. -150' }))),
-    field('Reading date', el('input', { type: 'date', id: 'p_date', value: new Date().toISOString().slice(0, 10), max: new Date().toISOString().slice(0, 10) })),
+    field('Reading date', el('input', { type: 'date', id: 'p_date', value: todayStr(), max: todayStr() })),
     el('div', { class: 'help', style: 'margin:-6px 0 8px' }, 'Today by default. Choose an earlier date to add a historical reading: the reading with the newest date is the value shown (and used for grading); an older one is kept in the history only.'),
     field('Note (optional)', el('input', { id: 'p_note', placeholder: 'who / instrument / observation' })),
     detailCard,
     el('h4', { style: 'margin:12px 0 4px' }, 'Received date'),
     el('div', { class: 'form-row' },
-      field('Received date', el('input', { type: 'date', id: 'p_received', value: data.receivedDate || '', max: new Date().toISOString().slice(0, 10), min: data.harvestDate || '' })),
+      field('Received date', el('input', { type: 'date', id: 'p_received', value: data.receivedDate || '', max: todayStr(), min: data.harvestDate || '' })),
       field('Reason for changing it', el('input', { id: 'p_received_why', placeholder: 'required only when you change a date that is already filled in' }))),
     el('label', {}, 'Feedstock Stability log'), history);
   modal('Update feedstock conditions — ' + t.lot, body, async () => {
@@ -868,7 +868,10 @@ async function updateCondition(t) {
     render();
   }, 'Save & close', { wide: true });
 }
-const todayStr = () => new Date().toISOString().slice(0, 10);
+// A date input's "today" is the browser's LOCAL calendar day (toISOString is UTC, a day ahead on a Pacific evening, and the
+// server refuses a received / run / reading date after ITS today). Use these for every date pre-filled with, or capped at, today.
+const localDateStr = (d = new Date()) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+const todayStr = () => localDateStr();
 function drawMoveHistory(host, log, showQty) {
   host.innerHTML = '';
   if (!log.length) { host.append(el('div', { class: 'help' }, 'No moves recorded yet.')); return; }
@@ -939,8 +942,8 @@ async function openHarvest() {
       field('Farm site', selectFrom('', sites, null, 'h_site'))),
     el('div', { class: 'form-row-3' },
       field('Species', selectFrom('', species, null, 'h_species')),
-      field('Harvest date', el('input', { type: 'date', id: 'h_date', value: new Date().toISOString().slice(0, 10) })),
-      field('Received date', el('input', { type: 'date', id: 'h_received', value: new Date().toISOString().slice(0, 10) }))),
+      field('Harvest date', el('input', { type: 'date', id: 'h_date', value: todayStr() })),
+      field('Received date', el('input', { type: 'date', id: 'h_received', value: todayStr() }))),
     el('div', { class: 'form-row' },
       field('Storage location', editableSelect(locs, 'h_loc')),
       field('Number of storage units', el('input', { type: 'number', id: 'h_count', min: '1', value: '1' }))),
@@ -4211,7 +4214,7 @@ async function openNewRun() {
       sl('Nabenzoate (w/v)', s.nabenzoateTarget != null ? (s.nabenzoateTarget * 100).toFixed(2) + '%' : '—'));
   }
   renderSpecPanel();
-  const dateInp = el('input', { type: 'date', id: 'nr_date', value: new Date().toISOString().slice(0, 10) });
+  const dateInp = el('input', { type: 'date', id: 'nr_date', value: todayStr() });
   const locSel = productionLocationSelect('nr_loc');
   const operatorsSelect = buildOperatorsSelect('');
   const body = el('div', {},
@@ -4245,7 +4248,7 @@ async function openHistoricalRun() {
   const skus = State.ref.skus.filter(s => s.active);
   const lot = el('input', { placeholder: 'e.g. PR-20260506-012' });
   const skuSel = skuGroupedSelect(skus, NEW_RUN_DEFAULT_SKU);
-  const dateInp = el('input', { type: 'date', max: new Date().toISOString().slice(0, 10) });
+  const dateInp = el('input', { type: 'date', max: todayStr() });
   const locSel = productionLocationSelect('hr_loc');
   const operatorsSelect = buildOperatorsSelect('');
   const inv = selectFrom('', [['count', 'Count it: deduct stock and assign supplier lots as of the run date'], ['skip', 'Leave inventory alone: no stock or lot effect']]);
@@ -4591,7 +4594,7 @@ async function openRun(draftSummary, opts) {
       el('div', { class: 'accordion-body' },
         el('div', { class: 'form-row' },
           field(reqLabel('Product SKU'), skuSel),
-          field(reqLabel('Run date'), el('input', { type: 'date', id: 'r_date', value: draft?.runDate || new Date().toISOString().slice(0, 10) }))),
+          field(reqLabel('Run date'), el('input', { type: 'date', id: 'r_date', value: draft?.runDate || todayStr() }))),
         specPanel,
         el('div', { class: 'form-row', style: 'margin-top:8px' },
           field(reqLabel('Production Location'), productionLocationSelect('r_loc', draft?.location)),
@@ -6112,7 +6115,7 @@ function supplierPicker(c, current) {
 // Receiving stock records a LOT per supplier lot: who supplied it, the supplier's lot number, when it arrived and when it expires, and ONE delivery (invoice, PO, order, carrier, documents)
 // that all the lots of the invoice share. Every later use of the item is assigned to a lot automatically (earliest expiry first), which is what lets a recall be traced.
 async function receiveStock(c) {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayStr();
   let last = null;
   try { last = ((await api('GET', '/consumables/' + c.id + '/lots')).lots || [])[0] || null; } catch (e) { /* no earlier lot */ }
   const packaging = c.isContainer;
@@ -6930,8 +6933,8 @@ async function pageYield(v) {
     draw();
   }
   function setRange(from, to) { fromInp.value = from; toInp.value = to; load(); }
-  const today = new Date().toISOString().slice(0, 10);
-  const daysAgo = n => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
+  const today = todayStr();
+  const daysAgo = n => localDateStr(new Date(Date.now() - n * 86400000));
   v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Yield & Usage'),
     el('div', { class: 'actions' },
       el('button', { class: 'secondary', onclick: () => exportYieldCsv(data) }, '⬇ CSV'),
@@ -7750,7 +7753,7 @@ async function drawRetentionInventory(host) {
   const selected = State.retentionSel = State.retentionSel || new Set();
   const vs = sampleViewState('retention');
   const inInv = samples.filter(s => ['available', 'in_cart'].includes(s.status));
-  const soon = inInv.filter(s => s.discardBy && !s.expired && s.discardBy <= new Date(Date.now() + 30 * 864e5).toISOString().slice(0, 10));
+  const soon = inInv.filter(s => s.discardBy && !s.expired && s.discardBy <= localDateStr(new Date(Date.now() + 30 * 864e5)));
   const showAll = el('input', { type: 'checkbox' }); showAll.checked = !!f.showRemoved;
   showAll.addEventListener('change', () => { f.showRemoved = showAll.checked; draw(); });
   const byId = id => samples.find(s => s.id === id);

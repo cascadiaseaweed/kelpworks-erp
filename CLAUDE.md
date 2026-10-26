@@ -688,6 +688,9 @@ for `main` so a red run blocks the merge.
   rowClick?)`; `modal(title, body, onSubmit, submitLabel, opts?)`
   (**backdrop click does not close** — only Cancel/submit). `api(method, path,
   body)` wraps fetch with the bearer token.
+- **"Today" in a date input is the browser's LOCAL day**: use `todayStr()` / `localDateStr(date)` (app.js), never `new Date().toISOString().slice(0, 10)` (the UTC day, already tomorrow on a Pacific
+  evening; the server refuses a received / run / reading date after its own `today_iso()`). Render's server runs in UTC, which is never behind a Pacific browser, so the local default is always accepted
+  there. `tests/test_local_date_defaults.py` fails if the UTC form comes back.
 - Pages are functions (`pageDashboard`, `pageProduction`, …) selected by
   `State.tab` in `render()`. Add a tab: a button in the right colour group of the
   `<nav id="tabs">` in `index.html` (groups: Overview, Inventory, Process, Quality,
