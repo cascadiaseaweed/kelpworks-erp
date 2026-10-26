@@ -996,6 +996,17 @@ CREATE TABLE IF NOT EXISTS consumable_txns (
     created_at    TEXT NOT NULL
 );
 
+-- KW-89: every rename of an inventory item (append-only). It is the log of the change AND the list of names an item used to have (they cannot be given to another item).
+CREATE TABLE IF NOT EXISTS consumable_name_history (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    consumable_id INTEGER NOT NULL REFERENCES consumables(id),
+    old_name      TEXT NOT NULL,
+    new_name      TEXT NOT NULL,
+    reason        TEXT,
+    changed_by    TEXT,
+    changed_at    TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS fg_skus (
     code               TEXT PRIMARY KEY,        -- KELPIVEX, FIELDKELP, SACC-LKE (Sugar Kelp Extract), MACRO-LKE (Macrocystis Kelp Extract), ...
     name               TEXT NOT NULL,
@@ -2282,6 +2293,35 @@ def submitted_detail(conn, run_id, fg_created):
     return detail
 
 
+# ---- Standard items are found by a stable KEY, not by name (KW-89) -----------------------------------------------------------------------------------------------------------
+# An item's identity is its id / item number; its name is a label. The standard items the code needs to find carry a `system_key`, assigned once from their current names, so a renamed one is
+# still found and is never created a second time at start-up. `ibc_used` (the pool emptied totes return to) is LOCKED: it cannot be renamed or changed, by anyone.
+STANDARD_ITEMS = (("citric_acid", "Citric Acid"), ("potassium_sorbate", "Potassium Sorbate"), ("sodium_benzoate", "Sodium Benzoate"),
+                  ("cip_acid", "CIP Acid"), ("cip_caustic", "CIP Caustic"), ("cip_sanitizer", "CIP Sanitizer"),
+                  ("ibc_new", "New 1,000 L IBC Tote"), ("ibc_used", "Used 1,000 L IBC Tote"), ("drum_55", "55 gallon drum"),
+                  ("sample_falcon_50ml", "50 mL falcon tube"), ("sample_bag_100g", "100 g sample bag"), ("sample_bottle_1l", "1 L bottle"), ("sample_bottle_2l", "2 L bottle"))
+LOCKED_SYSTEM_KEYS = ("ibc_used",)
+REAGENT_TYPE_KEYS = {"Citric Acid": "citric_acid", "Potassium Sorbate": "potassium_sorbate", "Sodium Benzoate": "sodium_benzoate"}
+
+
+def assign_system_keys(conn):
+    """Give each standard item its key once: the item that carries the key already keeps it; otherwise the item with the standard name gets it. Never takes a key from another item."""
+    for key, name in STANDARD_ITEMS:
+        if not conn.execute("SELECT 1 FROM consumables WHERE system_key=?", (key,)).fetchone():
+            conn.execute("UPDATE consumables SET system_key=? WHERE name=? AND system_key IS NULL", (key, name))
+
+
+def ensure_reagent_defaults(conn):
+    """Each reagent type has ONE default item (is_type_default): the one the production-log picker preselects. A type that has none gets the item that comes first today (the one named like
+    the type, else the first by name), so nothing changes at upgrade, and a default whose item is gone heals at the next start."""
+    for rtype in REAGENT_TYPE_KEYS:
+        if conn.execute("SELECT 1 FROM consumables WHERE reagent_type=? AND is_type_default=1", (rtype,)).fetchone():
+            continue
+        first = conn.execute("SELECT id FROM consumables WHERE reagent_type=? ORDER BY CASE WHEN name=? THEN 0 ELSE 1 END, name LIMIT 1", (rtype, rtype)).fetchone()
+        if first:
+            conn.execute("UPDATE consumables SET is_type_default=1 WHERE id=?", (first["id"],))
+
+
 def ensure_reagent_types(conn):
     """The three standard reagents carry their reagent type. migrate() sets it when the column is added, which on a NEW database is before
     the reagents exist (seed() inserts them afterwards), so this runs again after seeding. Only fills a blank type."""
@@ -2316,6 +2356,7 @@ def init_db():
             ensure_requisition_contact(conn)
             ensure_sgs_analyses(conn)
             ensure_reagent_types(conn)
+            ensure_reagent_defaults(conn)
             ensure_site_list(conn)
             ensure_suppliers(conn)
             ensure_sds_supplier_links(conn)
@@ -4827,6 +4868,11 @@ def migrate(conn):
     for col in ("manufacturer", "manufacturer_code", "grade", "form", "chemical"):          # KW-86: what an item IS (blank until filled in; nothing is backfilled)
         if col not in rtcols:
             conn.execute("ALTER TABLE consumables ADD COLUMN %s TEXT" % col)
+    for col, ddl in (("system_key", "TEXT"), ("is_type_default", "INTEGER NOT NULL DEFAULT 0")):                            # KW-89: a stable key for the standard items; the default item of a reagent type
+        if col not in {r["name"] for r in conn.execute("PRAGMA table_info(consumables)")}:
+            conn.execute("ALTER TABLE consumables ADD COLUMN %s %s" % (col, ddl))
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_consumables_system_key ON consumables(system_key) WHERE system_key IS NOT NULL")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_consumables_type_default ON consumables(reagent_type) WHERE is_type_default=1")
     rccols = {r["name"] for r in conn.execute("PRAGMA table_info(run_reagent_commits)")}
     if "consumable_id" not in rccols:
         conn.execute("ALTER TABLE run_reagent_commits ADD COLUMN consumable_id INTEGER")
@@ -5095,19 +5141,20 @@ def migrate(conn):
     # 55 gallon drum FG package (55 US gal = 208.2 L; unit must not be 'tote',
     # which the harvest check-in source list filters on). Insert-only so an
     # admin's later edits stick; on-hand starts at 0 for the plant to count in.
-    if not conn.execute("SELECT 1 FROM consumables WHERE name='Sodium Benzoate'").fetchone():
+    if not conn.execute("SELECT 1 FROM consumables WHERE name='Sodium Benzoate' OR system_key='sodium_benzoate'").fetchone():
         conn.execute("INSERT INTO consumables (name,unit,on_hand,reorder_level)"
                      " VALUES ('Sodium Benzoate','kg',0,0)")
     # The three CIP (Clean In Place) cleaning agents -- reagents in litres,
     # flagged is_cip_agent so they're the ones offered on a CIP log line.
     # Named "CIP ..." so Acid can't be confused with Citric Acid.
-    for cip_name in ("CIP Acid", "CIP Caustic", "CIP Sanitizer"):
-        if not conn.execute("SELECT 1 FROM consumables WHERE name=?", (cip_name,)).fetchone():
+    for cip_name, cip_key in (("CIP Acid", "cip_acid"), ("CIP Caustic", "cip_caustic"), ("CIP Sanitizer", "cip_sanitizer")):
+        if not conn.execute("SELECT 1 FROM consumables WHERE name=? OR system_key=?", (cip_name, cip_key)).fetchone():
             conn.execute("INSERT INTO consumables (name,unit,on_hand,reorder_level,is_cip_agent)"
                          " VALUES (?,'L',0,0,1)", (cip_name,))
     if not conn.execute("SELECT 1 FROM consumables WHERE name='55 gallon drum'").fetchone():
         conn.execute("INSERT INTO consumables (name,unit,on_hand,reorder_level,is_container,litres_each)"
                      " VALUES ('55 gallon drum','drum',0,0,1,208.2)")
+    assign_system_keys(conn)                                                                                          # KW-89: every standard item now carries its key (once)
     # A finished-good label item for every product SKU in each of the two bulk
     # package types (1,000 L IBC and 55 gal drum); on-hand starts at 0 to be
     # counted in. Insert-only, so an existing label (and its stock) is never
@@ -11067,7 +11114,7 @@ class Handler(BaseHTTPRequestHandler):
             if not citric:
                 raise ApiError(400, "No Citric Acid reagent exists in Inventory Items")
             self._consume(conn, citric["id"], -b["citric_kg"], "Pre-processing pH adjustment", b["batch_lot"], uname)
-        used = self._consumable_by_name(conn, "Used 1,000 L IBC Tote")
+        used = self._used_ibc_pool(conn)
         if used and inputs:
             self._consume(conn, used["id"], len(inputs), "Emptied by pre-processing", b["batch_lot"], uname)
         # output lots, one per IBC
@@ -11389,6 +11436,7 @@ class Handler(BaseHTTPRequestHandler):
                     labelPackage=r["label_package"], isCipAgent=bool(r["is_cip_agent"]),
                     reagentType=r["reagent_type"], organic=bool(r["organic"]), low=(r["on_hand"] <= r["reorder_level"]),
                     manufacturer=r["manufacturer"], manufacturerCode=r["manufacturer_code"], grade=r["grade"], form=r["form"], chemical=r["chemical"],
+                    systemKey=r["system_key"], locked=r["system_key"] in LOCKED_SYSTEM_KEYS, isTypeDefault=bool(r["is_type_default"]),
                     lastCountedAt=r["last_counted_at"], lastCountedBy=r["last_counted_by"])
 
     def _clean_item_number(self, conn, raw, exclude_id=None):
@@ -12157,7 +12205,10 @@ class Handler(BaseHTTPRequestHandler):
                 suppliers = {}
                 for s in conn.execute("SELECT * FROM consumable_suppliers ORDER BY name COLLATE NOCASE"):
                     suppliers.setdefault(s["consumable_id"], []).append({"id": s["id"], "name": s["name"]})
-                return {"consumables": [dict(self._consumable_public(r), sds=sds.get(r["id"], []), lotCount=lots.get(r["id"], (0, 0))[0],
+                prev = {}
+                for h in conn.execute("SELECT consumable_id, old_name FROM consumable_name_history ORDER BY id DESC"):
+                    prev.setdefault(h["consumable_id"], []).append(h["old_name"])
+                return {"consumables": [dict(self._consumable_public(r), sds=sds.get(r["id"], []), previousNames=prev.get(r["id"], []), lotCount=lots.get(r["id"], (0, 0))[0],
                                              lotsRemaining=round(lots.get(r["id"], (0, 0))[1], 4), packs=packs.get(r["id"], []), suppliers=suppliers.get(r["id"], [])) for r in rows]}
             if method == "POST":
                 d = self._body_json()
@@ -12192,6 +12243,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._require_admin(user)
                 if conn.execute("SELECT 1 FROM consumables WHERE name=?", (name,)).fetchone():
                     raise ApiError(409, "That item already exists")
+                if conn.execute("SELECT 1 FROM consumable_name_history WHERE LOWER(old_name)=LOWER(?)", (name,)).fetchone():
+                    raise ApiError(409, "That name belonged to another item before it was renamed; choose another name")
                 item_number = self._clean_item_number(conn, d.get("itemNumber"))
                 unit = "ea" if is_label else self.normalize_unit(d.get("unit") or "ea")
                 location = self._ensure_location(conn, d.get("location"))
@@ -12336,6 +12389,7 @@ class Handler(BaseHTTPRequestHandler):
             if not c:
                 raise ApiError(404, "Item not found")
             d = self._body_json()
+            c = self._item_name_and_default(conn, user, c, d)                    # KW-89: rename (administrator only), the type default, the lock on the Used IBC pool
             location = self._ensure_location(conn, d["location"]) if "location" in d else c["location"]
             item_number = ((self._clean_item_number(conn, d["itemNumber"], cid) or c["item_number"])
                            if "itemNumber" in d else c["item_number"])
@@ -12556,7 +12610,7 @@ class Handler(BaseHTTPRequestHandler):
             name = (row.get("name") or "").strip()
             if not name:
                 raise ApiError(400, "Row %d: name is required" % i)
-            c = conn.execute("SELECT * FROM consumables WHERE name=?", (name,)).fetchone()
+            c = self._consumable_by_name(conn, name)
             if not c:
                 raise ApiError(400, "Row %d: unknown item '%s'" % (i, name))
             try:
@@ -12617,7 +12671,70 @@ class Handler(BaseHTTPRequestHandler):
             left = round(left - back, 6)
 
     def _consumable_by_name(self, conn, name):
-        return conn.execute("SELECT * FROM consumables WHERE name=?", (name,)).fetchone()
+        """The item with this name; failing that the item that used to have it (a renamed item is still found by its old name, KW-89)."""
+        row = conn.execute("SELECT * FROM consumables WHERE name=?", (name,)).fetchone()
+        if row or not name:
+            return row
+        old = conn.execute("SELECT consumable_id FROM consumable_name_history WHERE LOWER(old_name)=LOWER(?) ORDER BY id DESC LIMIT 1", (name,)).fetchone()
+        return conn.execute("SELECT * FROM consumables WHERE id=?", (old["consumable_id"],)).fetchone() if old else None
+
+    def _consumable_by_key(self, conn, key, fallback_name=None):
+        """A standard item by its stable key; the old by-name lookup only when no item carries the key (an older database)."""
+        row = conn.execute("SELECT * FROM consumables WHERE system_key=?", (key,)).fetchone()
+        return row or (self._consumable_by_name(conn, fallback_name) if fallback_name else None)
+
+    def _used_ibc_pool(self, conn):
+        return self._consumable_by_key(conn, "ibc_used", "Used 1,000 L IBC Tote")
+
+    def _reagent_legacy(self, conn, rtype):
+        """The item standing for a reagent type when no typed item exists (an old run's commit made before items could be chosen): the standard item by key, else by name."""
+        return self._consumable_by_key(conn, REAGENT_TYPE_KEYS.get(rtype, ""), rtype) if rtype in REAGENT_TYPE_KEYS else self._consumable_by_name(conn, rtype)
+
+    def _item_name_and_default(self, conn, user, c, d):
+        """KW-89: rename an item (administrator only; reagents and CIP agents in this phase) and move the default of a reagent type. Returns the item row, fresh."""
+        locked = c["system_key"] in LOCKED_SYSTEM_KEYS
+        who = user["name"] if user else None
+        if locked and (("litresEach" in d and (numn(d.get("litresEach")) or None) != (c["litres_each"] or None)) or ("isSampleContainer" in d and bool(d.get("isSampleContainer")) != bool(c["is_sample_container"]))):
+            raise ApiError(409, "%s is a locked system item: what it is cannot be changed" % c["name"])
+        if "name" in d:
+            new = clean_item_text(d.get("name"), 120)
+            if new != c["name"]:
+                if not (user and user["role"] == "admin"):
+                    raise ApiError(403, "Only an administrator can rename an item")
+                if locked:
+                    raise ApiError(409, "%s is a locked system item and cannot be renamed" % c["name"])
+                if c["is_container"] or c["label_sku_code"]:
+                    raise ApiError(400, "Renaming containers and labels is not available yet")
+                if not new:
+                    raise ApiError(400, "Enter the new name")
+                reason = clean_item_text(d.get("renameReason"), 300)
+                if not reason:
+                    raise ApiError(400, "Enter the reason for renaming this item")
+                if (conn.execute("SELECT 1 FROM consumables WHERE LOWER(name)=LOWER(?) AND id!=?", (new, c["id"])).fetchone()
+                        or conn.execute("SELECT 1 FROM consumable_name_history WHERE LOWER(old_name)=LOWER(?) AND consumable_id!=?", (new, c["id"])).fetchone()):
+                    raise ApiError(409, "That name is already used (or belonged to another item before it was renamed)")
+                conn.execute("UPDATE consumables SET name=? WHERE id=?", (new, c["id"]))
+                conn.execute("INSERT INTO consumable_name_history (consumable_id,old_name,new_name,reason,changed_by,changed_at) VALUES (?,?,?,?,?,?)", (c["id"], c["name"], new, reason, who, now_iso()))
+                conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('inventory_item',?,?,?,?,?,?)", (new, "Name", c["name"], new, who, now_iso()))
+                conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('inventory_item',?,?,?,?,?,?)", (new, "Reason for rename", None, reason, who, now_iso()))
+                c = conn.execute("SELECT * FROM consumables WHERE id=?", (c["id"],)).fetchone()
+        if "isTypeDefault" in d:
+            want = d.get("isTypeDefault") in (True, 1, "1", "true")
+            if want != bool(c["is_type_default"]):
+                if not (user and user["role"] == "admin"):
+                    raise ApiError(403, "Only an administrator can choose the default item of a reagent type")
+                if not want:
+                    raise ApiError(400, "A reagent type always has a default: make another item the default instead")
+                if not c["reagent_type"] or c["is_container"] or c["label_sku_code"]:
+                    raise ApiError(400, "Only an item with a reagent type can be a default")
+                old = conn.execute("SELECT name FROM consumables WHERE reagent_type=? AND is_type_default=1", (c["reagent_type"],)).fetchone()
+                conn.execute("UPDATE consumables SET is_type_default=0 WHERE reagent_type=?", (c["reagent_type"],))
+                conn.execute("UPDATE consumables SET is_type_default=1 WHERE id=?", (c["id"],))
+                conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('inventory_item',?,?,?,?,?,?)",
+                             (c["name"], "Default for %s" % c["reagent_type"], old["name"] if old else None, c["name"], who, now_iso()))
+                c = conn.execute("SELECT * FROM consumables WHERE id=?", (c["id"],)).fetchone()
+        return c
+
 
     def _consumable_history(self, conn, cid):
         return [{"delta": r["delta"], "reason": r["reason"], "ref": r["ref"],
@@ -12716,8 +12833,8 @@ class Handler(BaseHTTPRequestHandler):
                             "Sodium Benzoate": "dilution_nabenzoate_item_id"}
 
     def _reagent_items(self, conn, rtype):
-        """Every inventory item of this reagent type; the one named exactly like the type (the original item) first."""
-        return conn.execute("SELECT * FROM consumables WHERE reagent_type=? ORDER BY CASE WHEN name=? THEN 0 ELSE 1 END, name",
+        """Every inventory item of this reagent type; the type's DEFAULT item first (KW-89: chosen by an administrator, by item number)."""
+        return conn.execute("SELECT * FROM consumables WHERE reagent_type=? ORDER BY is_type_default DESC, CASE WHEN name=? THEN 0 ELSE 1 END, name",
                             (rtype, rtype)).fetchall()
 
     def _reagent_item(self, conn, rtype, selected_id=None):
@@ -12728,7 +12845,7 @@ class Handler(BaseHTTPRequestHandler):
             if r:
                 return r
         items = self._reagent_items(conn, rtype)
-        return items[0] if items else self._consumable_by_name(conn, rtype)
+        return items[0] if items else self._reagent_legacy(conn, rtype)
 
     def route_reagents(self, query, conn):
         """GET /api/reagents[?runId=] -- every reagent type with its inventory items (and, for a run, what that run has
@@ -12737,7 +12854,7 @@ class Handler(BaseHTTPRequestHandler):
         for t in self.REAGENT_RUN_COLUMNS:
             items = self._reagent_items(conn, t)
             if not items:
-                legacy = self._consumable_by_name(conn, t)
+                legacy = self._reagent_legacy(conn, t)
                 items = [legacy] if legacy else []
             types.append({"type": t, "defaultItemId": items[0]["id"] if items else None,
                           "items": [{"id": i["id"], "name": i["name"], "itemNumber": i["item_number"], "unit": i["unit"],
@@ -12749,7 +12866,7 @@ class Handler(BaseHTTPRequestHandler):
             for rc in conn.execute("SELECT * FROM run_reagent_commits WHERE run_id=?", (int(rid),)):
                 item_id = rc["consumable_id"]
                 if not item_id:
-                    legacy = self._consumable_by_name(conn, rc["reagent"])
+                    legacy = self._reagent_legacy(conn, rc["reagent"])
                     item_id = legacy["id"] if legacy else None
                 commits[rc["reagent"]] = {"itemId": item_id, "kg": rc["committed_kg"]}
         return {"types": types, "commits": commits}
@@ -12793,7 +12910,7 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             prev_kg, prev_id = committed.get(name, (0, None))
             if prev_kg and not prev_id:                  # committed before items were selectable: the item named like the type
-                legacy = self._consumable_by_name(conn, name)
+                legacy = self._reagent_legacy(conn, name)
                 prev_id = legacy["id"] if legacy else item["id"]
             total_delta = round(current[name] - (prev_kg or 0), 4)
             base_kg = prev_kg or 0
@@ -13542,7 +13659,7 @@ class Handler(BaseHTTPRequestHandler):
         if b["citric_kg"]:
             add(self._reagent_item(conn, "Citric Acid", b["citric_item_id"]), -b["citric_kg"])
         n_in = conn.execute("SELECT COUNT(*) c FROM preproc_inputs WHERE batch_id=?", (b["id"],)).fetchone()["c"]
-        add(self._consumable_by_name(conn, "Used 1,000 L IBC Tote"), n_in)
+        add(self._used_ibc_pool(conn), n_in)
         return want
 
     def _preproc_stock_differences(self, conn, b):
@@ -15662,8 +15779,8 @@ class Handler(BaseHTTPRequestHandler):
         output_litres = round(output_litres, 2)
 
         # Consumables (citric, sorbate): a shortage never blocks the run; on-hand goes negative.
-        citric_row = self._consumable_by_name(conn, "Citric Acid")
-        sorbate_row = self._consumable_by_name(conn, "Potassium Sorbate")
+        citric_row = self._reagent_item(conn, "Citric Acid")
+        sorbate_row = self._reagent_item(conn, "Potassium Sorbate")
 
         # Processing lot number: reserved at draft creation (or, for a direct
         # one-shot run, right here) from the row's own id — see lot_number_for.
@@ -15732,7 +15849,7 @@ class Handler(BaseHTTPRequestHandler):
         # The IBC totes the stabilized kelp was stored in are now emptied by
         # processing and return to the USED-IBC pool (one per tote actually
         # processed — a rejected tote's IBC was never emptied).
-        used_row = self._consumable_by_name(conn, "Used 1,000 L IBC Tote")
+        used_row = self._used_ibc_pool(conn)
         if used_row and accepted_rows:
             self._consume(conn, used_row["id"], len(accepted_rows), "Emptied by processing", lot, uname)
 
@@ -15964,7 +16081,7 @@ class Handler(BaseHTTPRequestHandler):
         # exactly what run_reagent_commits holds.
         for rc in conn.execute("SELECT reagent, committed_kg, consumable_id FROM run_reagent_commits WHERE run_id=?", (rid,)):
             row = (conn.execute("SELECT * FROM consumables WHERE id=?", (rc["consumable_id"],)).fetchone()
-                   if rc["consumable_id"] else self._consumable_by_name(conn, rc["reagent"]))
+                   if rc["consumable_id"] else self._reagent_legacy(conn, rc["reagent"]))
             if row and rc["committed_kg"]:
                 self._consume(conn, row["id"], rc["committed_kg"], note, r["processing_lot"], uname)
         self._files_to_remove += [os.path.join(UPLOAD_DIR, a["stored_name"]) for a in conn.execute(

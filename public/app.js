@@ -5700,8 +5700,9 @@ async function pageConsumables(v) {
       if (lg === 'sku') row.push(c.labelPackage || c.name);
       else if (lg === 'package') row.push(skuName(c.labelSku));
       else if (lg === 'none') row.push(skuName(c.labelSku), c.labelPackage || '—');
-      else row.push(c.name);
-      if (opts.showType) row.push(el('span', {}, c.reagentType || '—', c.organic ? el('span', { class: 'badge in_stock', style: 'margin-left:6px' }, 'Organic') : null));
+      else row.push(c.locked ? el('span', { title: 'Locked system item: it cannot be renamed or changed' }, '🔒 ', c.name) : c.name);
+      if (opts.showType) row.push(el('span', {}, c.reagentType || '—', c.organic ? el('span', { class: 'badge in_stock', style: 'margin-left:6px' }, 'Organic') : null,
+        c.isTypeDefault ? el('span', { class: 'badge pending_release', style: 'margin-left:6px', title: 'Preselected in the production log' }, 'Default') : null));
       if (opts.showMaker) row.push(c.manufacturer || '—');
       if (opts.showMaker === 'full') row.push([c.grade, c.form].filter(Boolean).join(' · ') || '—');
       if (opts.showSds) row.push((c.sds || []).length ? el('span', {}, ...c.sds.flatMap((x, k) => [k ? ', ' : null,
@@ -6495,17 +6496,28 @@ function editC(c) {
   const chemInp = isPlainReagent ? el('input', { value: c.chemical ?? '', placeholder: 'e.g. Potassium sorbate' }) : null;
   const gradeSel = isPlainReagent ? itemChoices(ITEM_GRADES, 'Select grade(s)…', 'Other grade(s), separated by commas', null, c.grade || '') : null;
   const formSel = isPlainReagent ? itemChoices(ITEM_FORMS, 'Select form(s)…', 'Other form or concentration', null, c.form || '') : null;
+  // KW-89: only an administrator renames an item (reagents and CIP agents for now); the Used IBC pool is locked; a reagent type has one default item, chosen by item number.
+  const isAdminUser = State.user.role === 'admin';
+  const canRename = isAdminUser && isPlainReagent && !c.locked;
+  const nameInp = canRename ? el('input', { value: c.name }) : null, renameReason = canRename ? el('input', { placeholder: 'required when you change the name' }) : null;
+  const prevNames = (c.previousNames || []).length ? el('div', { class: 'help' }, 'Previously called: ' + c.previousNames.join('; ') + '. An old name cannot be given to another item.') : null;
+  const defaultCb = isAdminUser && isPlainReagent && c.reagentType ? el('input', { type: 'checkbox' }) : null;
+  if (defaultCb) { defaultCb.checked = !!c.isTypeDefault; defaultCb.disabled = !!c.isTypeDefault; }
+  if (c.locked) { if (litresInp) litresInp.disabled = true; if (sampleCb) sampleCb.disabled = true; }
   const reasonInp = el('input', { placeholder: 'required to change a value that is already filled in' });
   const identityHelp = isPlainReagent && c.lotCount ? el('div', { class: 'help', style: 'color:var(--danger)' },
     'This item has been received (' + c.lotCount + ' lot' + (c.lotCount === 1 ? '' : 's') + '). Changing its manufacturer, chemical, grade or form rewrites what past receipts and runs refer to: if the product is different, add a NEW item instead. A change needs a reason and is logged. Filling in a blank needs none.') : null;
   const body = el('div', {},
+    c.locked ? el('div', { class: 'card', style: 'margin:0 0 10px;padding:10px' }, el('b', {}, '🔒 Locked system item. '), 'The program relies on this item (emptied totes return to it), so it cannot be renamed or changed by anyone. Stock can still be counted, received and written off.') : null,
+    nameInp ? el('div', {}, field('Name', nameInp), field('Reason for renaming', renameReason), prevNames) : (isAdminUser || !prevNames ? null : prevNames),
     field('Item #', el('input', { id: 'c_itemno', value: c.itemNumber ?? '', placeholder: 'Auto-assigned (e.g. RGT-008) — leave blank' })),
     typeSel ? field('Reagent type (items of one type are offered together in the production log)', typeSel) : null,
     isPlainReagent ? el('div', { class: 'form-row' }, field('Chemical', chemInp), field('Manufacturer', makerInp)) : field('Manufacturer', makerInp),
     el('div', { class: 'form-row' }, field('Manufacturer product code', mcodeInp), gradeSel ? field('Grade (one or more)', gradeSel.el) : null),
     formSel ? field('Form or concentration (one or more)', formSel.el) : null,
     identityHelp, identityHelp ? field('Reason for the change', reasonInp) : null,
-    organicCb ? el('div', { class: 'check-group' }, checkLine(organicCb, 'Organic grade', 'The only grade an organic product may use. Changes are logged.')) : null,
+    organicCb || defaultCb ? el('div', { class: 'check-group' }, organicCb ? checkLine(organicCb, 'Organic grade', 'The only grade an organic product may use. Changes are logged.') : null,
+      defaultCb ? checkLine(defaultCb, 'Default ' + c.reagentType + ' item', c.isTypeDefault ? 'This is the item the production log preselects. To change it, open the item that should be the default.' : 'Preselected in the production log for ' + c.reagentType + '. The change is logged.') : null) : null,
     el('div', { class: 'form-row' },
       field('Reorder level', el('input', { type: 'number', id: 'c_re', value: c.reorderLevel, step: '0.1' })),
       field('Cost per unit', el('input', { type: 'number', id: 'c_cost', value: c.costPerUnit ?? '', step: '0.01' }))),
@@ -6524,6 +6536,8 @@ function editC(c) {
     }
     if (typeSel) payload.reagentType = typeSel.value || null;
     if (organicCb) payload.organic = organicCb.checked;
+    if (nameInp && nameInp.value.trim() !== c.name) { payload.name = nameInp.value; payload.renameReason = renameReason.value; }          // KW-89
+    if (defaultCb && defaultCb.checked && !c.isTypeDefault) payload.isTypeDefault = true;
     payload.manufacturer = makerInp.value; payload.manufacturerCode = mcodeInp.value;           // KW-86
     if (isPlainReagent) { payload.chemical = chemInp.value; payload.grade = gradeSel.value; payload.form = formSel.value; payload.identityReason = reasonInp.value; }
     await api('PUT', '/consumables/' + c.id, payload);

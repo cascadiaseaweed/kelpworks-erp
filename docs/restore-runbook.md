@@ -90,7 +90,7 @@ configuration, restore a **clean backup** instead of a normal one. The same step
 labs + analyses + requisition templates + contact details, quality-chart limits, the SOP and safety-data-sheet register with its links and files, and the history of changes
 to those (the tool proves, row for row, that every one of these tables is identical afterwards). **Cleared:** every record, every uploaded document and photo, and the release /
 audit history. **Inventory items (KW-60):** every reagent, packaging and finished-good-label item is removed, with its suppliers, packs, safety-data-sheet links and history, so it
-can be added again with real quantities and documents; only the four items the program finds by their exact name (Citric Acid, Potassium Sorbate, New 1,000 L IBC Tote, Used 1,000 L
+can be added again with real quantities and documents; only the four items the program finds by their stable key (shown here by their standard names; a renamed one is still kept) (Citric Acid, Potassium Sorbate, New 1,000 L IBC Tote, Used 1,000 L
 IBC Tote) stay, as blank items (stock 0, no cost, no suppliers). The server recreates its other standard items (sodium benzoate, sample containers, CIP agents, finished-good labels) at
 every start. **One entry** (`system / clean_start`) is added to the change history of the clean database: who made the file, from which backup, how much was cleared.
 

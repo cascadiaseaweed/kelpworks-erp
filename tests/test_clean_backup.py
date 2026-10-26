@@ -260,16 +260,46 @@ def test_the_report_and_the_draft_cut_over_note_are_written_next_to_the_zip(sour
     assert "Real Citric Acid (Supplier B)" in note and "Citric Acid, Potassium Sorbate" in note
 
 
+def test_a_renamed_system_item_is_still_kept_because_it_is_found_by_its_key(source):
+    """KW-89: the four system items are found by their stable key, so renaming one does not lose it."""
+    with zipfile.ZipFile(source["zip"]) as zf:
+        zf.extract("kelp_erp.db", str(source["folder"] / "renamed"))
+    db = str(source["folder"] / "renamed" / "kelp_erp.db")
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE consumables SET name='Citric acid, anhydrous - Maker' WHERE system_key='citric_acid'")
+    conn.commit()
+    conn.close()
+    r = M.clean_database(db, str(source["folder"] / "renamed" / "clean.db"))
+    assert r["systemItemsMissing"] == [] and "Citric acid, anhydrous - Maker" in r["systemItems"] and "Citric acid, anhydrous - Maker" not in r["itemsRemoved"]
+    out = sqlite3.connect(str(source["folder"] / "renamed" / "clean.db"))
+    assert out.execute("SELECT on_hand, system_key FROM consumables WHERE name='Citric acid, anhydrous - Maker'").fetchone() == (0, "citric_acid")
+    out.close()
+
+
 def test_a_source_without_a_system_item_is_warned_about_not_stopped(source):
     with zipfile.ZipFile(source["zip"]) as zf:
         zf.extract("kelp_erp.db", str(source["folder"] / "nosys"))
     db = str(source["folder"] / "nosys" / "kelp_erp.db")
     conn = sqlite3.connect(db)
-    conn.execute("UPDATE consumables SET name='Citric Acid (renamed)' WHERE name='Citric Acid'")
+    conn.execute("UPDATE consumables SET name='Citric Acid (renamed)', system_key=NULL WHERE name='Citric Acid'")          # no key and not the standard name: nothing to find it by
     conn.commit()
     conn.close()
     r = M.clean_database(db, str(source["folder"] / "nosys" / "clean.db"))
     assert r["systemItemsMissing"] == ["Citric Acid"] and "Citric Acid (renamed)" in r["itemsRemoved"]
+
+
+def test_a_backup_made_before_the_keys_existed_is_read_by_the_standard_names(source):
+    with zipfile.ZipFile(source["zip"]) as zf:
+        zf.extract("kelp_erp.db", str(source["folder"] / "nokey"))
+    db = str(source["folder"] / "nokey" / "kelp_erp.db")
+    conn = sqlite3.connect(db)
+    conn.execute("DROP INDEX IF EXISTS idx_consumables_system_key")
+    conn.execute("ALTER TABLE consumables DROP COLUMN system_key")
+    conn.execute("DROP TABLE consumable_name_history")
+    conn.commit()
+    conn.close()
+    r = M.clean_database(db, str(source["folder"] / "nokey" / "clean.db"))
+    assert r["systemItemsMissing"] == [] and sorted(r["systemItems"]) == sorted(M.SYSTEM_ITEMS)
 
 
 def test_after_the_restore_the_system_items_work_and_every_number_starts_at_001(source):
