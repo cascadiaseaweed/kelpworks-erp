@@ -33,7 +33,7 @@ import tempfile
 import zipfile
 
 KEEP = {
-    "app_flags", "coa_specs", "config_log", "consumable_pack_log", "consumable_packs", "consumable_supplier_log", "consumable_suppliers", "consumables", "container_units", "document_edits", "document_revisions", "feedstock_grade_rules", "fg_sku_species", "fg_skus",
+    "app_flags", "coa_specs", "config_log", "consumable_name_history", "consumable_pack_log", "consumable_packs", "consumable_supplier_log", "consumable_suppliers", "consumables", "container_units", "document_edits", "document_revisions", "feedstock_grade_rules", "fg_sku_species", "fg_skus",
     "lab_analyses", "labs", "locations", "qc_chart_limit_log", "qc_chart_limits", "requisition_contact", "sample_label_names", "sds_documents",
     "sds_items", "settings", "sites", "sop_document_edits", "sop_documents", "sop_links", "species", "supplier_log", "suppliers", "user_permission_log", "users",
 }
@@ -51,9 +51,11 @@ CLEAR_FOLDERS = ("uploads",)
 # bookkeeping about the backups of the OLD data
 STALE_FLAGS = ("last_backup", "last_backup_error", "staging_restored_at")
 # KW-60: the four inventory items the program finds by their exact name (reagent types Citric Acid / Potassium Sorbate, the packaging container, the empty-IBC pool): they stay, blank
-SYSTEM_ITEMS = ("Citric Acid", "Potassium Sorbate", "New 1,000 L IBC Tote", "Used 1,000 L IBC Tote")
+# KW-89: they are found by their stable key (system_key), so a renamed one is still kept; a backup made before the keys existed is read by the standard names
+SYSTEM_KEYS = (("citric_acid", "Citric Acid"), ("potassium_sorbate", "Potassium Sorbate"), ("ibc_new", "New 1,000 L IBC Tote"), ("ibc_used", "Used 1,000 L IBC Tote"))
+SYSTEM_ITEMS = tuple(n for _k, n in SYSTEM_KEYS)                          # the standard names (the fallback, and what the reports call them when nothing was renamed)
 # what hangs on an inventory item, children first (the rows of every item go: the four blank items have none)
-ITEM_DEPENDENTS = ("consumable_pack_log", "consumable_supplier_log", "consumable_packs", "consumable_suppliers", "sds_items")
+ITEM_DEPENDENTS = ("consumable_pack_log", "consumable_supplier_log", "consumable_packs", "consumable_suppliers", "sds_items", "consumable_name_history")
 BLANK_ITEM = {"on_hand": 0, "reorder_level": 0, "cost_per_unit": None, "location": None, "organic": 0, "last_counted_at": None, "last_counted_by": None}
 # KEEP tables that are MEANT to differ afterwards (everything else in KEEP must be identical, row for row)
 INTENDED = {"consumables", "app_flags", "config_log"} | set(ITEM_DEPENDENTS)
@@ -95,7 +97,21 @@ def baseline(conn, tables):
     return base
 
 
-def verify_clean(before, dst_path, tables):
+def find_system_items(conn):
+    """(the items to keep as [(id, current name)], the standard names that were not found). By key; by standard name for a backup that predates the keys (KW-89)."""
+    has_key = "system_key" in {r[1] for r in conn.execute("PRAGMA table_info(consumables)")}
+    kept, missing = [], []
+    for key, name in SYSTEM_KEYS:
+        row = conn.execute("SELECT id, name FROM consumables WHERE system_key=?", (key,)).fetchone() if has_key else None
+        row = row or conn.execute("SELECT id, name FROM consumables WHERE name=?", (name,)).fetchone()
+        if row and row[0] not in [k[0] for k in kept]:
+            kept.append((row[0], row[1]))
+        else:
+            missing.append(name)
+    return kept, missing
+
+
+def verify_clean(before, dst_path, tables, kept_names=None):
     """Open the finished clean file and prove it: every record table is empty, every KEEP table is unchanged except the intended ones, the intended ones changed
     only as planned. -> {table: 'unchanged' | description}. Raises CleanError."""
     conn = sqlite3.connect(dst_path)
@@ -112,8 +128,9 @@ def verify_clean(before, dst_path, tables):
                 problems.append("%s changed (%d rows before, %d after)" % (t, before[t][0], after[0]))
             verdict[t] = "unchanged"
         names = {r[0] for r in conn.execute("SELECT name FROM consumables")}
-        if names - set(SYSTEM_ITEMS):
-            problems.append("inventory items other than the system items remain: %s" % ", ".join(sorted(names - set(SYSTEM_ITEMS))[:5]))
+        allowed = set(kept_names) if kept_names is not None else set(SYSTEM_ITEMS)
+        if names - allowed:
+            problems.append("inventory items other than the system items remain: %s" % ", ".join(sorted(names - allowed)[:5]))
         for t in [d for d in ITEM_DEPENDENTS if d in tables]:
             if conn.execute('SELECT COUNT(*) FROM "%s"' % t).fetchone()[0]:
                 problems.append("%s still has rows" % t)
@@ -157,9 +174,9 @@ def clean_database(src_path, dst_path, source_name="", source_sha="", by=""):
         deps = [t for t in ITEM_DEPENDENTS if t in tables]                    # an older release may not have every one of them yet
         before = baseline(work, tables)
         has_seq = "sqlite_sequence" in {r[0] for r in work.execute("SELECT name FROM sqlite_master")}
-        item_names = [r[0] for r in work.execute("SELECT name FROM consumables ORDER BY name")]
-        items_removed = [n for n in item_names if n not in SYSTEM_ITEMS]
-        missing_system = [n for n in SYSTEM_ITEMS if n not in item_names]
+        kept_items, missing_system = find_system_items(work)
+        kept_ids = [i for i, _n in kept_items]
+        items_removed = [n for i, n in work.execute("SELECT id, name FROM consumables ORDER BY name") if i not in kept_ids]
         suppliers = sorted({r[0] for r in work.execute("SELECT name FROM consumable_suppliers")}, key=str.lower) if "consumable_suppliers" in tables else []
         removed = {}
         work.execute("PRAGMA foreign_keys=OFF")
@@ -171,7 +188,10 @@ def clean_database(src_path, dst_path, source_name="", source_sha="", by=""):
             removed[t] = work.execute('SELECT COUNT(*) FROM "%s"' % t).fetchone()[0]
             work.execute('DELETE FROM "%s"' % t)
         removed["consumables (items removed)"] = len(items_removed)
-        work.execute("DELETE FROM consumables WHERE name NOT IN (%s)" % ",".join("?" * len(SYSTEM_ITEMS)), SYSTEM_ITEMS)
+        if kept_ids:
+            work.execute("DELETE FROM consumables WHERE id NOT IN (%s)" % ",".join("?" * len(kept_ids)), kept_ids)
+        else:
+            work.execute("DELETE FROM consumables")
         cols = {r[1] for r in work.execute("PRAGMA table_info(consumables)")}
         blank = {c: v for c, v in BLANK_ITEM.items() if c in cols}
         work.execute("UPDATE consumables SET %s" % ", ".join("%s=?" % c for c in blank), tuple(blank.values()))
@@ -195,7 +215,7 @@ def clean_database(src_path, dst_path, source_name="", source_sha="", by=""):
     finally:
         work.close()
     try:
-        verified = verify_clean(before, dst_path, tables)
+        verified = verify_clean(before, dst_path, tables, [n for _i, n in kept_items])
     except CleanError:
         if os.path.exists(dst_path):
             os.remove(dst_path)
@@ -206,7 +226,7 @@ def clean_database(src_path, dst_path, source_name="", source_sha="", by=""):
     finally:
         check.close()
     return {"removed": removed, "kept": kept, "before": {t: v[0] for t, v in before.items() if isinstance(v, tuple)}, "verified": verified, "itemsRemoved": items_removed,
-            "systemItemsMissing": missing_system, "suppliers": suppliers, "entry": dict(zip(("area", "key", "field", "old", "new", "by", "at"), entry))}
+            "systemItems": [n for _i, n in kept_items], "systemItemsMissing": missing_system, "suppliers": suppliers, "entry": dict(zip(("area", "key", "field", "old", "new", "by", "at"), entry))}
 
 
 def sha256_file(path):
@@ -226,11 +246,10 @@ def build_report(res, meta):
     for t in sorted(CLEAR):
         if r["removed"].get(t) is not None:
             L.append("  %-28s %6d" % (t, r["removed"][t]))
-    L += ["", "INVENTORY ITEMS REMOVED (%d); the %d system items stay as blank items: %s" % (len(r["itemsRemoved"]), len(SYSTEM_ITEMS) - len(r["systemItemsMissing"]),
-                                                                                              ", ".join(n for n in SYSTEM_ITEMS if n not in r["systemItemsMissing"]))]
+    L += ["", "INVENTORY ITEMS REMOVED (%d); the %d system items stay as blank items: %s" % (len(r["itemsRemoved"]), len(r["systemItems"]), ", ".join(r["systemItems"]))]
     L += ["  " + n for n in r["itemsRemoved"]] or ["  (none)"]
     if r["systemItemsMissing"]:
-        L += ["", "WARNING: the source has no inventory item called: %s. The program looks these up by name; add them in Inventory Items after the restore." % ", ".join(r["systemItemsMissing"])]
+        L += ["", "WARNING: the source has no inventory item for: %s. The program looks these up by key (or by this name in an older backup); add them in Inventory Items after the restore." % ", ".join(r["systemItemsMissing"])]
     for t in ITEM_DEPENDENTS:
         L.append("  %-28s %6d rows removed with the items" % (t, r["removed"].get(t, 0)))
     L += ["", "Approved supplier names that were on the removed items (re-enter them when the items are added again):"]
@@ -257,7 +276,7 @@ def build_cut_over_note(res, meta):
     L += ["| %s | %d |" % (t, r["removed"][t]) for t in sorted(CLEAR) if r["removed"].get(t)]
     L += ["", "Uploaded documents and photos of those records were dropped with them. They remain only in the pre-go-live backup above.", "",
           "**Inventory items removed (%d):** %s" % (len(r["itemsRemoved"]), ", ".join(r["itemsRemoved"]) or "none"),
-          "", "They are added again, with real quantities, suppliers and documents, under KW-64. The four items the program finds by name (%s) were kept as blank items: stock 0, no cost, no suppliers, no links." % ", ".join(SYSTEM_ITEMS), "",
+          "", "They are added again, with real quantities, suppliers and documents, under KW-64. The four items the program finds by key (%s) were kept as blank items: stock 0, no cost, no suppliers, no links." % ", ".join(r["systemItems"]), "",
           "## What was kept", "", "Users, roles and passwords; settings; products and specifications; Certificate of Analysis specifications; the lab catalogue and requisition templates; the SOP and safety-data-sheet register and files; quality-chart limits; "
           "species, sites and locations; and the history of changes to those. The tool compared every one of these tables row for row before and after: all identical (details in the verification report).", "",
           "## Numbering", "", "Run (processing lot), tote, pre-processing batch, CIP and requisition numbers start again at 001 (for example the next production run is PR-<date>-001). Old numbers are not reused anywhere else: the old records exist only in the pre-go-live backup.", "",
@@ -376,7 +395,7 @@ def main(argv):
     for t in sorted(CLEAR):
         if r["removed"].get(t):
             print("  %-26s %d" % (t, r["removed"][t]))
-    print("Inventory items removed: %d; kept as blank items: %s" % (len(r["itemsRemoved"]), ", ".join(ascii_safe(n) for n in SYSTEM_ITEMS if n not in r["systemItemsMissing"])))
+    print("Inventory items removed: %d; kept as blank items: %s" % (len(r["itemsRemoved"]), ", ".join(ascii_safe(n) for n in r["systemItems"])))
     for n in r["itemsRemoved"][:40]:
         print("  " + ascii_safe(n))
     if len(r["itemsRemoved"]) > 40:

@@ -162,7 +162,7 @@ def test_packaging_takes_only_a_manufacturer_and_the_name_never_changes(admin):
     assert admin.put("/api/consumables/%d" % c["id"], {"manufacturer": "Greif", "manufacturerCode": "G-9"}).ok
     assert admin.put("/api/consumables/%d" % c["id"], {"grade": "Food"}).status == 400
     assert admin.put("/api/consumables/%d" % c["id"], {"grade": ""}).ok                                    # blank is fine
-    assert admin.put("/api/consumables/%d" % c["id"], {"name": "Renamed drum"}).ok
+    assert admin.put("/api/consumables/%d" % c["id"], {"name": "Renamed drum", "renameReason": "x"}).status == 400                 # containers and labels cannot be renamed yet (KW-89 phase 1)
     assert get_item(admin, name)["manufacturer"] == "Greif" and [x for x in admin.get("/api/consumables").json["consumables"] if x["name"] == "Renamed drum"] == []
 
 

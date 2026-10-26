@@ -91,7 +91,7 @@ and the history of changes to those. Old records exist only in the pre-go-live b
 ## Lessons from 2026-10-23
 
 - The existing `tools/make_clean_backup.py` plus the start-up restore already did most of the work; extending them avoided a new in-place command on the live database.
-- Four inventory items must stay because the code looks them up by exact name and `seed()` never runs again; the other standard items come back at every start.
+- Four inventory items must stay because the code needs them and `seed()` never runs again (they are found by a stable key, so one that was renamed is still kept); the other standard items come back at every start.
 - A backup from an older release lacked tables and crashed the tool; fixed (PR #95). Make the clean file from a fresh backup anyway.
 - The sync script's `_sync-state.json` is only its memory of files copied; deleting it does not touch the change log.
 - Staging rehearsal was skipped; a local throwaway-server rehearsal of the same file was done instead.
