@@ -30,7 +30,7 @@ def conflicts(admin, rid):
 
 
 def test_an_item_can_be_marked_organic_and_every_change_is_logged(srv, admin):
-    r = admin.post("/api/consumables", {"name": "Organic Citric Acid (test)", "unit": "kg", "onHand": 10, "reagentType": "Citric Acid", "organic": True})
+    r = admin.post("/api/consumables", {"name": "Organic Citric Acid (test)", "unit": "kg", "onHand": 10, "reagentType": "Citric Acid", "organic": True, "manufacturer": "Test Maker", "grade": "Food"})
     assert r.status == 200, r.text
     c = item(admin, "Organic Citric Acid (test)")
     assert c["organic"] is True and c["reagentType"] == "Citric Acid"
@@ -39,10 +39,10 @@ def test_an_item_can_be_marked_organic_and_every_change_is_logged(srv, admin):
     assert {i["name"]: i["organic"] for i in reagents["Citric Acid"]["items"]}["Organic Citric Acid (test)"] is True
     assert admin.put("/api/consumables/%d" % c["id"], {"organic": False}).status == 200
     assert admin.put("/api/consumables/%d" % c["id"], {"organic": True}).status == 200
-    log = sql(srv, "SELECT field, old_value, new_value, changed_by FROM config_log WHERE area='inventory_item' AND key='Organic Citric Acid (test)' ORDER BY id")
+    log = sql(srv, "SELECT field, old_value, new_value, changed_by FROM config_log WHERE area='inventory_item' AND key='Organic Citric Acid (test)' AND field='Organic grade' ORDER BY id")
     assert [(x[1], x[2]) for x in log] == [("yes", "no"), ("no", "yes")] and log[0][3]
     assert admin.put("/api/consumables/%d" % c["id"], {"organic": True}).status == 200                # no change, no log line
-    assert sql(srv, "SELECT COUNT(*) FROM config_log WHERE area='inventory_item' AND key='Organic Citric Acid (test)'") == [(2,)]
+    assert sql(srv, "SELECT COUNT(*) FROM config_log WHERE area='inventory_item' AND key='Organic Citric Acid (test)' AND field='Organic grade'") == [(2,)]
 
 
 def test_an_item_that_is_not_a_plain_reagent_cannot_be_marked_organic(srv, admin):

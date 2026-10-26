@@ -13,7 +13,7 @@ async function api(method, path, body) {
   let data = {};
   try { data = await res.json(); } catch (e) {}
   if (res.status === 401) { if (State.token) logout(data.code === 'idle_timeout' ? data.error : null); throw new Error(data.error || 'Session expired'); }     // (already signed out: a late request must not wipe the sign-in message)
-  if (!res.ok) { const err = new Error(data.error || ('HTTP ' + res.status)); err.code = data.code; if (data.problems) { err.problems = data.problems; err.problemCount = data.problemCount; } throw err; }
+  if (!res.ok) { const err = new Error(data.error || ('HTTP ' + res.status)); err.code = data.code; if (data.duplicates) err.duplicates = data.duplicates; if (data.problems) { err.problems = data.problems; err.problemCount = data.problemCount; } throw err; }
   return data;
 }
 
@@ -3394,7 +3394,7 @@ function buildMultiSelectDropdown(items, initialValue, opts) {
     items.forEach(it => {
       const cb = el('input', { type: 'checkbox', style: 'width:auto;flex:none' });
       cb.checked = known.has(it.value);
-      cb.addEventListener('change', () => { cb.checked ? known.add(it.value) : known.delete(it.value); renderBtn(); });
+      cb.addEventListener('change', () => { cb.checked ? known.add(it.value) : known.delete(it.value); renderBtn(); if (opts.onChange) opts.onChange(); });
       panel.append(el('label', { class: 'qc-loc-option', style: 'display:flex;align-items:center;gap:8px;cursor:pointer' },
         cb, it.label));
     });
@@ -3404,7 +3404,7 @@ function buildMultiSelectDropdown(items, initialValue, opts) {
   }
   function close() { panel.classList.add('hidden'); document.removeEventListener('click', onDocClick, true); }
   btn.addEventListener('click', () => { panel.classList.contains('hidden') ? open() : close(); });
-  otherInput.addEventListener('input', renderBtn);
+  otherInput.addEventListener('input', () => { renderBtn(); if (opts.onChange) opts.onChange(); });
   renderBtn();
   return { el: wrap, get value() { return currentValue(); } };
 }
@@ -3655,10 +3655,11 @@ function buildReagentWatch(runId, selected) {
   w.itemSelect = t => {
     const sel = el('select', {});
     const rebuild = () => {
-      const list = offered(t), cur = w.itemId(t);
+      const list = offered(t).slice().sort((a, b) => (a.manufacturer || '').localeCompare(b.manufacturer || '') || a.name.localeCompare(b.name)), cur = w.itemId(t);
       sel.innerHTML = '';
       if (!list.length) sel.append(el('option', { value: '' }, w.organicProduct() ? 'No organic ' + t + ' item: mark one as Organic in Inventory Items' : 'No ' + t + ' item in Inventory Items'));
-      list.forEach(i => sel.append(el('option', { value: i.id }, i.name + (i.organic ? ' — Organic' : '') + (i.itemNumber ? ' (#' + i.itemNumber + ')' : '') + ' — ' + fmt(i.onHand, 1) + ' ' + i.unit + ' on hand')));
+      const detail = i => { const bits = [i.manufacturer, i.grade, i.form].filter(x => x && !i.name.toLowerCase().includes(x.toLowerCase())); return bits.length ? ' [' + bits.join(' · ') + ']' : ''; };
+      list.forEach(i => sel.append(el('option', { value: i.id }, i.name + (i.organic ? ' — Organic' : '') + detail(i) + (i.itemNumber ? ' (#' + i.itemNumber + ')' : '') + ' — ' + fmt(i.onHand, 1) + ' ' + i.unit + ' on hand')));
       if (cur != null) sel.value = String(cur);
     };
     sel.addEventListener('change', () => { w.selected[t] = sel.value ? +sel.value : null; w.notify(); });
@@ -5687,6 +5688,8 @@ async function pageConsumables(v) {
     if (lg === 'sku') headers.push('Package'); else if (lg === 'package') headers.push('SKU'); else if (lg === 'none') headers.push('SKU', 'Package'); else headers.push('Item');
     const bools = headers.map(() => false);
     if (opts.showType) { headers.push('Type'); bools.push(false); }
+    if (opts.showMaker) { headers.push('Manufacturer'); bools.push(false); }
+    if (opts.showMaker === 'full') { headers.push('Grade / form'); bools.push(false); }
     if (opts.showSds) { headers.push('SDS'); bools.push(false); }
     if (opts.showVolume) { headers.push('Volume (L)'); bools.push(true); }
     headers.push('Location', 'On hand', 'Reorder at', 'Cost/unit', '', 'Actions');
@@ -5699,6 +5702,8 @@ async function pageConsumables(v) {
       else if (lg === 'none') row.push(skuName(c.labelSku), c.labelPackage || '—');
       else row.push(c.name);
       if (opts.showType) row.push(el('span', {}, c.reagentType || '—', c.organic ? el('span', { class: 'badge in_stock', style: 'margin-left:6px' }, 'Organic') : null));
+      if (opts.showMaker) row.push(c.manufacturer || '—');
+      if (opts.showMaker === 'full') row.push([c.grade, c.form].filter(Boolean).join(' · ') || '—');
       if (opts.showSds) row.push((c.sds || []).length ? el('span', {}, ...c.sds.flatMap((x, k) => [k ? ', ' : null,
         el('a', { href: docDownloadUrl('sds', x.id), target: '_blank', rel: 'noopener', title: x.chemical + ' — ' + x.supplier, onclick: e => e.stopPropagation() }, 'SDS')])) : '—');
       if (opts.showVolume) row.push(c.litresEach != null ? fmt(c.litresEach, c.litresEach % 1 ? 2 : 0) : '—');
@@ -5741,7 +5746,7 @@ async function pageConsumables(v) {
     const reagents = r.consumables.filter(c => !c.isContainer && !c.labelSku);
     host.append(el('div', { class: 'page-head' }, el('h2', {}, 'Reagents'),
       el('div', { class: 'actions' }, el('button', { onclick: addConsumable }, '+ Add reagent'))));
-    host.append(itemsTable(reagents, { history: true, showType: true, showSds: true }));
+    host.append(itemsTable(reagents, { history: true, showType: true, showMaker: 'full', showSds: true }));
     host.append(el('div', { class: 'help', style: 'margin-top:6px' },
       'Type groups items that are the same reagent (e.g. several Citric Acid grades or suppliers): the production log offers every item of a type and deducts from the one chosen. Set it with Edit.'));
     host.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Packaging'),
@@ -5752,7 +5757,7 @@ async function pageConsumables(v) {
       'Every container Production uses -- Packaging table output units and Sample Point vessels alike -- with its own on-hand inventory. '
       + (isAdmin ? 'Only an admin can bulk-upload counts or add a new container type; anyone can receive, adjust or edit an existing one.'
         : 'Ask an admin to bulk-upload counts or add a new container type.')));
-    host.append(itemsTable(containers, { showVolume: true, wholeUnits: true, history: true }));
+    host.append(itemsTable(containers, { showVolume: true, wholeUnits: true, history: true, showMaker: 'short' }));
     // Finished-good labels are the physical labels stuck on each finished
     // package -- not the internal barcode labels printed from a row's Label button.
     const grpSel = selectFrom('', [['sku', 'Group by SKU'], ['package', 'Group by package'], ['none', 'No grouping']], () => {
@@ -6485,17 +6490,28 @@ function editC(c) {
   if (typeSel) typeSel.value = c.reagentType || '';
   const organicCb = isPlainReagent ? el('input', { type: 'checkbox' }) : null;          // KW-46
   if (organicCb) organicCb.checked = !!c.organic;
+  const makerInp = el('input', { value: c.manufacturer ?? '', placeholder: 'the maker, not the seller' }), mcodeInp = el('input', { value: c.manufacturerCode ?? '' });
+  const chemInp = isPlainReagent ? el('input', { value: c.chemical ?? '', placeholder: 'e.g. Potassium sorbate' }) : null;
+  const gradeSel = isPlainReagent ? itemChoices(ITEM_GRADES, 'Select grade(s)…', 'Other grade(s), separated by commas', null, c.grade || '') : null;
+  const formSel = isPlainReagent ? itemChoices(ITEM_FORMS, 'Select form(s)…', 'Other form or concentration', null, c.form || '') : null;
+  const reasonInp = el('input', { placeholder: 'required to change a value that is already filled in' });
+  const identityHelp = isPlainReagent && c.lotCount ? el('div', { class: 'help', style: 'color:var(--danger)' },
+    'This item has been received (' + c.lotCount + ' lot' + (c.lotCount === 1 ? '' : 's') + '). Changing its manufacturer, chemical, grade or form rewrites what past receipts and runs refer to: if the product is different, add a NEW item instead. A change needs a reason and is logged. Filling in a blank needs none.') : null;
   const body = el('div', {},
     field('Item #', el('input', { id: 'c_itemno', value: c.itemNumber ?? '', placeholder: 'Auto-assigned (e.g. RGT-008) — leave blank' })),
     typeSel ? field('Reagent type (items of one type are offered together in the production log)', typeSel) : null,
-    organicCb ? field('Organic grade (the only grade an organic product may use; changes are logged)', organicCb) : null,
+    isPlainReagent ? el('div', { class: 'form-row' }, field('Chemical', chemInp), field('Manufacturer', makerInp)) : field('Manufacturer', makerInp),
+    el('div', { class: 'form-row' }, field('Manufacturer product code', mcodeInp), gradeSel ? field('Grade (one or more)', gradeSel.el) : null),
+    formSel ? field('Form or concentration (one or more)', formSel.el) : null,
+    identityHelp, identityHelp ? field('Reason for the change', reasonInp) : null,
+    organicCb ? el('div', { class: 'check-group' }, checkLine(organicCb, 'Organic grade', 'The only grade an organic product may use. Changes are logged.')) : null,
     el('div', { class: 'form-row' },
       field('Reorder level', el('input', { type: 'number', id: 'c_re', value: c.reorderLevel, step: '0.1' })),
       field('Cost per unit', el('input', { type: 'number', id: 'c_cost', value: c.costPerUnit ?? '', step: '0.01' }))),
     field('Warehouse location', editableSelect(locs, 'c_loc')),
     c.isContainer ? el('div', { class: 'form-row' },
       field('Volume (L, blank if not an FG package)', litresInp),
-      field('Used for Sample Point', sampleCb)) : null);
+      el('div', { class: 'check-group' }, checkLine(sampleCb, 'Used for Sample Point'))) : null);
   body.querySelector('#c_loc').value = c.location || '';
   body.append(supplierEditor(c));
   modal('Edit ' + c.name, body, async () => {
@@ -6507,6 +6523,8 @@ function editC(c) {
     }
     if (typeSel) payload.reagentType = typeSel.value || null;
     if (organicCb) payload.organic = organicCb.checked;
+    payload.manufacturer = makerInp.value; payload.manufacturerCode = mcodeInp.value;           // KW-86
+    if (isPlainReagent) { payload.chemical = chemInp.value; payload.grade = gradeSel.value; payload.form = formSel.value; payload.identityReason = reasonInp.value; }
     await api('PUT', '/consumables/' + c.id, payload);
     State.ref = await api('GET', '/refdata');
     toast('Updated'); render();
@@ -6538,25 +6556,76 @@ async function showConsumableHistory(c) {
     consumableHistoryTable(data.history));
   modal('Transaction history — ' + c.name, body, async () => {}, 'Close', { noCancel: true });
 }
+// What an item IS (KW-86): a different manufacturer, grade, form / concentration, organic status or SDS is a NEW item; a different supplier is not.
+// Grade and Form can each hold several choices (an acid can be anhydrous AND granular); "Organic" is its own checkbox, not a grade.
+const ITEM_GRADES = ['Food', 'FCC', 'Technical', 'USP', 'Reagent'];
+const ITEM_FORMS = ['anhydrous', 'monohydrate', 'granular', 'powder', 'liquid'];
+const sentenceCase = s => (s || '').charAt(0).toUpperCase() + (s || '').slice(1).toLowerCase();
+// A short name: "Chemical, form(s) - Manufacturer", then in brackets only what the plain name would hide: a grade that is not the usual food grade, and (Org) for organic.
+// The Grade field still holds every grade, and the item tables and pickers show it beside the name.
+const NAME_COMMON_GRADES = ['food', 'fcc'];
+function suggestItemName(p) {
+  const list = s => (s || '').split(/[,;]/).map(x => x.trim()).filter(Boolean);
+  const head = [(p.chemical || '').trim(), ...list(p.form)].filter(Boolean).join(', ');
+  const tags = [...list(p.grade).filter(g => !NAME_COMMON_GRADES.includes(g.toLowerCase())), ...(p.organic ? ['Org'] : [])];
+  return ([head, (p.manufacturer || '').trim()].filter(Boolean).join(' - ') + (tags.length ? ' (' + tags.join(', ') + ')' : '')).trim();
+}
+// A tidy checkbox: the box beside its label, with an optional line of help underneath.
+function checkLine(input, label, help) {
+  return el('label', { class: 'check-line' }, input, el('span', {}, el('span', { class: 'check-text' }, label), help ? el('span', { class: 'help' }, help) : null));
+}
+const itemChoices = (list, placeholder, other, onChange, initial) => buildMultiSelectDropdown(list.map(v => ({ value: v, label: v })), initial || '', { placeholder, otherPlaceholder: other, onChange });
 function addConsumable() {
   const locs = State.ref.locations.map(l => [l, l]);
   // Admin-only: a CIP cleaning agent is offered on CIP Log chemical lines.
   const cipCb = State.user.role === 'admin' ? el('input', { type: 'checkbox' }) : null;
   const typeSel = selectFrom('', [['', '— none —'], ...REAGENT_TYPES.map(t => [t, t])]);
   const organicNew = el('input', { type: 'checkbox' });
+  const nameInp = el('input', { id: 'n_name' });
+  const chem = el('input', { id: 'n_chem', placeholder: 'e.g. Potassium sorbate' }), maker = el('input', { id: 'n_maker', placeholder: 'the maker, not the seller' });
+  const mcode = el('input', { id: 'n_mcode', placeholder: 'optional' });
+  const gradeSel = itemChoices(ITEM_GRADES, 'Select grade(s)…', 'Other grade(s), separated by commas', () => refreshName());
+  const formSel = itemChoices(ITEM_FORMS, 'Select form(s) (optional)…', 'Other form or concentration, e.g. 15 % PAA', () => refreshName());
+  const dupCb = el('input', { type: 'checkbox' });
+  const dupRow = el('div', { class: 'hidden' }, checkLine(dupCb, 'Add it anyway: I checked and it is a different product.', 'This looks like an item you already have.'));
+  let nameTouched = false, chemTouched = false;
+  const suggested = () => suggestItemName({ chemical: chem.value, form: formSel.value, grade: gradeSel.value, manufacturer: maker.value, organic: organicNew.checked });
+  const refreshName = () => { if (!nameTouched) nameInp.value = suggested(); };
+  nameInp.addEventListener('input', () => { nameTouched = true; });
+  chem.addEventListener('input', () => { chemTouched = true; });
+  typeSel.addEventListener('change', () => { if (!chemTouched && typeSel.value) chem.value = sentenceCase(typeSel.value); refreshName(); });
+  [chem, maker].forEach(x => x.addEventListener('input', refreshName));
+  organicNew.addEventListener('change', refreshName);
+  const useSuggested = el('a', { href: '#', onclick: e => { e.preventDefault(); nameTouched = false; refreshName(); } }, 'Use the suggested name');
   const body = el('div', {},
-    el('div', { class: 'form-row' }, field('Name', el('input', { id: 'n_name' })), field('Stock unit', selectFrom('', STOCK_UNITS.map(u => [u, u]), null, 'n_unit'))),
-    field('Reagent type (items of one type are offered together in the production log)', typeSel),
-    field('Organic grade (the only grade an organic product may use)', organicNew),
-    field('Item #', el('input', { id: 'n_itemno', placeholder: 'Auto-assigned (e.g. RGT-008) — leave blank' })),
+    el('div', { class: 'card', style: 'margin:0 0 10px;padding:10px' }, el('b', {}, 'One item = one specific product. '),
+      'A different manufacturer, grade, form / concentration, organic status or safety data sheet means a NEW item. A different supplier or distributor is NOT a new item: add it as an approved supplier of the item. ',
+      'The lot / batch number and the pack size are recorded when you receive.'),
+    el('div', { class: 'form-row' }, field('Reagent type (items of one type are offered together in the production log)', typeSel), field('Chemical', chem)),
+    el('div', { class: 'form-row' }, field('Manufacturer *', maker), field('Manufacturer product code', mcode)),
+    el('div', { class: 'form-row' }, field('Grade * (one or more)', gradeSel.el), field('Form or concentration (one or more)', formSel.el)),
+    el('div', { class: 'check-group' },
+      checkLine(organicNew, 'Organic grade', 'The only grade an organic product may use.'),
+      cipCb ? checkLine(cipCb, 'CIP cleaning agent', 'Offered on CIP Log lines.') : null),
+    field('Name (a short name suggested from the fields above; you can edit it)', nameInp),
+    el('div', { class: 'help', style: 'margin:-4px 0 8px' }, useSuggested),
+    el('div', { class: 'form-row' }, field('Stock unit', selectFrom('', STOCK_UNITS.map(u => [u, u]), null, 'n_unit')),
+      field('Item #', el('input', { id: 'n_itemno', placeholder: 'Auto-assigned (e.g. RGT-008) — leave blank' }))),
     el('div', { class: 'form-row' }, field('On hand', el('input', { type: 'number', id: 'n_oh', value: '0' })),
       field('Reorder level', el('input', { type: 'number', id: 'n_re', value: '0' }))),
     el('div', { class: 'form-row' }, field('Cost per unit', el('input', { type: 'number', id: 'n_cost', step: '0.01' })),
       field('Warehouse location', editableSelect(locs, 'n_loc'))),
-    cipCb ? field('CIP cleaning agent (offered on CIP Log lines)', cipCb) : null);
+    dupRow);
   modal('Add reagent', body, async () => {
-    await api('POST', '/consumables', { name: body.querySelector('#n_name').value, unit: body.querySelector('#n_unit').value, onHand: +body.querySelector('#n_oh').value, reorderLevel: +body.querySelector('#n_re').value, costPerUnit: body.querySelector('#n_cost').value || null, location: body.querySelector('#n_loc').value,
-      itemNumber: body.querySelector('#n_itemno').value, isCipAgent: cipCb ? cipCb.checked : false, reagentType: typeSel.value || null, organic: organicNew.checked });
+    try {
+      await api('POST', '/consumables', { name: nameInp.value, unit: body.querySelector('#n_unit').value, onHand: +body.querySelector('#n_oh').value, reorderLevel: +body.querySelector('#n_re').value,
+        costPerUnit: body.querySelector('#n_cost').value || null, location: body.querySelector('#n_loc').value, itemNumber: body.querySelector('#n_itemno').value,
+        isCipAgent: cipCb ? cipCb.checked : false, reagentType: typeSel.value || null, organic: organicNew.checked,
+        chemical: chem.value, manufacturer: maker.value, manufacturerCode: mcode.value, grade: gradeSel.value, form: formSel.value, confirmDuplicate: dupCb.checked });
+    } catch (e) {
+      if (e.code === 'likely_duplicate') dupRow.classList.remove('hidden');
+      throw e;
+    }
     State.ref = await api('GET', '/refdata');
     toast('Added'); render();
   }, 'Add');
@@ -6577,14 +6646,16 @@ function addContainerType() {
     el('div', { class: 'form-row' }, field('Cost per unit', el('input', { type: 'number', id: 'n_cost', step: '0.01' })),
       field('Warehouse location', editableSelect(locs, 'n_loc'))),
     el('div', { class: 'form-row' }, field('Volume (L, blank if not an FG package)', litresInp),
-      field('Used for Sample Point', sampleCb)));
+      el('div', { class: 'check-group' }, checkLine(sampleCb, 'Used for Sample Point'))),
+    el('div', { class: 'form-row' }, field('Manufacturer (optional)', el('input', { id: 'n_maker', placeholder: 'the maker, not the seller' })), field('Manufacturer product code (optional)', el('input', { id: 'n_mcode' }))));
   modal('Add container type', body, async () => {
     await api('POST', '/consumables', {
       name: body.querySelector('#n_name').value, unit: body.querySelector('#n_unit').value,
       onHand: +body.querySelector('#n_oh').value, reorderLevel: +body.querySelector('#n_re').value,
       costPerUnit: body.querySelector('#n_cost').value || null, location: body.querySelector('#n_loc').value,
       isContainer: true, litresEach: litresInp.value.trim() === '' ? null : +litresInp.value,
-      isSampleContainer: sampleCb.checked, itemNumber: body.querySelector('#n_itemno').value
+      isSampleContainer: sampleCb.checked, itemNumber: body.querySelector('#n_itemno').value,
+      manufacturer: body.querySelector('#n_maker').value, manufacturerCode: body.querySelector('#n_mcode').value
     });
     State.ref = await api('GET', '/refdata');
     toast('Container type added'); render();

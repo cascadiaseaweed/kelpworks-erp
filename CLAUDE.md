@@ -110,6 +110,14 @@ for `main` so a red run blocks the merge.
   changes, refunds the old item and charges the new one (`run_reagent_commits.consumable_id`). `GET /api/reagents[?runId=]` feeds the
   pickers; `buildReagentWatch` (app.js) renders the pickers and the "Exceeds inventory" note under each reagent field (stock = on-hand + what
   this run already deducted from that item). Pre-Processing's citric acid picks an item the same way (`preproc_batches.citric_item_id`).
+- **An item is one specific product** (KW-86; tests in `tests/test_item_identity.py`). `consumables.manufacturer`, `manufacturer_code`, `grade`, `form`, `chemical` (TEXT, blank until filled in; nothing is backfilled, existing items keep
+  their names and numbers). A different manufacturer, grade, form / concentration, organic status or SDS is a NEW item; a different supplier is not (it is an approved supplier of the item, KW-23 / KW-81); lot / batch and pack size are on
+  the receipt. Every item may have a manufacturer + product code; **reagents and CIP agents** (not container, not label) also have Chemical, Grade and Form. `POST /api/consumables` for a reagent or CIP agent needs a manufacturer and a grade (400);
+  a **likely duplicate** (`likely_duplicate_items`: same chemical -- an older item's chemical falls back to its Item type --, manufacturer, grade, form and organic status, ignoring case and spacing; chemical, manufacturer and grade must all
+  be given) answers 409 `likely_duplicate` with the matches until the request carries `confirmDuplicate` (a warning, not a block). `PUT` edits the same fields: **changing a value that is already filled in** (manufacturer, chemical, grade, form)
+  on an item that has lots or ledger lines needs `identityReason` (400); filling a blank and the product code never do. Every set / change is a `config_log` line (area `inventory_item`: "Item identity" on create, one line per field
+  on edit, plus "Reason for change"). The item NAME never changes, so a short name in the pattern `Chemical, form(s) - Manufacturer (grade if not food / FCC, Org)` (suggested by `suggestItemName` in app.js as the Add form is filled in; the Grade field and the pickers carry the rest) identifies what a
+  run used; the signed run snapshot is unchanged (it stores the item id). The production-log pickers stay one per Item type (`buildReagentWatch`); each option adds manufacturer / grade / form when the name does not already say them.
 - **Reagent usage** (Citric Acid, Potassium Sorbate, Sodium Benzoate) is deducted
   by `_commit_reagent_usage` from the Dilution & Preservation entries on that
   section's Save and at finalize: one net-change ledger line per reagent

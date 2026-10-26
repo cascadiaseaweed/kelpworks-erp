@@ -4821,6 +4821,9 @@ def migrate(conn):
         for t in ("Citric Acid", "Potassium Sorbate", "Sodium Benzoate"):
             conn.execute("UPDATE consumables SET reagent_type=? WHERE name LIKE ? AND COALESCE(is_container,0)=0 "
                          "AND label_sku_code IS NULL AND COALESCE(is_cip_agent,0)=0", (t, t + "%"))
+    for col in ("manufacturer", "manufacturer_code", "grade", "form", "chemical"):          # KW-86: what an item IS (blank until filled in; nothing is backfilled)
+        if col not in rtcols:
+            conn.execute("ALTER TABLE consumables ADD COLUMN %s TEXT" % col)
     rccols = {r["name"] for r in conn.execute("PRAGMA table_info(run_reagent_commits)")}
     if "consumable_id" not in rccols:
         conn.execute("ALTER TABLE run_reagent_commits ADD COLUMN consumable_id INTEGER")
@@ -5874,6 +5877,49 @@ def link_unlinked_sds(conn, who):
 def ensure_sds_supplier_links(conn):
     """Once: the sheets already in the library are linked to the supplier records their names match exactly."""
     run_once(conn, "sds_supplier_links_kw83", lambda: link_unlinked_sds(conn, "System"))
+
+
+# ---- What an inventory item IS: chemical, manufacturer, grade, form (KW-86) -----------------------------------------------------------------------------------------------
+# A different manufacturer, grade, form / concentration, organic status or SDS is a NEW item; a different supplier is not (it is an approved supplier of the item). The item NAME never changes,
+# so a name written as "Chemical, form, grade - Manufacturer [- Organic]" is the exact record of what a run used.
+def clean_item_text(v, n):
+    t = re.sub(r"\s+", " ", "" if v is None or isinstance(v, (dict, list, bool)) else str(v)).strip()
+    return t[:n] or None
+
+
+def clean_item_list(v, n):
+    """Several choices (a grade, a form) from a list or a text with commas / semicolons: trimmed, each once (ignoring case), stored as "a, b". None when empty."""
+    parts = v if isinstance(v, list) else re.split(r"[,;]", "" if v is None or isinstance(v, (dict, bool)) else str(v))
+    out, seen = [], set()
+    for p in parts:
+        t = clean_item_text(p, n)
+        if t and t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+    return (", ".join(out))[:n].rstrip(", ") or None
+
+
+def _item_set(v):
+    """The choices in a stored list, ignoring case and order."""
+    return frozenset(x.strip().lower() for x in re.split(r"[,;]", v or "") if x.strip())
+
+
+def _item_norm(v):
+    return re.sub(r"\s+", " ", v or "").strip().lower()
+
+
+def likely_duplicate_items(conn, chemical, manufacturer, grade, form, organic):
+    """Reagent / CIP items that are the same product as the one described: same chemical (an older item's chemical falls back to its Item type), manufacturer, grade, form and organic
+    status, compared ignoring case and spacing. Chemical, manufacturer and grade must all be given or nothing can be said (-> [])."""
+    key = [_item_norm(chemical), _item_norm(manufacturer), _item_set(grade)]
+    if not all(key):
+        return []
+    out = []
+    for r in conn.execute("SELECT * FROM consumables WHERE COALESCE(is_container,0)=0 AND label_sku_code IS NULL ORDER BY name"):
+        if ([_item_norm(r["chemical"] or r["reagent_type"]), _item_norm(r["manufacturer"]), _item_set(r["grade"])] == key
+                and _item_set(r["form"]) == _item_set(form) and bool(r["organic"]) == bool(organic)):
+            out.append({"id": r["id"], "name": r["name"], "itemNumber": r["item_number"]})
+    return out
 
 
 def ensure_site_list(conn):
@@ -11294,6 +11340,7 @@ class Handler(BaseHTTPRequestHandler):
                     itemNumber=r["item_number"], labelSku=r["label_sku_code"],
                     labelPackage=r["label_package"], isCipAgent=bool(r["is_cip_agent"]),
                     reagentType=r["reagent_type"], organic=bool(r["organic"]), low=(r["on_hand"] <= r["reorder_level"]),
+                    manufacturer=r["manufacturer"], manufacturerCode=r["manufacturer_code"], grade=r["grade"], form=r["form"], chemical=r["chemical"],
                     lastCountedAt=r["last_counted_at"], lastCountedBy=r["last_counted_by"])
 
     def _clean_item_number(self, conn, raw, exclude_id=None):
@@ -12108,6 +12155,22 @@ class Handler(BaseHTTPRequestHandler):
                 rtype = (d.get("reagentType") or "").strip() or None
                 if rtype and (rtype not in self.REAGENT_RUN_COLUMNS or is_container or is_label):
                     raise ApiError(400, "Reagent type must be one of: %s" % ", ".join(self.REAGENT_RUN_COLUMNS))
+                plain = not is_container and not is_label              # a reagent or CIP agent (KW-86)
+                maker = clean_item_text(d.get("manufacturer"), 120)
+                maker_code = clean_item_text(d.get("manufacturerCode"), 60)
+                grade = clean_item_list(d.get("grade"), 120) if plain else None
+                form = clean_item_list(d.get("form"), 120) if plain else None
+                chemical = clean_item_text(d.get("chemical"), 80) if plain else None
+                organic_new = bool(d.get("organic") in (True, 1, "1", "true") and plain)
+                if plain and not maker:
+                    raise ApiError(400, "Enter the manufacturer (the maker, not the seller). A different manufacturer is a different item.")
+                if plain and not grade:
+                    raise ApiError(400, "Enter the grade (for example Food / FCC, Technical, USP). A different grade is a different item.")
+                if plain:
+                    dups = likely_duplicate_items(conn, chemical or rtype, maker, grade, form, organic_new)
+                    if dups and d.get("confirmDuplicate") not in (True, 1, "1", "true"):
+                        raise ApiError(409, "This looks like an item you already have (same chemical, manufacturer, grade, form and organic status): %s. A different supplier is not a new item: "
+                                            "add it as an approved supplier of that item." % ", ".join(x["name"] for x in dups), "likely_duplicate", {"duplicates": dups})
                 cur = conn.execute(
                     "INSERT INTO consumables (name,unit,on_hand,reorder_level,cost_per_unit,location,"
                     "is_container,litres_each,is_sample_container,item_number,label_sku_code,label_package,"
@@ -12120,6 +12183,13 @@ class Handler(BaseHTTPRequestHandler):
                     conn.execute("UPDATE consumables SET reagent_type=? WHERE id=?", (rtype, cur.lastrowid))
                 if d.get("organic") in (True, 1, "1", "true") and not is_container and not is_label:
                     conn.execute("UPDATE consumables SET organic=1 WHERE id=?", (cur.lastrowid,))
+                conn.execute("UPDATE consumables SET manufacturer=?, manufacturer_code=?, grade=?, form=?, chemical=? WHERE id=?", (maker, maker_code, grade, form, chemical, cur.lastrowid))
+                bits = [("%s: %s" % (lab, val)) for lab, val in (("Chemical", chemical), ("Manufacturer", maker), ("Product code", maker_code), ("Grade", grade), ("Form", form)) if val]
+                if organic_new:
+                    bits.append("Organic: yes")
+                if bits:
+                    conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('inventory_item',?,?,?,?,?,?)",
+                                 (name, "Item identity", None, "; ".join(bits), user["name"] if user else None, now_iso()))
                 if not item_number:
                     assign_item_numbers(conn)
                 return {"ok": True, "itemNumber": conn.execute("SELECT item_number FROM consumables WHERE id=?", (cur.lastrowid,)).fetchone()["item_number"]}
@@ -12225,6 +12295,32 @@ class Handler(BaseHTTPRequestHandler):
                     conn.execute("UPDATE consumables SET organic=? WHERE id=?", (new_org, cid))
                     conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('inventory_item',?,?,?,?,?,?)",
                                  (c["name"], "Organic grade", "yes" if c["organic"] else "no", "yes" if new_org else "no", user["name"] if user else None, now_iso()))
+            plain = not c["is_container"] and not c["label_sku_code"]
+            changes = []
+            for key, col, label, n, identity, plain_only in (("manufacturer", "manufacturer", "Manufacturer", 120, True, False), ("manufacturerCode", "manufacturer_code", "Manufacturer product code", 60, False, False),
+                                                              ("chemical", "chemical", "Chemical", 80, True, True), ("grade", "grade", "Grade", 120, True, True),
+                                                              ("form", "form", "Form / concentration", 120, True, True)):      # KW-86: what the item IS
+                if key not in d:
+                    continue
+                new = clean_item_list(d[key], n) if key in ("grade", "form") else clean_item_text(d[key], n)
+                if plain_only and not plain:
+                    if new:
+                        raise ApiError(400, "%s applies to reagents and CIP agents only" % label)
+                    continue
+                if (_item_set(new) != _item_set(c[col])) if key in ("grade", "form") else (new != (c[col] or None)):
+                    changes.append((col, label, c[col] or None, new, identity))
+            hard = [ch for ch in changes if ch[4] and ch[2]]                  # changing a value that is already filled in (filling a blank needs no reason)
+            reason = clean_item_text(d.get("identityReason"), 300)
+            if hard and not reason and (conn.execute("SELECT 1 FROM consumable_lots WHERE consumable_id=? LIMIT 1", (cid,)).fetchone()
+                                        or conn.execute("SELECT 1 FROM consumable_txns WHERE consumable_id=? LIMIT 1", (cid,)).fetchone()):
+                raise ApiError(400, "This item has already been received or used. Enter the reason for changing %s (if the product is different, add a new item instead)." % ", ".join(ch[1] for ch in hard))
+            for col, label, old, new, _identity in changes:
+                conn.execute("UPDATE consumables SET %s=? WHERE id=?" % col, (new, cid))
+                conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('inventory_item',?,?,?,?,?,?)",
+                             (c["name"], label, old, new, user["name"] if user else None, now_iso()))
+            if hard and reason:
+                conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('inventory_item',?,?,?,?,?,?)",
+                             (c["name"], "Reason for change", None, reason, user["name"] if user else None, now_iso()))
             if "reagentType" in d:
                 rtype = (d["reagentType"] or "").strip() or None
                 if rtype and rtype not in self.REAGENT_RUN_COLUMNS:
@@ -12595,7 +12691,8 @@ class Handler(BaseHTTPRequestHandler):
                 items = [legacy] if legacy else []
             types.append({"type": t, "defaultItemId": items[0]["id"] if items else None,
                           "items": [{"id": i["id"], "name": i["name"], "itemNumber": i["item_number"], "unit": i["unit"],
-                                     "onHand": i["on_hand"], "organic": bool(i["organic"])} for i in items]})
+                                     "onHand": i["on_hand"], "organic": bool(i["organic"]), "manufacturer": i["manufacturer"], "grade": i["grade"], "form": i["form"],
+                                     "chemical": i["chemical"]} for i in items]})
         commits = {}
         rid = query.get("runId", [""])[0]
         if rid.isdigit():

@@ -117,7 +117,7 @@ _n = [0]
 def item(admin, name, unit="kg", suppliers=(), plain=False):
     _n[0] += 1
     name = name if plain else "%s %d" % (name, _n[0])
-    assert admin.post("/api/consumables", {"name": name, "unit": unit, "onHand": 0}).ok
+    assert admin.post("/api/consumables", {"name": name, "unit": unit, "onHand": 0, "manufacturer": "Test Maker", "grade": "Food"}).ok
     c = [x for x in admin.get("/api/consumables").json["consumables"] if x["name"] == name][0]
     for s in suppliers:
         assert admin.post("/api/consumables/%d/suppliers" % c["id"], {"name": s}).ok

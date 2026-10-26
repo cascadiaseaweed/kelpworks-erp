@@ -24,7 +24,7 @@ def people(srv):
 
 
 def new_item(admin, name, unit="kg", **kw):
-    r = admin.post("/api/consumables", dict({"name": name, "unit": unit, "onHand": 0}, **kw))
+    r = admin.post("/api/consumables", dict({"name": name, "unit": unit, "onHand": 0, "manufacturer": "Test Maker", "grade": "Food"}, **kw))
     assert r.ok, r.text
     cid = [c["id"] for c in admin.get("/api/consumables").json["consumables"] if c["name"] == name][0]
     approve_suppliers(admin, cid)
@@ -126,10 +126,10 @@ def test_a_pack_of_another_item_cannot_be_used(srv, people):
 
 def test_a_new_item_must_use_a_known_stock_unit(srv, people):
     a = people["admin"]
-    assert a.post("/api/consumables", {"name": "Recv Unit KG", "unit": "KG"}).ok
+    assert a.post("/api/consumables", {"name": "Recv Unit KG", "unit": "KG", "manufacturer": "Test Maker", "grade": "Food"}).ok
     assert [c["unit"] for c in a.get("/api/consumables").json["consumables"] if c["name"] == "Recv Unit KG"] == ["kg"]
-    assert a.post("/api/consumables", {"name": "Recv Unit Bag", "unit": "bag"}).status == 400
-    assert a.post("/api/consumables", {"name": "Recv Unit Blank", "unit": ""}).ok
+    assert a.post("/api/consumables", {"name": "Recv Unit Bag", "unit": "bag", "manufacturer": "Test Maker", "grade": "Food"}).status == 400
+    assert a.post("/api/consumables", {"name": "Recv Unit Blank", "unit": "", "manufacturer": "Test Maker", "grade": "Food"}).ok
 
 
 # ---- documents --------------------------------------------------------------------------------------------------------------------

@@ -43,7 +43,7 @@ def make(client, **over):
 
 
 def new_item(admin, name):
-    assert admin.post("/api/consumables", {"name": name, "unit": "kg", "onHand": 0}).ok
+    assert admin.post("/api/consumables", {"name": name, "unit": "kg", "onHand": 0, "manufacturer": "Test Maker", "grade": "Food"}).ok
     return [c["id"] for c in admin.get("/api/consumables").json["consumables"] if c["name"] == name][0]
 
 

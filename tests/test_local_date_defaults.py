@@ -38,7 +38,7 @@ def srv():
 
 def test_the_server_accepts_today_and_refuses_tomorrow_as_a_received_date(srv):
     a = srv.admin_client()
-    assert a.post("/api/consumables", {"name": "Local date item", "unit": "kg", "onHand": 0}).ok
+    assert a.post("/api/consumables", {"name": "Local date item", "unit": "kg", "onHand": 0, "manufacturer": "Test Maker", "grade": "Food"}).ok
     cid = [c["id"] for c in a.get("/api/consumables").json["consumables"] if c["name"] == "Local date item"][0]
     approve_suppliers(a, cid)
     today = datetime.date.today()           # the server's local day (the harness server runs on this machine)
