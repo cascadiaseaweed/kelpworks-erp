@@ -5849,8 +5849,8 @@ function adjustStock(c) {
 // KW-23); everyone can read. A delivery or lot keeps the supplier name it was recorded with.
 const SUPPLIER_TYPES = ['Manufacturer', 'Distributor', 'Carrier', 'Lab', 'Service'];
 const SUPPLIER_STATUSES = ['Approved', 'Conditional', 'Not approved', 'Inactive'];
-const SUPPLIER_DOC_KINDS = ['Certificate', 'Organic certificate', 'SDS', 'Insurance', 'Other'];
-const SUPPLIER_FLAG_INFO = { docs_expired: ['low', 'Document expired'], docs_expiring: ['hold', 'Document expiring'], review_overdue: ['low', 'Review overdue'], no_review_date: ['hold', 'No review date'] };
+const SUPPLIER_DOC_KINDS = ['Certificate', 'Organic certificate', 'Insurance', 'Other'];                 // safety data sheets come from the Documents tab (KW-83)
+const SUPPLIER_FLAG_INFO = { docs_expired: ['low', 'Document expired'], docs_expiring: ['hold', 'Document expiring'], sds_review_overdue: ['low', 'Safety data sheet overdue'], review_overdue: ['low', 'Review overdue'], no_review_date: ['hold', 'No review date'] };
 const supplierStatusBadge = st => badge(st === 'Approved' ? 'on_hand' : st === 'Conditional' ? 'hold' : st === 'Not approved' ? 'low' : 'consumed', st);
 const supplierFlagBadges = flags => el('span', {}, ...(flags || []).map(f => el('span', {}, badge(SUPPLIER_FLAG_INFO[f][0], SUPPLIER_FLAG_INFO[f][1]), ' ')));
 const supplierDocBadge = d => d.status === 'expired' ? badge('low', 'Expired') : d.status === 'expiring' ? badge('hold', 'Expiring soon') : null;
@@ -5970,6 +5970,14 @@ async function openSupplierPanel(ref, opts = {}) {
             } catch (e) { err.textContent = e.message; }
           } }, 'Add document')));
       }
+      panel.append(el('h4', {}, 'Safety data sheets'),
+        s.sds.length ? table(['Chemical', 'Issued', 'Review due', 'File'], s.sds.map(x => [
+          el('span', { class: x.status === 'withdrawn' ? 'muted' : '' }, x.chemical, x.status === 'withdrawn' ? ' (withdrawn)' : '',
+            x.items.length ? el('div', { class: 'help' }, 'Used for: ' + x.items.map(i => i.name).join(', ')) : null), x.issueDate || '—',
+          el('span', {}, x.reviewDue || '—', ' ', sdsReviewBadge(x)),
+          x.hasFile ? el('a', { href: docDownloadUrl('sds', x.id), target: '_blank', rel: 'noopener' }, 'Open') : el('span', { class: 'muted' }, 'No file')]))
+          : el('div', { class: 'help' }, 'No safety data sheet is linked to this supplier yet.'),
+        el('div', { class: 'help' }, 'Safety data sheets are loaded through the Documents tab (the SharePoint folder); an administrator links a sheet to its supplier there.'));
       panel.append(el('details', {}, el('summary', {}, 'History (' + s.history.length + ')'),
         table(['When', 'What', 'From', 'To', 'Reason', 'By'], s.history.map(h => [fmtWhen(h.at), h.field, h.old || '—', h.new || '—', h.reason || '', h.by || '']))));
     }
@@ -5998,7 +6006,7 @@ async function pageSuppliers(v) {
   const q = el('input', { placeholder: 'Search name, contact, account number', value: f.q });
   const typeSel = selectFrom('', [['', 'All types'], ...SUPPLIER_TYPES.map(t => [t, t])]);
   const statusSel = selectFrom('', [['', 'All statuses'], ...SUPPLIER_STATUSES.map(t => [t, t])]);
-  const flagSel = selectFrom('', [['', 'All suppliers'], ['any', 'Needs attention'], ['docs_expired', 'Documents expired'], ['docs_expiring', 'Documents expiring'], ['review_overdue', 'Review overdue'], ['no_review_date', 'No review date']]);
+  const flagSel = selectFrom('', [['', 'All suppliers'], ['any', 'Needs attention'], ['docs_expired', 'Documents expired'], ['docs_expiring', 'Documents expiring'], ['sds_review_overdue', 'Safety data sheet overdue'], ['review_overdue', 'Review overdue'], ['no_review_date', 'No review date']]);
   typeSel.value = f.type; statusSel.value = f.status; flagSel.value = f.flag;
   v.append(el('div', { class: 'toolbar' }, q, typeSel, statusSel, flagSel));
   const host = el('div', {}), dup = el('div', {});
@@ -6014,7 +6022,8 @@ async function pageSuppliers(v) {
     host.append(table(['Supplier', 'Type', 'Status', 'Next review', 'Documents', 'Items', 'Contact'],
       list.map(s => [s.name, s.type || '—', supplierStatusBadge(s.approvalStatus),
         el('span', {}, s.nextReviewDate || '—', ' ', s.flags.includes('review_overdue') ? badge('low', 'Overdue') : (s.flags.includes('no_review_date') ? badge('hold', 'No date') : null)),
-        el('span', {}, String(s.nDocs), ' ', s.flags.includes('docs_expired') ? badge('low', 'Expired') : (s.flags.includes('docs_expiring') ? badge('hold', 'Expiring') : null)),
+        el('span', {}, String(s.nDocs), ' ', s.flags.includes('docs_expired') ? badge('low', 'Expired') : (s.flags.includes('docs_expiring') ? badge('hold', 'Expiring') : null),
+          s.flags.includes('sds_review_overdue') ? [' ', badge('low', 'SDS overdue')] : null),
         String(s.nItems), s.contactName || s.contactEmail || '—']), ['', '', '', '', '', 'num', ''],
       i => openSupplierPanel(list[i].id, { onChange: load }).catch(e => toast(e.message, true))));
     dup.innerHTML = '';
@@ -6065,6 +6074,7 @@ function supplierPicker(c, current) {
       else if (rec.approvalStatus === 'Conditional') msgs.push(['hold', 'This supplier is Conditional (not fully approved yet).']);
       if (rec.flags.includes('docs_expired')) msgs.push(['low', 'A supplier document has expired.']);
       else if (rec.flags.includes('docs_expiring')) msgs.push(['hold', 'A supplier document expires soon.']);
+      if (rec.flags.includes('sds_review_overdue')) msgs.push(['hold', 'A safety data sheet of this supplier is overdue for review.']);
       if (rec.flags.includes('review_overdue')) msgs.push(['hold', 'The supplier review is overdue.']);
       msgs.forEach(([cls, t]) => notice.append(el('div', { style: 'margin-top:2px' }, badge(cls, t))));
     } catch (e) { /* the notice is a courtesy: the receipt does not depend on it */ }
@@ -7156,7 +7166,7 @@ const CALCULATIONS = [
   {
     title: 'Supplier document: expired or expiring',
     formula: 'Expired: the document’s expiry date is before today.   Expiring soon: the expiry date is today or within the warning days.   A supplier is flagged when any of its documents is expired or expiring.',
-    description: 'Each supplier document (certificate, organic certificate, safety data sheet, insurance) can carry an expiry date. The flags show on the Suppliers list and as a warning in the Receive window; they never block a receipt.',
+    description: 'Each supplier document (certificate, organic certificate, insurance) can carry an expiry date. The flags show on the Suppliers list and as a warning in the Receive window; they never block a receipt. Safety data sheets are not supplier documents: they come from the Documents tab and raise their own flag when a linked sheet is overdue for review.',
     location: 'Suppliers → Documents',
     settings: ['supplier_doc_warning_days'],
   },
@@ -9496,6 +9506,7 @@ function downloadDbBackup() {
 /* ---------------- Documents: SOPs and safety data sheets (SharePoint is the master) ---------------- */
 // Quality keeps 03_SOPs/Current and 04_Safety-Data-Sheets/Current in SharePoint; the sync on the office PC reports those folders to KelpWorks, and every
 // difference waits here for an administrator to accept or ignore. Everyone can read the lists and open the files.
+const sdsReviewBadge = s => s.reviewStatus === 'overdue' ? badge('low', 'Overdue') : s.reviewStatus === 'soon' ? badge('hold', 'Review soon') : s.reviewStatus ? badge('ok', 'OK') : null;
 function docDownloadUrl(kind, id) { return (kind === 'sop' ? '/api/sop-documents/' : '/api/sds-documents/') + id + '/download?token=' + encodeURIComponent(dlToken()); }
 function docRevisionUrl(id) { return '/api/doc-revisions/' + id + '/download?dl=1&token=' + encodeURIComponent(dlToken()); }
 function inboxFileUrl(id) { return '/api/library/inbox/' + id + '/file?token=' + encodeURIComponent(dlToken()); }
@@ -9514,11 +9525,18 @@ async function pageDocuments(v) {
   v.append(sopTable(d.sops, {}));
 
   v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Safety data sheets'), el('div', { class: 'help' }, 'Reviewed every ' + fmt(d.reviewYears, 0) + ' years')));
-  const reviewBadge = s => s.reviewStatus === 'overdue' ? badge('low', 'Overdue') : s.reviewStatus === 'soon' ? badge('hold', 'Review soon') : s.reviewStatus ? badge('ok', 'OK') : null;
+  const unlinked = d.sds.filter(s => !s.supplierId);
+  if (isAdmin && unlinked.length) v.append(el('div', { class: 'card', style: 'margin-bottom:10px' }, el('h3', {}, 'Safety data sheets not linked to a supplier (' + unlinked.length + ')'),
+    el('div', { class: 'help' }, 'A sheet is linked automatically when the supplier in its file name matches a supplier record exactly. Link the others here, or add the supplier on the Suppliers tab and they link by themselves.'),
+    table(['Chemical', 'Supplier in the file name', 'Suggested record', ''], unlinked.map(s => [s.chemical, s.supplier,
+      s.supplierSuggestion ? s.supplierSuggestion.name : el('span', { class: 'muted' }, 'none'), rowActions([['Link…', () => editSdsItems(s)]])]))));
   v.append(table(['Chemical', 'Supplier', 'Issued', 'Review due', 'Used for', 'Status', 'File', ''],
     d.sds.map(s => [
-      s.chemical, s.supplier, s.issueDate || '—',
-      el('span', {}, s.reviewDue || '—', ' ', reviewBadge(s)),
+      s.chemical,
+      s.supplierId ? el('a', { href: '#', title: 'Open the supplier record (file name: ' + s.supplier + ')', onclick: e => { e.preventDefault(); e.stopPropagation(); openSupplierPanel(s.supplierId).catch(x => toast(x.message, true)); } }, s.supplierName)
+        : el('span', {}, s.supplier, ' ', badge('hold', 'not linked')),
+      s.issueDate || '—',
+      el('span', {}, s.reviewDue || '—', ' ', sdsReviewBadge(s)),
       s.items.length ? s.items.map(i => i.name).join(', ') : el('span', { class: 'muted' }, 'not linked yet'),
       s.status === 'withdrawn' ? badge('disposed', 'Withdrawn') : badge('on_hand', 'Current'),
       s.hasFile ? el('a', { href: docDownloadUrl('sds', s.id), target: '_blank', rel: 'noopener' }, s.filename || 'Open') : el('span', { class: 'muted' }, 'No file'),
@@ -9715,9 +9733,17 @@ async function reviewLibraryItem(i) {
 async function editSdsItems(s) {
   const list = sdsItemChecklist(await sdsLinkableItems(), new Set(s.items.map(x => x.id)));
   const notes = el('input', { value: s.notes || '', placeholder: 'e.g. reviewed by QA on …' });
-  modal('Safety data sheet — ' + s.chemical, el('div', {}, el('div', { class: 'summary-line' }, sl('Supplier', s.supplier), sl('Issued', s.issueDate || '—')),
+  const suppliers = (await api('GET', '/suppliers')).suppliers;
+  const hint = s.supplierId ? null : s.supplierSuggestion;
+  const supSel = selectFrom('', [['', '— not linked —'], ...suppliers.map(x => [String(x.id), x.name + (hint && hint.id === x.id ? '  (suggested)' : '')])]);
+  supSel.value = String(s.supplierId || (hint ? hint.id : ''));
+  modal('Safety data sheet — ' + s.chemical, el('div', {}, el('div', { class: 'summary-line' }, sl('Supplier in the file name', s.supplier), sl('Issued', s.issueDate || '—')),
+    field('Supplier record', supSel),
+    el('div', { class: 'help', style: 'margin:-4px 0 8px' }, hint ? 'The record whose name starts like the file name is selected; saving links it.' : 'The sheet stays linked if the supplier is renamed. Choose “not linked” to remove the link.'),
     list.node, field('Notes', notes)), async () => {
-    await api('PUT', '/sds-documents/' + s.id, { itemIds: list.get(), notes: notes.value });
+    const body = { itemIds: list.get(), notes: notes.value };
+    if (String(s.supplierId || '') !== supSel.value) body.supplierId = supSel.value ? +supSel.value : null;
+    await api('PUT', '/sds-documents/' + s.id, body);
     toast('Saved'); render();
   }, 'Save');
 }
