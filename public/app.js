@@ -3093,6 +3093,8 @@ const SAMPLE_DESCRIPTIONS = ['Microbial', 'Retention', 'Metals & Nutrients', 'Pr
 // Sample Point container options are the container consumables flagged
 // isSampleContainer (Inventory Items -> Packaging); picking one here
 // live-adjusts that container's on-hand stock (see update_sample_point).
+// KW-90: a record keeps the container name it was written with; a renamed container's old name shows as its current name in a picker (the stored text changes only if the person picks another value).
+function containerDisplay(name) { return ((State.ref && State.ref.containerAliases) || {})[name] || name; }
 function sampleContainerOptions() {
   const names = (State.ref.containers || []).filter(c => c.isSampleContainer).map(c => c.name);
   return names.length ? names : [''];
@@ -3194,7 +3196,7 @@ function buildSamplePointsSection(initial, getRunId, processingLot, getCollected
         qtyInp.value = String(q);
         patch(it.id, { qty: q });
       });
-      const containerSel = selectCell(sampleContainerOptions(), it.container, () => patch(it.id, { container: containerSel.value }));
+      const containerSel = selectCell(sampleContainerOptions(), containerDisplay(it.container), () => patch(it.id, { container: containerSel.value }));
       const removeBtn = it.required ? el('span', { class: 'help', title: 'A required sample: it can be added to but not removed or reduced below ' + floor }, '🔒 required') : el('button', {
         type: 'button', class: 'icon-btn remove', title: 'Remove sample', onclick: async () => {
           if (!confirm('Remove this sample?')) return;
@@ -3272,7 +3274,7 @@ function buildPackagingEntriesSection(initial, getRunId) {
     items.forEach(it => {
       const options = unitOptions();
       const unitSel = el('select', {}, ...options.map(o => el('option', { value: o }, o)));
-      unitSel.value = options.includes(it.containerUnit) ? it.containerUnit : (options[0] || '');
+      unitSel.value = options.includes(containerDisplay(it.containerUnit)) ? containerDisplay(it.containerUnit) : (options[0] || '');
       unitSel.addEventListener('change', () => patch(it.id, { containerUnit: unitSel.value }));
       const qtyInp = el('input', { type: 'number', min: '0', step: 'any', value: String(it.qty ?? 1) });
       qtyInp.addEventListener('change', () => patch(it.id, { qty: +qtyInp.value || 0 }));
@@ -6498,7 +6500,9 @@ function editC(c) {
   const formSel = isPlainReagent ? itemChoices(ITEM_FORMS, 'Select form(s)…', 'Other form or concentration', null, c.form || '') : null;
   // KW-89: only an administrator renames an item (reagents and CIP agents for now); the Used IBC pool is locked; a reagent type has one default item, chosen by item number.
   const isAdminUser = State.user.role === 'admin';
-  const canRename = isAdminUser && isPlainReagent && !c.locked;
+  const canRename = isAdminUser && !c.labelSku && !c.locked;                     // KW-90: containers too; a label follows its container
+  const ibcCb = c.isContainer ? el('input', { type: 'checkbox' }) : null;           // KW-90: "Counts as an IBC" decides the run's New IBCs filled
+  if (ibcCb) { ibcCb.checked = !!c.isIbc; ibcCb.disabled = !isAdminUser || !!c.locked; }
   const nameInp = canRename ? el('input', { value: c.name }) : null, renameReason = canRename ? el('input', { placeholder: 'required when you change the name' }) : null;
   const prevNames = (c.previousNames || []).length ? el('div', { class: 'help' }, 'Previously called: ' + c.previousNames.join('; ') + '. An old name cannot be given to another item.') : null;
   const defaultCb = isAdminUser && isPlainReagent && c.reagentType ? el('input', { type: 'checkbox' }) : null;
@@ -6509,7 +6513,10 @@ function editC(c) {
     'This item has been received (' + c.lotCount + ' lot' + (c.lotCount === 1 ? '' : 's') + '). Changing its manufacturer, chemical, grade or form rewrites what past receipts and runs refer to: if the product is different, add a NEW item instead. A change needs a reason and is logged. Filling in a blank needs none.') : null;
   const body = el('div', {},
     c.locked ? el('div', { class: 'card', style: 'margin:0 0 10px;padding:10px' }, el('b', {}, '🔒 Locked system item. '), 'The program relies on this item (emptied totes return to it), so it cannot be renamed or changed by anyone. Stock can still be counted, received and written off.') : null,
-    nameInp ? el('div', {}, field('Name', nameInp), field('Reason for renaming', renameReason), prevNames) : (isAdminUser || !prevNames ? null : prevNames),
+    nameInp ? el('div', {}, field('Name', nameInp), field('Reason for renaming', renameReason), prevNames,
+      c.isContainer ? el('div', { class: 'help' }, 'Records already written keep the name they were written with; the new name is used from now on. Its finished-good labels are renamed with it.') : null)
+      : (isAdminUser || !prevNames ? null : prevNames),
+    c.labelSku ? el('div', { class: 'help', style: 'margin:0 0 8px' }, 'A finished-good label follows its container: to rename it, rename the container (package type) ' + (c.labelPackage || '') + '.') : null,
     field('Item #', el('input', { id: 'c_itemno', value: c.itemNumber ?? '', placeholder: 'Auto-assigned (e.g. RGT-008) — leave blank' })),
     typeSel ? field('Reagent type (items of one type are offered together in the production log)', typeSel) : null,
     isPlainReagent ? el('div', { class: 'form-row' }, field('Chemical', chemInp), field('Manufacturer', makerInp)) : field('Manufacturer', makerInp),
@@ -6524,7 +6531,8 @@ function editC(c) {
     field('Warehouse location', editableSelect(locs, 'c_loc')),
     c.isContainer ? el('div', { class: 'form-row' },
       field('Volume (L, blank if not an FG package)', litresInp),
-      el('div', { class: 'check-group' }, checkLine(sampleCb, 'Used for Sample Point'))) : null);
+      el('div', { class: 'check-group' }, checkLine(sampleCb, 'Used for Sample Point'),
+        checkLine(ibcCb, 'Counts as an IBC', 'Counted in the run’s “New IBCs filled”. Only an administrator changes it; the change is logged.'))) : null);
   body.querySelector('#c_loc').value = c.location || '';
   body.append(supplierEditor(c));
   modal('Edit ' + c.name, body, async () => {
@@ -6533,6 +6541,7 @@ function editC(c) {
     if (c.isContainer) {
       payload.litresEach = litresInp.value.trim() === '' ? null : +litresInp.value;
       payload.isSampleContainer = sampleCb.checked;
+      if (isAdminUser) payload.isIbc = ibcCb.checked;
     }
     if (typeSel) payload.reagentType = typeSel.value || null;
     if (organicCb) payload.organic = organicCb.checked;
@@ -6652,6 +6661,7 @@ function addContainerType() {
   const locs = State.ref.locations.map(l => [l, l]);
   const litresInp = el('input', { type: 'number', min: '0', step: 'any', placeholder: 'e.g. 1000 for IBC -- blank if not an FG package' });
   const sampleCb = el('input', { type: 'checkbox' });
+  const ibcCb = el('input', { type: 'checkbox' });
   const body = el('div', {},
     el('div', { class: 'form-row' }, field('Name', el('input', { id: 'n_name', placeholder: 'e.g. 4 L' })),
       field('Stock unit', (() => { const s = selectFrom('', STOCK_UNITS.map(u => [u, u]), null, 'n_unit'); s.value = 'ea'; return s; })())),
@@ -6661,7 +6671,7 @@ function addContainerType() {
     el('div', { class: 'form-row' }, field('Cost per unit', el('input', { type: 'number', id: 'n_cost', step: '0.01' })),
       field('Warehouse location', editableSelect(locs, 'n_loc'))),
     el('div', { class: 'form-row' }, field('Volume (L, blank if not an FG package)', litresInp),
-      el('div', { class: 'check-group' }, checkLine(sampleCb, 'Used for Sample Point'))),
+      el('div', { class: 'check-group' }, checkLine(sampleCb, 'Used for Sample Point'), checkLine(ibcCb, 'Counts as an IBC', 'Counted in a run’s “New IBCs filled” (needs a volume).'))),
     el('div', { class: 'form-row' }, field('Manufacturer (optional)', el('input', { id: 'n_maker', placeholder: 'the maker, not the seller' })), field('Manufacturer product code (optional)', el('input', { id: 'n_mcode' }))));
   modal('Add container type', body, async () => {
     await api('POST', '/consumables', {
@@ -6669,7 +6679,7 @@ function addContainerType() {
       onHand: +body.querySelector('#n_oh').value, reorderLevel: +body.querySelector('#n_re').value,
       costPerUnit: body.querySelector('#n_cost').value || null, location: body.querySelector('#n_loc').value,
       isContainer: true, litresEach: litresInp.value.trim() === '' ? null : +litresInp.value,
-      isSampleContainer: sampleCb.checked, itemNumber: body.querySelector('#n_itemno').value,
+      isSampleContainer: sampleCb.checked, isIbc: ibcCb.checked, itemNumber: body.querySelector('#n_itemno').value,
       manufacturer: body.querySelector('#n_maker').value, manufacturerCode: body.querySelector('#n_mcode').value
     });
     State.ref = await api('GET', '/refdata');
@@ -7359,8 +7369,8 @@ const CALCULATIONS = [
   },
   {
     title: 'Output (L) / New IBCs filled',
-    formula: 'Output (L) = Σ over container units of (total qty of that unit × litres each)   ·   New IBCs filled = Σ qty of the units whose name contains “IBC”',
-    description: 'A run’s total bottled output and IBC usage, computed from the Packaging table’s entries (rows naming the same container are added up) using each container’s litres-each value (Inventory Items → Packaging). Once a finished-goods lot exists for a unit, the litres-each it was created with are used, so changing a container’s size later does not rewrite a finished run.',
+    formula: 'Output (L) = Σ over container units of (total qty of that unit × litres each)   ·   New IBCs filled = Σ qty of the units flagged “Counts as an IBC” (Inventory Items → Edit)',
+    description: 'A run’s total bottled output and IBC usage, computed from the Packaging table’s entries (rows naming the same container, under its current or an earlier name, are added up) using each container’s litres-each value (Inventory Items → Packaging). Once a finished-goods lot exists for a unit, the litres-each it was created with are used, so changing a container’s size later does not rewrite a finished run.',
     location: 'Production → Packaging section, applied when a run is finalized',
     settings: [],
   },
@@ -8789,7 +8799,7 @@ async function openPreprocBatch(id, section) {
   function addPackRow(r) {
     r = r || { container: '', qty: null, litresEach: null };
     const sel = el('select', {}, el('option', { value: '' }, 'Select…'), ...containers.map(c => el('option', { value: c.name }, c.name + ' (' + fmt(c.onHand, 0) + ' on hand)')));
-    sel.value = r.container || '';
+    sel.value = containerDisplay(r.container) || '';
     const qty = preNumInput(r.qty, 0, 'IBCs'), fill = preNumInput(r.litresEach, 1, 'L each');
     sel.addEventListener('change', () => { const c = containers.find(x => x.name === sel.value); if (c && c.litresEach && !fill.value) fill.value = formatQcValue(c.litresEach, 1); calcPack(); });
     [qty, fill].forEach(i => i.addEventListener('input', calcPack));

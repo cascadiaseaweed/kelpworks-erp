@@ -96,7 +96,7 @@ def test_only_an_administrator_renames_with_a_reason_and_it_is_logged_with_the_o
     assert rename(a, after, new).status == 200                                                                    # the same name again: nothing to do
 
 
-def test_names_stay_unique_also_against_old_names_and_containers_and_labels_cannot_be_renamed_yet(srv, people):
+def test_names_stay_unique_also_against_old_names_and_a_label_cannot_be_renamed_on_its_own(srv, people):
     a = people["admin"]
     c1, c2 = reagent(a), reagent(a)
     first, second = uniq("Renamed one"), uniq("Renamed two")
@@ -106,9 +106,8 @@ def test_names_stay_unique_also_against_old_names_and_containers_and_labels_cann
     assert a.post("/api/consumables", {"name": c1["name"], "unit": "kg", "manufacturer": "M", "grade": "G"}).status == 409
     assert rename(a, item(a, name=first), c1["name"]).status == 200                                                # an item may take its own old name back
     assert rename(a, item(a, name=c1["name"]), first).status == 200
-    drum = item(a, key="drum_55")
-    r = rename(a, drum, "55 gal drum - Other")
-    assert r.status == 400 and "later" in r.text.lower() or "not available" in r.text.lower()
+    label = [c for c in a.get("/api/consumables").json["consumables"] if c["labelSku"]][0]               # a container can be renamed since KW-90 (tests/test_container_rename.py); a label follows its container
+    assert rename(a, label, "Label on its own").status == 400
 
 
 def test_a_renamed_item_is_still_found_by_its_old_name(srv, people):

@@ -547,11 +547,31 @@ def get_setting_value(conn, key, default=None):
     return r["value"] if r else default
 
 
-def packaging_container_litres_map(conn):
+def container_name_aliases(conn):
+    """{old name: current name} for every container that was renamed (KW-90). Records keep the container name they were written with; every lookup
+    by that text resolves an old name through this map (a chain of renames all point at the current name)."""
+    return {r["old_name"]: r["name"] for r in conn.execute(
+        "SELECT h.old_name, c.name FROM consumable_name_history h JOIN consumables c ON c.id=h.consumable_id WHERE c.is_container=1 ORDER BY h.id")}
+
+
+def canonical_container_name(conn, text, aliases=None):
+    """The current name of the container a stored name refers to (a current name is returned unchanged; an unknown text too)."""
+    if not text:
+        return text
+    return (container_name_aliases(conn) if aliases is None else aliases).get(text, text)
+
+
+def packaging_container_litres_map(conn, current_only=False):
     """Live name -> litres-each lookup for every container consumable valid
-    as a Packaging table / FG-output option (litres_each set)."""
-    return {r["name"]: r["litres_each"] for r in
-            conn.execute("SELECT name, litres_each FROM consumables WHERE is_container=1 AND litres_each IS NOT NULL")}
+    as a Packaging table / FG-output option (litres_each set). Old names of a
+    renamed container resolve to the same litres (KW-90) unless current_only."""
+    out = {r["name"]: r["litres_each"] for r in
+           conn.execute("SELECT name, litres_each FROM consumables WHERE is_container=1 AND litres_each IS NOT NULL")}
+    if not current_only:
+        for old, cur in container_name_aliases(conn).items():
+            if cur in out and old not in out:
+                out[old] = out[cur]
+    return out
 
 # --------------------------------------------------------------------------- #
 # Database
@@ -2309,6 +2329,8 @@ def assign_system_keys(conn):
     for key, name in STANDARD_ITEMS:
         if not conn.execute("SELECT 1 FROM consumables WHERE system_key=?", (key,)).fetchone():
             conn.execute("UPDATE consumables SET system_key=? WHERE name=? AND system_key IS NULL", (key, name))
+            if key == "ibc_new":                                                                   # KW-90: the standard IBC package counts as an IBC (only when the key is first given)
+                conn.execute("UPDATE consumables SET is_ibc=1 WHERE system_key='ibc_new' AND litres_each IS NOT NULL")
 
 
 def ensure_reagent_defaults(conn):
@@ -4811,9 +4833,13 @@ def migrate(conn):
     for col, decl in [("is_container", "INTEGER NOT NULL DEFAULT 0"), ("litres_each", "REAL"),
                        ("is_sample_container", "INTEGER NOT NULL DEFAULT 0"),
                        ("item_number", "TEXT"), ("label_sku_code", "TEXT"), ("label_package", "TEXT"),
-                       ("is_cip_agent", "INTEGER NOT NULL DEFAULT 0")]:
+                       ("is_cip_agent", "INTEGER NOT NULL DEFAULT 0"), ("is_ibc", "INTEGER NOT NULL DEFAULT 0")]:
         if col not in ccols:
             conn.execute("ALTER TABLE consumables ADD COLUMN %s %s" % (col, decl))
+    # KW-90: a package counts as an IBC (the run's "New IBCs filled") from this flag, not because its name contains "IBC". Set once from what the name rule counted until now,
+    # so no stored figure changes; the standard "New 1,000 L IBC Tote" is flagged when it gets its key (assign_system_keys).
+    run_once(conn, "ibc_flag_kw90", lambda: conn.execute(
+        "UPDATE consumables SET is_ibc=1 WHERE is_container=1 AND litres_each IS NOT NULL AND UPPER(name) LIKE '%IBC%'"))
     ctcols = {r["name"] for r in conn.execute("PRAGMA table_info(consumable_txns)")}
     if "user_name" not in ctcols:
         conn.execute("ALTER TABLE consumable_txns ADD COLUMN user_name TEXT")
@@ -5111,8 +5137,8 @@ def migrate(conn):
     _rename_consumable(conn, "1000 L IBC", "New 1,000 L IBC Tote")
     _rename_consumable(conn, "Empty Used IBC Tote", "Used 1,000 L IBC Tote")
     conn.execute("UPDATE consumables SET is_container=1, litres_each=1000"
-                 " WHERE name='New 1,000 L IBC Tote' AND litres_each IS NULL")
-    conn.execute("UPDATE consumables SET is_container=1 WHERE name='Used 1,000 L IBC Tote'")
+                 " WHERE (name='New 1,000 L IBC Tote' OR system_key='ibc_new') AND litres_each IS NULL")
+    conn.execute("UPDATE consumables SET is_container=1 WHERE name='Used 1,000 L IBC Tote' OR system_key='ibc_used'")
     # Carry over any OTHER container units an admin already added/edited in
     # the now-retired Container Units table before this round's rework (the
     # is_ibc-flagged one, whatever it's named, was just handled above).
@@ -5127,8 +5153,8 @@ def migrate(conn):
     # admin's already-edited counts are never overwritten. On-hand starts at 0
     # since these are being tracked for the first time; the plant enters its
     # real starting counts via Inventory Items -> Packaging.
-    for name in ("50 mL falcon tube", "100 g sample bag", "1 L bottle", "2 L bottle"):
-        if not conn.execute("SELECT 1 FROM consumables WHERE name=?", (name,)).fetchone():
+    for key, name in (("sample_falcon_50ml", "50 mL falcon tube"), ("sample_bag_100g", "100 g sample bag"), ("sample_bottle_1l", "1 L bottle"), ("sample_bottle_2l", "2 L bottle")):
+        if not conn.execute("SELECT 1 FROM consumables WHERE name=? OR system_key=?", (name, key)).fetchone():            # KW-90: a renamed vessel is not created again
             conn.execute(
                 "INSERT INTO consumables (name,unit,on_hand,reorder_level,is_container,is_sample_container)"
                 " VALUES (?,'ea',0,0,1,1)", (name,))
@@ -5151,7 +5177,7 @@ def migrate(conn):
         if not conn.execute("SELECT 1 FROM consumables WHERE name=? OR system_key=?", (cip_name, cip_key)).fetchone():
             conn.execute("INSERT INTO consumables (name,unit,on_hand,reorder_level,is_cip_agent)"
                          " VALUES (?,'L',0,0,1)", (cip_name,))
-    if not conn.execute("SELECT 1 FROM consumables WHERE name='55 gallon drum'").fetchone():
+    if not conn.execute("SELECT 1 FROM consumables WHERE name='55 gallon drum' OR system_key='drum_55'").fetchone():
         conn.execute("INSERT INTO consumables (name,unit,on_hand,reorder_level,is_container,litres_each)"
                      " VALUES ('55 gallon drum','drum',0,0,1,208.2)")
     assign_system_keys(conn)                                                                                          # KW-89: every standard item now carries its key (once)
@@ -5159,9 +5185,11 @@ def migrate(conn):
     # package types (1,000 L IBC and 55 gal drum); on-hand starts at 0 to be
     # counted in. Insert-only, so an existing label (and its stock) is never
     # touched and a SKU added later gets its labels on the next boot.
-    for pkg in ("New 1,000 L IBC Tote", "55 gallon drum"):
-        if not conn.execute("SELECT 1 FROM consumables WHERE is_container=1 AND name=?", (pkg,)).fetchone():
+    for pkg_key, pkg_std in (("ibc_new", "New 1,000 L IBC Tote"), ("drum_55", "55 gallon drum")):
+        pkg_row = conn.execute("SELECT name FROM consumables WHERE is_container=1 AND (system_key=? OR name=?) ORDER BY system_key IS NULL LIMIT 1", (pkg_key, pkg_std)).fetchone()
+        if not pkg_row:
             continue
+        pkg = pkg_row["name"]                                                                  # KW-90: the package's CURRENT name (it may have been renamed)
         for sku in conn.execute("SELECT code, name FROM fg_skus WHERE COALESCE(uses_labels,1)=1 ORDER BY code").fetchall():
             if conn.execute("SELECT 1 FROM consumables WHERE label_sku_code=? AND label_package=?",
                             (sku["code"], pkg)).fetchone():
@@ -9104,7 +9132,7 @@ class Handler(BaseHTTPRequestHandler):
         containers = [dict(id=r["id"], name=r["name"], unit=r["unit"], onHand=r["on_hand"],
                           reorderLevel=r["reorder_level"], costPerUnit=r["cost_per_unit"],
                           location=r["location"], litresEach=r["litres_each"],
-                          isSampleContainer=bool(r["is_sample_container"]),
+                          isSampleContainer=bool(r["is_sample_container"]), isIbc=bool(r["is_ibc"]),
                           low=(r["on_hand"] <= r["reorder_level"]))
                      for r in conn.execute("SELECT * FROM consumables WHERE is_container=1 ORDER BY name")]
         qc_fields = [dict(id=f[0], stage=f[1], stageLabel=f[2], subtitle=f[3], label=f[4], unit=f[5])
@@ -9112,7 +9140,7 @@ class Handler(BaseHTTPRequestHandler):
         return {"species": species, "sites": sites, "locations": locations,
                 "skus": skus, "customers": customers, "sops": sops, "libraryPending": library_pending_count(conn),
                 "sopSpots": list(SOP_SPOT_INFO.values()), "sopLinks": self._sop_links_by_spot(conn),
-                "settings": get_settings(conn), "containers": containers,
+                "settings": get_settings(conn), "containers": containers, "containerAliases": container_name_aliases(conn),
                 "qcFields": qc_fields, "requiredFields": required_keys_by_stage()}
 
     # ---- settings: admin-editable constants used by calculated fields ----- #
@@ -9422,12 +9450,15 @@ class Handler(BaseHTTPRequestHandler):
                       for r in conn.execute(
                           "SELECT species_code, COUNT(*) totes, COALESCE(SUM(avg_weight_kg),0) kg "
                           "FROM tote_lots WHERE status='in_stock' GROUP BY species_code ORDER BY kg DESC")]
-        fg = [{"sku": r["sku_code"], "packageSize": r["package_size"],
-               "qty": r["qty"], "litres": round(r["litres"] or 0, 1)}
-              for r in conn.execute(
-                  "SELECT sku_code, package_size, SUM(qty) qty, SUM(qty*litres_each) litres "
-                  "FROM fg_lots WHERE status NOT IN ('sold','disposed') GROUP BY sku_code, package_size "
-                  "ORDER BY sku_code, litres DESC")]
+        fg_agg, dash_aliases = {}, container_name_aliases(conn)
+        for r in conn.execute("SELECT sku_code, package_size, SUM(qty) qty, SUM(qty*litres_each) litres "
+                              "FROM fg_lots WHERE status NOT IN ('sold','disposed') GROUP BY sku_code, package_size"):
+            k = (r["sku_code"], canonical_container_name(conn, r["package_size"], dash_aliases))      # lots written under an earlier container name count with the container (KW-90)
+            a = fg_agg.setdefault(k, [0, 0.0])
+            a[0] += r["qty"] or 0
+            a[1] += r["litres"] or 0
+        fg = [{"sku": k[0], "packageSize": k[1], "qty": v[0], "litres": round(v[1], 1)}
+              for k, v in sorted(fg_agg.items(), key=lambda kv: (kv[0][0] or "", -kv[1][1]))]
         fg_litres = conn.execute(
             "SELECT COALESCE(SUM(qty*litres_each),0) l FROM fg_lots WHERE status NOT IN ('sold','disposed')").fetchone()["l"]
         consum = [dict(id=r["id"], name=r["name"], unit=r["unit"], onHand=r["on_hand"],
@@ -10739,6 +10770,9 @@ class Handler(BaseHTTPRequestHandler):
         lab = conn.execute("SELECT * FROM labs WHERE id=?", (lab_id,)).fetchone()
         an = {a["id"]: a for a in conn.execute("SELECT * FROM lab_analyses WHERE lab_id=?", (lab_id,))}
         vols = {r_["name"]: r_["litres_each"] for r_ in conn.execute("SELECT name, litres_each FROM consumables WHERE is_sample_container=1")}
+        for old_name, cur_name in container_name_aliases(conn).items():            # a sample row written under an earlier name of the vessel (KW-90)
+            if cur_name in vols:
+                vols.setdefault(old_name, vols[cur_name])
         sample_rows = []
         scan_pool = list(an.values())
 
@@ -11436,7 +11470,7 @@ class Handler(BaseHTTPRequestHandler):
                     labelPackage=r["label_package"], isCipAgent=bool(r["is_cip_agent"]),
                     reagentType=r["reagent_type"], organic=bool(r["organic"]), low=(r["on_hand"] <= r["reorder_level"]),
                     manufacturer=r["manufacturer"], manufacturerCode=r["manufacturer_code"], grade=r["grade"], form=r["form"], chemical=r["chemical"],
-                    systemKey=r["system_key"], locked=r["system_key"] in LOCKED_SYSTEM_KEYS, isTypeDefault=bool(r["is_type_default"]),
+                    systemKey=r["system_key"], locked=r["system_key"] in LOCKED_SYSTEM_KEYS, isTypeDefault=bool(r["is_type_default"]), isIbc=bool(r["is_ibc"]),
                     lastCountedAt=r["last_counted_at"], lastCountedBy=r["last_counted_by"])
 
     def _clean_item_number(self, conn, raw, exclude_id=None):
@@ -12226,7 +12260,7 @@ class Handler(BaseHTTPRequestHandler):
                         raise ApiError(400, "Choose a product SKU for this label")
                     if not sku_row["u"]:
                         raise ApiError(400, "%s uses no finished-good labels" % sku_row["name"])
-                    if label_package not in packaging_container_litres_map(conn):
+                    if label_package not in packaging_container_litres_map(conn, current_only=True):
                         raise ApiError(400, "Choose a package type for this label")
                     if conn.execute("SELECT 1 FROM consumables WHERE label_sku_code=? AND label_package=?",
                                     (label_sku, label_package)).fetchone():
@@ -12250,6 +12284,7 @@ class Handler(BaseHTTPRequestHandler):
                 location = self._ensure_location(conn, d.get("location"))
                 litres_each = numn(d.get("litresEach")) if is_container else None
                 is_sample = 1 if (is_container and d.get("isSampleContainer")) else 0
+                is_ibc_new = 1 if (is_container and d.get("isIbc") in (True, 1, "1", "true") and litres_each) else 0
                 # Only a plain reagent can be a CIP cleaning agent (offered on
                 # CIP log lines) -- not a container or a label.
                 is_cip = 1 if (d.get("isCipAgent") and not is_container and not is_label) else 0
@@ -12284,6 +12319,8 @@ class Handler(BaseHTTPRequestHandler):
                      label_sku if is_label else None, label_package if is_label else None, is_cip))
                 if rtype:
                     conn.execute("UPDATE consumables SET reagent_type=? WHERE id=?", (rtype, cur.lastrowid))
+                if is_ibc_new:
+                    conn.execute("UPDATE consumables SET is_ibc=1 WHERE id=?", (cur.lastrowid,))
                 if d.get("organic") in (True, 1, "1", "true") and not is_container and not is_label:
                     conn.execute("UPDATE consumables SET organic=1 WHERE id=?", (cur.lastrowid,))
                 conn.execute("UPDATE consumables SET manufacturer=?, manufacturer_code=?, grade=?, form=?, chemical=? WHERE id=?", (maker, maker_code, grade, form, chemical, cur.lastrowid))
@@ -12430,6 +12467,16 @@ class Handler(BaseHTTPRequestHandler):
                 if rtype and rtype not in self.REAGENT_RUN_COLUMNS:
                     raise ApiError(400, "Reagent type must be one of: %s" % ", ".join(self.REAGENT_RUN_COLUMNS))
                 conn.execute("UPDATE consumables SET reagent_type=? WHERE id=?", (rtype, cid))
+            if "isIbc" in d and c["is_container"]:                       # KW-90: "Counts as an IBC" decides what the run's New IBCs filled counts (administrator only, logged)
+                want_ibc = 1 if d.get("isIbc") in (True, 1, "1", "true") else 0
+                if want_ibc != (c["is_ibc"] or 0):
+                    if not (user and user["role"] == "admin"):
+                        raise ApiError(403, "Only an administrator can change whether a package counts as an IBC")
+                    if want_ibc and not ((numn(d["litresEach"]) if "litresEach" in d else c["litres_each"])):
+                        raise ApiError(400, "An IBC package needs a fill volume (litres each)")
+                    conn.execute("UPDATE consumables SET is_ibc=? WHERE id=?", (want_ibc, cid))
+                    conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('inventory_item',?,?,?,?,?,?)",
+                                 (c["name"], "Counts as an IBC", "yes" if c["is_ibc"] else "no", "yes" if want_ibc else "no", user["name"] if user else None, now_iso()))
             conn.execute(
                 "UPDATE consumables SET reorder_level=?, cost_per_unit=?, location=?, litres_each=?,"
                 " is_sample_container=?, item_number=? WHERE id=?",
@@ -12694,6 +12741,8 @@ class Handler(BaseHTTPRequestHandler):
         """KW-89: rename an item (administrator only; reagents and CIP agents in this phase) and move the default of a reagent type. Returns the item row, fresh."""
         locked = c["system_key"] in LOCKED_SYSTEM_KEYS
         who = user["name"] if user else None
+        if locked and ("isIbc" in d and bool(d.get("isIbc")) != bool(c["is_ibc"])):
+            raise ApiError(409, "%s is a locked system item: what it is cannot be changed" % c["name"])
         if locked and (("litresEach" in d and (numn(d.get("litresEach")) or None) != (c["litres_each"] or None)) or ("isSampleContainer" in d and bool(d.get("isSampleContainer")) != bool(c["is_sample_container"]))):
             raise ApiError(409, "%s is a locked system item: what it is cannot be changed" % c["name"])
         if "name" in d:
@@ -12703,8 +12752,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(403, "Only an administrator can rename an item")
                 if locked:
                     raise ApiError(409, "%s is a locked system item and cannot be renamed" % c["name"])
-                if c["is_container"] or c["label_sku_code"]:
-                    raise ApiError(400, "Renaming containers and labels is not available yet")
+                if c["label_sku_code"]:
+                    raise ApiError(400, "A finished-good label follows its container: rename the container and its labels are renamed with it")
                 if not new:
                     raise ApiError(400, "Enter the new name")
                 reason = clean_item_text(d.get("renameReason"), 300)
@@ -12713,7 +12762,25 @@ class Handler(BaseHTTPRequestHandler):
                 if (conn.execute("SELECT 1 FROM consumables WHERE LOWER(name)=LOWER(?) AND id!=?", (new, c["id"])).fetchone()
                         or conn.execute("SELECT 1 FROM consumable_name_history WHERE LOWER(old_name)=LOWER(?) AND consumable_id!=?", (new, c["id"])).fetchone()):
                     raise ApiError(409, "That name is already used (or belonged to another item before it was renamed)")
+                # KW-90: the finished-good labels of a container follow its name (a label whose name was typed by hand keeps its name; its package text follows)
+                labels = []
+                if c["is_container"]:
+                    for lab in conn.execute("SELECT * FROM consumables WHERE label_sku_code IS NOT NULL AND label_package=?", (c["name"],)).fetchall():
+                        sku = conn.execute("SELECT name FROM fg_skus WHERE code=?", (lab["label_sku_code"],)).fetchone()
+                        sku_name = sku["name"] if sku else lab["label_sku_code"]
+                        lab_new = "FG Label - %s - %s" % (sku_name, new) if lab["name"] == "FG Label - %s - %s" % (sku_name, c["name"]) else lab["name"]
+                        if lab_new != lab["name"] and (conn.execute("SELECT 1 FROM consumables WHERE LOWER(name)=LOWER(?) AND id!=?", (lab_new, lab["id"])).fetchone()
+                                                       or conn.execute("SELECT 1 FROM consumable_name_history WHERE LOWER(old_name)=LOWER(?) AND consumable_id!=?", (lab_new, lab["id"])).fetchone()):
+                            raise ApiError(409, "The label %s cannot be renamed to %s: that name is already used" % (lab["name"], lab_new))
+                        labels.append((lab, lab_new))
                 conn.execute("UPDATE consumables SET name=? WHERE id=?", (new, c["id"]))
+                for lab, lab_new in labels:
+                    conn.execute("UPDATE consumables SET name=?, label_package=? WHERE id=?", (lab_new, new, lab["id"]))
+                    note = "Follows container %s -> %s: %s" % (c["name"], new, reason)
+                    if lab_new != lab["name"]:
+                        conn.execute("INSERT INTO consumable_name_history (consumable_id,old_name,new_name,reason,changed_by,changed_at) VALUES (?,?,?,?,?,?)", (lab["id"], lab["name"], lab_new, note, who, now_iso()))
+                        conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('inventory_item',?,?,?,?,?,?)", (lab_new, "Name", lab["name"], lab_new, who, now_iso()))
+                    conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('inventory_item',?,?,?,?,?,?)", (lab_new, "Package", c["name"], new, who, now_iso()))
                 conn.execute("INSERT INTO consumable_name_history (consumable_id,old_name,new_name,reason,changed_by,changed_at) VALUES (?,?,?,?,?,?)", (c["id"], c["name"], new, reason, who, now_iso()))
                 conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('inventory_item',?,?,?,?,?,?)", (new, "Name", c["name"], new, who, now_iso()))
                 conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('inventory_item',?,?,?,?,?,?)", (new, "Reason for rename", None, reason, who, now_iso()))
@@ -12805,9 +12872,10 @@ class Handler(BaseHTTPRequestHandler):
         A shortage never blocks (same as before), it shows as low/negative."""
         want = {}
         if sku and self._sku_uses_labels(conn, sku):
+            aliases = container_name_aliases(conn)
             for unit, qty in container_totals.items():
                 row = conn.execute("SELECT id FROM consumables WHERE label_sku_code=? AND label_package=?",
-                                   (sku, unit)).fetchone()
+                                   (sku, canonical_container_name(conn, unit, aliases))).fetchone()
                 if row and qty:
                     want[row["id"]] = want.get(row["id"], 0) + qty
         have = {r["consumable_id"]: r["committed_qty"] for r in conn.execute(
@@ -13685,8 +13753,9 @@ class Handler(BaseHTTPRequestHandler):
         for unit, tot in self._packaging_totals(conn, rid).items():
             out.setdefault(unit, {})["entries"] = tot
         lots = conn.execute("SELECT id, fg_lot_number, package_size, qty FROM fg_lots WHERE run_id=?", (rid,)).fetchall()
+        aliases = container_name_aliases(conn)
         for l in lots:
-            u = out.setdefault(l["package_size"], {})
+            u = out.setdefault(canonical_container_name(conn, l["package_size"], aliases), {})
             u["lots"] = u.get("lots", 0) + (l["qty"] or 0)
             u["shipped"] = u.get("shipped", 0) + (conn.execute(
                 "SELECT COALESCE(SUM(sl.qty),0) q FROM shipment_lines sl JOIN shipments s ON s.id=sl.shipment_id"
@@ -13727,8 +13796,10 @@ class Handler(BaseHTTPRequestHandler):
                 if abs((r["output_litres"] or 0) - expected) > 0.01:
                     add("warning", "Output litres", r, "Run output is %g L but its packaging entries total %g L."
                         % (r["output_litres"] or 0, expected), "Recompute the run's output litres.", "recompute_output")
-                commits = {c["container_unit"]: c["committed_qty"] for c in conn.execute(
-                    "SELECT container_unit, committed_qty FROM run_packaging_commits WHERE run_id=?", (rid,))}
+                commits = {}
+                for c in conn.execute("SELECT container_unit, committed_qty FROM run_packaging_commits WHERE run_id=?", (rid,)):
+                    cu = canonical_container_name(conn, c["container_unit"])
+                    commits[cu] = commits.get(cu, 0) + (c["committed_qty"] or 0)
                 if commits:
                     for unit, u in acct.items():
                         if abs(commits.get(unit, 0) - u["entries"]) > 1e-6:
@@ -13857,14 +13928,15 @@ class Handler(BaseHTTPRequestHandler):
         """(output litres, IBC count) of a run from its packaging rows. A finished-goods lot keeps the litres per unit it was created with,
         so a lot that exists decides the size of its unit; a later change to the container's fill volume only affects units without a lot."""
         unit_litres = packaging_container_litres_map(conn)
+        aliases = container_name_aliases(conn)
         for lot in conn.execute("SELECT package_size, litres_each FROM fg_lots WHERE run_id=? AND litres_each IS NOT NULL", (run_id,)):
-            unit_litres[lot["package_size"]] = lot["litres_each"]
+            unit_litres[canonical_container_name(conn, lot["package_size"], aliases)] = lot["litres_each"]
         output, ibc = 0.0, 0
         for unit, qty in self._packaging_totals(conn, run_id).items():
             qty = num(qty)
             if unit in unit_litres and qty > 0:
                 output += unit_litres[unit] * qty
-                if is_ibc_unit(unit):
+                if is_ibc_unit(conn, unit):
                     ibc += int(qty)
         return round(output, 2), ibc
 
@@ -15289,6 +15361,8 @@ class Handler(BaseHTTPRequestHandler):
     def _seed_default_samples(self, conn, run_id, lot, user):
         uname = user["name"] if user else None
         for typ, desc, qty, container in self.DEFAULT_LKE_SAMPLES:
+            std_item = self._consumable_by_key(conn, {"50 mL falcon tube": "sample_falcon_50ml", "1 L bottle": "sample_bottle_1l"}.get(container, ""), container)
+            container = std_item["name"] if std_item else container                          # KW-90: the standard vessel under its current name
             conn.execute("INSERT INTO run_sample_points (run_id,type,description,qty,container,stage,created_at,min_qty)"
                          " VALUES (?,?,?,?,?,'packaging',?,?)", (run_id, typ, desc, qty, container, now_iso(), qty))
             row = self._consumable_by_name(conn, container)
@@ -15300,27 +15374,28 @@ class Handler(BaseHTTPRequestHandler):
     #   description Microbial          -> qty 1, 50 mL falcon tube
     #   description Metals & Nutrients -> qty 2, 50 mL falcon tube
     #   type Solid                     -> 100 g sample bag
-    SAMPLE_FALCON = "50 mL falcon tube"
-    SAMPLE_BAG = "100 g sample bag"
+    SAMPLE_FALCON = ("sample_falcon_50ml", "50 mL falcon tube")             # (stable key, standard name): the default follows the item if it was renamed (KW-90)
+    SAMPLE_BAG = ("sample_bag_100g", "100 g sample bag")
 
     def _sample_point_defaults(self, conn, old, d):
         explicit = set(d)
         d = dict(d)
 
-        def has(name):
-            return conn.execute("SELECT 1 FROM consumables WHERE name=?", (name,)).fetchone() is not None
+        def current_name(item):
+            row = self._consumable_by_key(conn, item[0], item[1])
+            return row["name"] if row else None
         desc = (d.get("description") or "").strip() if "description" in d else None
         if desc and desc != (old["description"] if old else None):
             rule = {"Microbial": (1, self.SAMPLE_FALCON), "Metals & Nutrients": (2, self.SAMPLE_FALCON)}.get(desc)
             if rule:
                 if "qty" not in explicit:
                     d["qty"] = rule[0]
-                if "container" not in explicit and has(rule[1]):
-                    d["container"] = rule[1]
+                if "container" not in explicit and current_name(rule[1]):
+                    d["container"] = current_name(rule[1])
         typ = (d.get("type") or "").strip() if "type" in d else None
         if typ == "Solid" and typ != (old["type"] if old else None):
-            if "container" not in explicit and has(self.SAMPLE_BAG):
-                d["container"] = self.SAMPLE_BAG
+            if "container" not in explicit and current_name(self.SAMPLE_BAG):
+                d["container"] = current_name(self.SAMPLE_BAG)
         return d
 
     def add_sample_point(self, conn, run_id, user):
@@ -15424,9 +15499,14 @@ class Handler(BaseHTTPRequestHandler):
         return bool(r and r["status"] == "completed")
 
     def _packaging_totals(self, conn, run_id):
-        return {r["container_unit"]: (r["total"] or 0) for r in conn.execute(
-            "SELECT container_unit, SUM(qty) total FROM run_packaging_entries"
-            " WHERE run_id=? AND container_unit IS NOT NULL GROUP BY container_unit", (run_id,))}
+        """Packaged quantity per container, keyed by the container's CURRENT name (rows written under an old name count for the same container, KW-90)."""
+        aliases = container_name_aliases(conn)
+        out = {}
+        for r in conn.execute("SELECT container_unit, SUM(qty) total FROM run_packaging_entries"
+                              " WHERE run_id=? AND container_unit IS NOT NULL GROUP BY container_unit", (run_id,)):
+            unit = canonical_container_name(conn, r["container_unit"], aliases)
+            out[unit] = out.get(unit, 0) + (r["total"] or 0)
+        return out
 
     def _ensure_packaging_baseline(self, conn, run_id):
         """A finalized run with no commit rows (finalized before the commit
@@ -15441,7 +15521,7 @@ class Handler(BaseHTTPRequestHandler):
             conn.execute("INSERT INTO run_packaging_commits (run_id,container_unit,committed_qty) VALUES (?,?,?)",
                          (run_id, unit, qty))
             label = conn.execute("SELECT id FROM consumables WHERE label_sku_code=? AND label_package=?",
-                                 (run["sku_code"], unit)).fetchone() if run and self._sku_uses_labels(conn, run["sku_code"]) else None
+                                 (run["sku_code"], canonical_container_name(conn, unit))).fetchone() if run and self._sku_uses_labels(conn, run["sku_code"]) else None
             if label and qty and not conn.execute(
                     "SELECT 1 FROM run_label_commits WHERE run_id=? AND consumable_id=?", (run_id, label["id"])).fetchone():
                 conn.execute("INSERT INTO run_label_commits (run_id,consumable_id,committed_qty) VALUES (?,?,?)",
@@ -15492,7 +15572,7 @@ class Handler(BaseHTTPRequestHandler):
         if qty != qty or qty <= 0 or qty > lot["qty"] or abs(qty - round(qty)) > 1e-9:
             raise ApiError(400, "Assign a whole number of units, between 1 and the %g on hand" % lot["qty"])
         qty = int(round(qty))
-        label = conn.execute("SELECT id FROM consumables WHERE label_sku_code=? AND label_package=?", (sku_code, lot["package_size"])).fetchone()
+        label = conn.execute("SELECT id FROM consumables WHERE label_sku_code=? AND label_package=?", (sku_code, canonical_container_name(conn, lot["package_size"]))).fetchone()
         if label:
             self._consume(conn, label["id"], -qty, "FG labels (SKU assigned)", lot["fg_lot_number"], who)
         now = now_iso()
@@ -15521,6 +15601,12 @@ class Handler(BaseHTTPRequestHandler):
     def _adjust_fg_lot(self, conn, run, unit, delta, unit_litres):
         lot_no = "%s-%s" % (run["processing_lot"], unit)
         lot = conn.execute("SELECT * FROM fg_lots WHERE run_id=? AND fg_lot_number=?", (run["id"], lot_no)).fetchone()
+        if not lot:                                                    # KW-90: the run's lot for this container written under an earlier name of it
+            aliases = container_name_aliases(conn)
+            for cand in conn.execute("SELECT * FROM fg_lots WHERE run_id=? ORDER BY id", (run["id"],)).fetchall():
+                if canonical_container_name(conn, cand["package_size"], aliases) == unit:
+                    lot = cand
+                    break
         if not lot:
             if delta > 0 and unit in unit_litres:
                 conn.execute(
@@ -15766,15 +15852,16 @@ class Handler(BaseHTTPRequestHandler):
         output_litres = 0.0
         ibc_used = 0
         pack_totals = {}                              # container unit -> total qty (several rows may name the same container)
+        pack_aliases = container_name_aliases(conn)
         for pe in packaging_entries:
-            unit = pe["container_unit"]
+            unit = canonical_container_name(conn, pe["container_unit"], pack_aliases)             # KW-90: a row written under an old name makes the lot under the current one
             qty = num(pe["qty"])
             if unit not in unit_litres or qty <= 0:
                 continue
             pack_totals[unit] = pack_totals.get(unit, 0) + qty
         for unit, qty in pack_totals.items():
             output_litres += unit_litres[unit] * qty
-            if is_ibc_unit(unit):
+            if is_ibc_unit(conn, unit):
                 ibc_used += int(qty)
         output_litres = round(output_litres, 2)
 
@@ -17213,9 +17300,11 @@ def sample_qty(v):
     return max(1, min(10, int(f)))
 
 
-def is_ibc_unit(unit):
-    """True for an IBC tote container ('IBC', '1,000 L IBC', ...): ibc_used counts these."""
-    return "IBC" in (unit or "").upper()
+def is_ibc_unit(conn, unit):
+    """True for a container flagged "Counts as an IBC" (KW-90): ibc_used counts these. Found by its name or an old name; the text is never searched for "IBC"."""
+    name = canonical_container_name(conn, unit)
+    row = conn.execute("SELECT is_ibc FROM consumables WHERE name=? AND is_container=1", (name,)).fetchone() if name else None
+    return bool(row and row["is_ibc"])
 
 
 def integrity_message(e):
