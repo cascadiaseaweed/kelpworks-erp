@@ -5981,7 +5981,8 @@ async function openSupplierPanel(ref, opts = {}) {
       panel.append(el('h4', {}, 'Safety data sheets'),
         s.sds.length ? table(['Chemical', 'Issued', 'Review due', 'File'], s.sds.map(x => [
           el('span', { class: x.status === 'withdrawn' ? 'muted' : '' }, x.chemical, x.status === 'withdrawn' ? ' (withdrawn)' : '',
-            x.items.length ? el('div', { class: 'help' }, 'Used for: ' + x.items.map(i => i.name).join(', ')) : null), x.issueDate || '—',
+            x.items.length ? el('div', { class: 'help' }, 'Used for: ' + x.items.map(i => i.name).join(', ')) : null,
+            x.lastReviewedOn ? el('div', { class: 'help' }, 'Last reviewed ' + x.lastReviewedOn + (x.lastReviewedBy ? ' by ' + x.lastReviewedBy : '')) : null), x.issueDate || '—',
           el('span', {}, x.reviewDue || '—', ' ', sdsReviewBadge(x)),
           x.hasFile ? el('a', { href: docDownloadUrl('sds', x.id), target: '_blank', rel: 'noopener' }, 'Open') : el('span', { class: 'muted' }, 'No file')]))
           : el('div', { class: 'help' }, 'No safety data sheet is linked to this supplier yet.'),
@@ -6030,7 +6031,7 @@ async function pageSuppliers(v) {
     host.append(table(['Supplier', 'Type', 'Status', 'Next review', 'Documents', 'Items', 'Contact'],
       list.map(s => [s.name, s.type || '—', supplierStatusBadge(s.approvalStatus),
         el('span', {}, s.nextReviewDate || '—', ' ', s.flags.includes('review_overdue') ? badge('low', 'Overdue') : (s.flags.includes('no_review_date') ? badge('hold', 'No date') : null)),
-        el('span', {}, String(s.nDocs), ' ', s.flags.includes('docs_expired') ? badge('low', 'Expired') : (s.flags.includes('docs_expiring') ? badge('hold', 'Expiring') : null),
+        el('span', {}, String(s.nDocs + (s.nSds || 0)) + (s.nSds ? ' (' + s.nSds + ' SDS)' : ''), ' ', s.flags.includes('docs_expired') ? badge('low', 'Expired') : (s.flags.includes('docs_expiring') ? badge('hold', 'Expiring') : null),
           s.flags.includes('sds_review_overdue') ? [' ', badge('low', 'SDS overdue')] : null),
         String(s.nItems), s.contactName || s.contactEmail || '—']), ['', '', '', '', '', 'num', ''],
       i => openSupplierPanel(list[i].id, { onChange: load }).catch(e => toast(e.message, true))));
@@ -7225,8 +7226,8 @@ const CALCULATIONS = [
   },
   {
     title: 'Safety data sheet: review due date',
-    formula: 'Review due = issue date + review interval (years).   Status: Overdue when the due date has passed; Review soon when it is within the warning window; otherwise OK.',
-    description: 'A safety data sheet’s issue date is read from its file name in the SharePoint folder (SDS_Chemical_Supplier_2025-03-14.pdf). The review interval and the warning window are listed below; an administrator can change them.',
+    formula: 'Review due = the later of the issue date and the last reviewed date, + review interval (years).   Status: Overdue when the due date has passed; Review soon when it is within the warning window; otherwise OK.',
+    description: 'A safety data sheet’s issue date is read from its file name in the SharePoint folder (SDS_Chemical_Supplier_2025-03-14.pdf) and is the manufacturer’s: it never changes here. An administrator or Quality Manager records a review (Record review…) when the sheet has been checked and found current, which restarts the interval from that date; a new issue from the manufacturer starts it again from the new issue date. The review interval and the warning window are listed below; an administrator can change them.',
     location: 'Documents → Safety data sheets',
     settings: ['sds_review_years', 'sds_review_warning_days'],
   },
@@ -9604,18 +9605,21 @@ async function pageDocuments(v) {
     el('div', { class: 'help' }, 'A sheet is linked automatically when the supplier in its file name matches a supplier record exactly. Link the others here, or add the supplier on the Suppliers tab and they link by themselves.'),
     table(['Chemical', 'Supplier in the file name', 'Suggested record', ''], unlinked.map(s => [s.chemical, s.supplier,
       s.supplierSuggestion ? s.supplierSuggestion.name : el('span', { class: 'muted' }, 'none'), rowActions([['Link…', () => editSdsItems(s)]])]))));
-  v.append(table(['Chemical', 'Supplier', 'Issued', 'Review due', 'Used for', 'Status', 'File', ''],
+  const canReview = isAdmin || !!State.user.isQualityManager;
+  v.append(table(['Chemical', 'Supplier', 'Issued', 'Review due', 'Last reviewed', 'Used for', 'Status', 'File', ''],
     d.sds.map(s => [
       s.chemical,
       s.supplierId ? el('a', { href: '#', title: 'Open the supplier record (file name: ' + s.supplier + ')', onclick: e => { e.preventDefault(); e.stopPropagation(); openSupplierPanel(s.supplierId).catch(x => toast(x.message, true)); } }, s.supplierName)
         : el('span', {}, s.supplier, ' ', badge('hold', 'not linked')),
       s.issueDate || '—',
       el('span', {}, s.reviewDue || '—', ' ', sdsReviewBadge(s)),
+      s.lastReviewedOn ? el('span', { title: (s.lastReviewedBy ? 'Reviewed by ' + s.lastReviewedBy : '') + (s.lastReviewNote ? ': ' + s.lastReviewNote : '') }, s.lastReviewedOn) : '—',
       s.items.length ? s.items.map(i => i.name).join(', ') : el('span', { class: 'muted' }, 'not linked yet'),
       s.status === 'withdrawn' ? badge('disposed', 'Withdrawn') : badge('on_hand', 'Current'),
       s.hasFile ? el('a', { href: docDownloadUrl('sds', s.id), target: '_blank', rel: 'noopener' }, s.filename || 'Open') : el('span', { class: 'muted' }, 'No file'),
-      rowActions([['History', () => showDocHistory('sds', s.id, s.chemical + ' (' + s.supplier + ')')], isAdmin ? ['Used for…', () => editSdsItems(s)] : null])]),
-    [false, false, false, false, false, false, false, false], ri => showDocHistory('sds', d.sds[ri].id, d.sds[ri].chemical + ' (' + d.sds[ri].supplier + ')')));
+      rowActions([['History', () => showDocHistory('sds', s.id, s.chemical + ' (' + s.supplier + ')')], canReview && s.status === 'current' ? ['Record review…', () => recordSdsReview(s, d.reviewYears)] : null,
+        isAdmin ? ['Used for…', () => editSdsItems(s)] : null])]),
+    [false, false, false, false, false, false, false, false, false], ri => showDocHistory('sds', d.sds[ri].id, d.sds[ri].chemical + ' (' + d.sds[ri].supplier + ')')));
   if (!d.sds.length) v.append(el('div', { class: 'help', style: 'margin-top:6px' },
     'No safety data sheets yet. Put them in the SharePoint folder 04_Safety-Data-Sheets/Current as SDS_Chemical-Name_Supplier_2025-03-14.pdf; they appear here after the next nightly sync and your approval.'));
 }
@@ -9804,6 +9808,21 @@ async function reviewLibraryItem(i) {
   }, 'Accept');
 }
 
+// Record that KelpWorks reviewed a safety data sheet and found it current (KW-88). The manufacturer's issue date is not touched; review due = the later of the two dates + the interval.
+function recordSdsReview(s, years) {
+  const on = el('input', { type: 'date', value: todayStr(), max: todayStr() }), note = el('input', { placeholder: 'optional, e.g. checked the manufacturer’s site: no newer revision' });
+  if (s.issueDate) on.min = s.issueDate;
+  const due = el('div', { class: 'help' });
+  const upd = () => {
+    const base = on.value && s.issueDate && on.value > s.issueDate ? on.value : s.issueDate;
+    due.textContent = base ? 'Review due will be ' + addMonthsISO(base, Math.round(years * 12)) + ' (the later of the issue date and this review, plus ' + years + ' years).' : '';
+  };
+  on.addEventListener('input', upd); upd();
+  modal('Record a review — ' + s.chemical, el('div', {}, el('div', { class: 'summary-line' }, sl('Supplier in the file name', s.supplier), sl('Issued by the manufacturer', s.issueDate || '—'), sl('Last reviewed', s.lastReviewedOn || 'never')),
+    field('Reviewed on', on), field('Note', note), due,
+    el('div', { class: 'help' }, 'This records that KelpWorks checked the sheet and found it current. The manufacturer’s issue date does not change. The review is logged with your name and cannot be edited or deleted.')),
+    async () => { await api('POST', '/sds-documents/' + s.id + '/review', { reviewedOn: on.value, note: note.value }); toast('Review recorded'); render(); }, 'Record review');
+}
 async function editSdsItems(s) {
   const list = sdsItemChecklist(await sdsLinkableItems(), new Set(s.items.map(x => x.id)));
   const notes = el('input', { value: s.notes || '', placeholder: 'e.g. reviewed by QA on …' });
