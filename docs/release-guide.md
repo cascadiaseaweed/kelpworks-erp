@@ -138,6 +138,7 @@ Staging never auto-deploys, and its Restore button exists only there: the live s
 - **Backups:** the server writes a full backup (database + documents) every night to `/var/data/backups/nightly/` (the newest 3 stay on the disk) and an office PC copies it, and every run's documents, into the
   SharePoint library `KelpWorks-Records` (setup, retention and restore notes: `docs/records-archive.md`). Check Admin > Records archive & backups after a deploy: the nightly backup should say **on**.
 - **Restore the live data from a backup:** follow `docs/restore-runbook.md` (a one-time start-up restore that keeps a copy of what it replaces). Only for damaged or wrong data.
+- **Reset live to a clean start (all records cleared, configuration kept):** follow `docs/clean-cut-over.md`.
 - **Protect live data:** never edit the live database directly; never copy a local or staging database over it. The Render disk holds the only copy: take regular disk snapshots or download full backups (Admin > Download full backup).
 - **Disk guard:** once `python -c "import os;print(os.path.ismount('/var/data'))"` prints `True` in the Render shell, set `KELP_ERP_REQUIRE_MOUNT=/var/data` so a missing disk stops the service instead of creating a new empty database.
 - **Never set** `KELP_ERP_ENV`, `KELP_ERP_ALLOW_RESTORE` or `KELP_ERP_STAGING_PASSWORD` on the live service.
