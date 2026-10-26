@@ -97,6 +97,13 @@ The page also shows when each folder was last reported. If that is more than 3 d
 **Safety data sheets** show a **Review due** date = issue date + 3 years (settings `sds_review_years` and `sds_review_warning_days`, which an administrator can change on the Calculations page):
 OK / Review soon / Overdue. **Used for...** links a sheet to the inventory items it covers; those items then show an **SDS** link on the Inventory Items page.
 
+**Safety data sheets and suppliers.** This library is the only way an SDS is loaded: it is no longer a document kind on a supplier. Each sheet can be **linked to a supplier record** (Suppliers tab):
+- **Automatically**, when the supplier in the file name is the same name as one supplier record (case, spaces and punctuation do not matter): when the sheet is accepted, and also when a matching supplier is added or renamed later.
+- **By an administrator**, in all other cases ("Univar" in the file name, "Univar Solutions Canada" on the record): Documents lists the sheets that are **not linked** with the record KelpWorks suggests; **Link...** (or **Used for...** on the sheet) opens a window with a Supplier record drop-down. Nothing is linked on a guess.
+- The link follows the supplier's record, not the file name: renaming the supplier in KelpWorks keeps it, and a new revision or a withdrawn sheet coming back keeps it. The link is logged on the sheet (History) and on the supplier (History: "Safety data sheet").
+- The supplier's panel then lists its sheets (current and withdrawn, review date, items covered, download), and a **Safety data sheet overdue** flag appears on the supplier, in the Suppliers list filter and as a warning when receiving from it.
+- Changing the supplier part of a file name is a different sheet by design (the sheet's identity is chemical + supplier).
+
 ## Safeguards
 
 - An **empty** folder (for example the library is not synced on that PC) is never read as "everything was removed": KelpWorks warns and changes nothing.

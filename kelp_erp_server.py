@@ -2297,6 +2297,7 @@ def init_db():
             ensure_reagent_types(conn)
             ensure_site_list(conn)
             ensure_suppliers(conn)
+            ensure_sds_supplier_links(conn)
             ensure_grade_rules(conn)
             soft_step(conn, "feedstock grades", lambda: sync_tote_grades(conn, None, "Start-up check", quiet=True))
             soft_step(conn, "foreign-key indexes", lambda: ensure_indexes(conn))
@@ -4578,6 +4579,8 @@ def migrate(conn):
     """Idempotent schema migrations for databases created before a column existed."""
     if "supplier_id" not in {r["name"] for r in conn.execute("PRAGMA table_info(consumable_suppliers)")}:
         conn.execute("ALTER TABLE consumable_suppliers ADD COLUMN supplier_id INTEGER REFERENCES suppliers(id)")        # KW-81: the item's approved-supplier link points at the supplier record
+    if "supplier_id" not in {r["name"] for r in conn.execute("PRAGMA table_info(sds_documents)")}:
+        conn.execute("ALTER TABLE sds_documents ADD COLUMN supplier_id INTEGER REFERENCES suppliers(id)")              # KW-83: the sheet's supplier record
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(tote_lots)")}
     if "ph_updated" not in cols:
         conn.execute("ALTER TABLE tote_lots ADD COLUMN ph_updated TEXT")
@@ -5308,7 +5311,8 @@ SITE_LIST = [("CDV", "Cordova"), ("COR", "Cormorant"), ("DIP", "Diplock Island")
 # lists of items (consumable_suppliers, KW-23) point at the record through supplier_id. Records are never deleted: a supplier that stops being used is set Inactive.
 SUPPLIER_TYPES = ("Manufacturer", "Distributor", "Carrier", "Lab", "Service")
 SUPPLIER_STATUSES = ("Approved", "Conditional", "Not approved", "Inactive")
-SUPPLIER_DOC_KINDS = ("Certificate", "Organic certificate", "SDS", "Insurance", "Other")
+SUPPLIER_DOC_KINDS = ("Certificate", "Organic certificate", "Insurance", "Other")
+SUPPLIER_DOC_KINDS_RETIRED = ("SDS",)          # KW-83: safety data sheets are loaded through the Documents tab (the SharePoint folder); rows already stored with this kind still show
 SUPPLIER_FIELDS = [        # (request key, column, label, longest)
     ("name", "name", "name", 80), ("type", "supplier_type", "supplier type", 40), ("accountNumber", "account_number", "account number", 80),
     ("contactName", "contact_name", "contact name", 120), ("contactPhone", "contact_phone", "contact phone", 60), ("contactEmail", "contact_email", "contact email", 160),
@@ -5334,8 +5338,9 @@ def add_months(iso, months):
     return datetime.date(y, m, min(d.day, last)).isoformat()
 
 
-def supplier_flags(status, next_review, expiries, today, warn_days):
-    """What needs attention on a supplier: docs_expired / docs_expiring (an active document), review_overdue / no_review_date (only while Approved or Conditional).
+def supplier_flags(status, next_review, expiries, today, warn_days, sds_overdue=False):
+    """What needs attention on a supplier: docs_expired / docs_expiring (an active document), sds_review_overdue (a current safety data sheet of it is past its review date, KW-83),
+    review_overdue / no_review_date (only while Approved or Conditional).
     expiries = the expiry dates (or None) of its active documents; dates are YYYY-MM-DD, so they compare as text."""
     flags = []
     soon = (datetime.date.fromisoformat(today) + datetime.timedelta(days=int(round(float(warn_days))))).isoformat()
@@ -5343,6 +5348,8 @@ def supplier_flags(status, next_review, expiries, today, warn_days):
         flags.append("docs_expired")
     if any(e and today <= e <= soon for e in expiries):
         flags.append("docs_expiring")
+    if sds_overdue:
+        flags.append("sds_review_overdue")
     if status in ("Approved", "Conditional"):
         if next_review and next_review < today:
             flags.append("review_overdue")
@@ -5373,6 +5380,7 @@ def supplier_record(conn, name, status="Conditional", by="System"):
     cur = conn.execute("INSERT INTO suppliers (name,approval_status,created_by,created_at) VALUES (?,?,?,?)", (name, status, by, now_iso()))
     conn.execute("INSERT INTO supplier_log (supplier_id,field,old_value,new_value,reason,user_name,created_at) VALUES (?,?,?,?,?,?,?)",
                  (cur.lastrowid, "record", None, "created (%s)" % status, None, by, now_iso()))
+    link_unlinked_sds(conn, by)                                              # KW-83: sheets whose file-name supplier matches this new record exactly
     return conn.execute("SELECT * FROM suppliers WHERE id=?", (cur.lastrowid,)).fetchone(), True
 
 
@@ -5400,6 +5408,61 @@ def ensure_suppliers(conn):
                          (None, "%d records (%s); %d possible duplicates listed" % (len(made), "; ".join(made), len(near)), "System", now_iso()))
     run_once(conn, "suppliers_from_item_lists_kw81", apply)
     soft_step(conn, "link approved-supplier lists to supplier records", lambda: link_supplier_records(conn, "Conditional"))
+
+
+# ---- Safety data sheets and suppliers (KW-83) -----------------------------------------------------------------------------------------------------------------------------
+# The controlled SDS library (Documents tab, SharePoint master) is the only way an SDS is loaded. Each sheet can point at a supplier RECORD (sds_documents.supplier_id): automatically when the
+# supplier name in the file name matches exactly one record ignoring case and spacing; otherwise an administrator chooses (a likely record is only SUGGESTED, never applied by itself).
+def exact_supplier_for(conn, text):
+    key = supplier_name_key(text)
+    if not key:
+        return None
+    for r in conn.execute("SELECT * FROM suppliers").fetchall():
+        if supplier_name_key(r["name"]) == key:
+            return r
+    return None
+
+
+def sds_supplier_suggestion(suppliers, text):
+    """The one record whose name starts with the file-name supplier ('Univar' -> 'Univar Solutions Canada'), else None. Only a suggestion."""
+    key = supplier_name_key(text)
+    if not key:
+        return None
+    hits = [r for r in suppliers if supplier_name_key(r["name"]).startswith(key + " ")]
+    return hits[0] if len(hits) == 1 else None
+
+
+def link_sds_to_supplier(conn, sds, supplier, who):
+    """Point a sheet at a supplier record (None = unlink) and log it on both sides: the sheet's audit trail and the supplier's history. -> True when something changed."""
+    old_id, new_id = sds["supplier_id"], (supplier["id"] if supplier else None)
+    if old_id == new_id:
+        return False
+
+    def name_of(i):
+        row = conn.execute("SELECT name FROM suppliers WHERE id=?", (i,)).fetchone() if i else None
+        return row["name"] if row else None
+    conn.execute("UPDATE sds_documents SET supplier_id=?, updated_at=? WHERE id=?", (new_id, now_iso(), sds["id"]))
+    library_log_edit(conn, "sds", sds["id"], who, "Supplier", name_of(old_id) or "-", name_of(new_id) or "-")
+    label = "%s (issued %s)" % (sds["chemical"], sds["issue_date"] or "no date")
+    for sid, old, new in ((old_id, label, None), (new_id, None, label)):
+        if sid:
+            conn.execute("INSERT INTO supplier_log (supplier_id,field,old_value,new_value,reason,user_name,created_at) VALUES (?,?,?,?,?,?,?)", (sid, "Safety data sheet", old, new, None, who, now_iso()))
+    return True
+
+
+def link_unlinked_sds(conn, who):
+    """Link every sheet that has no supplier yet to the record its file-name supplier matches EXACTLY (nothing is guessed). -> how many were linked."""
+    n = 0
+    for s in conn.execute("SELECT * FROM sds_documents WHERE supplier_id IS NULL ORDER BY id").fetchall():
+        rec = exact_supplier_for(conn, s["supplier"])
+        if rec and link_sds_to_supplier(conn, s, rec, who):
+            n += 1
+    return n
+
+
+def ensure_sds_supplier_links(conn):
+    """Once: the sheets already in the library are linked to the supplier records their names match exactly."""
+    run_once(conn, "sds_supplier_links_kw83", lambda: link_unlinked_sds(conn, "System"))
 
 
 def ensure_site_list(conn):
@@ -7640,6 +7703,9 @@ class Handler(BaseHTTPRequestHandler):
             if conn.execute("SELECT 1 FROM consumables WHERE id=?", (cid,)).fetchone():
                 conn.execute("INSERT OR IGNORE INTO sds_items (sds_id, consumable_id) VALUES (?,?)", (cur.lastrowid, cid))
         library_log_edit(conn, "sds", cur.lastrowid, who, "Added from the SharePoint folder", "-", row["filename"])
+        rec = exact_supplier_for(conn, supplier)
+        if rec:                                                              # KW-83: the supplier of the file name has a record: linked (and logged on both sides)
+            link_sds_to_supplier(conn, conn.execute("SELECT * FROM sds_documents WHERE id=?", (cur.lastrowid,)).fetchone(), rec, who)
         return cur.lastrowid, "Added: %s (%s)" % (chemical, supplier)
 
     @staticmethod
@@ -7649,13 +7715,18 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             raise ApiError(400, "The issue date must be a real date, year-month-day")
 
-    def _sds_public(self, conn, r, items, years, warn):
+    def _sds_public(self, conn, r, items, years, warn, suppliers=None):
         due, review = sds_review(r["issue_date"], years, warn)
         if r["status"] != "current":
             review = None                                   # a withdrawn sheet is not due for review
+        if suppliers is None:
+            suppliers = conn.execute("SELECT id, name FROM suppliers").fetchall()
+        linked = next((s for s in suppliers if s["id"] == r["supplier_id"]), None) if r["supplier_id"] else None
+        hint = None if linked else sds_supplier_suggestion(suppliers, r["supplier"])          # KW-83: only a suggestion; the file-name text stays as "supplier"
         return {"id": r["id"], "chemical": r["chemical"], "supplier": r["supplier"], "issueDate": r["issue_date"], "reviewDue": due, "reviewStatus": review,
                 "status": r["status"], "filename": r["filename"], "hasFile": bool(r["stored_name"]), "size": r["size"], "uploadedAt": r["uploaded_at"],
-                "notes": r["notes"], "items": items.get(r["id"], [])}
+                "notes": r["notes"], "items": items.get(r["id"], []), "supplierId": linked["id"] if linked else None, "supplierName": linked["name"] if linked else None,
+                "supplierSuggestion": {"id": hint["id"], "name": hint["name"]} if hint else None}
 
     def _sds_items_map(self, conn):
         out = {}
@@ -7668,9 +7739,10 @@ class Handler(BaseHTTPRequestHandler):
             years = float(get_setting_value(conn, "sds_review_years", 3) or 3)
             warn = float(get_setting_value(conn, "sds_review_warning_days", 60) or 60)
             items = self._sds_items_map(conn)
+            sups = conn.execute("SELECT id, name FROM suppliers").fetchall()
             links = self._sop_spots_by_sop(conn)
             out = {"sops": [self._sop_public(r, links.get(r["id"])) for r in conn.execute("SELECT * FROM sop_documents WHERE status!='retired' ORDER BY doc_number IS NULL, doc_number, name")],
-                   "sds": [self._sds_public(conn, r, items, years, warn) for r in conn.execute("SELECT * FROM sds_documents ORDER BY chemical, supplier")],
+                   "sds": [self._sds_public(conn, r, items, years, warn, sups) for r in conn.execute("SELECT * FROM sds_documents ORDER BY chemical, supplier")],
                    "reviewYears": years, "pending": library_pending_count(conn)}
             if user["role"] == "admin":
                 out.update(library_scan_info(conn))
@@ -7709,6 +7781,13 @@ class Handler(BaseHTTPRequestHandler):
                         conn.execute("INSERT INTO sds_items (sds_id, consumable_id) VALUES (?,?)", (did, i))
                     names = lambda s: ", ".join(sorted(r["name"] for r in conn.execute("SELECT name FROM consumables WHERE id IN (%s)" % ",".join("?" * len(s)), tuple(s)))) if s else "-"
                     library_log_edit(conn, "sds", did, user["name"], "Used for (inventory items)", names(old), names(ids))
+            if "supplierId" in d:                                        # KW-83: a supplier record, or null / "" to unlink
+                raw, rec = d.get("supplierId"), None
+                if raw not in (None, ""):
+                    rec = conn.execute("SELECT * FROM suppliers WHERE id=?", (int(raw),)).fetchone() if str(raw).isdigit() else None
+                    if not rec:
+                        raise ApiError(404, "Supplier not found")
+                link_sds_to_supplier(conn, doc, rec, user["name"])
             if "notes" in d:
                 notes = (d.get("notes") or "").strip()[:1000] or None
                 if notes != doc["notes"]:
@@ -10850,17 +10929,24 @@ class Handler(BaseHTTPRequestHandler):
     def _supplier_public(self, conn, r, detail=False):
         today, warn = self._supplier_today(conn)
         docs = conn.execute("SELECT * FROM supplier_documents WHERE supplier_id=? AND removed_at IS NULL ORDER BY id", (r["id"],)).fetchall()
+        years = float(get_setting_value(conn, "sds_review_years", 3) or 3)
+        sds_warn = float(get_setting_value(conn, "sds_review_warning_days", 60) or 60)
+        sheets = [(s,) + sds_review(s["issue_date"], years, sds_warn) for s in conn.execute("SELECT * FROM sds_documents WHERE supplier_id=? ORDER BY status, chemical", (r["id"],))]       # KW-83
         out = {"id": r["id"], "name": r["name"], "type": r["supplier_type"] or "", "accountNumber": r["account_number"] or "", "contactName": r["contact_name"] or "",
                "contactPhone": r["contact_phone"] or "", "contactEmail": r["contact_email"] or "", "address": r["address"] or "", "website": r["website"] or "",
                "paymentTerms": r["payment_terms"] or "", "currency": r["currency"] or "", "taxNumber": r["tax_number"] or "", "approvalStatus": r["approval_status"],
                "approvalDate": r["approval_date"] or "", "nextReviewDate": r["next_review_date"] or "", "notes": r["notes"] or "",
                "createdBy": r["created_by"], "createdAt": r["created_at"], "updatedBy": r["updated_by"], "updatedAt": r["updated_at"],
-               "flags": supplier_flags(r["approval_status"], r["next_review_date"], [d["expiry_date"] for d in docs], today, warn), "nDocs": len(docs),
+               "flags": supplier_flags(r["approval_status"], r["next_review_date"], [d["expiry_date"] for d in docs], today, warn,
+                                       any(s["status"] == "current" and review == "overdue" for s, _due, review in sheets)), "nDocs": len(docs),
                "nItems": conn.execute("SELECT COUNT(*) FROM consumable_suppliers WHERE supplier_id=?", (r["id"],)).fetchone()[0]}
         if detail:
             out["items"] = [{"id": c["id"], "itemNumber": c["item_number"], "name": c["name"]} for c in conn.execute(
                 "SELECT c.id, c.item_number, c.name FROM consumable_suppliers s JOIN consumables c ON c.id=s.consumable_id WHERE s.supplier_id=? ORDER BY c.name COLLATE NOCASE", (r["id"],))]
             out["documents"] = [self._supplier_doc_public(d, today, warn) for d in docs]
+            items = self._sds_items_map(conn)
+            out["sds"] = [{"id": s["id"], "chemical": s["chemical"], "issueDate": s["issue_date"], "reviewDue": due, "reviewStatus": review if s["status"] == "current" else None,
+                           "status": s["status"], "filename": s["filename"], "hasFile": bool(s["stored_name"]), "items": items.get(s["id"], [])} for s, due, review in sheets]
             out["history"] = [{"field": l["field"], "old": l["old_value"], "new": l["new_value"], "reason": l["reason"], "by": l["user_name"], "at": l["created_at"]}
                               for l in conn.execute("SELECT * FROM supplier_log WHERE supplier_id=? ORDER BY id DESC LIMIT 200", (r["id"],))]
         return out
@@ -10900,7 +10986,9 @@ class Handler(BaseHTTPRequestHandler):
         return vals
 
     def _store_supplier_document(self, conn, sid, d, user):
-        """One document on a supplier (certificate, organic certificate, SDS, insurance ...): same file rules, storage room and daily quota as every other upload."""
+        """One document on a supplier (certificate, organic certificate, insurance ...): same file rules, storage room and daily quota as every other upload."""
+        if d.get("kind") in SUPPLIER_DOC_KINDS_RETIRED:
+            raise ApiError(400, "Safety data sheets are loaded through the Documents tab (the SharePoint folder 04_Safety-Data-Sheets/Current), not on a supplier. They show on the supplier once linked.")
         filename = (d.get("filename") or "document").strip().replace("\\", "/").split("/")[-1] or "document"
         data_b64 = d.get("dataB64") or ""
         if data_b64.startswith("data:") and "," in data_b64:
@@ -10966,6 +11054,7 @@ class Handler(BaseHTTPRequestHandler):
             cols = list(vals)
             cur = conn.execute("INSERT INTO suppliers (%s,created_by,created_at) VALUES (%s)" % (",".join(cols), ",".join("?" * (len(cols) + 2))), [vals[c] for c in cols] + [user["name"], now_iso()])
             self._supplier_log(conn, cur.lastrowid, "record", None, "created (%s)" % vals["approval_status"], None, user)
+            link_unlinked_sds(conn, user["name"])                        # KW-83: sheets already in the library whose file-name supplier matches this record exactly
             return detail({"id": cur.lastrowid})
         if len(seg) >= 3 and seg[2].isdigit():
             r = conn.execute("SELECT * FROM suppliers WHERE id=?", (int(seg[2]),)).fetchone()
@@ -10993,6 +11082,7 @@ class Handler(BaseHTTPRequestHandler):
                 conn.execute("UPDATE suppliers SET updated_by=?, updated_at=? WHERE id=?", (user["name"], now_iso(), r["id"]))
                 if any(c == "name" for c, _o, _n in changes):                 # the item lists follow the new spelling; deliveries and lots keep the name they were recorded with
                     conn.execute("UPDATE consumable_suppliers SET name=? WHERE supplier_id=?", (new_name, r["id"]))
+                    link_unlinked_sds(conn, user["name"])                # KW-83: the new name may now match a sheet's file-name supplier
                 return detail(r)
             if len(seg) == 4 and seg[3] == "documents" and method == "POST":
                 need()
