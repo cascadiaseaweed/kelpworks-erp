@@ -3403,12 +3403,14 @@ def sample_stage_info(stage):
 
 
 def add_months(iso_date, months):
-    """YYYY-MM-DD + whole months (day clamped to the month's length)."""
+    """YYYY-MM-DD + whole months (day clamped to the month's length). A date WITH a time ("2026-05-04T12:00") is read by its date part; an unreadable date gives None.
+    This is the ONLY add_months: a second definition later in the file would silently replace it (that broke the Retention inventory once)."""
     try:
         d = datetime.date.fromisoformat((iso_date or "")[:10])
-    except ValueError:
+        n = int(round(float(months)))
+    except (ValueError, TypeError):
         return None
-    m = d.month - 1 + int(months)
+    m = d.month - 1 + n
     y, m = d.year + m // 12, m % 12 + 1
     last = (datetime.date(y + (m == 12), m % 12 + 1, 1) - datetime.timedelta(days=1)).day
     return datetime.date(y, m, min(d.day, last)).isoformat()
@@ -5434,14 +5436,6 @@ def clean_supplier_name(raw):
 def supplier_name_key(name):
     """Two names are the SAME supplier when they match ignoring case and spacing (nothing looser)."""
     return clean_supplier_name(name).lower()
-
-
-def add_months(iso, months):
-    d = datetime.date.fromisoformat(iso)
-    m = d.month - 1 + int(round(float(months)))
-    y, m = d.year + m // 12, m % 12 + 1
-    last = (31, 29 if y % 4 == 0 and (y % 100 != 0 or y % 400 == 0) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)[m - 1]
-    return datetime.date(y, m, min(d.day, last)).isoformat()
 
 
 def supplier_flags(status, next_review, expiries, today, warn_days, sds_overdue=False):
