@@ -12185,6 +12185,8 @@ class Handler(BaseHTTPRequestHandler):
                     conn.execute("UPDATE consumable_lots SET receipt_id=? WHERE id=?", (cur.lastrowid, lot["id"]))
                     lot = conn.execute("SELECT * FROM consumable_lots WHERE id=?", (lot["id"],)).fetchone()
                 return self._receipt_public(conn, conn.execute("SELECT * FROM inventory_receipts WHERE id=?", (lot["receipt_id"],)).fetchone())
+            if len(seg) == 4 and seg[3] == "correct" and method == "POST":
+                return self._correct_receipt(conn, user, lot)
             if len(seg) == 3 and method == "PUT":
                 if not can_edit:
                     raise ApiError(403, "Only a Quality Manager or an administrator can change a lot")
@@ -12222,6 +12224,86 @@ class Handler(BaseHTTPRequestHandler):
                              (new["supplier"], new["supplier_lot"], new["expiry_date"], new["po_ref"], new["notes"], new["on_hold"], new["hold_reason"], lot["id"]))
                 return self._lot_public(conn, conn.execute("SELECT * FROM consumable_lots WHERE id=?", (lot["id"],)).fetchone())
         raise ApiError(404, "Unknown lots endpoint")
+
+    def _correct_receipt(self, conn, user, lot):
+        """KW-91: an administrator or Quality Manager corrects what a received lot recorded -- unit cost, line amount, pack and quantity -- with a reason. Every change is logged on the lot (and on its delivery); a quantity
+        change moves the item's stock by the difference through _consume (one ledger line) and the lot's own quantities, and can never take the lot below what has already been used from it."""
+        if not (user and (user["role"] == "admin" or self._is_quality_manager(user))):
+            raise ApiError(403, "Only a Quality Manager or an administrator can correct the unit cost, pack or quantity of a received lot")
+        d = self._body_json()
+        reason = (d.get("reason") or "").strip()
+        c = conn.execute("SELECT * FROM consumables WHERE id=?", (lot["consumable_id"],)).fetchone()
+
+        def number(key, label, positive=False):
+            raw = d.get(key)
+            if raw in (None, ""):
+                return None
+            v = numn(raw)
+            if v is None or v < 0 or (positive and v <= 0):
+                raise ApiError(400, "%s must be a number %s" % (label, "greater than 0" if positive else "(0 or more)"))
+            return v
+        pack, as_text, qty_new = None, lot["received_as"], lot["qty_received"]
+        if "packId" in d:
+            if d.get("packId") in (None, "", 0):
+                as_text = None
+                if "qtyReceived" in d:
+                    qty_new = number("qtyReceived", "The quantity received", positive=True) or qty_new
+            else:
+                pack = conn.execute("SELECT * FROM consumable_packs WHERE id=? AND consumable_id=?", (d.get("packId"), c["id"])).fetchone()
+                if not pack:
+                    raise ApiError(400, "That pack size does not belong to this item")
+                packs = number("packs", "The number of packs", positive=True)
+                if packs is None:
+                    raise ApiError(400, "Enter how many packs were received")
+                qty_new = round(packs * pack["qty_per_pack"], 6)
+                as_text = "%g x %s" % (packs, pack["name"])
+        elif "qtyReceived" in d:
+            if lot["received_as"]:
+                raise ApiError(400, "This lot was received as %s: choose the pack and the number of packs, or choose no pack and enter the quantity" % lot["received_as"])
+            qty_new = number("qtyReceived", "The quantity received", positive=True) or qty_new
+        price, total = lot["unit_price"], lot["line_total"]
+        if "unitPrice" in d:
+            price = number("unitPrice", "The unit cost")
+            if price is not None and d.get("priceBasis") == "pack":
+                if not pack:
+                    raise ApiError(400, "Choose the pack to enter a cost per pack")
+                price = round(price / pack["qty_per_pack"], 6)
+        if "lineTotal" in d:
+            total = number("lineTotal", "The line amount")
+
+        def same(a, b):
+            return (a is None and b is None) or (a is not None and b is not None and abs(float(a) - float(b)) < 1e-9)
+
+        def show(v):
+            return "-" if v in (None, "") else ("%g" % v if isinstance(v, (int, float)) else str(v))
+        changes = []
+        if not same(price, lot["unit_price"]):
+            changes.append(("Unit cost (per %s)" % c["unit"], show(lot["unit_price"]), show(price)))
+        if not same(total, lot["line_total"]):
+            changes.append(("Line amount", show(lot["line_total"]), show(total)))
+        if (as_text or None) != (lot["received_as"] or None):
+            changes.append(("Pack", show(lot["received_as"]), show(as_text)))
+        delta = round(qty_new - lot["qty_received"], 6)
+        if abs(delta) > 1e-9:
+            changes.append(("Quantity received (%s)" % c["unit"], show(lot["qty_received"]), show(qty_new)))
+        if not changes:
+            return self._lot_public(conn, lot)
+        if not reason:
+            raise ApiError(400, "Enter the reason for the correction")
+        remaining = round(lot["qty_remaining"] + delta, 6) if abs(delta) > 1e-9 else lot["qty_remaining"]
+        if remaining < -1e-9:
+            used = round(lot["qty_received"] - lot["qty_remaining"], 6)
+            raise ApiError(409, "%g %s of this lot has already been used, so the quantity received cannot be less than %g. Move uses to another lot first." % (used, c["unit"], used))
+        who = user["name"]
+        conn.execute("UPDATE consumable_lots SET unit_price=?, line_total=?, received_as=?, qty_received=?, qty_remaining=? WHERE id=?",
+                     (price, total, as_text, qty_new, remaining, lot["id"]))
+        if abs(delta) > 1e-9:
+            self._consume(conn, c["id"], delta, "Receipt correction (lot %s): quantity %g -> %g" % (lot["lot_code"], lot["qty_received"], qty_new), lot["lot_code"], who, to_lots=False)
+        for label, old, new in changes:
+            self._lot_log(conn, lot["id"], "receipt_corrected", "%s: %s -> %s" % (label, old, new), reason, user)
+            if lot["receipt_id"]:
+                self._receipt_log(conn, lot["receipt_id"], "Lot %s: %s" % (lot["lot_code"], label), old, new, reason, user)
+        return self._lot_public(conn, conn.execute("SELECT * FROM consumable_lots WHERE id=?", (lot["id"],)).fetchone())
 
     def route_consumables(self, method, seg, conn, user):
         if seg == ["api", "consumables"]:
@@ -12673,7 +12755,9 @@ class Handler(BaseHTTPRequestHandler):
                 updated += 1
         return {"updated": updated}
 
-    def _consume(self, conn, consumable_id, delta, reason, ref, user_name=None):
+    def _consume(self, conn, consumable_id, delta, reason, ref, user_name=None, to_lots=True):
+        """The one path that changes an item's stock: on_hand + one ledger line, and (to_lots) the lots the use came from / goes back to. to_lots=False is for a correction of a lot's own
+        quantity (KW-91): the caller updates that lot itself, so a decrease is not taken from other lots and an increase refunds no use."""
         as_of = None
         if ref:
             hist = conn.execute("SELECT run_date, hist_deduct FROM production_runs WHERE processing_lot=? AND is_historical=1", (ref,)).fetchone()
@@ -12684,6 +12768,8 @@ class Handler(BaseHTTPRequestHandler):
         conn.execute("UPDATE consumables SET on_hand = on_hand + ? WHERE id=?", (delta, consumable_id))
         conn.execute("INSERT INTO consumable_txns (consumable_id,delta,reason,ref,user_name,created_at)"
                      " VALUES (?,?,?,?,?,?)", (consumable_id, delta, reason, ref, user_name, now_iso()))
+        if not to_lots:
+            return
         if delta < 0:
             self._lots_allocate(conn, consumable_id, -delta, ref, reason, as_of)  # recall traceability: which lot(s) the stock came from
         elif delta > 0 and ref:
