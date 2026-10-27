@@ -6383,6 +6383,7 @@ async function openLotTrace(id) {
   const body = el('div', {});
   body.append(el('div', { class: 'summary-line' }, sl('Lot', l.lotCode), sl('Supplier lot', l.supplierLot), sl('Item', l.item), sl('Supplier', l.supplier || '—'),
     sl('Received', l.receivedDate), sl('Expiry', l.expiryDate || '—'), sl('Left', fmt(l.qtyRemaining, 2) + ' / ' + fmt(l.qtyReceived, 2) + ' ' + l.unit), el('span', {}, 'Status: ', lotStatusBadge(l)),
+    sl('Received as', l.receivedAs || '—'), sl('Unit cost', l.unitPrice != null ? '$' + fmt(l.unitPrice, 4) + ' / ' + l.unit : '—'),
     sl('Invoice', l.invoiceNo || '—'), sl('PO', l.poNumber || '—'), sl('Order', l.orderNo || '—'), sl('Documents', l.docCount || 0)));
   body.append(el('div', { style: 'margin:4px 0' }, el('button', { type: 'button', class: 'secondary', onclick: () => openDelivery(l) }, 'Delivery & documents')));
   if (l.onHold) body.append(el('div', { class: 'help', style: 'color:var(--danger);font-weight:600' }, 'On hold: ' + (l.holdReason || '') + ' — no new use is assigned to this lot.'));
@@ -6403,7 +6404,8 @@ async function openLotTrace(id) {
   if (canEdit) {
     body.append(el('div', { style: 'margin-top:10px;display:flex;gap:8px;flex-wrap:wrap' },
       el('button', { type: 'button', class: l.onHold ? '' : 'danger', onclick: () => holdLot(l) }, l.onHold ? 'Release the hold' : 'Put this lot on hold'),
-      el('button', { type: 'button', class: 'secondary', onclick: () => editLot(l) }, 'Correct details…')));
+      el('button', { type: 'button', class: 'secondary', onclick: () => editLot(l) }, 'Correct details…'),
+      el('button', { type: 'button', class: 'secondary', title: 'Unit cost, pack and quantity received (Quality Manager or administrator)', onclick: () => correctReceipt(l) }, 'Correct receipt…')));
   }
   if (d.log.length) body.append(el('details', { class: 'accordion' }, el('summary', {}, 'History (' + d.log.length + ')'), el('div', { class: 'accordion-body' },
     table(['When', 'By', 'What', 'Reason'], d.log.map(g => [fmtWhen(g.at), g.by || '—', (g.event === 'received' ? 'Received ' : '') + (g.detail || ''), g.reason || '—'])))));
@@ -6425,6 +6427,49 @@ async function editLot(l) {
     el('div', { class: 'form-row' }, field('Expiry date', exp), field('PO / reference', po)), field('Notes', nt), field('Reason for the correction (required)', reason)),
     async () => { await api('PUT', '/lots/' + l.id, { supplierLot: sl_.value, supplier: sup.value, expiryDate: exp.value || null, poRef: po.value, notes: nt.value, reason: reason.value });
       toast('Saved'); await lotReload(l.id); }, 'Save');
+}
+// KW-91: an administrator corrects what a received lot recorded (unit cost, line amount, pack, quantity). A quantity change moves the item's stock by the difference (one ledger line).
+async function correctReceipt(l) {
+  const item = (await api('GET', '/consumables')).consumables.find(x => x.id === l.consumableId) || {};
+  const packs = item.packs || [];
+  const had = /^([0-9.]+) x (.+)$/.exec(l.receivedAs || '');
+  const hadPack = had ? packs.find(p => p.name === had[2]) : null;
+  const used = Math.round((l.qtyReceived - l.qtyRemaining) * 1e6) / 1e6;
+  const packSel = selectFrom('', [['', 'No pack (enter the quantity)'], ...packs.map(p => [String(p.id), p.name + ' (' + fmt(p.qtyPerPack, 4) + ' ' + l.unit + ' each)'])]);
+  packSel.value = hadPack ? String(hadPack.id) : '';
+  const packsInp = el('input', { type: 'number', min: '0', step: 'any', value: had ? had[1] : '' });
+  const qtyInp = el('input', { type: 'number', min: '0', step: 'any', value: String(l.qtyReceived) });
+  const priceInp = el('input', { type: 'number', min: '0', step: 'any', value: l.unitPrice ?? '', placeholder: 'blank = not recorded' });
+  const basisSel = selectFrom('', [['unit', 'per ' + l.unit], ['pack', 'per pack']]);
+  const totalInp = el('input', { type: 'number', min: '0', step: 'any', value: l.lineTotal ?? '', placeholder: 'blank = not recorded' });
+  const reason = el('input', { placeholder: 'e.g. invoice shows 12 boxes, not 10' });
+  const packsField = field('Number of packs', packsInp), qtyField = field('Quantity received (' + l.unit + ')', qtyInp);
+  const note = el('div', { class: 'help' });
+  const selPack = () => packs.find(p => String(p.id) === packSel.value) || null;
+  const sync = () => {
+    const p = selPack();
+    packsField.style.display = p ? '' : 'none';
+    qtyInp.disabled = !!p;
+    if (p && +packsInp.value > 0) qtyInp.value = String(Math.round(+packsInp.value * p.qtyPerPack * 1e6) / 1e6);
+    const q = +qtyInp.value, d = Math.round((q - l.qtyReceived) * 1e6) / 1e6;
+    note.textContent = !(q > 0) ? 'Enter a quantity greater than 0.' : (d === 0 ? 'The quantity is unchanged: stock does not move.'
+      : 'Stock changes by ' + (d > 0 ? '+' : '') + fmt(d, 4) + ' ' + l.unit + ' (one ledger line). ' + (q < used ? 'Not allowed: ' + fmt(used, 4) + ' ' + l.unit + ' of this lot has already been used.' : (used > 0 ? 'Used from this lot so far: ' + fmt(used, 4) + ' ' + l.unit + '.' : ''))).trim();
+  };
+  [packSel, packsInp, qtyInp].forEach(i => i.addEventListener('input', sync));
+  packSel.addEventListener('change', sync);
+  sync();
+  modal('Correct what was received: ' + l.lotCode, el('div', {},
+    el('div', { class: 'help' }, 'Quality Manager or administrator. Every change is logged on the lot and its delivery with your name and the reason. Use this when the receipt was entered wrongly; the item’s own cost per unit is not changed.'),
+    el('div', { class: 'form-row' }, field('Pack', packSel), packsField), qtyField, note,
+    el('div', { class: 'form-row' }, field('Unit cost', priceInp), field('Cost is', basisSel)), field('Line amount (invoice)', totalInp),
+    field('Reason for the correction (required)', reason)),
+    async () => {
+      const body = { reason: reason.value, unitPrice: priceInp.value === '' ? null : +priceInp.value, priceBasis: basisSel.value, lineTotal: totalInp.value === '' ? null : +totalInp.value };
+      if (selPack()) { body.packId = +packSel.value; body.packs = +packsInp.value; }
+      else { body.packId = null; body.qtyReceived = +qtyInp.value; }
+      await api('POST', '/lots/' + l.id + '/correct', body);
+      toast('Corrected'); await lotReload(l.id);
+    }, 'Save the correction');
 }
 async function moveLotUse(l, u) {
   const r = await api('GET', '/consumables/' + l.consumableId + '/lots');
