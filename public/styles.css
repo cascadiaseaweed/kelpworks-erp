@@ -577,6 +577,27 @@ button.stage-step:focus-visible { outline: 2px solid var(--teal); outline-offset
 .stage-step.partial .stage-dot { border-color: var(--warn); color: var(--fg-8a5a00); }
 .stage-step.done { border-color: var(--bd-9fd6cd); background: var(--bg-e6f6f3); color: var(--accent-text); font-weight: 600; }
 .stage-step.done .stage-dot { background: var(--teal); border-color: var(--teal); color: #fff; font-size: 12px; }
+/* KW-94: the release checklist reuses the stage chips; red = not met, grey = not applicable yet */
+.stage-step.fail { border-color: var(--danger); background: var(--bg-fbe3df); color: var(--danger); font-weight: 600; }
+.stage-step.fail .stage-dot { background: var(--danger); border-color: var(--danger); color: #fff; font-size: 12px; }
+.stage-step.empty { opacity: .65; }
+.release-status { border-radius: 10px; padding: 10px 12px; margin-top: 10px; border: 1px solid var(--line); background: var(--bg-eef3f2); font-size: 13px; }
+.release-status.danger { border-color: var(--danger); background: var(--bg-fbe3df); }
+.release-status.warn { border-color: var(--bd-f0c98a); background: var(--bg-fff8ec); }
+.release-status .rs-head { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.release-status .rs-line { margin-top: 5px; }
+.rs-blocked { color: var(--danger); font-weight: 600; }
+.hold-why { font-size: 11px; color: var(--muted); margin-top: 3px; max-width: 340px; line-height: 1.3; }
+.hold-why.lab, .hold-why.rejected { color: var(--danger); }
+.hold-lot { display: block; margin: 6px 0; font-size: 13px; }
+.hold-lot input { width: auto; margin-right: 4px; }
+tr.hold-row td { background: var(--bg-fcefd6); }
+.chk-dots { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; }
+.chk-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bg-e3ecea); border: 1px solid var(--line); }
+.chk-dot.ok { background: var(--teal); border-color: var(--teal); }
+.chk-dot.fail { background: var(--danger); border-color: var(--danger); }
+.chk-dot.warn { background: var(--warn); border-color: var(--warn); }
+.chk-n { margin-left: 4px; font-size: 11px; color: var(--muted); }
 .stage-meter { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 11px; color: var(--muted); }
 .stage-meter-track { flex: 1; max-width: 260px; height: 6px; border-radius: 999px; background: var(--bg-e3ecea); overflow: hidden; }
 .stage-meter-bar { display: block; height: 100%; background: var(--teal); border-radius: 999px; }
