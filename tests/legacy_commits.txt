@@ -64,3 +64,4 @@ a06f4a3  2026-10-26  Standard items found by a stable key, locked Used IBC pool,
 d9e0bc1  2026-10-26  Rename of containers, finished-good labels and the New 1,000 L IBC Tote by an administrator, "Counts as an IBC" flag (KW-90) (PR 113) merged to main and live
 f016365  2026-10-26  A Quality Manager or administrator can correct a received lot's unit cost, line amount, pack and quantity (KW-91) (PR 115) merged to main and live
 a98b66c  2026-10-27  Retention inventory no longer answers 500: one add_months for the whole program (hardening fix, no KW item) (PR 117) merged to main and live
+e6ffb1a  2026-10-28  Release status line, release checklist, hold reasons and a guarded Release from hold on the Product Release screens (KW-94) (PR 119) merged to main and live
