@@ -4967,11 +4967,11 @@ function releaseChecklistView(items, onAction) {
     el('div', { class: 'stage-meter' + (met === applicable.length ? ' complete' : '') },
       el('span', {}, met + ' of ' + applicable.length + ' checks met' + (met === applicable.length ? ' — nothing is holding this run up' : ''))));
 }
-// Compact version for the list: one dot per check and "n/m".
+// Compact version for the list: one dot per check and what is left to do ("2 to do", or a tick when nothing is).
 function releaseCheckDots(items) {
   const applicable = items.filter(i => i.state !== 'na'), met = applicable.filter(i => i.state === 'ok').length;
-  return el('span', { class: 'chk-dots', title: items.map(i => (i.state === 'ok' ? '✓ ' : i.state === 'na' ? '– ' : '✕ ') + i.label + (i.reason && i.state !== 'ok' ? ': ' + i.reason : '')).join('\n') },
-    ...items.map(i => el('span', { class: 'chk-dot ' + i.state })), el('span', { class: 'chk-n' }, met + '/' + applicable.length));
+  return el('span', { class: 'chk-dots', title: items.map(i => (i.state === 'ok' ? '✓ ' : i.state === 'na' ? '– ' : i.state === 'warn' ? '! ' : '✕ ') + i.label + (i.reason && i.state !== 'ok' ? ': ' + i.reason : '')).join('\n') },
+    ...items.map(i => el('span', { class: 'chk-dot ' + i.state })), el('span', { class: 'chk-n' }, met === applicable.length ? '✓' : (applicable.length - met) + ' to do'));
 }
 async function pageRelease(v) {
   const r = await api('GET', '/release');

@@ -102,6 +102,31 @@ def test_status_line_follows_the_workflow(srv, people):
     assert listed(qm, rid)["releaseStatus"]["stage"] == "Released" and {c["state"] for c in listed(qm, rid)["checklist"]} == {"ok"}
 
 
+def test_the_comment_check_is_amber_until_the_lab_results_are_in(srv, people):
+    """The production log's own pH / TDS must not turn "out-of-specification results have a comment" green: it stays amber until the results are known."""
+    qm = people["qm"]
+    rid = finished_run(people["admin"])
+    sql(srv, "UPDATE production_runs SET packaging_qc_ph=3.5, packaging_tds_pct=1.5 WHERE id=?", (rid,))       # the log alone shows nothing out of specification
+    c = [x for x in detail(qm, rid)["checklist"] if x["key"] == "comment"][0]
+    assert c["state"] == "warn" and "Results still to come" in c["reason"] and "Salmonella" in c["reason"] and c["action"] == "lab"
+    # results on file but no lab report attached: still not known
+    results = [{"specCode": k, "value": v} for k, v in dict(MICROBIAL).items()]
+    people["qm"].post("/api/production/%d/lab-results" % rid, {"labName": "Test Lab", "reportNumber": "T-0", "results": results})
+    c = [x for x in detail(qm, rid)["checklist"] if x["key"] == "comment"][0]
+    assert c["state"] == "warn" and "Results still to come" in c["reason"]                                        # the metals are still missing
+    release_ready_results(srv, qm, rid)                                                                          # every gated result is in, with its report
+    c = [x for x in detail(qm, rid)["checklist"] if x["key"] == "comment"][0]
+    assert c["state"] == "ok" and "No out-of-specification" in c["reason"]
+    # a result voided after release is open again
+    people["pm"].post("/api/release/runs/%d/review" % rid, {"decision": "approve", "password": people["pm_pw"]}).raise_for_status()
+    qm.post("/api/release/runs/%d/release" % rid, {"decision": "release", "password": people["qm_pw"]}).raise_for_status()
+    assert [x for x in detail(qm, rid)["checklist"] if x["key"] == "comment"][0]["state"] == "ok"
+    void_salmonella(people, rid)
+    c = [x for x in detail(qm, rid)["checklist"] if x["key"] == "comment"][0]
+    assert c["state"] == "warn" and "Salmonella" in c["reason"]
+    assert [x for x in listed(qm, rid)["checklist"] if x["key"] == "comment"][0]["state"] == "warn"                # the list agrees with the window
+
+
 def test_returned_and_rejected_runs_say_who_and_why(srv, people):
     rid = finished_run(people["admin"])
     people["pm"].post("/api/release/runs/%d/review" % rid, {"decision": "return", "comment": "Tank 5A level missing", "password": people["pm_pw"]}).raise_for_status()
@@ -293,7 +318,7 @@ def test_the_screens_draw_the_status_the_checklist_and_the_hold_reason():
     js = flat("app.js")
     for needle in ("function releaseStatusBlock(", "function releaseChecklistView(", "function releaseCheckDots(", "function holdWhy(", "const fgStatusWithWhy",
                    "releaseStatusBlock(d.releaseStatus)", "'Release checklist'", "function releaseFromHoldBox()", "'/release-from-hold'",
-                   "'Released, but lots are on hold — needs attention'", "releaseCheckDots(x.checklist)", "fgStatusWithWhy(f)", "holdWhy(l.holdInfo)", "f.holdInfo.summary"):
+                   "'Released, but lots are on hold — needs attention'", "releaseCheckDots(x.checklist)", "' to do'", "fgStatusWithWhy(f)", "holdWhy(l.holdInfo)", "f.holdInfo.summary"):
         assert needle in js, needle
     # the Release-from-hold box is only built for a Quality Manager, and its button starts disabled unless the gate is met
     assert "me.canRelease) body.append(releaseFromHoldBox())" in js and "btn.disabled = !gateMet" in js

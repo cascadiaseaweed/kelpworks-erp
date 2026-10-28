@@ -3422,8 +3422,24 @@ def release_checklist(conn, r, gate, lab, problems, amendment, log_matches=None,
         add("report", "Lab report attached where the gate requires it", "ok" if with_result else "na", "" if with_result else "No lab results yet")
     gated = {g["name"] for g in gate if g["rule"] == "pass"}
     failed = [f for f in lab["failed"] if f not in gated]
+    # "No out-of-specification results" can only be said once the results are in: a test with no result yet, a result that cannot be judged, or a result without its lab report
+    # leaves the answer open (amber), so the run's own pH / TDS alone never turns this green
+    waiting = []
+    if not (state == "legacy" and problems is None):               # a grandfathered historical run has no lab results to wait for
+        to_come = [g["name"] for g in gate if g["result"] is None] + [n for n in lab["missingRequired"] if n not in {g["name"] for g in gate}]
+        unjudged = [g["name"] for g in gate if g["result"] is not None and g["status"] in ("review", "not_evaluated")]
+        if to_come:
+            waiting.append("Results still to come: " + ", ".join(to_come))
+        if unjudged:
+            waiting.append("Results that cannot be judged yet: " + ", ".join(unjudged))
+        if no_report:
+            waiting.append("No lab report attached for: " + ", ".join(no_report))
+    wait_text = ". ".join(waiting)
     if not failed:
-        add("comment", "Out-of-specification results have a release comment", "ok", "No out-of-specification results")
+        if waiting:
+            add("comment", "Out-of-specification results have a release comment", "warn", "Not known yet. " + wait_text, "lab")
+        else:
+            add("comment", "Out-of-specification results have a release comment", "ok", "No out-of-specification results")
     elif state in ("released", "legacy"):
         ev = conn.execute("SELECT detail FROM release_events WHERE run_id=? AND event_type IN ('released','legacy_release') ORDER BY id DESC LIMIT 1", (r["id"],)).fetchone()
         try:
@@ -3431,10 +3447,12 @@ def release_checklist(conn, r, gate, lab, problems, amendment, log_matches=None,
         except (ValueError, AttributeError):
             accepted = set()
         unaccepted = [f for f in failed if f not in accepted]
-        add("comment", "Out-of-specification results have a release comment", "fail" if unaccepted else "ok",
-            ("Outside specification and not accepted at release: " + ", ".join(unaccepted)) if unaccepted else "Accepted at release: " + ", ".join(failed))
+        add("comment", "Out-of-specification results have a release comment", "fail" if unaccepted else ("warn" if waiting else "ok"),
+            ("Outside specification and not accepted at release: " + ", ".join(unaccepted)) if unaccepted else
+            "Accepted at release: " + ", ".join(failed) + (". " + wait_text if waiting else ""), "lab" if waiting and not unaccepted else None)
     else:
-        add("comment", "Out-of-specification results have a release comment", "warn", "Outside specification: %s. A release comment is required to release." % ", ".join(failed), "release")
+        add("comment", "Out-of-specification results have a release comment", "warn",
+            "Outside specification: %s. A release comment is required to release.%s" % (", ".join(failed), (" " + wait_text) if waiting else ""), "release")
     if state in ("pending_review", "returned", "amending"):
         add("log", "Production log unchanged since review", "na", "Not reviewed yet")
     elif log_matches is False:
