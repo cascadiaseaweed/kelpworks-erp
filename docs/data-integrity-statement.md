@@ -35,7 +35,7 @@ procedural controls listed in section 5. It is a description of design and pract
 
 1. The audit chain is tamper-**evident**, not tamper-proof: it is a hash chain without a secret key, so a person with direct access to the database file could in principle recompute it. Direct database access is limited to those with access to the hosting account; adding a keyed signature is planned.
 2. Signatures are authenticated by password re-entry. This is not presented as compliant with 21 CFR Part 11 or equivalent electronic-signature regulations.
-3. Past runs entered after go-live ("historical" runs) are retrospective records. They keep their original lot number and date, are marked as historical, and the entry date and person are in the audit trail. Grandfathered historical runs skip the release gate by administrator decision.
+3. Past runs entered after go-live ("historical" runs) are retrospective records. They keep their original lot number and date, are marked as historical, and the entry date and person are in the audit trail. Grandfathered historical runs skip the release gate by administrator decision. A batch of historical runs is loaded with an import tool that never fills a missing value (what the paper log does not show is left blank and listed in the run's notes), records the source workbook's checksum, reconciles every run against the workbook after loading, and is rehearsed on a staging copy before it is run on the live system.
 4. The records of the software's own validation (requirements, test protocol, results, approval) are kept separately from the automated tests; completing that package is a quality-system responsibility.
 5. Paper originals, where any exist, remain the original record; the KelpWorks entry is a transcription.
 
