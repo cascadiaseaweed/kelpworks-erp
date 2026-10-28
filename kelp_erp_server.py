@@ -3283,6 +3283,254 @@ def release_gate(conn, r):
     return out
 
 
+def release_conformance_problems(conn, run, gate=None, lab=None):
+    """Does a RELEASED run still conform? -> the list of what it no longer meets ([] = conforms), or None when the question does not apply (the run is not released, or it was
+    grandfathered at entry). A result the release depended on that was removed or now fails, or a new failure the release did not accept. A run released under the release gate
+    is held to the tests that gate checked (its `released` event lists them); an older run keeps the old rule (required results present, no new failure). ONE rule for two jobs:
+    `_lab_regate` puts a run's lots on hold when it finds a problem, and a hold on a released run can be lifted only when it finds none (KW-94)."""
+    if run["release_state"] not in ("released", "legacy"):
+        return None
+    if run["is_historical"] and run["release_state"] == "legacy":
+        return None                                                      # grandfathered at entry: results added later are recorded, they do not hold lots
+    if lab is None:
+        lab = coa_evaluate(conn, run)["summary"]
+    ev = conn.execute("SELECT detail FROM release_events WHERE run_id=? AND event_type IN ('released','legacy_release') ORDER BY id DESC LIMIT 1",
+                      (run["id"],)).fetchone()
+    accepted, snapshot = set(), None
+    if ev and ev["detail"]:
+        try:
+            detail = json.loads(ev["detail"])
+            accepted = set(detail.get("outOfSpec", []))
+            snapshot = detail.get("gate")
+        except (ValueError, AttributeError):
+            accepted = set()
+    if snapshot is not None:
+        held_to = {g["code"] for g in snapshot}
+        if gate is None:
+            gate = release_gate(conn, run)
+        problems = ["%s: %s" % (g["name"], g["reason"]) for g in gate if g["code"] in held_to and not g["ok"]]
+        problems += [f for f in lab["failed"] if f not in accepted and f not in {g["name"] for g in gate if g["rule"] == "pass"}]
+    else:
+        problems = list(lab["missingRequired"]) + [f for f in lab["failed"] if f not in accepted]
+    return problems
+
+
+HOLD_EVENT_TYPES = ("lab_result_hold", "release_rejected", "fg_lot_edited", "released", "reopened")
+
+
+def hold_info_for_lots(conn, lots, conform=None):
+    """Why is each finished-goods lot on hold (KW-94)? `lots` = fg_lots rows. -> {lot id: {kind, label, text, summary, by, at, capacity, conformsNow}} for the lots whose status is hold.
+    Read-only: derived from the run's append-only release events, newest decision per lot -- a lab result that changed after release (`lab_result_hold`), a Quality reject
+    (`release_rejected`), or a hold set by hand (`fg_lot_edited` to hold, with its reason); a later change of that lot's status, a release or a reopen clears it. A hold with no matching
+    event (an older record) says so instead of guessing. One events query per run, never per lot. `conformsNow` = the release gate / conformance rule passes now (a released run only);
+    `conform` = {run id: problems} the caller already worked out."""
+    held = [l for l in lots if l["status"] == "hold"]
+    by_run = {}
+    for l in held:
+        by_run.setdefault(l["run_id"] or 0, []).append(l)
+    out, conform = {}, (conform if conform is not None else {})
+    for rid, group in by_run.items():
+        causes = {}
+        for e in conn.execute("SELECT * FROM release_events WHERE run_id=? AND event_type IN (%s) ORDER BY id" % ",".join("?" * len(HOLD_EVENT_TYPES)), (rid, *HOLD_EVENT_TYPES)):
+            try:
+                d = json.loads(e["detail"]) if e["detail"] else {}
+            except ValueError:
+                d = {}
+            t = e["event_type"]
+            if t == "lab_result_hold":
+                for x in d.get("lots") or []:
+                    causes[x.get("lot")] = ("lab", "Lab result changed after release: " + "; ".join(d.get("problems") or ["a required result is no longer met"]), e)
+            elif t == "release_rejected":
+                for x in d.get("lots") or []:
+                    causes[x.get("lot")] = ("rejected", "Rejected at Quality release" + (": " + e["comment"] if e["comment"] else ""), e)
+            elif t == "fg_lot_edited":
+                st = (d.get("changes") or {}).get("status")
+                if st and st.get("to") == "hold":
+                    causes[d.get("lot")] = ("manual", "Put on hold by hand" + (": " + e["comment"] if e["comment"] else ""), e)
+                elif st:
+                    causes.pop(d.get("lot"), None)
+            else:                                                        # released / reopened: the run's earlier holds no longer stand
+                causes.clear()
+        if rid not in conform:
+            run = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone() if rid else None
+            conform[rid] = release_conformance_problems(conn, run) if run and run["release_state"] == "released" else None
+        problems = conform[rid]
+        for l in group:
+            c = causes.get(l["fg_lot_number"])
+            if c:
+                kind, text, e = c
+                by, at = e["user_name"], e["created_at"]
+                summary = "%s (%s, %s)" % (text, by, (at or "")[:10])
+            else:
+                kind, text, by, at, summary = "unknown", "No reason recorded (an older record)", None, None, "No reason recorded (an older record)"
+                e = None
+            out[l["id"]] = {"kind": kind, "text": text, "summary": summary, "by": by, "at": at, "capacity": e["capacity"] if e else None,
+                            "conformsNow": (not problems) if problems is not None else None}
+    return out
+
+
+def fg_public_list(conn, rows, conform=None):
+    """fg_public for each row, plus `holdInfo` (why it is on hold) on the lots that are on hold."""
+    rows = list(rows)
+    info = hold_info_for_lots(conn, rows, conform)
+    out = []
+    for r in rows:
+        d = fg_public(r)
+        if r["id"] in info:
+            d["holdInfo"] = info[r["id"]]
+        out.append(d)
+    return out
+
+
+def release_checklist(conn, r, gate, lab, problems, amendment, log_matches=None, lots=()):
+    """The release workflow as a short checklist (KW-94): [{key, label, state ok | fail | warn | na, reason, action}], built only from what the release already knows (the release
+    gate, the lab results, the review state, the open amendment). Nothing here is a second copy of a rule: a released run's gate item is judged by the same conformance rule that
+    puts its lots on hold."""
+    state = r["release_state"]
+    items = []
+
+    def add(key, label, st, reason="", action=None):
+        items.append({"key": key, "label": label, "state": st, "reason": reason, "action": action})
+
+    if state == "pending_review":
+        add("review", "Production log reviewed", "fail", "Waiting for the Production Manager's review", "review")
+    elif state == "returned":
+        add("review", "Production log reviewed", "fail", "Returned for correction: correct the log and resubmit it", "review")
+    elif state == "amending":
+        add("review", "Production log reviewed", "fail", "Under amendment: the earlier review no longer stands", "amend")
+    else:
+        add("review", "Production log reviewed", "ok")
+    blocked = [g for g in gate if not g["ok"]]
+    if not gate:
+        add("gate", "Release gate: no test has a release rule", "ok")
+    else:
+        label = "Release gate: %d of %d tests met" % (len(gate) - len(blocked), len(gate))
+        if problems is not None:
+            add("gate", label, "fail" if problems else "ok", "; ".join(problems), "lab")
+        else:
+            add("gate", label, "fail" if blocked else "ok", "; ".join("%s: %s" % (g["name"], g["reason"]) for g in blocked), "lab")
+    no_report, with_result = [], 0
+    for s in conn.execute("SELECT code, name FROM coa_specs WHERE release_rule IN ('pass','min') AND basis!='run' ORDER BY sort, code").fetchall():
+        x = conn.execute("SELECT attachment_id FROM lab_results WHERE run_id=? AND spec_code=? AND voided_at IS NULL ORDER BY id DESC LIMIT 1", (r["id"], s["code"])).fetchone()
+        if x:
+            with_result += 1
+            if not x["attachment_id"]:
+                no_report.append(s["name"])
+    if no_report:
+        add("report", "Lab report attached where the gate requires it", "fail", "No lab report is attached for: " + ", ".join(no_report), "lab")
+    else:
+        add("report", "Lab report attached where the gate requires it", "ok" if with_result else "na", "" if with_result else "No lab results yet")
+    gated = {g["name"] for g in gate if g["rule"] == "pass"}
+    failed = [f for f in lab["failed"] if f not in gated]
+    # "No out-of-specification results" can only be said once the results are in: a test with no result yet, a result that cannot be judged, or a result without its lab report
+    # leaves the answer open (amber), so the run's own pH / TDS alone never turns this green
+    waiting = []
+    if not (state == "legacy" and problems is None):               # a grandfathered historical run has no lab results to wait for
+        to_come = [g["name"] for g in gate if g["result"] is None] + [n for n in lab["missingRequired"] if n not in {g["name"] for g in gate}]
+        unjudged = [g["name"] for g in gate if g["result"] is not None and g["status"] in ("review", "not_evaluated")]
+        if to_come:
+            waiting.append("Results still to come: " + ", ".join(to_come))
+        if unjudged:
+            waiting.append("Results that cannot be judged yet: " + ", ".join(unjudged))
+        if no_report:
+            waiting.append("No lab report attached for: " + ", ".join(no_report))
+    wait_text = ". ".join(waiting)
+    if not failed:
+        if waiting:
+            add("comment", "Out-of-specification results have a release comment", "warn", "Not known yet. " + wait_text, "lab")
+        else:
+            add("comment", "Out-of-specification results have a release comment", "ok", "No out-of-specification results")
+    elif state in ("released", "legacy"):
+        ev = conn.execute("SELECT detail FROM release_events WHERE run_id=? AND event_type IN ('released','legacy_release') ORDER BY id DESC LIMIT 1", (r["id"],)).fetchone()
+        try:
+            accepted = set((json.loads(ev["detail"]) if ev and ev["detail"] else {}).get("outOfSpec", []))
+        except (ValueError, AttributeError):
+            accepted = set()
+        unaccepted = [f for f in failed if f not in accepted]
+        add("comment", "Out-of-specification results have a release comment", "fail" if unaccepted else ("warn" if waiting else "ok"),
+            ("Outside specification and not accepted at release: " + ", ".join(unaccepted)) if unaccepted else
+            "Accepted at release: " + ", ".join(failed) + (". " + wait_text if waiting else ""), "lab" if waiting and not unaccepted else None)
+    else:
+        add("comment", "Out-of-specification results have a release comment", "warn",
+            "Outside specification: %s. A release comment is required to release.%s" % (", ".join(failed), (" " + wait_text) if waiting else ""), "release")
+    if state in ("pending_review", "returned", "amending"):
+        add("log", "Production log unchanged since review", "na", "Not reviewed yet")
+    elif log_matches is False:
+        add("log", "Production log unchanged since review", "fail", "The production log no longer matches the log that was reviewed", "log")
+    else:
+        add("log", "Production log unchanged since review", "ok")
+    if amendment:
+        add("amendment", "No open amendment", "fail", "Amendment open since %s by %s" % ((amendment["opened_at"] or "")[:10], amendment["opened_by"]), "amend")
+    else:
+        add("amendment", "No open amendment", "ok")
+    held = [l for l in lots if l["status"] == "hold"]
+    if state not in ("released", "legacy", "rejected"):
+        add("hold", "No finished-goods lot on hold", "na", "Not released yet")
+    elif held:
+        add("hold", "No finished-goods lot on hold", "fail", "%d of %d lot%s on hold: %s" % (len(held), len(lots), "" if len(lots) == 1 else "s", "; ".join(
+            dict.fromkeys((l.get("holdInfo") or {}).get("summary", "") for l in held))), "hold")
+    else:
+        add("hold", "No finished-goods lot on hold", "ok")
+    return items
+
+
+def release_status(r, lots, last, amendment, gate, problems):
+    """One status line for a run (KW-94): the stage, who it is waiting on, what happens next, and -- for a released run with lots on hold -- why. The words live here so the Product
+    Release list, the run window and the tests all read the same text. `lots` = fg_public rows (with holdInfo), `last` = the newest release event of each type."""
+    state = r["release_state"]
+    held = [l for l in lots if l["status"] == "hold"]
+    blocked = [g for g in gate if not g["ok"]]
+    st = {"stage": RELEASE_LABELS.get(state, "-"), "tone": "info", "waitingOn": None, "next": None, "cause": None, "heldLots": len(held), "totalLots": len(lots),
+          "conformsNow": (not problems) if problems is not None else None, "problems": problems or []}
+
+    def by(ev):
+        return "%s on %s" % (ev["user"], (ev["at"] or "")[:10]) if ev else ""
+
+    if state == "pending_review":
+        st.update(tone="warn", waitingOn="Production Manager", next="Review the production log, then approve it or return it for correction.")
+    elif state == "returned":
+        ev = last.get("review_returned")
+        st.update(tone="warn", waitingOn="Production team", cause=("Returned by %s: %s" % (by(ev), ev["comment"])) if ev else None,
+                  next="Correct the production log and resubmit it for review.")
+    elif state == "pending_release":
+        if blocked:
+            st.update(tone="warn", waitingOn="Quality Manager", next="Not ready to release: %d of %d release-gate tests are not met (%s). Enter or correct the lab results first." % (
+                len(blocked), len(gate), ", ".join(g["name"] for g in blocked)))
+        else:
+            st.update(tone="info", waitingOn="Quality Manager", next="Every release-gate test is met. Release the product or reject it.")
+    elif state == "released" and held:
+        causes = []
+        for l in held:
+            s = (l.get("holdInfo") or {}).get("summary")
+            if s and s not in causes:
+                causes.append(s)
+        st["stage"] = "Released - %d of %d lot%s on hold" % (len(held), len(lots), "" if len(lots) == 1 else "s")
+        st.update(tone="danger", waitingOn="Quality Manager", cause="; ".join(causes))
+        if problems:
+            st["next"] = "The release gate is not met (%s). Enter or correct the lab results; then a Quality Manager releases the lots from hold." % "; ".join(problems)
+        else:
+            st["next"] = "The release gate is met. A Quality Manager can release the lots from hold."
+    elif state in ("released", "legacy"):
+        ev = last.get("released")
+        st.update(tone="ok", next=("Released by %s." % by(ev)) if ev and state == "released" else None)
+    elif state == "rejected":
+        ev = last.get("release_rejected")
+        st.update(tone="danger", waitingOn="Quality Manager", cause=("Rejected by %s: %s" % (by(ev), ev["comment"])) if ev else None,
+                  next="Reopen the run to send it back for review.")
+    elif state == "amending":
+        st.update(tone="warn", waitingOn="Production Log Amender", cause=("Opened by %s on %s: %s" % (amendment["opened_by"], (amendment["opened_at"] or "")[:10], amendment["reason"])) if amendment else None,
+                  next="Make the log changes, then submit the amendment for review.")
+    parts = [st["stage"] + "."]
+    if st["cause"]:
+        parts.append("Cause: %s." % st["cause"].rstrip("."))
+    if st["waitingOn"]:
+        parts.append("Waiting for: %s." % st["waitingOn"])
+    if st["next"]:
+        parts.append(st["next"] if state == "released" and not held else "Next: " + st["next"])
+    st["text"] = " ".join(parts)
+    return st
+
+
 def lab_result_public(x):
     return {"id": x["id"], "runId": x["run_id"], "specCode": x["spec_code"], "analyte": x["analyte"], "labId": x["lab_id"],
             "labName": x["lab_name"], "reportNumber": x["report_number"], "reportDate": x["report_date"], "sampleRef": x["sample_ref"],
@@ -10087,28 +10335,7 @@ class Handler(BaseHTTPRequestHandler):
         """A lab result added or voided AFTER release can make released product non-conforming: a result the release depended on removed or now failing, or a new
         failure that the release did not accept. The run's unsold lots are then put on hold and the audit trail says why. A run released under the release gate is
         held to the tests that gate checked (its `released` event lists them); an older run keeps the old rule (required results present, no new failure)."""
-        if run["release_state"] not in ("released", "legacy"):
-            return
-        if run["is_historical"] and run["release_state"] == "legacy":
-            return                                                       # grandfathered at entry: results added later are recorded, they do not hold lots
-        lab = coa_evaluate(conn, run)["summary"]
-        ev = conn.execute("SELECT detail FROM release_events WHERE run_id=? AND event_type IN ('released','legacy_release') ORDER BY id DESC LIMIT 1",
-                          (run["id"],)).fetchone()
-        accepted, snapshot = set(), None
-        if ev and ev["detail"]:
-            try:
-                detail = json.loads(ev["detail"])
-                accepted = set(detail.get("outOfSpec", []))
-                snapshot = detail.get("gate")
-            except (ValueError, AttributeError):
-                accepted = set()
-        if snapshot is not None:
-            held_to = {g["code"] for g in snapshot}
-            gate = release_gate(conn, run)
-            problems = ["%s: %s" % (g["name"], g["reason"]) for g in gate if g["code"] in held_to and not g["ok"]]
-            problems += [f for f in lab["failed"] if f not in accepted and f not in {g["name"] for g in gate if g["rule"] == "pass"}]
-        else:
-            problems = list(lab["missingRequired"]) + [f for f in lab["failed"] if f not in accepted]
+        problems = release_conformance_problems(conn, run)           # None: not released / grandfathered at entry (results added later are recorded, they do not hold lots)
         if not problems:
             return
         moved = self._set_lot_status(conn, run["id"], ("on_hand",), "hold")
@@ -13599,9 +13826,9 @@ class Handler(BaseHTTPRequestHandler):
     def _release_snapshot_hash(self, conn, rid):
         return hashlib.sha256(_canon(self._release_snapshot(conn, rid)).encode("utf-8")).hexdigest()
 
-    def _release_lots(self, conn, rid):
-        return [fg_public(x) for x in conn.execute(
-            "SELECT * FROM fg_lots WHERE run_id=? ORDER BY package_size, fg_lot_number", (rid,))]
+    def _release_lots(self, conn, rid, conform=None):
+        return fg_public_list(conn, conn.execute(
+            "SELECT * FROM fg_lots WHERE run_id=? ORDER BY package_size, fg_lot_number", (rid,)).fetchall(), conform)
 
     def _set_lot_status(self, conn, rid, from_statuses, to_status):
         """Move this run's lots between statuses; returns what moved."""
@@ -14073,23 +14300,31 @@ class Handler(BaseHTTPRequestHandler):
                  "at": e["created_at"], "entryHash": e["entry_hash"]}
                 for e in conn.execute("SELECT * FROM release_events WHERE run_id=? ORDER BY id", (rid,))]
 
-    def _release_summary(self, conn, r):
-        lots = self._release_lots(conn, r["id"])
+    def _release_summary(self, conn, r, gate=None, log_matches=None):
         ev = self._release_events_public(conn, r["id"])
         last = {}
         for e in ev:
             last[e["type"]] = e
+        lab_ev = coa_evaluate(conn, r)["summary"]
+        if gate is None:
+            gate = release_gate(conn, r)
+        problems = release_conformance_problems(conn, r, gate, lab_ev)       # does a RELEASED run still conform? (None: not applicable)
+        lots = self._release_lots(conn, r["id"], {r["id"]: problems})
+        am = self._open_amendment(conn, r["id"])
         return {"id": r["id"], "lot": r["processing_lot"], "sku": r["sku_code"], "runDate": r["run_date"],
                 "outputLitres": r["output_litres"], "finalizedAt": r["finalized_at"], "finalizedBy": r["finalized_by"],
                 "state": r["release_state"], "label": RELEASE_LABELS.get(r["release_state"], "—"),
                 "lots": lots,
-                "amendment": (lambda am: self._amendment_public(am) if am else None)(self._open_amendment(conn, r["id"])),
+                "releaseStatus": release_status(r, lots, last, am, gate, problems),
+                "checklist": release_checklist(conn, r, gate, lab_ev, problems, am, log_matches, lots),
+                "heldLots": [{"id": l["id"], "lot": l["lot"], "qty": l["qty"]} for l in lots if l["status"] == "hold"],
+                "amendment": self._amendment_public(am) if am else None,
                 "reviewedBy": (last.get("review_approved") or {}).get("user") if r["release_state"] in ("pending_release", "released") else None,
                 "reviewedAt": (last.get("review_approved") or {}).get("at") if r["release_state"] in ("pending_release", "released") else None,
                 "releasedBy": (last.get("released") or {}).get("user") if r["release_state"] == "released" else None,
                 "releasedAt": (last.get("released") or {}).get("at") if r["release_state"] == "released" else None,
                 "releasedComment": (last.get("released") or {}).get("comment") if r["release_state"] == "released" else None,
-                "lab": coa_evaluate(conn, r)["summary"]}
+                "lab": lab_ev}
 
     def route_release(self, method, seg, query, conn, user):
         me = {"canReview": bool(user["is_production_manager"]), "canRelease": bool(user["is_quality_manager"])}
@@ -14108,23 +14343,64 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(404, "Production run not found")
             if len(seg) == 4 and method == "GET":
                 now_hash = self._release_snapshot_hash(conn, rid)
-                out = self._release_summary(conn, r)
+                gate = release_gate(conn, r)
+                matches = (r["release_review_hash"] == now_hash) if r["release_review_hash"] else None
+                out = self._release_summary(conn, r, gate, matches)
                 out.update({"run": self._run_full(conn, r), "events": self._release_events_public(conn, rid),
                             "me": me, "currentLogHash": now_hash, "reviewedLogHash": r["release_review_hash"],
-                            "logMatchesReview": (r["release_review_hash"] == now_hash) if r["release_review_hash"] else None,
-                            "chain": release_verify_chain(conn), "gate": release_gate(conn, r), "coaRows": coa_rows_for_review(conn, r), "organicConflicts": organic_conflicts(conn, r),
+                            "logMatchesReview": matches,
+                            "chain": release_verify_chain(conn), "gate": gate, "coaRows": coa_rows_for_review(conn, r), "organicConflicts": organic_conflicts(conn, r),
                             "separateSigners": bool(float(get_setting_value(conn, "release_separate_signers", 0) or 0))})
                 return out
             if len(seg) == 5 and method == "POST" and seg[4] in ("review", "release", "reopen", "resubmit"):
                 return self._release_action(conn, r, seg[4], self._body_json(), user)
+            if len(seg) == 5 and method == "POST" and seg[4] == "release-from-hold":
+                return self._release_from_hold(conn, r, self._body_json(), user)
             if len(seg) == 5 and method == "GET" and seg[4] == "recall":
                 return self._recall_report(conn, r)
         raise ApiError(404, "Unknown release endpoint")
 
+    def _release_from_hold(self, conn, r, d, user):
+        """POST /api/release/runs/<id>/release-from-hold {lotIds?, reason} (KW-94). A Quality Manager puts held finished goods of a RELEASED run back on sale once the run conforms again
+        (the release gate / conformance rule passes now: no override). All or nothing; each lot gets the same `fg_lot_edited` hash-chained event the hand edit writes. A run rejected at
+        Quality release is not lifted this way: reopen it."""
+        self._require_quality_manager(user, "release product from hold")
+        if r["release_state"] != "released":
+            raise ApiError(409, "Only a released run's lots can be released from hold here" + (" - reopen a rejected run instead" if r["release_state"] == "rejected" else ""))
+        reason = (d.get("reason") or "").strip()
+        if len(reason) < 3:
+            raise ApiError(400, "Enter the reason for releasing this product from hold (it is recorded in the audit trail)")
+        held = {x["id"]: x for x in conn.execute("SELECT * FROM fg_lots WHERE run_id=? AND status='hold'", (r["id"],))}
+        ids = d.get("lotIds")
+        if ids is None or ids == []:
+            ids = list(held)
+        try:
+            ids = [int(x) for x in ids]
+        except (TypeError, ValueError):
+            raise ApiError(400, "lotIds must be a list of finished-goods lot ids")
+        if not ids:
+            raise ApiError(409, "This run has no lots on hold")
+        for i in ids:
+            if i not in held:
+                raise ApiError(400, "Finished-goods lot %s is not on hold for this run" % i)
+        problems = release_conformance_problems(conn, r)
+        if problems:
+            raise ApiError(409, "Release from hold blocked - the release gate is not met: " + "; ".join(problems)
+                           + ". Enter or correct the lab results with the run's Lab results button.", "release_gate")
+        for i in dict.fromkeys(ids):
+            it = held[i]
+            conn.execute("UPDATE fg_lots SET status='on_hand' WHERE id=?", (i,))
+            release_log(conn, r["id"], "fg_lot_edited", user, capacity="Quality Manager",
+                        meaning="Finished-goods lot %s edited: status." % it["fg_lot_number"], comment=reason,
+                        detail={"lot": it["fg_lot_number"], "changes": {"status": {"from": "hold", "to": "on_hand"}}, "via": "release_from_hold"})
+        return self._release_summary(conn, r)
+
     def _recall_report(self, conn, r):
         """Where did this run's product go? Every finished-goods lot of the run with what is still here and what shipped, to which customer, on which shipment."""
         lots = []
-        for l in conn.execute("SELECT * FROM fg_lots WHERE run_id=? ORDER BY fg_lot_number", (r["id"],)).fetchall():
+        fg_rows = conn.execute("SELECT * FROM fg_lots WHERE run_id=? ORDER BY fg_lot_number", (r["id"],)).fetchall()
+        hold_info = hold_info_for_lots(conn, fg_rows)
+        for l in fg_rows:
             ships = [{"shipmentNo": x["shipment_no"], "date": x["ship_date"], "status": x["status"], "customer": x["customer"], "contact": x["contact"],
                       "email": x["email"], "phone": x["phone"], "reference": x["reference"], "carrier": x["carrier"], "tracking": x["tracking_no"], "qty": x["qty"]}
                      for x in conn.execute(
@@ -14132,7 +14408,7 @@ class Handler(BaseHTTPRequestHandler):
                          " FROM shipment_lines sl JOIN shipments s ON s.id=sl.shipment_id LEFT JOIN customers c ON c.id=s.customer_id"
                          " WHERE sl.fg_lot_id=? ORDER BY s.ship_date, s.id", (l["id"],))]
             lots.append({"lotNumber": l["fg_lot_number"], "status": l["status"], "qtyOnHand": l["qty"], "location": l["location"],
-                         "shipments": ships, "unitsShipped": sum(x["qty"] for x in ships if x["status"] != "cancelled")})
+                         "shipments": ships, "unitsShipped": sum(x["qty"] for x in ships if x["status"] != "cancelled"), "holdInfo": hold_info.get(l["id"])})
         customers = {}
         for l in lots:
             for x in l["shipments"]:
@@ -16311,6 +16587,13 @@ class Handler(BaseHTTPRequestHandler):
             if len(reason) < 3:
                 raise ApiError(400, "Enter the reason for this change (it is recorded in the audit trail)")
             capacity = "Quality Manager" if self._is_quality_manager(user) else "Production Manager"
+            if "status" in changes and changes["status"] == ("hold", "on_hand"):
+                # KW-94: product on hold goes back on sale only when the run conforms again -- the same rule as Release from hold (a released run; a grandfathered one has no results to judge)
+                run = conn.execute("SELECT * FROM production_runs WHERE id=?", (it["run_id"],)).fetchone() if it["run_id"] else None
+                problems = release_conformance_problems(conn, run) if run and run["release_state"] == "released" else None
+                if problems:
+                    raise ApiError(409, "This lot cannot be released from hold - the release gate is not met: " + "; ".join(problems)
+                                   + ". Enter or correct the lab results with the run's Lab results button.", "release_gate")
         conn.execute("UPDATE fg_lots SET qty=?, status=?, location=? WHERE id=?",
                      (changes["qty"][1] if "qty" in changes else it["qty"], changes["status"][1] if "status" in changes else it["status"], new_loc, it["id"]))
         if new_loc != it["location"]:
@@ -16320,7 +16603,7 @@ class Handler(BaseHTTPRequestHandler):
                         meaning="Finished-goods lot %s edited: %s." % (it["fg_lot_number"], ", ".join(sorted(changes))),
                         comment=(d.get("reason") or "").strip(),
                         detail={"lot": it["fg_lot_number"], "changes": {k: {"from": v[0], "to": v[1]} for k, v in changes.items()}})
-        return {"fg": fg_public(conn.execute("SELECT * FROM fg_lots WHERE id=?", (it["id"],)).fetchone())}
+        return {"fg": fg_public_list(conn, [conn.execute("SELECT * FROM fg_lots WHERE id=?", (it["id"],)).fetchone()])[0]}
 
     def route_fg(self, method, seg, query, conn, user):
         if seg == ["api", "fg"] and method == "GET":
@@ -16328,7 +16611,7 @@ class Handler(BaseHTTPRequestHandler):
             sql = "SELECT * FROM fg_lots" + (" WHERE status=?" if status else "")
             sql += " ORDER BY produced_date DESC, fg_lot_number"
             rows = conn.execute(sql, (status,) if status else ()).fetchall()
-            return {"fg": [fg_public(r) for r in rows]}
+            return {"fg": fg_public_list(conn, rows)}
         if seg == ["api", "fg", "move-bulk"] and method == "POST":
             d = self._body_json()
             ids = [int(x) for x in (d.get("ids") or [])]

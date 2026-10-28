@@ -4935,6 +4935,44 @@ const RELEASE_EVENTS = {
   fg_lot_edited: 'Finished-goods lot edited', lab_result_hold: 'Lots put on HOLD (lab result changed after release)',
 };
 const shortHash = h => h ? h.slice(0, 10) + '…' : '—';
+// ---- KW-94: the release workflow as one status line, a checklist and hold reasons. The server decides all of it (`releaseStatus`, `checklist`, `holdInfo` on each lot); these only draw it. ----
+const STATUS_TONE = { ok: 'on_hand', warn: 'pending_release', danger: 'hold', info: 'wip' };
+const releaseStageBadge = s => badge(STATUS_TONE[s.tone] || 'wip', s.stage);
+// Why a lot is on hold, small and muted under its badge (the full sentence is also the tooltip). Nothing is drawn for a lot that is not on hold.
+function holdWhy(info) {
+  if (!info) return null;
+  const gate = info.conformsNow === true ? ' · release gate met' : info.conformsNow === false ? ' · release gate NOT met' : '';
+  return el('div', { class: 'hold-why ' + info.kind, title: info.summary + gate }, info.summary + gate);
+}
+const fgStatusWithWhy = l => el('div', {}, fgStatusBadge(l.status), holdWhy(l.holdInfo));
+function releaseStatusBlock(s) {
+  const plain = s.tone === 'ok' && !s.heldLots;
+  return el('div', { class: 'release-status ' + s.tone },
+    el('div', { class: 'rs-head' }, releaseStageBadge(s), s.waitingOn ? el('span', {}, 'Waiting for: ', el('b', {}, s.waitingOn)) : null),
+    s.cause ? el('div', { class: 'rs-line' }, el('b', {}, 'Cause: '), s.cause) : null,
+    s.next ? el('div', { class: 'rs-line' }, plain ? '' : el('b', {}, 'Next: '), s.next) : null);
+}
+// The checklist, drawn with the production log's stage chips: green = met, red = not met, amber = needs a comment at release, grey = not applicable yet.
+const CHECK_CLASS = { ok: 'done', fail: 'fail', warn: 'partial', na: 'empty' };
+function releaseChecklistView(items, onAction) {
+  const applicable = items.filter(i => i.state !== 'na'), met = applicable.filter(i => i.state === 'ok').length;
+  return el('div', { class: 'stage-progress' },
+    el('div', { class: 'stage-steps' }, ...items.map(i => {
+      const act = onAction && i.action && (i.state === 'fail' || i.state === 'warn');
+      const tip = i.label + (i.reason ? ' — ' + i.reason : i.state === 'ok' ? ' — met' : '') + (act ? '\n(click to go there)' : '');
+      return el(act ? 'button' : 'span', Object.assign({ class: 'stage-step ' + CHECK_CLASS[i.state], title: tip }, act ? { type: 'button', onclick: () => onAction(i) } : {}),
+        el('span', { class: 'stage-dot' }, i.state === 'ok' ? '✓' : i.state === 'fail' ? '✕' : i.state === 'warn' ? '!' : ''),
+        el('span', { class: 'stage-name' }, i.label));
+    })),
+    el('div', { class: 'stage-meter' + (met === applicable.length ? ' complete' : '') },
+      el('span', {}, met + ' of ' + applicable.length + ' checks met' + (met === applicable.length ? ' — nothing is holding this run up' : ''))));
+}
+// Compact version for the list: one dot per check and what is left to do ("2 to do", or a tick when nothing is).
+function releaseCheckDots(items) {
+  const applicable = items.filter(i => i.state !== 'na'), met = applicable.filter(i => i.state === 'ok').length;
+  return el('span', { class: 'chk-dots', title: items.map(i => (i.state === 'ok' ? '✓ ' : i.state === 'na' ? '– ' : i.state === 'warn' ? '! ' : '✕ ') + i.label + (i.reason && i.state !== 'ok' ? ': ' + i.reason : '')).join('\n') },
+    ...items.map(i => el('span', { class: 'chk-dot ' + i.state })), el('span', { class: 'chk-n' }, met === applicable.length ? '✓' : (applicable.length - met) + ' to do'));
+}
 async function pageRelease(v) {
   const r = await api('GET', '/release');
   v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Product Release'),
@@ -4950,24 +4988,30 @@ async function pageRelease(v) {
     + 'and then released by a Quality Manager. Heavy metals and microbial tests must pass and TDS must be at or above its lower limit before a run can be released. Your permissions: '
     + ([r.me.canReview ? 'Production Manager (review)' : '', r.me.canRelease ? 'Quality Manager (release)' : ''].filter(Boolean).join(' + ') || 'none — view only')
     + (r.legacyCount ? '. ' + r.legacyCount + ' earlier run(s) pre-date this process and are treated as released.' : '.')));
+  // KW-94: a released run with lots on hold is NOT "Released" as far as anyone needs to act: it gets its own group at the top, with the reason
+  const held = x => x.state === 'released' && (x.heldLots || []).length > 0;
   const groups = [
-    ['Under amendment', ['amending']],
-    ['Awaiting production-log review', ['pending_review']],
-    ['Awaiting Quality release', ['pending_release']],
-    ['Returned for correction / rejected', ['returned', 'rejected']],
-    ['Released', ['released']],
+    ['Released, but lots are on hold — needs attention', x => held(x)],
+    ['Under amendment', x => x.state === 'amending'],
+    ['Awaiting production-log review', x => x.state === 'pending_review'],
+    ['Awaiting Quality release', x => x.state === 'pending_release'],
+    ['Returned for correction / rejected', x => ['returned', 'rejected'].includes(x.state)],
+    ['Released', x => x.state === 'released' && !held(x)],
   ];
-  for (const [title, states] of groups) {
-    const rows = r.runs.filter(x => states.includes(x.state));
+  for (const [title, pick] of groups) {
+    const rows = r.runs.filter(pick);
+    if (!rows.length && title.startsWith('Released, but')) continue;
     v.append(el('h3', { style: 'margin:16px 0 6px' }, title + ' (' + rows.length + ')'));
     if (!rows.length) { v.append(el('div', { class: 'help' }, 'Nothing here.')); continue; }
-    v.append(table(['Run', 'Product', 'Finalized', 'Finished goods', 'Litres', 'Status', 'Lab results', 'Reviewed', 'Released'],
+    v.append(table(['Run', 'Product', 'Finalized', 'Finished goods', 'Litres', 'Status', 'Checks', 'Lab results', 'Reviewed', 'Released'],
       rows.map(x => [mono(x.lot), skuName(x.sku), fmtWhen(x.finalizedAt) + (x.finalizedBy ? ' · ' + x.finalizedBy : ''),
         x.lots.map(l => fmt(l.qty) + ' × ' + l.packageSize).join(', ') || '—',
-        num(fmt(x.lots.reduce((a, l) => a + (l.litres || 0), 0), 0)), releaseBadge(x.state), labBadge(x.lab),
+        num(fmt(x.lots.reduce((a, l) => a + (l.litres || 0), 0), 0)),
+        el('div', {}, releaseStageBadge(x.releaseStatus), x.releaseStatus.cause && x.state !== 'released' || held(x) ? el('div', { class: 'hold-why', title: x.releaseStatus.text }, x.releaseStatus.cause) : null),
+        releaseCheckDots(x.checklist), labBadge(x.lab),
         x.reviewedBy ? x.reviewedBy + ' · ' + fmtWhen(x.reviewedAt) : '—',
         x.releasedBy ? x.releasedBy + ' · ' + fmtWhen(x.releasedAt) : '—']),
-      [false, false, false, false, true, false, false, false, false], i => openReleaseRun(rows[i].id)));
+      [false, false, false, false, true, false, false, false, false, false], i => openReleaseRun(rows[i].id)));
   }
   v.append(el('div', { class: 'help', style: 'margin-top:10px' }, 'Click a row to review the production log, sign, and see the full audit trail.'));
 }
@@ -5041,7 +5085,7 @@ async function openRecallReport(d) {
   body.append(el('h4', { style: 'margin:12px 0 4px' }, 'By lot'));
   const rows = [];
   r.lots.forEach(l => {
-    rows.push({ group: el('span', {}, el('b', {}, l.lotNumber), ' — ', fgStatusBadge(l.status), ' · on site: ' + fmt(l.qtyOnHand) + (l.location ? ' (' + l.location + ')' : '') + ' · shipped: ' + fmt(l.unitsShipped)) });
+    rows.push({ group: el('span', {}, el('b', {}, l.lotNumber), ' — ', fgStatusBadge(l.status), ' · on site: ' + fmt(l.qtyOnHand) + (l.location ? ' (' + l.location + ')' : '') + ' · shipped: ' + fmt(l.unitsShipped), holdWhy(l.holdInfo)) });
     l.shipments.forEach(x => rows.push([x.shipmentNo, x.date, x.customer || '—', num(fmt(x.qty)), x.status, x.reference || '—', x.carrier ? x.carrier + (x.tracking ? ' ' + x.tracking : '') : '—']));
   });
   body.append(table(['Shipment', 'Date', 'Customer', 'Units', 'Status', 'Reference', 'Carrier'], rows, [false, false, false, true, false, false, false]));
@@ -5056,8 +5100,17 @@ async function openReleaseRun(id) {
   const me = d.me;
   const body = el('div', {});
   const refresh = async () => { body.closest('.modal-bg')?.remove(); await openReleaseRun(id); if (State.tab === 'release') { /* list refreshes on next visit */ } };
-  body.append(el('div', { class: 'summary-line' }, sl('Run', d.lot), sl('Product', skuName(d.sku)), el('span', {}, 'Status: ', releaseBadge(d.state)),
+  body.append(el('div', { class: 'summary-line' }, sl('Run', d.lot), sl('Product', skuName(d.sku)), el('span', {}, 'Status: ', releaseStageBadge(d.releaseStatus)),
     sl('Finalized', fmtWhen(d.finalizedAt) + (d.finalizedBy ? ' by ' + d.finalizedBy : ''))));
+  // KW-94: where the run stands, what it is waiting for, why any lot is on hold, and the checklist -- before anything else
+  body.append(releaseStatusBlock(d.releaseStatus));
+  body.append(el('div', { class: 'sign-box' }, el('h4', {}, 'Release checklist'), releaseChecklistView(d.checklist, i => {
+    if (i.action === 'lab') openLabResults(d.run);
+    else if (i.action === 'log' || i.action === 'amend') openProcessLog(d.run);
+    else (body.querySelector('[data-sign]') || body).scrollIntoView({ behavior: 'smooth', block: 'center' });
+  })));
+  if (d.state === 'released' && d.lots.some(l => l.status === 'hold') && me.canRelease) body.append(releaseFromHoldBox());
+  else if (d.state === 'released' && d.lots.some(l => l.status === 'hold')) body.append(el('div', { class: 'help sign-box' }, 'Only a Quality Manager can release these lots from hold.'));
   // KW-30: what QA checks first -- every result on the Certificate of Analysis passes and has its lab report -- then the sign-off; everything else is folded away below
   if ((d.organicConflicts || []).length) body.append(el('div', { class: 'sign-box', style: 'border-color:var(--danger,#b00020)' }, el('b', { style: 'color:var(--danger,#b00020)' }, '⚠ Organic product made with a reagent that is not marked Organic: '),
     d.organicConflicts.map(x => x.reagent + ' (' + x.item + ')').join(', '), el('div', { class: 'help' }, 'Check this before signing: it may need a deviation record.')));
@@ -5111,10 +5164,33 @@ async function openReleaseRun(id) {
         toast('Signature recorded'); await refresh();
       } catch (e) { err.textContent = e.message; btn.disabled = false; }
     });
-    return el('div', { class: 'sign-box' }, el('h4', {}, title),
+    return el('div', { class: 'sign-box', 'data-sign': '1' }, el('h4', {}, title),
       el('div', { class: 'sign-attest' }, attest),
       decSel ? field('Decision', decSel) : null,
       field('Comment', comment), field('Password', pw), err, btn);
+  }
+  // KW-94: a Quality Manager puts held lots of a RELEASED run back on sale. Enabled only while the release gate is met (the server enforces it too: there is no override).
+  function releaseFromHoldBox() {
+    const gateMet = d.releaseStatus.conformsNow === true;
+    const held = d.lots.filter(l => l.status === 'hold');
+    const boxes = held.map(l => { const cb = el('input', { type: 'checkbox', 'aria-label': 'Release ' + l.lot }); cb.checked = true; return [l, cb]; });
+    const reason = el('textarea', { rows: '2', placeholder: 'Reason for releasing from hold (required) — it is recorded in the audit trail' });
+    const err = el('div', { class: 'error' });
+    const btn = el('button', { type: 'button' }, 'Release from hold');
+    btn.disabled = !gateMet;
+    btn.addEventListener('click', async () => {
+      err.textContent = '';
+      const ids = boxes.filter(([, cb]) => cb.checked).map(([l]) => l.id);
+      if (!ids.length) { err.textContent = 'Tick at least one lot.'; return; }
+      btn.disabled = true;
+      try { await api('POST', '/release/runs/' + id + '/release-from-hold', { lotIds: ids, reason: reason.value }); toast('Released from hold'); await refresh(); }
+      catch (e) { err.textContent = e.message; btn.disabled = !gateMet; }
+    });
+    return el('div', { class: 'sign-box', 'data-sign': '1' }, el('h4', {}, 'Release from hold (Quality Manager)'),
+      el('div', { class: gateMet ? 'help' : 'help rs-blocked' }, gateMet ? 'The release gate is met. Tick the lots to put back on sale.'
+        : 'Not available yet: the release gate is not met (' + d.releaseStatus.problems.join('; ') + '). Enter or correct the lab results first. There is no override.'),
+      ...boxes.map(([l, cb]) => el('label', { class: 'hold-lot' }, cb, ' ', el('b', {}, l.lot), ' — ' + fmt(l.qty) + ' units', holdWhy(l.holdInfo))),
+      field('Reason', reason), err, btn);
   }
   if (d.state === 'pending_review') {
     body.append(me.canReview ? signBox('Production-log review sign-off',
@@ -5143,13 +5219,13 @@ async function openReleaseRun(id) {
   }
   // the supporting detail, folded away so the lab results and the sign-off are what is in front of the reviewer
   body.append(fold('Run notes', runNotesPanel(d.run, d.events, { emptyText: 'No notes were written on this run.' })));
-  body.append(fold('Finished goods lots (' + d.lots.length + ')', table(['FG lot', 'Pack', 'Units', 'Litres', 'Status'], d.lots.map(l => [mono(l.lot), l.packageSize, fmt(l.qty), num(fmt(l.litres, 0)), fgStatusBadge(l.status)]), [false, false, true, true, false])));
+  body.append(fold('Finished goods lots (' + d.lots.length + ')', table(['FG lot', 'Pack', 'Units', 'Litres', 'Status'], d.lots.map(l => [mono(l.lot), l.packageSize, fmt(l.qty), num(fmt(l.litres, 0)), fgStatusWithWhy(l)]), [false, false, true, true, false])));
   body.append(fold('Materials used and their lots', await materialsCard(id)));
   body.append(fold('Production log summary', releaseLogSummary(d.run)));
   body.append(el('h3', { style: 'margin:14px 0 6px;font-size:14px' }, 'Audit trail'));
   body.append(el('div', { class: 'tablewrap' }, el('table', {},
     el('thead', {}, el('tr', {}, ...['#', 'When', 'Event', 'Signed by', 'Statement / comment', 'Log hash'].map(h => el('th', {}, h)))),
-    el('tbody', {}, ...d.events.map(e => el('tr', {},
+    el('tbody', {}, ...d.events.map(e => el('tr', { class: ['lab_result_hold', 'release_rejected'].includes(e.type) ? 'hold-row' : null },
       el('td', { class: 'muted' }, e.id), el('td', { class: 'muted' }, fmtWhen(e.at)), el('td', {}, el('b', {}, RELEASE_EVENTS[e.type] || e.type)),
       el('td', {}, e.user || '—', e.capacity ? el('div', { class: 'muted' }, e.capacity) : null),
       el('td', {}, e.meaning || '', e.comment ? el('div', {}, '“' + e.comment + '”') : null,
@@ -5199,7 +5275,7 @@ async function pageFG(v) {
         rowCheck(f, selected, updateBulk),
         mono(f.lot), fgSkuText(f), f.packageSize, fmt(f.qty), num(fmt(f.litres, 0)),
         f.tds != null ? fmt(f.tds, 2) + '%' : '—', f.ph != null ? fmt(f.ph, 2) : '—', f.producedDate || '—', f.location || '—',
-        fgStatusBadge(f.status), rowActions([
+        fgStatusWithWhy(f), rowActions([
           f.status !== 'sold' ? ['Move', () => moveFG(f)] : null,
           ['Label', () => printLabels([fgLabel(f)])],
           f.skuAssigned === false && f.status === 'on_hand' && f.qty > 0 ? ['Assign SKU', () => assignSkuModal(f)] : null,
@@ -5252,6 +5328,9 @@ function assignSkuModal(f) {
 }
 function editFG(f) {
   const body = el('div', {},
+    f.status === 'hold' && f.holdInfo ? el('div', { class: 'release-status danger' }, el('div', { class: 'rs-line' }, el('b', {}, 'On hold: '), f.holdInfo.summary),
+      f.holdInfo.conformsNow === false ? el('div', { class: 'rs-line' }, 'The release gate is not met, so this lot cannot be released from hold yet (Product Release shows what is missing).')
+        : f.holdInfo.conformsNow === true ? el('div', { class: 'rs-line' }, 'The release gate is met: a Quality Manager can release it from hold here or from Product Release.') : null) : null,
     el('div', { class: 'form-row' },
       field('Units on hand', el('input', { type: 'number', id: 'f_qty', value: f.qty, min: '0' })),
       f.status === 'pending_release'
