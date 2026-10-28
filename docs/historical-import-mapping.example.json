@@ -1,0 +1,13 @@
+{
+  "assumptionsAcceptedBy": "<your name and the date, once you have read and accepted the workbook's assumptions>",
+  "lotNumberFormat": "PR-{date}-{seq:03d}",
+  "lots": {
+    "1": {
+      "sku": "<product code, as in Admin > Products; the paper log does not name it>",
+      "release": "review",
+      "inventory": "count",
+      "toteLots": {"5": "<the KelpWorks tote lot number, only for a tote whose workbook cell shows ???>"}
+    },
+    "2": {"sku": "<product code>", "release": "grandfather"}
+  }
+}
