@@ -66,3 +66,4 @@ f016365  2026-10-26  A Quality Manager or administrator can correct a received l
 a98b66c  2026-10-27  Retention inventory no longer answers 500: one add_months for the whole program (hardening fix, no KW item) (PR 117) merged to main and live
 e6ffb1a  2026-10-28  Release status line, release checklist, hold reasons and a guarded Release from hold on the Product Release screens (KW-94) (PR 119) merged to main and live
 53251a6  2026-10-28  Import tool for the nine historical production runs, Lots 1 to 9 (KW-64) (PR 120) merged to main and live
+50b7ae0  2026-10-29  Tiered tests: a quick tier, parallel runs, cached older-release databases and self-maintaining timing reports (KW-70) (PR 123) merged to main and live

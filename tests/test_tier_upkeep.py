@@ -139,6 +139,54 @@ def test_the_javascript_check_covers_every_script_the_page_loads():
         assert os.path.dirname(src) in ("", "public"), "%s is outside public/*.js: the CI check would not see it" % src
 
 
+# ---------------------------------------------------------------- the workflow file must be valid YAML (GitHub runs NOTHING when it is not)
+def plain_scalar_problems(text):
+    """Lines whose unquoted value has a colon followed by a space: YAML reads that as a second key and GitHub refuses the whole workflow ("workflow file issue",
+    no jobs, no `test` check, nothing blocks the merge). This is what broke the first KW-70 merge: `name: Test timing report (advisory: warns ...)`.
+    Stdlib only: no YAML library is installed. Lines inside a `run: |` block are shell, not YAML, and are skipped."""
+    import re
+    problems, block_indent = [], None
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if block_indent is not None:
+            if indent > block_indent:
+                continue
+            block_indent = None
+        m = re.match(r"^(\s*)(?:-\s+)?[\w.-]+:\s+(.*)$", line)
+        if not m:
+            continue
+        value = re.split(r"\s#", m.group(2), 1)[0].strip()
+        if value[:1] in ("|", ">"):
+            block_indent = indent
+            continue
+        if not value or value[:1] in "\"'[{&*!%@`":
+            continue
+        if ": " in value or value.endswith(":"):
+            problems.append("line %d: %s" % (number, line.strip()))
+    return problems
+
+
+def test_the_checker_finds_the_error_that_broke_the_first_kw70_merge():
+    broken = "jobs:\n  test:\n    steps:\n      - name: Test timing report (advisory: warns, never fails the run)\n        run: echo hi\n"
+    assert plain_scalar_problems(broken) == ["line 4: - name: Test timing report (advisory: warns, never fails the run)"]
+    fine = ('jobs:\n  test:\n    steps:\n      - name: "Quoted (advisory: ok)"\n        run: |\n          echo "a: b"\n'
+            "      - name: Plain - no colon here  # a comment: with a colon\n        run: x\n        with:\n          path: .legacy_cache   # note: fine\n")
+    assert plain_scalar_problems(fine) == []
+
+
+def test_the_ci_workflow_is_valid_yaml_for_github():
+    text = read(".github", "workflows", "tests.yml")
+    assert plain_scalar_problems(text) == []
+    try:                                                              # a full parse as well when a YAML library happens to be installed
+        import yaml
+    except ImportError:
+        return
+    steps = yaml.safe_load(text)["jobs"]["test"]["steps"]
+    assert steps and all(("run" in s) or ("uses" in s) for s in steps)
+
+
 # ---------------------------------------------------------------- the written workflow
 def test_the_release_guide_says_when_and_how_the_core_set_is_updated():
     guide = read("docs", "release-guide.md")
