@@ -1,0 +1,336 @@
+{
+ "_about": "KW-71 backfill: 'PROPOSED' impacts are Claude Code's proposals for the Quality Manager to confirm or correct (remove the word PROPOSED in Excel, or tell Claude Code); the others are confirmed from the item's own record (a QM-001 ref or 'no requirement changed'). 'register' lists the refs the manual already carries.",
+ "impacts": [
+  {
+   "id": "KW-01",
+   "impact": "Record / control changed - a standalone Notes section was added to the production log (QM-001 B14)"
+  },
+  {
+   "id": "KW-02",
+   "impact": "PROPOSED Record / control changed - uploaded photos can be replaced or deleted, which the manual's record-control wording may need to say"
+  },
+  {
+   "id": "KW-03",
+   "impact": "Record / control changed - photos are shrunk in the browser and the originals are not kept (QM-001 decision C11)"
+  },
+  {
+   "id": "KW-04",
+   "impact": "PROPOSED Record / control changed - photos are backed up to SharePoint and purged from the server after a set age (retention)"
+  },
+  {
+   "id": "KW-05",
+   "impact": "Requirement relaxed - odour and odour intensity are no longer required fields (QM-001 decision C10)"
+  },
+  {
+   "id": "KW-06",
+   "impact": "PROPOSED None - an optional observation, no required field"
+  },
+  {
+   "id": "KW-07",
+   "impact": "PROPOSED None - shows who has a card open; no requirement involved"
+  },
+  {
+   "id": "KW-08",
+   "impact": "Requirement changed - the idle timeout is a setting and the behaviour at timeout was decided (QM-001 B15 / C16)"
+  },
+  {
+   "id": "KW-10",
+   "impact": "Requirement changed - Homogenization tank selection 2A / 2B / both is required, with per-tank entries (QM-001 decision C13)"
+  },
+  {
+   "id": "KW-11",
+   "impact": "PROPOSED Requirement changed - the solids-loading process check is recorded per tank (2A and 2B), following QM-001 C13"
+  },
+  {
+   "id": "KW-12",
+   "impact": "PROPOSED None - SOP links are shown beside each QC check; the SOPs themselves are unchanged"
+  },
+  {
+   "id": "KW-13",
+   "impact": "Requirement changed - the required sample points are locked and cannot be removed or reduced (QM-001 decision C12)"
+  },
+  {
+   "id": "KW-14",
+   "impact": "PROPOSED None - a summary table on the sample point card"
+  },
+  {
+   "id": "KW-15",
+   "impact": "Requirement relaxed - extraction can be bypassed and its fields are then not required (QM-001 B11 / C14)"
+  },
+  {
+   "id": "KW-16",
+   "impact": "PROPOSED None - follows the extraction bypass already recorded in QM-001 B11 / C14 (KW-15)"
+  },
+  {
+   "id": "KW-17",
+   "impact": "PROPOSED None - moves a sample point within the section"
+  },
+  {
+   "id": "KW-18",
+   "impact": "Requirement relaxed - % moisture is required for one of centrifuge or screw press solids, not both (QM-001 C15)"
+  },
+  {
+   "id": "KW-19",
+   "impact": "PROPOSED None - fills a plan value automatically from a value already recorded"
+  },
+  {
+   "id": "KW-20",
+   "impact": "PROPOSED None - display of totals only"
+  },
+  {
+   "id": "KW-21",
+   "impact": "PROPOSED None - a default of 0 for a required field"
+  },
+  {
+   "id": "KW-23",
+   "impact": "PROPOSED Requirement changed - the supplier on a receipt must be chosen from the approved supplier list (no free text)"
+  },
+  {
+   "id": "KW-25",
+   "impact": "PROPOSED None - run summary card layout"
+  },
+  {
+   "id": "KW-27",
+   "impact": "PROPOSED None - shows a sample count on the finalize card"
+  },
+  {
+   "id": "KW-28",
+   "impact": "PROPOSED Record / control changed - amendment notes are shown in the production-log review before release"
+  },
+  {
+   "id": "KW-29",
+   "impact": "PROPOSED Requirement changed - a submitted amendment sends the run back through product release"
+  },
+  {
+   "id": "KW-30",
+   "impact": "PROPOSED None - presentation of the review screen only"
+  },
+  {
+   "id": "KW-31",
+   "impact": "Record / control changed - the finished-good record shows the actual final TDS and pH (QM-001 B13)"
+  },
+  {
+   "id": "KW-32",
+   "impact": "Requirement added - an intermediate stage before the finished good is assigned (QM-001 B17 / C17)"
+  },
+  {
+   "id": "KW-33",
+   "impact": "PROPOSED Requirement changed - the default retention period for retention samples is 24 months (the manual may say 12)"
+  },
+  {
+   "id": "KW-34",
+   "impact": "PROPOSED None - hides two catalogue columns"
+  },
+  {
+   "id": "KW-35",
+   "impact": "PROPOSED None - a default filter on the analysis catalogue"
+  },
+  {
+   "id": "KW-43",
+   "impact": "PROPOSED None - a per-user display setting"
+  },
+  {
+   "id": "KW-46",
+   "impact": "Requirement changed - organic and non-organic reagents are separate types in the production log (QM-001 decision C20)"
+  },
+  {
+   "id": "KW-51",
+   "impact": "PROPOSED Record / control changed - an administrator can free a stuck tote, and the change is audit-logged"
+  },
+  {
+   "id": "KW-59",
+   "impact": "Requirement added - ORP (mV) is a required field in the Homogenization and Packaging QC checks (QM-001 decision C18)"
+  },
+  {
+   "id": "KW-60",
+   "impact": "PROPOSED Record / control changed - the live database was wiped for a clean start; the cut-over note is a QM-001 record (Ref to be added once signed)"
+  },
+  {
+   "id": "KW-61",
+   "impact": "None - no requirement changed (recorded in the item's Notes at release)"
+  },
+  {
+   "id": "KW-62",
+   "impact": "None - no requirement changed (recorded in the item's Notes at release)"
+  },
+  {
+   "id": "KW-63",
+   "impact": "PROPOSED Requirement changed - Separation requires % moisture for both solids streams, reversing C15 (KW-18), and adds required liquid fields; an entry is still needed"
+  },
+  {
+   "id": "KW-64",
+   "impact": "PROPOSED Record / control changed - nine historical production runs were entered retrospectively (QM-001 note row S17, decisions D18 to D20)"
+  },
+  {
+   "id": "KW-65",
+   "impact": "None - no requirement changed (recorded in the item's Notes at release)"
+  },
+  {
+   "id": "KW-66",
+   "impact": "PROPOSED Record / control changed - the change log is a controlled record with one writer, backups and a read-only copy"
+  },
+  {
+   "id": "KW-67",
+   "impact": "None - no requirement changed (recorded in the item's Notes at release)"
+  },
+  {
+   "id": "KW-68",
+   "impact": "None - no requirement changed (recorded in the item's Notes at release)"
+  },
+  {
+   "id": "KW-69",
+   "impact": "None - no requirement changed (recorded in the item's Notes at release)"
+  },
+  {
+   "id": "KW-70",
+   "impact": "PROPOSED None - test and CI tooling only; no product or record requirement involved"
+  },
+  {
+   "id": "KW-79",
+   "impact": "PROPOSED None - change-log classification columns and layout; no requirement involved"
+  },
+  {
+   "id": "KW-81",
+   "impact": "PROPOSED Requirement added - an approved-supplier programme with supplier records, approval status, review dates and documents (draft note QM-001_Rev5.1_change_note_KW-81_Suppliers)"
+  },
+  {
+   "id": "KW-82",
+   "impact": "PROPOSED Record / control changed - receiving records can be filled from an uploaded invoice, always confirmed by a person (combined draft note)"
+  },
+  {
+   "id": "KW-83",
+   "impact": "PROPOSED Record / control changed - safety data sheets from the controlled SharePoint library are linked to supplier records (draft note row S6)"
+  },
+  {
+   "id": "KW-86",
+   "impact": "PROPOSED Record / control changed - each reagent item is one specific product (manufacturer, grade, form), changes are logged (combined draft note)"
+  },
+  {
+   "id": "KW-88",
+   "impact": "PROPOSED Record / control changed - a recorded review of a safety data sheet, separate from the issue date (combined draft note)"
+  },
+  {
+   "id": "KW-89",
+   "impact": "PROPOSED Record / control changed - item master data: stable keys, a locked Used IBC pool, administrator-only rename (combined draft note)"
+  },
+  {
+   "id": "KW-90",
+   "impact": "PROPOSED Record / control changed - containers and finished-good labels can be renamed, stored records keep the old text (draft note rows S15, D14, D15)"
+  },
+  {
+   "id": "KW-91",
+   "impact": "PROPOSED Record / control changed - an administrator can correct a received lot's cost, pack and quantity, logged (draft note rows S16, D16, D17)"
+  },
+  {
+   "id": "KW-94",
+   "impact": "PROPOSED Record / control changed - release status, checklist, hold reasons, and a hold can be lifted only when the gate passes (draft note row S18, D21, D22)"
+  }
+ ],
+ "register": [
+  {
+   "ref": "B11",
+   "kw_items": [
+    "KW-15"
+   ],
+   "date": "2026-10-19"
+  },
+  {
+   "ref": "B13",
+   "kw_items": [
+    "KW-31"
+   ],
+   "date": "2026-10-19"
+  },
+  {
+   "ref": "B14",
+   "kw_items": [
+    "KW-01"
+   ],
+   "date": "2026-10-19"
+  },
+  {
+   "ref": "B15",
+   "kw_items": [
+    "KW-08"
+   ],
+   "date": "2026-10-19"
+  },
+  {
+   "ref": "B17",
+   "kw_items": [
+    "KW-32"
+   ],
+   "date": "2026-10-20"
+  },
+  {
+   "ref": "C10",
+   "kw_items": [
+    "KW-05"
+   ],
+   "date": "2026-10-19"
+  },
+  {
+   "ref": "C11",
+   "kw_items": [
+    "KW-03"
+   ],
+   "date": "2026-10-19"
+  },
+  {
+   "ref": "C12",
+   "kw_items": [
+    "KW-13"
+   ],
+   "date": "2026-10-19"
+  },
+  {
+   "ref": "C13",
+   "kw_items": [
+    "KW-10"
+   ],
+   "date": "2026-10-19"
+  },
+  {
+   "ref": "C14",
+   "kw_items": [
+    "KW-15"
+   ],
+   "date": "2026-10-19"
+  },
+  {
+   "ref": "C15",
+   "kw_items": [
+    "KW-18"
+   ],
+   "date": "2026-10-19"
+  },
+  {
+   "ref": "C16",
+   "kw_items": [
+    "KW-08"
+   ],
+   "date": "2026-10-19"
+  },
+  {
+   "ref": "C17",
+   "kw_items": [
+    "KW-32"
+   ],
+   "date": "2026-10-20"
+  },
+  {
+   "ref": "C18",
+   "kw_items": [
+    "KW-59"
+   ],
+   "date": "2026-10-21"
+  },
+  {
+   "ref": "C20",
+   "kw_items": [
+    "KW-46"
+   ],
+   "date": "2026-10-21"
+  }
+ ]
+}

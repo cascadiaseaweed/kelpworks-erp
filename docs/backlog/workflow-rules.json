@@ -1,6 +1,6 @@
 {
   "title": "Change Log Workflow Rules",
-  "subtitle": "Revised 2026-10-22 (KW-66, KW-67; N. Wrana). Applies to Claude (chat), Claude Code, KelpWorks and people editing in Excel. Written from docs/backlog/workflow-rules.json by changelog_write.py --rules-sheet: change it there.",
+  "subtitle": "Revised 2026-10-29 (KW-66, KW-67, KW-71; N. Wrana). Applies to Claude (chat), Claude Code, KelpWorks and people editing in Excel. Written from docs/backlog/workflow-rules.json by changelog_write.py --rules-sheet: change it there.",
   "sections": [
     {
       "heading": "1. Where the change log lives",
@@ -17,8 +17,8 @@
       "heading": "2. Column ownership (header colour on Change Log)",
       "columns": ["Owner", "Columns", "Rules"],
       "rows": [
-        ["Intake - Claude (chat), only through inbox notes", "A-M: ID ... Acceptance Criteria; Open Decisions columns A-D; KW plan sheets", "Never writes the workbook. Leaves a note (new item, revision, new decision, plan cells); Claude Code applies it with --apply-inbox. New rows get the next free ID from the tool. A revision is accepted only while Status is Not started, Deferred or Blocked (never In progress or On staging; for a Released item raise a new item), must say what changed (appended to Context / Rationale as 'Revised <date> (Claude chat): <what changed>') and is rejected if the item changed since the note was written. If the scope changes while Approved to Start is Y, the human clears it so the item is approved again. Never edits Status, Notes, Claude Code columns or human columns."],
-        ["Claude Code (blue)", "N Status, P Notes, R PR #, S Released Date, V QM-001 Ref; D Type and E Touches (classification)", "Through python tools/changelog_write.py only. Status: Not started -> In progress -> On staging -> Released, or Blocked. Never sets Deferred / Won't do. Never starts an item unless Approved to Start = Y (or Pre-rule). Released needs a PR # and a Released Date. Type (one value from a fixed list) and Touches (one or more areas) may be set on an item in any status, to fix a classification; a change to only those two is not stamped in Row Updated (section 6)."],
+        ["Intake - Claude (chat), only through inbox notes", "A-M: ID ... Acceptance Criteria; Open Decisions columns A-D; KW plan sheets", "Never writes the workbook. Leaves a note (new item, revision, new decision, plan cells, or a QM-001 register entry); Claude Code applies it with --apply-inbox. New rows get the next free ID from the tool. A revision is accepted only while Status is Not started, Deferred or Blocked (never In progress or On staging; for a Released item raise a new item), must say what changed (appended to Context / Rationale as 'Revised <date> (Claude chat): <what changed>') and is rejected if the item changed since the note was written. If the scope changes while Approved to Start is Y, the human clears it so the item is approved again. Never edits Status, Notes, Claude Code columns or human columns."],
+        ["Claude Code (blue)", "N Status, P Notes, R PR #, S Released Date, V QM-001 Ref, Y QM-001 Impact; D Type and E Touches (classification)", "Through python tools/changelog_write.py only. Status: Not started -> In progress -> On staging -> Released, or Blocked. Never sets Deferred / Won't do. Never starts an item unless Approved to Start = Y (or Pre-rule). Released needs a PR #, a Released Date and a confirmed QM-001 Impact (section 7). Type (one value from a fixed list) and Touches (one or more areas) may be set on an item in any status, to fix a classification; a change to only Type, Touches or QM-001 Impact is not stamped in Row Updated (sections 6 and 7)."],
         ["Human (orange)", "O Owner, Q Approved to Start, T Verified By, U Verified Date; Open Decisions Decided By and Decision", "Owner is N. Wrana by default: the tool fills it on every new item and filled the existing blanks once; change any cell in Excel. Approves work before it starts. Verifies on live after Released. Sets Deferred / Won't do (Claude Code records the reason in Notes). Answers decisions (Claude Code can record an answer given in chat: --decision)."],
         ["Every writer (grey)", "W Row Updated, X Updated By", "Stamped by the tool on every write."],
         ["KelpWorks ERP", "Read only", "Looks up columns by header name; must not write to this file."]
@@ -29,7 +29,7 @@
       "columns": ["Stage", "Who", "Evidence"],
       "rows": [
         ["Approved", "Human", "Approved to Start = Y"],
-        ["Released", "Claude Code", "PR # merged, Released Date, note of what changed, QM-001 ref if a requirement changed"],
+        ["Released", "Claude Code", "PR # merged, Released Date, note of what changed, a confirmed QM-001 Impact (and a QM-001 Ref on the register when the manual must change)"],
         ["Verified", "Human", "Checked on live; Verified By + Verified Date. Only now is the change closed (ISO 9001 change control)."]
       ]
     },
@@ -52,7 +52,8 @@
         ["new_item", "Adds a row (Status Not started, Approved to Start blank).", "A required field is missing (Type and Touches are required on every new item); Type or Touches is not from the lists in section 6; Priority or Claude Code Mode is not a value already used; the Change Request is already on the sheet; the note_id was used before."],
         ["revision", "Changes named intake columns (A-M) of an existing item and appends a 'Revised' line to Context / Rationale.", "The item is In progress, On staging, Released or Won't do; the item changed since based_on.Row Updated (stale); no revision_summary; a column that is not an intake column is named."],
         ["new_decision", "Adds a row to Open Decisions (ID, Decision Needed, Options Discussed, Recommendation).", "The ID is not an item; the same ID and question exist; Decided By or Decision is named (a human records those)."],
-        ["plan_cells", "Sets named cells on a sheet called 'KW-<number> ... Plan' (cell, was, now).", "The sheet name is not a KW plan sheet; a cell's text is not 'was' now (stale); the row does not exist; more than 50 cells."]
+        ["plan_cells", "Sets named cells on a sheet called 'KW-<number> ... Plan' (cell, was, now).", "The sheet name is not a KW plan sheet; a cell's text is not 'was' now (stale); the row does not exist; more than 50 cells."],
+        ["qm_entry", "Drafts a manual change on the QM-001 Changes register (kw_items, section, change, before, after, insert_after, reason); the next C-number is assigned. With ref, revises an entry that has no decision yet.", "A kw_items item is not on the Change Log; change is not Replace, Add or Delete or lacks the wording it needs; a Quality Manager column is named (those are human-only); the sheet does not exist yet (--qm-setup); the entry is a duplicate; the entry in ref is already decided or drafted."]
       ]
     },
     {
@@ -64,7 +65,18 @@
       ]
     },
     {
-      "heading": "7. If something looks wrong",
+      "heading": "7. QM-001 impact and the register of manual changes (KW-71)",
+      "columns": ["Item", "What it is", "Rules"],
+      "rows": [
+        ["QM-001 Impact (Change Log column Y)", "What the change does to the Quality Manual, for EVERY item: '<class> - <one line>'. Classes: None; Requirement changed; Requirement added; Requirement relaxed; Record / control changed. 'None - bug fix, no requirement involved' is always allowed.", "Proposed when the item is raised, confirmed in the plan, stated again at release. Claude Code writes it (python tools/changelog_write.py --id KW-nn \"QM-001 Impact=...\"). A value starting PROPOSED is an unconfirmed backfill and does not count. A change to only this column is not stamped in Row Updated."],
+        ["Release gate", "The tool refuses Status = Released unless the item has a confirmed QM-001 Impact.", "A class other than None also needs a QM-001 Ref that is on the QM-001 Changes sheet. It applies when Released is set; editing Notes on a released item is not judged. A workbook without the column refuses Released and says to run --qm-setup."],
+        ["QM-001 Changes (sheet)", "One row per manual change: Ref (the manual's own C-numbers continue), Date, KW items, Manual section / clause, Change (Replace, Add or Delete), Before, After, Insert after, Reason, Drafted by, then the Quality Manager's columns.", "Claude Code drafts a row (--qm-entry file.json) or Claude (chat) leaves a qm_entry note. QM Decision (Approved, Rejected, Needs change), Decided By, Decision Date, Manual Revision and Entered in Manual (date) are the Quality Manager's: the tool never writes them. Drafted In is written by the draft-revision tool. Rows with Drafted by 'backfill' are refs the manual already carried before the register existed."],
+        ["Report", "python tools/changelog_write.py --qm-report (also published as QM-001_Status_Report.txt beside the SharePoint copy after every write).", "Lists released items with no confirmed impact, entries waiting for the Quality Manager, and approved entries not yet in the manual (not yet drafted, or drafted and waiting to be entered)."],
+        ["Draft revision", "python tools/qm_draft_revision.py --rev 5.2 [--manual <a draft copy of the manual>]", "Writes a change list and, from a DRAFT copy of the manual, a copy with each approved change as a Word tracked change, into the drafts folder only. Never touches the controlled manual. The Quality Manager accepts the changes in Word, approves the revision in SharePoint, then enters Manual Revision and Entered in Manual on the register. Procedure: docs/qm001-change-tracking.md."]
+      ]
+    },
+    {
+      "heading": "8. If something looks wrong",
       "text": "Stop writing. Run 'python tools/changelog_write.py --backups', then '--restore <name>' (close Excel first; the current file is backed up before it is replaced), and tell the approver. If the SharePoint copy is older than the master, run '--publish'."
     }
   ]

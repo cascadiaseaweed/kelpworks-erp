@@ -24,6 +24,9 @@ DEFAULT_SNAPSHOT = SHAREPOINT_FOLDER + "\\" + CHANGE_LOG_NAME
 DEFAULT_MIRROR = SHAREPOINT_FOLDER + "\\Backups"
 DEFAULT_INBOX = SHAREPOINT_FOLDER + "\\Inbox"
 BACKUP_KEEP = 30
+# KW-71: the working folder for DRAFT revisions of the Quality Manual (QM-001). tools/qm_draft_revision.py reads a draft copy of the manual from here and writes only here: never the
+# controlled copy. KELPWORKS_QM_DRAFTS points it somewhere else (another PC, or the tests).
+DEFAULT_DRAFTS = r"C:\Users\nwran\OneDrive - Cascadia Seaweed Corp\Operations - Operations\Processing Operations\QAQC\1_General\General_WIP_Drafts"
 
 
 def _same(a, b):
@@ -55,6 +58,11 @@ def mirror_for(master=None):
 def inbox_for(master=None):
     """The folder Claude (chat) leaves notes in (None = not configured)."""
     return _for(master, "KELPWORKS_INBOX", DEFAULT_INBOX)
+
+
+def drafts_folder():
+    """The folder for DRAFT Quality Manual revisions (the only place qm_draft_revision.py reads a manual from or writes to)."""
+    return os.environ.get("KELPWORKS_QM_DRAFTS") or DEFAULT_DRAFTS
 
 
 def backup_dir(master=None):

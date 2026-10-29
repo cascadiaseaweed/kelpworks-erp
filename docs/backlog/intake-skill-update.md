@@ -66,3 +66,8 @@ A screen-only item: `"Type": "User experience", "Touches": "Feedstock inventory;
 ### In the skill's description
 
 Say that every new change request is classified with a Type and Touches from fixed lists and that the user confirms them before the note is written.
+
+### QM-001 impact (KW-71)
+
+Every item also records what it does to the Quality Manual (QM-001), but that is **not** a note field: Claude Code writes the `QM-001 Impact` column when the item is planned and released, so the skill must not send it. When the user asks the skill to draft a manual change
+for an item, it can leave a `qm_entry` note (format in `docs/backlog/inbox-note-format.md`: kw_items, section, change = Replace / Add / Delete, before, after, insert_after for an Add, reason). It never sets a decision: the Quality Manager decides each entry in Excel.

@@ -1,6 +1,6 @@
 # SOP: KelpWorks ERP change requests (request to verified on live)
 
-Document number: (to be assigned when this is filed in `03_SOPs`)   Revision: A (draft, KW-66, 2026-10-22)   Owner: N. Wrana
+Document number: (to be assigned when this is filed in `03_SOPs`)   Revision: B (draft, KW-71, 2026-10-29)   Owner: N. Wrana
 
 ## 1. Purpose
 
@@ -20,11 +20,11 @@ Every change to the KelpWorks ERP software (screens, calculations, reports, labe
 | Intake chat | Claude (chat) | Turns a request into a structured note in the Inbox. Never writes the workbook. |
 | Change approver | N. Wrana | Reviews each new item, sets **Approved to Start** (Y / Pre-rule) or **Deferred / Won't do**, answers open decisions, approves plans, merges pull requests, verifies on live. Only a human sets those. |
 | Builder | Claude Code | Applies inbox notes, plans, builds with tests, reports, opens pull requests when told, records status in the change log through `tools/changelog_write.py` only. |
-| Quality Manager | designated user | Is told (QM-001 change list) when a change touches release, Certificate of Analysis, specifications, required fields, records or document control, or the change log's own controls. |
+| Quality Manager | designated user (N. Wrana) | Decides every entry on the QM-001 Changes register (Approved / Rejected / Needs change) when a change touches release, Certificate of Analysis, specifications, required fields, records or document control, or the change log's own controls; approves each revision of the manual and records when an approved change is entered in it. Those columns are the only ones nobody else writes. |
 
 ## 4. Definitions and where things are
 
-- **Change log** = the workbook `LOG_KelpWorks_ChangeControl.xlsx`, sheets Change Log, Open Decisions, Workflow Rules, Summary. One row per item (`KW-nn`).
+- **Change log** = the workbook `LOG_KelpWorks_ChangeControl.xlsx`, sheets Change Log, Open Decisions, QM-001 Changes, Workflow Rules, Summary. One row per item (`KW-nn`). The QM-001 Changes sheet is the register of Quality Manual changes (one row per change, numbered with the manual's own C-numbers).
 - **Master** = `C:\KelpWorks\ChangeControl\LOG_KelpWorks_ChangeControl.xlsx` (outside OneDrive). The only file that is written. The user edits it in Excel for the human columns; tools write the rest.
 - **SharePoint copy** = the same file name, read-only, in `QAQC > KelpWorks ERP > Change_Control`. Refreshed after every tool write. Read it; never edit it.
 - **Backups** = `C:\KelpWorks\ChangeControl\Backups` and `Change_Control\Backups` (newest 30 each), one taken before every write.
@@ -46,7 +46,7 @@ Every change to the KelpWorks ERP software (screens, calculations, reports, labe
 | 8 | Change approver | Read the report; ask for changes. When satisfied: "commit, push and open a pull request". Wait for the green `test` check. **The approver merges** (Render deploys automatically). | Pull request; merge. |
 | 9 | Claude Code | When told it is live: mark **Released** with PR # and date (`--id KW-nn Status=Released "PR #=nn" "Released Date=YYYY-MM-DD"`), add the live commit to `tests/legacy_commits.txt` (small pull request), refresh the CSV snapshot, delete merged branches. | Status; PR #; Released Date. |
 | 10 | Change approver | Check the change on live. Fill **Verified By** and **Verified Date** in the master and run `--publish`. Released is not done until this is filled. | Verified By / Date. |
-| 11 | Quality Manager | If step 6 flagged release, CoA, specifications, required fields, records or document control (or this procedure), add it to the QM-001 change list; enter the reference in the QM-001 Ref column (Claude Code can record it). | QM-001 Ref. |
+| 11 | Claude Code + Quality Manager | **Every item has a QM-001 impact** (KW-71): proposed when the item is raised, confirmed in the plan (step 6), and recorded before step 9 as **QM-001 Impact** (`None - <reason>`, Requirement changed / added / relaxed, or Record / control changed). The tool refuses Released without it. If the manual must change (anything but None), Claude Code drafts the change on the **QM-001 Changes** register (`--qm-entry`: section, before, after, reason) and records its Ref in **QM-001 Ref**. The Quality Manager decides each entry in Excel (QM Decision, Decided By, Decision Date: Approved, Rejected or Needs change). Once approved, Claude Code generates a DRAFT revision (`python tools/qm_draft_revision.py --rev <rev> --manual <draft copy>`: a change list and a copy of the manual with tracked changes); the Quality Manager accepts the changes in Word, approves the revision through the normal document-control process, then enters Manual Revision and Entered in Manual on the register. Guide: `docs/qm001-change-tracking.md`. | QM-001 Impact; QM-001 Ref; register entry; decision; draft revision. |
 
 Rules that apply at every step:
 - Claude Code never starts an item without Approved to Start Y / Pre-rule, never sets Deferred / Won't do, and never merges.
@@ -71,3 +71,4 @@ The change log (master and SharePoint copy), its backups, the inbox result files
 | Rev | Date | Change | By |
 |---|---|---|---|
 | A | 2026-10-22 | First draft: master outside OneDrive, read-only SharePoint copy, backups, inbox (KW-66). | Claude Code, for N. Wrana |
+| B | 2026-10-29 | QM-001 impact on every item, the QM-001 Changes register, the Released gate, the status report and the draft-revision generator (KW-71). | Claude Code, for N. Wrana |
