@@ -13,6 +13,11 @@ The MASTER is C:\\KelpWorks\\ChangeControl\\LOG_KelpWorks_ChangeControl.xlsx (ou
     python tools/changelog_write.py --playbook-sheet [--playbook-file f.json]   # rewrite the Claude Code Playbook sheet from docs/backlog/claude-code-playbook.json
     python tools/changelog_write.py --classify-setup              # one time (KW-79): add Touches after Type, remove the Claude Code Prompt column, a Type drop-down
     python tools/changelog_write.py --default-owner               # one time (KW-79): Owner = N. Wrana where blank (and the spelling N.Wrana); no other name is changed
+    python tools/changelog_write.py --qm-setup                    # one time (KW-71): add the 'QM-001 Impact' column and the 'QM-001 Changes' register sheet
+    python tools/changelog_write.py --qm-entry entry.json         # draft a manual change on the register: {"kw_items": ["KW-99"], "section": "...", "change": "Replace|Add|Delete", "before": "...", "after": "...", "reason": "..."}
+    python tools/changelog_write.py --qm-backfill backfill.json   # one time: impacts for Released items (only where blank) and register rows for the refs the manual already carries
+    python tools/changelog_write.py --qm-drafted C21,C22 --text "<draft file, date>"   # note which draft revision approved entries went into (qm_draft_revision.py calls this)
+    python tools/changelog_write.py --qm-report                   # read-only: released items with no confirmed impact, entries waiting for the Quality Manager, approved entries not yet in the manual
     python tools/changelog_write.py --publish                     # copy the master to SharePoint now (after a hand edit in Excel)
     python tools/changelog_write.py --backups                     # list the backups (local + SharePoint mirror)
     python tools/changelog_write.py --restore latest|<backup name># put a backup back as the master (backs the current one up first)
@@ -20,8 +25,10 @@ The MASTER is C:\\KelpWorks\\ChangeControl\\LOG_KelpWorks_ChangeControl.xlsx (ou
 
 What it enforces (the 'Workflow Rules' sheet of the workbook):
 
-* Ownership: item updates may write only Status, Notes, PR #, Released Date, QM-001 Ref, Type and Touches (Row Updated and Updated By are stamped automatically, except when only Type /
-  Touches change: they classify a request and do not change it). Every other column belongs to the intake chat or to a human, and is refused. The intake columns change, and rows are added,
+* QM-001 (KW-71): an item cannot be Released until its QM-001 Impact is recorded and confirmed ('<class> - <one line>', not PROPOSED); a class other than None also needs a QM-001 Ref that is
+  on the 'QM-001 Changes' sheet. The Quality Manager's columns on that sheet (QM Decision, Decided By, Decision Date, Manual Revision, Entered in Manual) are human-only.
+* Ownership: item updates may write only Status, Notes, PR #, Released Date, QM-001 Ref, QM-001 Impact, Type and Touches (Row Updated and Updated By are stamped automatically, except when only
+  Type / Touches / QM-001 Impact change: they classify a request and do not change it). Every other column belongs to the intake chat or to a human, and is refused. The intake columns change, and rows are added,
   ONLY from a valid inbox note. A new item needs a Type (one value from a fixed list) and Touches (one or more areas) once the workbook has the Touches column, and gets Owner N. Wrana.
 * Status: Not started, In progress, On staging, Released or Blocked. Deferred and Won't do are a human's decision and are refused; so is moving an item OUT of them.
   In progress / On staging / Released need Approved to Start = Y or Pre-rule. Released also needs a PR # and a Released Date (given now or already in the row).
@@ -57,7 +64,10 @@ SHEET = "Change Log"
 DECISIONS = "Open Decisions"
 RULES = "Workflow Rules"
 RULES_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "backlog", "workflow-rules.json")
-OWNED = ["Status", "Notes", "PR #", "Released Date", "QM-001 Ref", "Type", "Touches"]
+IMPACT = "QM-001 Impact"                               # KW-71: what a change does to the Quality Manual (QM-001), recorded for EVERY item before it can be Released
+QM_SHEET = "QM-001 Changes"                            # the register of manual changes (one row per change; the Quality Manager's columns are human-only)
+IMPACT_CLASSES = ["None", "Requirement changed", "Requirement added", "Requirement relaxed", "Record / control changed"]
+OWNED = ["Status", "Notes", "PR #", "Released Date", "QM-001 Ref", "Type", "Touches", IMPACT]
 STAMPS = {"Row Updated": lambda: datetime.date.today().isoformat(), "Updated By": lambda: "Claude Code"}
 STATUSES = ["Not started", "In progress", "On staging", "Released", "Blocked"]
 HUMAN_STATUSES = ["Deferred", "Won't do"]
@@ -73,7 +83,7 @@ TYPES = ["Security & hardening", "Data integrity & traceability", "Quality & com
 TOUCHES = ["Production log", "Feedstock inventory", "Pre-processing", "Inventory items", "CIP / SIP log", "Samples", "Product release", "Finished goods / shipping", "Documents / SOPs",
            "Admin / users", "Settings / Calculations", "Reports / QC charts", "Records archive / backups", "Database / schema", "Change-log tooling", "Labels / printing", "New module",
            "Whole app", "Outside KelpWorks"]
-METADATA = {"Type", "Touches"}                         # they describe a request, never change its scope: a change to only these is not stamped (Row Updated stays the last REAL change)
+METADATA = {"Type", "Touches", IMPACT}                 # they describe a request, never change its scope: a change to only these is not stamped (Row Updated stays the last REAL change)
 DEFAULT_OWNER = "N. Wrana"                             # every task has an owner by default; a person changes the cell in Excel
 LAYOUT_INSERT, LAYOUT_AFTER, LAYOUT_DELETE, TOUCHES_WIDTH = "Touches", "Type", "Claude Code Prompt", 30
 PLAYBOOK = "Claude Code Playbook"
@@ -90,7 +100,7 @@ NOTE_FORMAT = r"""KelpWorks change log - how to leave a note here (Claude chat)
 
 Write ONE file per note into this folder, named <note_id>.json (UTF-8). Do not edit the workbook. Claude Code applies the notes (tools/changelog_write.py --apply-inbox);
 applied notes move to processed\, rejected ones to rejected\, each with <note_id>.result.json saying what happened or why not. The workbook in Change_Control is a read-only copy.
-note_id must be unique for ever (letters, digits, dot, dash, underscore; 6-80 characters). Four kinds of note:
+note_id must be unique for ever (letters, digits, dot, dash, underscore; 6-80 characters). Five kinds of note:
 
 1. NEW ITEM
 {"note_id": "chat-20261022-001", "kind": "new_item", "from": "Claude (chat)", "created": "2026-10-22T18:00:00Z",
@@ -120,6 +130,13 @@ The ID must be an item on the Change Log. Decided By and Decision are a human's:
  "cells": [{"cell": "C37", "was": "", "now": "2026-10-23 NW"}]}
 The sheet name must be KW-<number> <words> Plan. "was" is the text the cell holds in the copy you read; if it differs now, the note is rejected as stale. At most 50 cells per note,
 only cells in rows that exist.
+
+5. QM-001 REGISTER ENTRY (a change the Quality Manual needs: Claude drafts it, only the Quality Manager decides it)
+{"note_id": "chat-20261029-005", "kind": "qm_entry", "from": "Claude (chat)", "created": "...",
+ "fields": {"kw_items": ["KW-99"], "section": "2.2.2 User Roles", "change": "Replace", "before": "<the current wording>", "after": "<the new wording>", "reason": "..."}}
+change is Replace (needs before and after), Add (needs after and insert_after: the start of the paragraph the new wording goes after) or Delete (needs before). Every kw_items entry must be an
+item on the Change Log. The next C-number is assigned and returned; with "ref" among the fields an entry that has no Quality Manager decision yet is revised instead. QM Decision, Decided By,
+Decision Date, Manual Revision and Entered in Manual are the Quality Manager's: a note cannot set them.
 
 Only the intake columns Module, Section, Type, Touches, Change Request, Context / Rationale, Transcript Time, Raised By, Priority, Lens, Claude Code Mode and
 Acceptance Criteria can be set on an item. Status, Notes, Approved to Start, PR #, Owner and every other column are refused. A note with the same note_id as an applied one, or a
@@ -327,6 +344,8 @@ def check_value(column, value, classified=False):
         if not picked:
             raise Refused("Touches needs at least one area from: %s" % "; ".join(TOUCHES))
         value = "; ".join(t for t in TOUCHES if t in picked)
+    elif column == IMPACT:
+        value = check_impact(value)
     else:
         value = check_text(column, value)
     return value
@@ -361,6 +380,10 @@ def plan_update(snap, xml, kw, setting):
             for need in ("PR #", "Released Date"):
                 if not (new.get(need) or current.get(need, "")):
                     raise Refused("%s cannot be Released without a %s (give it in the same call, or fill it in first)" % (kw, need))
+            if was != "Released":                                        # KW-71: the QM-001 impact is part of being Released (a repeat of the same status is not judged again)
+                if IMPACT not in snap.headers:
+                    raise Refused("%s cannot be Released: the workbook has no '%s' column yet. Run: python tools/changelog_write.py --qm-setup" % (kw, IMPACT))
+                impact_gate(snap, kw, new.get(IMPACT) if IMPACT in new else current.get(IMPACT, ""), new.get("QM-001 Ref") if "QM-001 Ref" in new else current.get("QM-001 Ref", ""))
     if all(current.get(h, "") == text for h, text in new.items()):
         return xml, [], {}                                               # already as asked: nothing is written, not even the stamps
     if not set(h for h, text in new.items() if current.get(h, "") != text) <= METADATA:
@@ -675,6 +698,476 @@ def plan_default_owner(snap):
         lines.append("%s: Owner: %s -> %s" % (kw, cur or "(blank)", DEFAULT_OWNER))
         expected[(SHEET, kw, "Owner")] = DEFAULT_OWNER
     return xml, lines, expected
+
+
+# ---- QM-001: the Impact column, the register of manual changes, the release gate, entries, backfill and the report (KW-71) ---------------------------------------------------------
+QM_COLUMNS = ["Ref", "Date", "KW items", "Manual section / clause", "Change", "Before", "After", "Insert after", "Reason", "Drafted by", "QM Decision", "Decided By", "Decision Date",
+              "Drafted In", "Manual Revision", "Entered in Manual (date)"]
+QM_WIDTHS = [8, 12, 14, 30, 11, 46, 46, 30, 40, 16, 15, 16, 14, 34, 14, 16]
+QM_HUMAN = ["QM Decision", "Decided By", "Decision Date", "Manual Revision", "Entered in Manual (date)"]            # only the Quality Manager writes these (in Excel): the tool never does
+QM_CHANGES = ["Replace", "Add", "Delete"]
+QM_DECISIONS = ["Approved", "Rejected", "Needs change"]
+QM_FIELDS = {"kw_items": "KW items", "section": "Manual section / clause", "change": "Change", "before": "Before", "after": "After", "insert_after": "Insert after", "reason": "Reason"}
+QM_CANDIDATES = ("KW-23", "KW-51", "KW-66")                                  # released items that look like they changed the manual: listed first in the report
+QM_BACKFILL = "backfill"                                                      # Drafted by: a ref the manual already carries (entered before the register existed): never chased
+IMPACT_WIDTH = 46
+REF_RE = re.compile(r"\b[BC]\d+\b")
+
+
+def impact_parts(value):
+    """(proposed, class, one line) of a well-formed impact ('Requirement changed - ...', optionally after PROPOSED), else None."""
+    v = (value or "").strip()
+    proposed = bool(re.match(r"(?i)proposed\s", v))
+    if proposed:
+        v = v.split(None, 1)[1] if len(v.split(None, 1)) > 1 else ""
+    m = re.match(r"^(.+?)\s+-\s+(.+)$", v, re.S)
+    if not m:
+        return None
+    cls = {c.lower(): c for c in IMPACT_CLASSES}.get(m.group(1).strip().lower())
+    line = m.group(2).strip()
+    return (proposed, cls, line) if cls and line else None
+
+
+def check_impact(value):
+    """Validate a QM-001 Impact and write it in its standard form: '<class> - <one line>' (an unconfirmed backfill proposal starts with PROPOSED)."""
+    value = check_text(IMPACT, value)
+    parts = impact_parts(value)
+    if not parts:
+        raise Refused("%s must be '<class> - <one line>' where class is one of: %s (for example 'None - bug fix, no requirement involved'); got '%s'" % (IMPACT, "; ".join(IMPACT_CLASSES), value or "blank"))
+    proposed, cls, line = parts
+    return ("PROPOSED " if proposed else "") + cls + " - " + line
+
+
+def table_rows(snap, name, xml=None):
+    """(headers {header: column letters}, [(row number, {header: text})]) of any sheet, row 1 being the headers."""
+    xml = xml if xml is not None else snap.files[snap.paths[name]].decode("utf-8")
+    headers = xl.header_columns(xml, snap.sst)
+    by_letter = {l: h for h, l in headers.items() if h}
+    rows = {}
+    for ref, c in xl.cells_of(xml):
+        col_, row_ = split_ref(ref)
+        if row_ > 1 and col_ in by_letter:
+            rows.setdefault(row_, {})[by_letter[col_]] = xl.cell_text(c, snap.sst).strip()
+    return headers, sorted(rows.items())
+
+
+def register_refs(snap, xml=None):
+    """The Refs on the QM-001 Changes sheet, or None when the workbook has no such sheet."""
+    if QM_SHEET not in snap.paths:
+        return None
+    return {r.get("Ref", "").upper() for _n, r in table_rows(snap, QM_SHEET, xml)[1] if r.get("Ref", "")}
+
+
+def impact_gate(snap, kw, impact, ref):
+    """Refuse Released unless the QM-001 impact is recorded, confirmed, and (for a change) backed by a register entry. Raises Refused."""
+    if not impact:
+        raise Refused("%s cannot be Released without a %s (give it in the same call, for example \"%s=None - bug fix, no requirement involved\")" % (kw, IMPACT, IMPACT))
+    parts = impact_parts(impact)
+    if not parts:
+        raise Refused("%s: %s '%s' is not '<class> - <one line>' (classes: %s)" % (kw, IMPACT, impact[:60], "; ".join(IMPACT_CLASSES)))
+    proposed, cls, _line = parts
+    if proposed:
+        raise Refused("%s cannot be Released: its %s is still PROPOSED (not confirmed). Confirm or correct it first (write it without the word PROPOSED)" % (kw, IMPACT))
+    if cls == "None":
+        return
+    refs = [r.upper() for r in REF_RE.findall(ref or "")]
+    if not refs:
+        raise Refused("%s cannot be Released: its %s is '%s', so the manual change needs a register entry. Draft it with --qm-entry, then give its Ref as QM-001 Ref" % (kw, IMPACT, cls))
+    have = register_refs(snap)
+    if have is None:
+        raise Refused("%s cannot be Released: the workbook has no '%s' sheet yet. Run: python tools/changelog_write.py --qm-setup" % (kw, QM_SHEET))
+    missing = [r for r in refs if r not in have]
+    if missing:
+        raise Refused("%s cannot be Released: QM-001 Ref %s is not on the '%s' sheet (draft the entry with --qm-entry first)" % (kw, ", ".join(missing), QM_SHEET))
+
+
+def next_ref(snap, register_xml=None):
+    """The next free C-number: one more than the highest C-number on the register or in any item's QM-001 Ref."""
+    used = []
+    _h, rows = table_rows(snap, SHEET)
+    for _n, r in rows:
+        used += [int(x) for x in re.findall(r"\bC(\d+)\b", r.get("QM-001 Ref", ""), re.I)]
+    if QM_SHEET in snap.paths:
+        for _n, r in table_rows(snap, QM_SHEET, register_xml)[1]:
+            used += [int(x) for x in re.findall(r"\bC(\d+)\b", r.get("Ref", ""), re.I)]
+    return "C%d" % (max(used, default=0) + 1)
+
+
+def qm_styles(snap):
+    """(header, body, human) cell styles taken from the Open Decisions sheet (an Excel-written sheet); None where the workbook has no such sheet."""
+    if DECISIONS not in snap.paths:
+        return None, None, None
+    xml = snap.files[snap.paths[DECISIONS]].decode("utf-8")
+    heads = xl.header_columns(xml, snap.sst)
+    last = letters(max([colnum(l) for l in heads.values()] or [1]))
+
+    def style_of(ref):
+        for r, c in xl.cells_of(xml):
+            if r == ref:
+                m = re.search(r'\bs="(\d+)"', c.split(">")[0])
+                return m.group(1) if m else None
+        return None
+    return style_of("A1"), style_of("A2"), style_of(last + "2")
+
+
+def build_qm_sheet(snap):
+    """The XML of an empty QM-001 Changes sheet, cloned in structure from the Open Decisions sheet (frozen header, widths, drop-downs on Change and QM Decision)."""
+    header_s, _body, _human = qm_styles(snap)
+    n = len(QM_COLUMNS)
+    s_attr = ' s="%s"' % header_s if header_s else ""
+    head = '<row r="1" spans="1:%d" ht="30" customHeight="1">%s</row>' % (n, "".join('<c r="%s1"%s t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>' % (letters(i), s_attr, xl.escape(h)) for i, h in enumerate(QM_COLUMNS, 1)))
+    cols = "".join('<col min="%d" max="%d" width="%s" customWidth="1"/>' % (i, i, w) for i, w in enumerate(QM_WIDTHS, 1))
+
+    def rule(header, values):
+        col_ = letters(QM_COLUMNS.index(header) + 1)
+        return ('<dataValidation type="list" allowBlank="1" showErrorMessage="1" errorTitle="%s" error="Choose a %s from the list." sqref="%s2:%s500"><formula1>"%s"</formula1></dataValidation>'
+                % (xl.escape(header), xl.escape(header), col_, col_, xl.escape(",".join(values))))
+    validations = '<dataValidations count="2">%s%s</dataValidations>' % (rule("Change", QM_CHANGES), rule("QM Decision", QM_DECISIONS))
+    od = snap.files[snap.paths[DECISIONS]].decode("utf-8") if DECISIONS in snap.paths else ""
+    root = re.match(r"(<\?xml[^>]*\?>\s*<worksheet\b[^>]*>)", od)
+    root = re.sub(r'\s+xr:uid="[^"]*"', "", root.group(1)) if root else ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                                                                         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">')
+    def pick(pat, default):
+        m = re.search(pat, od)
+        return m.group(0) if m else default
+    fmt = pick(r"<sheetFormatPr\b[^>]*/>", '<sheetFormatPr defaultRowHeight="15"/>')
+    margins = pick(r"<pageMargins\b[^>]*/>", '<pageMargins left="0.75" right="0.75" top="1" bottom="1" header="0.5" footer="0.5"/>')
+    page = pick(r"<pageSetup\b[^>]*/>", "")
+    view = ('<sheetViews><sheetView workbookViewId="0"><pane xSplit="1" ySplit="1" topLeftCell="B2" activePane="bottomRight" state="frozen"/><selection pane="topRight" activeCell="B1" sqref="B1"/>'
+            '<selection pane="bottomLeft" activeCell="A2" sqref="A2"/><selection pane="bottomRight" activeCell="B2" sqref="B2"/></sheetView></sheetViews>')
+    return "%s<dimension ref=\"A1:%s1\"/>%s%s<cols>%s</cols><sheetData>%s</sheetData>%s%s%s</worksheet>" % (root, letters(n), view, fmt, cols, head, validations, margins, page)
+
+
+def add_impact_column_xml(snap):
+    """Append the QM-001 Impact column after the last one (so the Summary sheet's whole-column formulas keep their letters). -> (sheet xml, workbook xml)."""
+    headers = snap.headers
+    named = sorted((colnum(l), h) for h, l in headers.items() if h)
+    if [n for n, _h in named] != list(range(1, len(named) + 1)):
+        raise Refused("the header row of '%s' has gaps (columns must run A, B, C ... without a blank header)" % SHEET)
+    if "QM-001 Ref" not in headers:
+        raise Refused("the '%s' sheet has no 'QM-001 Ref' column to copy the style from" % SHEET)
+    old_last, new_letter = letters(len(named)), letters(len(named) + 1)
+    ref_letter = headers["QM-001 Ref"]
+    before = dict(xl.cells_of(snap.xml))
+
+    def do_row(m):
+        tag, row_no, body, end = m.group(1), int(m.group(2)), m.group(3), m.group(4)
+        cells = xl.cells_of(body)
+        if "".join(el for _r, el in cells) != body:
+            raise Refused("row %d of '%s' holds something other than cells; the new column does not apply" % (row_no, SHEET))
+        style = None
+        for ref, el in cells:
+            if split_ref(ref)[0] == ref_letter:
+                style = (re.search(r'\bs="(\d+)"', el.split(">")[0]) or [None, None])[1]
+        s_attr = (' s="%s"' % style) if style else ""
+        new = ('<c r="%s1"%s t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>' % (new_letter, s_attr, xl.escape(IMPACT))) if row_no == 1 else '<c r="%s%d"%s/>' % (new_letter, row_no, s_attr)
+        tag = re.sub(r'\bspans="(\d+):(\d+)"', lambda sm: 'spans="%s:%d"' % (sm.group(1), len(named) + 1), tag)
+        return tag + body + new + end
+
+    xml = re.sub(r'(<row r="(\d+)"[^>]*?(?<!/)>)(.*?)(</row>)', do_row, snap.xml, flags=re.S)
+    if colnum(new_letter) not in column_widths(xml):
+        block = re.search(r"</cols>", xml)
+        if not block:
+            raise Refused("the '%s' sheet has no <cols> block" % SHEET)
+        xml = xml.replace("</cols>", '<col min="%d" max="%d" width="%d" customWidth="1"/></cols>' % (colnum(new_letter), colnum(new_letter), IMPACT_WIDTH), 1)
+    xml = re.sub(r'(<dimension ref="[A-Z]+\d+:)%s(\d+")' % old_last, r"\g<1>%s\g<2>" % new_letter, xml)
+    xml = re.sub(r'(<autoFilter\b[^>]*?\bref="[A-Z]+\d+:)%s(\d+")' % old_last, r"\g<1>%s\g<2>" % new_letter, xml)
+    wb = re.sub(r"('%s'!\$[A-Z]+\$\d+:\$)%s(\$\d+)" % (re.escape(SHEET), old_last), r"\g<1>%s\g<2>" % new_letter, snap.files["xl/workbook.xml"].decode("utf-8"))
+    after = dict(xl.cells_of(xml))
+    if any(after.get(ref) != el for ref, el in before.items() if split_ref(ref)[0] != new_letter):
+        raise Refused("a cell changed while the column was added; nothing was written")
+    return xml, wb
+
+
+def plan_qm_setup(snap):
+    """One time: the 'QM-001 Impact' column (last) and the 'QM-001 Changes' sheet. Refuses if either exists. -> (parts {name: xml}, workbook xml, lines, expected)."""
+    if IMPACT in snap.headers:
+        raise Refused("the '%s' sheet already has a '%s' column" % (SHEET, IMPACT))
+    if QM_SHEET in snap.paths:
+        raise Refused("the workbook already has a sheet called '%s'" % QM_SHEET)
+    xml, wb = add_impact_column_xml(snap)
+    files = snap.files
+    sheet_xml = build_qm_sheet(snap)
+    nums = [int(x) for name in files for x in re.findall(r"^xl/worksheets/sheet(\d+)\.xml$", name)]
+    n = max(nums or [0]) + 1
+    part = "xl/worksheets/sheet%d.xml" % n
+    rels = files["xl/_rels/workbook.xml.rels"].decode("utf-8")
+    rid = "rId%d" % (max([int(x) for x in re.findall(r'\bId="rId(\d+)"', rels)] or [0]) + 1)
+    sid = max([int(x) for x in re.findall(r'<sheet\b[^>]*?\bsheetId="(\d+)"', wb)] or [0]) + 1
+    tags = re.findall(r"<sheet\b[^>]*/>", wb)
+    names = [xl.unescape(re.search(r'\bname="([^"]*)"', t).group(1)) for t in tags]
+    pos = names.index(DECISIONS) + 1 if DECISIONS in names else len(names)
+    if any(int(i) >= pos for i in re.findall(r'\blocalSheetId="(\d+)"', wb)):                  # a sheet-index reference would move: put the new sheet last instead
+        pos = len(names)
+    new_tag = '<sheet name="%s" sheetId="%d" r:id="%s"/>' % (xl.escape(QM_SHEET), sid, rid)
+    wb = wb.replace("</sheets>", new_tag + "</sheets>", 1) if pos == len(names) else wb.replace(tags[pos - 1], tags[pos - 1] + new_tag, 1)
+    active = re.search(r'\bactiveTab="(\d+)"', wb)
+    if active and int(active.group(1)) >= pos:
+        wb = wb.replace(active.group(0), 'activeTab="%d"' % (int(active.group(1)) + 1), 1)
+    rels = rels.replace("</Relationships>", '<Relationship Id="%s" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet%d.xml"/></Relationships>' % (rid, n), 1)
+    parts = {snap.part: xml, part: sheet_xml, "xl/_rels/workbook.xml.rels": rels}
+    if "[Content_Types].xml" in files:
+        ct = files["[Content_Types].xml"].decode("utf-8")
+        parts["[Content_Types].xml"] = ct.replace("</Types>", '<Override PartName="/%s" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>' % part, 1)
+    if "docProps/app.xml" in files:                                                           # the sheet list Excel keeps for itself: kept in step (it is informational)
+        app = files["docProps/app.xml"].decode("utf-8")
+        titles = re.search(r'<vt:vector size="(\d+)" baseType="lpstr">(.*?)</vt:vector>', app, re.S)
+        count = re.search(r"(<vt:lpstr>Worksheets</vt:lpstr></vt:variant><vt:variant><vt:i4>)(\d+)(</vt:i4>)", app)
+        if titles and count and int(titles.group(1)) == int(count.group(2)):
+            items = re.findall(r"<vt:lpstr>.*?</vt:lpstr>", titles.group(2))
+            if len(items) == len(names):
+                items.insert(pos, "<vt:lpstr>%s</vt:lpstr>" % xl.escape(QM_SHEET))
+                app = app.replace(titles.group(0), '<vt:vector size="%d" baseType="lpstr">%s</vt:vector>' % (len(items), "".join(items)), 1)
+                app = app.replace(count.group(0), "%s%d%s" % (count.group(1), len(items), count.group(3)), 1)
+                parts["docProps/app.xml"] = app
+    for text in list(parts.values()) + [wb]:                                                   # never save what Excel could not read
+        try:
+            ElementTree.fromstring(text.encode("utf-8"))
+        except ElementTree.ParseError as e:
+            raise Refused("the edited XML is not well-formed (%s); nothing was written" % e)
+    lines = ["%s sheet: column '%s' added at the end (%s)" % (SHEET, IMPACT, letters(len(snap.headers) + 1)),
+             "sheet '%s' added (%d columns: %s)" % (QM_SHEET, len(QM_COLUMNS), ", ".join(QM_COLUMNS))]
+    expected = {(SHEET, "%s1" % letters(len(snap.headers) + 1), ""): IMPACT}
+    for i, h in enumerate(QM_COLUMNS, 1):
+        expected[(QM_SHEET, "%s1" % letters(i), "")] = h
+    return parts, wb, lines, expected
+
+
+def qm_row_xml(headers, values, row, styles):
+    """One register row. Cells of the human-only columns carry the shaded style (the Quality Manager's)."""
+    _head, body, human = styles
+    widths = {colnum(letters(i)): w for i, w in enumerate(QM_WIDTHS, 1)}
+    cells, lines = "", 1
+    for h in QM_COLUMNS:
+        col_ = headers[h]
+        style = human if h in QM_HUMAN else body
+        s_attr = ' s="%s"' % style if style else ""
+        text = values.get(h, "")
+        if text:
+            cells += '<c r="%s%d"%s t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>' % (col_, row, s_attr, xl.escape(text))
+            lines = max(lines, text_lines(text, widths.get(colnum(col_), 12.0)))
+        else:
+            cells += '<c r="%s%d"%s/>' % (col_, row, s_attr)
+    return '<row r="%d" spans="1:%d" ht="%s" customHeight="1">%s</row>' % (row, len(QM_COLUMNS), row_height(lines, 30.0), cells)
+
+
+def set_dimension(xml, last_row):
+    return re.sub(r'(<dimension ref="[A-Z]+\d+:[A-Z]+)(\d+)(")', lambda m: m.group(1) + str(last_row) + m.group(3), xml, count=1)
+
+
+def kw_list(value, ids):
+    """'KW-99; KW-98' or ['KW-99'] -> 'KW-98; KW-99' (each must be on the Change Log)."""
+    found = re.findall(r"KW-\d+", " ".join(value) if isinstance(value, list) else str(value or ""))
+    if not found:
+        raise Refused("kw_items must name at least one change-log item (for example [\"KW-99\"])")
+    missing = [k for k in found if k not in ids]
+    if missing:
+        raise Refused("%s is not an item on the '%s' sheet" % (", ".join(missing), SHEET))
+    return "; ".join(sorted(set(found), key=lambda k: int(k[3:])))
+
+
+def qm_entry_values(fields, ids, current=None):
+    """Validate the fields of a register entry (merged over `current` when revising). -> {header: text}."""
+    unknown = [k for k in fields if k not in QM_FIELDS and k != "ref"]
+    if unknown:
+        raise Refused("a register entry takes only: ref (to revise one), %s (got %s)" % (", ".join(QM_FIELDS), ", ".join(unknown)))
+    values = dict(current or {})
+    for key, header in QM_FIELDS.items():
+        if key in fields:
+            values[header] = kw_list(fields[key], ids) if key == "kw_items" else check_text(header, fields[key] if isinstance(fields[key], str) else "" if fields[key] is None else str(fields[key]))
+    for need, key in (("KW items", "kw_items"), ("Manual section / clause", "section"), ("Change", "change"), ("Reason", "reason")):
+        if not values.get(need):
+            raise Refused("a register entry needs %s" % key)
+    hit ={c.lower(): c for c in QM_CHANGES}.get(values["Change"].lower())
+    if not hit:
+        raise Refused("change must be one of: %s (got '%s')" % ("; ".join(QM_CHANGES), values["Change"]))
+    values["Change"] = hit
+    before, after, anchor = values.get("Before", ""), values.get("After", ""), values.get("Insert after", "")
+    if hit == "Replace" and (not before or not after or before == after):
+        raise Refused("a Replace needs 'before' (the current wording) and a different 'after' (the new wording)")
+    if hit == "Delete" and (not before or after):
+        raise Refused("a Delete needs 'before' (the wording to remove) and no 'after'")
+    if hit == "Add" and (not after or before or not anchor):
+        raise Refused("an Add needs 'after' (the new wording) and 'insert_after' (the start of the paragraph it goes after), and no 'before'")
+    if hit != "Add" and anchor:
+        raise Refused("insert_after is only for an Add")
+    return values
+
+
+def plan_qm_entry(snap, xml, fields, by, today, ids):
+    """Add (or, with ref, revise) one entry on the register sheet. -> (new xml, ref, row, 'added'|'revised', line, expected {(sheet, row, header): text})."""
+    headers, rows = table_rows(snap, QM_SHEET, xml)
+    for h in QM_COLUMNS:
+        if h not in headers:
+            raise Refused("the '%s' sheet has no '%s' column" % (QM_SHEET, h))
+    ref = str(fields.get("ref", "")).strip().upper()
+    if ref:
+        hit = [(n, r) for n, r in rows if r.get("Ref", "").upper() == ref]
+        if not hit:
+            raise Refused("%s is not on the '%s' sheet" % (ref, QM_SHEET))
+        row, old = hit[0]
+        held = [h for h in ("QM Decision", "Drafted In", "Manual Revision", "Entered in Manual (date)") if old.get(h)]
+        if held:
+            raise Refused("%s cannot be revised: it already has %s (a decided or drafted entry is not changed: raise a new entry)" % (ref, ", ".join(held)))
+        values = qm_entry_values({k: v for k, v in fields.items() if k != "ref"}, ids, current={h: old.get(h, "") for h in QM_FIELDS.values()})
+        changed = {h: v for h, v in values.items() if old.get(h, "") != v}
+        if not changed:
+            return xml, ref, row, "unchanged", "%s: unchanged" % ref, {}
+        for h, v in changed.items():
+            xml = set_cell(xml, headers[h], row, v)
+        return xml, ref, row, "revised", "%s: revised (%s)" % (ref, "; ".join("%s: %s -> %s" % (h, (old.get(h, "")[:40] or "(blank)"), v[:50]) for h, v in changed.items())), {(QM_SHEET, row, h): v for h, v in changed.items()}
+    values = qm_entry_values(fields, ids)
+    for _n, r in rows:
+        if all(r.get(h, "") == values.get(h, "") for h in ("KW items", "Manual section / clause", "Change", "Before", "After", "Insert after")):
+            raise Refused("duplicate: %s already holds this change (revise it with ref, or change the wording)" % r.get("Ref", "?"))
+    ref = next_ref(snap, xml)
+    values.update({"Ref": ref, "Date": today, "Drafted by": by})
+    row = last_row_number(xml) + 1
+    xml = xml.replace("</sheetData>", qm_row_xml(headers, values, row, qm_styles(snap)) + "</sheetData>", 1)
+    xml = set_dimension(xml, row)
+    return xml, ref, row, "added", "%s: new register entry for %s (%s: %s)" % (ref, values["KW items"], values["Change"], values["Manual section / clause"][:50]), {(QM_SHEET, row, h): v for h, v in values.items() if v}
+
+
+def read_json(path, what):
+    try:
+        with open(path, encoding="utf-8-sig") as f:                      # (a file written by Windows PowerShell starts with a byte-order mark)
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        raise Refused("%s %s could not be read (%s)" % (what, path, e))
+
+
+def plan_qm_entries_file(snap, path, today):
+    """--qm-entry <file>: one entry (an object) or several (a list). -> (parts, lines, expected)."""
+    if QM_SHEET not in snap.paths:
+        raise Refused("the workbook has no '%s' sheet yet. Run: python tools/changelog_write.py --qm-setup" % QM_SHEET)
+    spec = read_json(path, "the entry file")
+    entries = spec if isinstance(spec, list) else [spec]
+    if not entries or not all(isinstance(e, dict) for e in entries):
+        raise Refused("an entry file is one JSON object (or a list of them): kw_items, section, change, before, after, insert_after, reason")
+    ids = {i for i, _r in snap.id_rows()}
+    xml = snap.files[snap.paths[QM_SHEET]].decode("utf-8")
+    lines, expected = [], {}
+    for e in entries:
+        xml, _ref, _row, _what, line, exp = plan_qm_entry(snap, xml, e, "Claude Code", today, ids)
+        lines.append(line)
+        expected.update(exp)
+    return {snap.paths[QM_SHEET]: xml}, lines, expected
+
+
+def plan_qm_backfill(snap, path):
+    """--qm-backfill <file>: proposed / confirmed impacts for Released items (only where blank) and register rows for the refs the manual already carries. -> (parts, lines, expected)."""
+    if IMPACT not in snap.headers or QM_SHEET not in snap.paths:
+        raise Refused("the workbook needs the '%s' column and the '%s' sheet first. Run: python tools/changelog_write.py --qm-setup" % (IMPACT, QM_SHEET))
+    spec = read_json(path, "the backfill file")
+    if not isinstance(spec, dict) or not isinstance(spec.get("impacts"), list):
+        raise Refused("a backfill file is {\"impacts\": [{\"id\": \"KW-23\", \"impact\": \"PROPOSED None - ...\"}], \"register\": [{\"ref\": \"C10\", \"kw_items\": [...], \"date\": \"2026-10-20\"}]}")
+    xml, lines, expected, problems, seen = snap.xml, [], {}, [], set()
+    for item in spec["impacts"]:
+        kw = item.get("id") if isinstance(item, dict) else None
+        if not isinstance(kw, str) or kw in seen:
+            raise Refused("every impact needs an id, and an id may appear once (got %r)" % (item,))
+        seen.add(kw)
+        row = snap.row_of(kw, xml)
+        current = snap.values(row, xml)
+        if current.get("Status") != "Released":
+            problems.append("%s is '%s', not Released (the backfill is only for Released items)" % (kw, current.get("Status", "")))
+            continue
+        if current.get(IMPACT, ""):
+            lines.append("%s: already has an impact (skipped)" % kw)
+            continue
+        value = check_impact(item.get("impact", ""))
+        xml = set_cell(xml, snap.headers[IMPACT], row, value)
+        expected[(SHEET, kw, IMPACT)] = value
+        lines.append("%s: %s: %s" % (kw, IMPACT, value[:90]))
+    if problems:
+        raise Refused("; ".join(problems))
+    parts = {snap.part: xml}
+    qxml = snap.files[snap.paths[QM_SHEET]].decode("utf-8")
+    headers, rows = table_rows(snap, QM_SHEET, qxml)
+    have = {r.get("Ref", "").upper() for _n, r in rows}
+    ids = {i for i, _r in snap.id_rows()}
+    for item in spec.get("register", []):
+        ref = str(item.get("ref", "")).strip().upper() if isinstance(item, dict) else ""
+        if not re.fullmatch(r"[BC]\d+", ref):
+            raise Refused("a register row needs a ref like C10 or B11 (got %r)" % (item,))
+        if ref in have:
+            lines.append("%s: already on the register (skipped)" % ref)
+            continue
+        date = str(item.get("date", "")).strip()
+        values = {"Ref": ref, "Date": date, "KW items": kw_list(item.get("kw_items", []), ids), "Manual section / clause": "see the manual's change list",
+                  "Reason": check_text("reason", item.get("reason", "")) or "Entered in the manual before this register existed: see the manual's change list", "Drafted by": QM_BACKFILL}
+        row = last_row_number(qxml) + 1
+        qxml = qxml.replace("</sheetData>", qm_row_xml(headers, values, row, qm_styles(snap)) + "</sheetData>", 1)
+        qxml = set_dimension(qxml, row)
+        have.add(ref)
+        for h, v in values.items():
+            if v:
+                expected[(QM_SHEET, row, h)] = v
+        lines.append("%s: register row (backfill) for %s" % (ref, values["KW items"]))
+    parts[snap.paths[QM_SHEET]] = qxml
+    return parts, lines, expected
+
+
+def plan_qm_drafted(snap, refs, text):
+    """--qm-drafted C21,C22 --text <draft file and date>: note which draft revision an APPROVED entry went into (the generator calls this). -> (parts, lines, expected)."""
+    if QM_SHEET not in snap.paths:
+        raise Refused("the workbook has no '%s' sheet yet" % QM_SHEET)
+    text = check_text("Drafted In", text)
+    if not text:
+        raise Refused("--qm-drafted needs --text (the draft revision file name and date)")
+    xml = snap.files[snap.paths[QM_SHEET]].decode("utf-8")
+    headers, rows = table_rows(snap, QM_SHEET, xml)
+    by_ref = {r.get("Ref", "").upper(): (n, r) for n, r in rows}
+    lines, expected = [], {}
+    for ref in [x.strip().upper() for x in str(refs).split(",") if x.strip()]:
+        if ref not in by_ref:
+            raise Refused("%s is not on the '%s' sheet" % (ref, QM_SHEET))
+        row, r = by_ref[ref]
+        if r.get("QM Decision", "").lower() != "approved":
+            raise Refused("%s is not Approved by the Quality Manager (QM Decision is '%s'): only an approved entry goes into a draft revision" % (ref, r.get("QM Decision", "") or "blank"))
+        if r.get("Entered in Manual (date)", ""):
+            raise Refused("%s is already entered in the manual" % ref)
+        if r.get("Drafted In", "") == text:
+            continue
+        xml = set_cell(xml, headers["Drafted In"], row, text)
+        expected[(QM_SHEET, row, "Drafted In")] = text
+        lines.append("%s: Drafted In: %s -> %s" % (ref, r.get("Drafted In", "") or "(blank)", text))
+    return {snap.paths[QM_SHEET]: xml}, lines, expected
+
+
+def qm_report(snap):
+    """The QM-001 status report as text lines (read-only): released items with no confirmed impact, entries waiting for the Quality Manager, approved entries not yet in the manual."""
+    out = ["QM-001 status report (KelpWorks change log, %s)" % datetime.date.today().isoformat(), ""]
+    if IMPACT not in snap.headers or QM_SHEET not in snap.paths:
+        return out + ["The workbook does not have the '%s' column and the '%s' sheet yet (run --qm-setup)." % (IMPACT, QM_SHEET)]
+    _h, items = table_rows(snap, SHEET)
+    released = [(r.get("ID", ""), r) for _n, r in items if r.get("Status") == "Released"]
+    open_ = []
+    for kw, r in released:
+        parts = impact_parts(r.get(IMPACT, ""))
+        if not parts or parts[0]:
+            open_.append((kw, r, "PROPOSED, not yet confirmed" if parts else "no impact recorded"))
+    open_.sort(key=lambda t: (t[0] not in QM_CANDIDATES, t[0]))
+    out.append("1. Released items with no confirmed QM-001 impact: %d of %d" % (len(open_), len(released)))
+    for kw, r, why in open_:
+        out.append("   %s%s  %s  [%s]" % (kw, " (candidate)" if kw in QM_CANDIDATES else "", (r.get("Module", "") + " / " + r.get("Section", ""))[:60], why))
+    _hh, rows = table_rows(snap, QM_SHEET)
+    real = [(n, r) for n, r in rows if r.get("Drafted by", "").lower() != QM_BACKFILL]
+    historic = [r for n, r in rows if r.get("Drafted by", "").lower() == QM_BACKFILL]
+    waiting = [r for n, r in real if not r.get("QM Decision")]
+    out += ["", "2. Register entries waiting for the Quality Manager's decision: %d" % len(waiting)]
+    out += ["   %s  %s  %s: %s" % (r.get("Ref", ""), r.get("KW items", ""), r.get("Change", ""), r.get("Manual section / clause", "")[:60]) for r in waiting]
+    approved = [r for n, r in real if r.get("QM Decision", "").lower() == "approved" and not r.get("Entered in Manual (date)")]
+    undrafted = [r for r in approved if not r.get("Drafted In")]
+    drafted = [r for r in approved if r.get("Drafted In")]
+    out += ["", "3. Approved entries not yet in the manual: %d (%d not yet in a draft revision, %d drafted)" % (len(approved), len(undrafted), len(drafted))]
+    out += ["   %s  %s  %s  [not yet drafted]" % (r.get("Ref", ""), r.get("KW items", ""), r.get("Manual section / clause", "")[:50]) for r in undrafted]
+    out += ["   %s  %s  %s  [drafted in: %s]" % (r.get("Ref", ""), r.get("KW items", ""), r.get("Manual section / clause", "")[:50], r.get("Drafted In", "")) for r in drafted]
+    other = [r for n, r in real if r.get("QM Decision", "").lower() in ("rejected", "needs change")]
+    out += ["", "4. Rejected or 'needs change' entries (for information): %d" % len(other)]
+    out += ["   %s  %s  %s" % (r.get("Ref", ""), r.get("KW items", ""), r.get("QM Decision", "")) for r in other]
+    out += ["", "%d register row(s) were entered in the manual before the register existed (Drafted by: %s); they are not chased." % (len(historic), QM_BACKFILL)]
+    return out
 
 
 # ---- the Claude Code Playbook sheet (written from docs/backlog/claude-code-playbook.json, cell by cell) -----------------------------------------------------------------
@@ -1089,6 +1582,26 @@ def do_plan_cells(c, note, sender):
     c.res.update(status="applied", id=name, reason="cells set: %s" % ", ".join(done))
 
 
+def do_qm_entry(c, note, sender):
+    snap, work = c.snap, c.work
+    if QM_SHEET not in snap.paths:
+        raise Reject("the workbook has no '%s' sheet yet (run --qm-setup)" % QM_SHEET)
+    fields = note.get("fields")
+    if not isinstance(fields, dict) or not fields or not all(isinstance(v, (str, list)) for v in fields.values()):
+        raise Reject("'fields' must be an object: kw_items, section, change, before, after, insert_after, reason (and ref to revise an entry that has no decision yet)")
+    try:
+        xml, ref, row, what, line, exp = plan_qm_entry(snap, work.sheet(QM_SHEET), fields, sender, c.today, c.ids)
+    except Refused as e:
+        raise Reject(str(e))
+    if what == "unchanged":
+        c.res.update(status="unchanged", id=ref, reason="the sheet already says this")
+        return
+    work.xml[QM_SHEET] = xml
+    c.expected.update(exp)
+    c.lines.append("%s (%s)" % (line, c.res["file"]))
+    c.res.update(status="applied", id=ref, reason="register entry %s %s at row %d of '%s'" % (ref, what, row, QM_SHEET))
+
+
 def plan_inbox(snap, inbox, today):
     """Judge every note against the workbook as it will be after the notes before it. -> (parts {part: xml}, workbook xml, results, lines, expected).
     results = [{file, note_id, status applied|rejected|unchanged, id, reason}]"""
@@ -1133,9 +1646,9 @@ def plan_inbox(snap, inbox, today):
             for stamp in c.stamps:
                 if stamp not in snap.headers:
                     raise Reject("the workbook has no '%s' column to stamp" % stamp)
-            handler = {"new_item": do_new_item, "revision": do_revision, "new_decision": do_new_decision, "plan_cells": do_plan_cells}.get(note.get("kind"))
+            handler = {"new_item": do_new_item, "revision": do_revision, "new_decision": do_new_decision, "plan_cells": do_plan_cells, "qm_entry": do_qm_entry}.get(note.get("kind"))
             if not handler:
-                raise Reject("kind must be 'new_item', 'revision', 'new_decision' or 'plan_cells'")
+                raise Reject("kind must be 'new_item', 'revision', 'new_decision', 'plan_cells' or 'qm_entry'")
             handler(c, note, sender)
         except Reject as e:
             res["reason"] = str(e)
@@ -1300,6 +1813,10 @@ def save(snap, parts, wb_xml=None):
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
             for i in snap.infos:
                 z.writestr(i.filename, files[i.filename])
+            known = {i.filename for i in snap.infos}
+            for name in files:                                          # a part that did not exist before (the QM-001 Changes sheet)
+                if name not in known:
+                    z.writestr(name, files[name])
         os.replace(tmp, snap.path)
     except OSError:
         if os.path.exists(tmp):
@@ -1339,14 +1856,16 @@ def parse_pairs(tokens):
     return out
 
 
-VALUE_OPTIONS = ("--file", "--id", "--batch", "--show", "--verify-wait", "--decision", "--by", "--text", "--needed", "--restore", "--rules-file", "--playbook-file")
-FLAG_OPTIONS = ("--dry-run", "--apply-inbox", "--publish", "--backups", "--migrate", "--rules-sheet", "--classify-setup", "--default-owner", "--playbook-sheet")
+VALUE_OPTIONS = ("--file", "--id", "--batch", "--show", "--verify-wait", "--decision", "--by", "--text", "--needed", "--restore", "--rules-file", "--playbook-file", "--qm-entry", "--qm-backfill",
+                 "--qm-drafted")
+FLAG_OPTIONS = ("--dry-run", "--apply-inbox", "--publish", "--backups", "--migrate", "--rules-sheet", "--classify-setup", "--default-owner", "--playbook-sheet", "--qm-setup", "--qm-report")
 
 
 def parse_args(argv):
     a = {"file": cp.configured_path(), "file_given": False, "dry": False, "wait": VERIFY_WAIT, "id": None, "pairs": [], "batch": None, "show": None, "decision": None, "by": None, "text": None,
          "needed": None, "restore": None, "apply_inbox": False, "publish": False, "backups": False, "migrate": False, "rules_sheet": False, "rules_file": RULES_FILE,
-         "classify_setup": False, "default_owner": False, "playbook_sheet": False, "playbook_file": PLAYBOOK_FILE}
+         "classify_setup": False, "default_owner": False, "playbook_sheet": False, "playbook_file": PLAYBOOK_FILE, "qm_setup": False, "qm_report": False, "qm_entry": None, "qm_backfill": None,
+         "qm_drafted": None}
     i = 0
     while i < len(argv):
         t = argv[i]
@@ -1460,7 +1979,28 @@ def finish_publish(path, wrote=True):
         return 7
     print("SharePoint copy refreshed (read-only): %s" % snapshot)
     tidy_inbox_readme(path)
+    publish_qm_report(path, snapshot)
     return 0
+
+
+QM_REPORT_NAME = "QM-001_Status_Report.txt"
+
+
+def publish_qm_report(path, snapshot):
+    """Write the QM-001 status report beside the SharePoint copy so it is never stale. A failure is a warning, not an error (the workbook is already published)."""
+    try:
+        snap = Snapshot(path)
+        if IMPACT not in snap.headers or QM_SHEET not in snap.paths:
+            return
+        target = os.path.join(os.path.dirname(os.path.abspath(snapshot)), QM_REPORT_NAME)
+        if os.path.exists(target):
+            os.chmod(target, stat.S_IREAD | stat.S_IWRITE)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write("\n".join(qm_report(snap)) + "\n")
+        os.chmod(target, stat.S_IREAD)
+        print("QM-001 status report updated: %s" % target)
+    except (ValueError, OSError) as e:
+        print("WARNING: the QM-001 status report could not be written (%s)." % e)
 
 
 def show(snap, kw):
@@ -1469,7 +2009,7 @@ def show(snap, kw):
     except Refused as e:
         print("Refused: %s" % e)
         return 2
-    for h in ("ID", "Type", "Touches", "Status", "Owner", "Approved to Start", "PR #", "Released Date", "Verified By (on live)", "Verified Date", "QM-001 Ref", "Row Updated", "Updated By", "Notes"):
+    for h in ("ID", "Type", "Touches", "Status", "Owner", "Approved to Start", "PR #", "Released Date", "Verified By (on live)", "Verified Date", "QM-001 Ref", IMPACT, "Row Updated", "Updated By", "Notes"):
         if h in row:
             print("%-24s %s" % (h, (row[h][:200] + "...") if len(row[h]) > 200 else row[h]))
     return 0
@@ -1504,7 +2044,8 @@ def find_backup(path, which):
 
 def main(argv=None):
     a = parse_args(list(sys.argv[1:] if argv is None else argv))
-    modes = [m for m in ("id", "batch", "show", "decision", "restore") if a and a[m]] + [m for m in ("apply_inbox", "publish", "backups", "migrate", "rules_sheet", "classify_setup", "default_owner", "playbook_sheet") if a and a[m]]
+    modes = ([m for m in ("id", "batch", "show", "decision", "restore", "qm_entry", "qm_backfill", "qm_drafted") if a and a[m]]
+             + [m for m in ("apply_inbox", "publish", "backups", "migrate", "rules_sheet", "classify_setup", "default_owner", "playbook_sheet", "qm_setup", "qm_report") if a and a[m]])
     if a is None or len(modes) != 1:
         print(__doc__)
         return 1
@@ -1519,7 +2060,7 @@ def main(argv=None):
     if not os.path.isfile(path) and not a["restore"]:
         print("STOPPED: the workbook was not found: %s" % path)
         return 6
-    if a["show"] or a["publish"]:
+    if a["show"] or a["publish"] or a["qm_report"]:
         try:
             snap = Snapshot(path)
         except (ValueError, OSError) as e:
@@ -1527,6 +2068,9 @@ def main(argv=None):
             return 6
         if a["show"]:
             return show(snap, a["show"])
+        if a["qm_report"]:
+            print("\n".join(qm_report(snap)))
+            return 0
         snapshot = cp.snapshot_for(path)
         if not snapshot:
             print("STOPPED: no SharePoint copy is configured for %s (KELPWORKS_SNAPSHOT)." % path)
@@ -1612,6 +2156,18 @@ def run_write(a, path, writes):
                      % (SHEET, LAYOUT_INSERT, LAYOUT_AFTER, letters(new_order.index(LAYOUT_INSERT) + 1), LAYOUT_DELETE, LAYOUT_AFTER)]
             expected = {(SHEET, "%s1" % letters(i + 1), ""): h for i, h in enumerate(new_order)}
             return commit(a, snap, parts, wb_xml, lines, expected, "classify-setup")
+        if a["qm_setup"]:
+            parts, wb_xml, lines, expected = plan_qm_setup(snap)
+            return commit(a, snap, parts, wb_xml, lines, expected, "qm-setup")
+        if a["qm_entry"]:
+            parts, lines, expected = plan_qm_entries_file(snap, a["qm_entry"], datetime.date.today().isoformat())
+            return commit(a, snap, parts, None, lines, expected, "qm-entry")
+        if a["qm_backfill"]:
+            parts, lines, expected = plan_qm_backfill(snap, a["qm_backfill"])
+            return commit(a, snap, parts, None, lines, expected, "qm-backfill")
+        if a["qm_drafted"]:
+            parts, lines, expected = plan_qm_drafted(snap, a["qm_drafted"], a["text"] or "")
+            return commit(a, snap, parts, None, lines, expected, "qm-drafted")
         if a["default_owner"]:
             xml, lines, expected = plan_default_owner(snap)
             return commit(a, snap, {snap.part: xml}, None, lines, expected, "default-owner")

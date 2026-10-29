@@ -16,14 +16,16 @@ Follow these steps in order. Do not skip one; say so if one does not apply.
 3. **Branch.** Make sure the working tree is clean and no other branch work is mixed in. Check `gh pr list` for open pull requests that touch the same files (a conflict risk). Create
    `updates/kw-<number>-<short-name>` from the latest `origin/main` (a bundle is named after its first ID; fixes may use `hardening/kw-...`). Never work on `main`.
 4. **Plan.** "Plan mode" items: write the plan (files, data changes, tests, risks) and get the user's approval before editing. "Direct" items: give a 3-5 bullet plan and go ahead unless a
-   risk flag below applies, then treat it like a Plan-mode item.
+   risk flag below applies, then treat it like a Plan-mode item. **Every plan states the QM-001 impact** (KW-71): `None - <reason>`, Requirement changed, Requirement added, Requirement relaxed or
+   Record / control changed, and for anything but None the manual section affected and the before / after wording.
 5. **Risk flags (check each; mention the ones that apply):**
    - new table or column -> additive and idempotent only (`SCHEMA` / `migrate()`), a table must be added to `KEEP` or `CLEAR` in `tools/make_clean_backup.py`;
    - production-log content that is signed (new field, new section, a notes section) -> `RELEASE_SNAPSHOT_VERSION`, the required-fields registry (`PROGRESS_SECTIONS`) and the progress rules;
    - a calculated value or a constant -> the `CALCULATIONS` entry and `SETTINGS_DEFAULTS` on the Calculations page;
    - stock -> only through `_consume`; stock never blocks a run;
    - uploads -> the upload rules (file types, storage room, daily quota) and the archive;
-   - release, Certificate of Analysis, specifications, required fields, records or document control -> a Quality Manager must be told: add it to the Quality Manual (QM-001) change list;
+   - release, Certificate of Analysis, specifications, required fields, records or document control -> a Quality Manager must be told: draft the manual change on the QM-001 Changes register
+     (`python tools/changelog_write.py --qm-entry entry.json`, see `docs/qm001-change-tracking.md`) and set the item's QM-001 Impact and QM-001 Ref; the tool refuses Released without them;
    - anything that changes an audit control -> `docs/data-integrity-statement.md`.
 6. **Build.** Standard library only (no new pip packages). Match the code around it. Add tests in `tests/` (extend the right file or add one) that fail without the change; run the QUICK tier
    (`py tools/quick_tests.py`, 1-2 minutes: the core tests plus the test files you changed and the ones related to your diff) while building and before reporting, and the FULL suite in
@@ -31,15 +33,16 @@ Follow these steps in order. Do not skip one; say so if one does not apply.
    test on the pull request and is the required check). A full run ends with a timing report: act on its warnings (`py tools/tier_health.py --apply` marks / unmarks slow files). Fix failures. Verify the change in the browser preview (restart the server first) and look at the console for errors. Update `CLAUDE.md` and any guide the change makes
    untrue.
 7. **Stop and report.** (Keep the workbook current as you go, see step 10.) Summarise: what changed (files), how each acceptance criterion is met, tests run, anything decided on the user's behalf, anything needing the user (decisions, Quality
-   Manager, a setting to change on the live site). Do NOT commit, push or open a pull request until the user says so.
+   Manager, a setting to change on the live site) and **the QM-001 impact** (class and one line; the register entry and its Ref when the manual must change). Do NOT commit, push or open a pull request until the user says so.
 8. **When told to commit / push / open the pull request:** commit message and pull request title start with the item ID ("KW-24: ..."); the pull request body lists the acceptance criteria as
-   a checklist, says what was tested, and names any follow-up. Never merge: the user merges.
+   a checklist, says what was tested, names any follow-up and carries the **QM-001 impact** line of the pull request template (`.github/pull_request_template.md`). Never merge: the user merges.
 9. **After the user says it is live:** add the live commit to `tests/legacy_commits.txt` (a small follow-up pull request).
 10. **Keep the master workbook up to date** (the user asked for this, and gave permission): whenever an item changes state -- plan approved or work started (`In progress`), pull request open
     (`In progress`, note the PR number), merged (`Released`, note the PR number and the date), found not to be a bug / dropped (`Won't do`, say why), a decision made (Open Decisions: Decided By +
     Decision, and a note on the item) -- write it into the workbook ONLY with `python tools/changelog_write.py --id KW-nn Status=... "PR #=nn" "Released Date=YYYY-MM-DD" Notes="..."` (or `--batch`; use `--dry-run` first). It writes
     only the columns Claude Code owns, refuses Deferred / Won't do and unapproved starts, stops if the master is open in Excel or another run is writing, takes a backup first, re-checks after saving and refreshes the read-only
     SharePoint copy. A decision goes to the Open Decisions sheet with `python tools/changelog_write.py --decision KW-nn --by "..." --text "..."` (`--needed "part of the question"` when the ID has several). Then refresh the
-    snapshot with `python tools/export_backlog.py`. The master is `C:\KelpWorks\ChangeControl\LOG_KelpWorks_ChangeControl.xlsx` (outside OneDrive; the SharePoint file is a read-only copy). Procedure for people: `docs/sop-change-requests.md`.
+    snapshot with `python tools/export_backlog.py`. **Released also needs the QM-001 Impact** (`"QM-001 Impact=None - <reason>"`, or a change class plus `"QM-001 Ref=Cnn"` from the register): give it in the same call. When the
+    Quality Manager has approved register entries, generate the draft revision with `python tools/qm_draft_revision.py` (never write into the controlled manual). The master is `C:\KelpWorks\ChangeControl\LOG_KelpWorks_ChangeControl.xlsx` (outside OneDrive; the SharePoint file is a read-only copy). Procedure for people: `docs/sop-change-requests.md`.
 
 Keep it small: one item (or the bundle named in the arguments) per branch.

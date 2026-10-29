@@ -7,7 +7,8 @@ re-run this after the workbook changes:
     python tools/export_backlog.py                       # reads the change log itself (tools/changelog_path.py: LOG_KelpWorks_ChangeControl.xlsx in ...\\KelpWorks ERP\\Change_Control)
     python tools/export_backlog.py "C:\\path\\to\\any copy.xlsx"   # or any copy of it (reading is harmless)
 
-Sheets exported: "Change Log" -> items.csv and "Open Decisions" -> open-decisions.csv. Every other sheet (Summary, Workflow Rules, the playbook ...) is ignored. Columns are found by
+Sheets exported: "Change Log" -> items.csv and "Open Decisions" -> open-decisions.csv, and (when the workbook has it, KW-71) "QM-001 Changes" -> qm001-changes.csv. Every other sheet (Summary,
+Workflow Rules, the playbook ...) is ignored. Columns are found by
 their HEADER NAME in row 1, never by position, so columns can be added or moved (the workbook now also has Approved to Start, PR #, Released Date, Verified By (on live),
 Verified Date, QM-001 Ref, Row Updated and Updated By) and a column this tool does not know is simply exported too. The workbook's "Claude Code Prompt" column is left out: it was
 written for a different tech stack (Flask / SQLAlchemy) and would mislead; the /kw-item command builds its own plan from the repo instead.
@@ -31,6 +32,7 @@ DROP_COLUMNS = {"Claude Code Prompt"}
 REQUIRED_HEADERS = {"Change Log": ("ID", "Status", "Approved to Start"), "Open Decisions": ("ID",)}
 KNOWN_STATUSES = ("Not started", "In progress", "On staging", "Released", "Blocked", "Deferred", "Won't do")
 SHEETS = {"Change Log": "items.csv", "Open Decisions": "open-decisions.csv"}
+OPTIONAL_SHEETS = {"QM-001 Changes": "qm001-changes.csv"}                                  # exported when the workbook has the sheet
 
 
 def col_index(ref):
@@ -111,6 +113,16 @@ def main(argv):
             unknown = [s for s in counts if s not in KNOWN_STATUSES and s != "(blank)"]
             if unknown:
                 print("  WARNING: unknown Status value(s): %s" % ", ".join(unknown))
+    for name, fname in OPTIONAL_SHEETS.items():                                            # KW-71: the QM-001 register, once the workbook has it (so Claude Code can read the entries)
+        rows = sheets.get(name)
+        if rows:
+            with open(os.path.join(outdir, fname), "w", encoding="utf-8-sig", newline="") as f:
+                w = csv.writer(f, lineterminator="\r\n")
+                width = len(rows[0])
+                for r in rows:
+                    if any(x for x in r):
+                        w.writerow([(r[i] if i < len(r) else "") for i in range(width)])
+            print("wrote docs/backlog/%s (%d rows)" % (fname, sum(1 for r in rows if any(r)) - 1))
     return 0
 
 

@@ -20,7 +20,8 @@ def load():
 
 
 HEADERS = ["ID", "Module", "Section", "Type", "Change Request", "Context / Rationale", "Transcript Time", "Raised By", "Priority", "Lens", "Claude Code Mode", "Claude Code Prompt",
-           "Acceptance Criteria", "Status", "Owner", "Notes", "Approved to Start", "PR #", "Released Date", "Verified By (on live)", "Verified Date", "QM-001 Ref", "Row Updated", "Updated By"]
+           "Acceptance Criteria", "Status", "Owner", "Notes", "Approved to Start", "PR #", "Released Date", "Verified By (on live)", "Verified Date", "QM-001 Ref", "Row Updated", "Updated By",
+           "QM-001 Impact"]
 NS = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
 
 
@@ -149,10 +150,19 @@ def test_released_needs_a_pr_number_and_a_date_and_they_are_checked(cw, wb, caps
     assert write(cw, wb, "--id", "KW-01", "Status=Released", "PR #=75") == 2 and "Released Date" in capsys.readouterr().out
     assert write(cw, wb, "--id", "KW-01", "Status=Released", "PR #=seventy", "Released Date=2026-10-21") == 2
     assert write(cw, wb, "--id", "KW-01", "Status=Released", "PR #=75", "Released Date=21/10/2026") == 2
-    assert write(cw, wb, "--id", "KW-01", "Status=Released", "PR #=#75", "Released Date=2026-10-21", "QM-001 Ref=C20") == 0
+    assert write(cw, wb, "--id", "KW-01", "Status=Released", "PR #=#75", "Released Date=2026-10-21", "QM-001 Ref=C20", "QM-001 Impact=None - fixture item") == 0
     r = row_of(cw, wb, "KW-01")
     assert (r["Status"], r["PR #"], r["Released Date"], r["QM-001 Ref"]) == ("Released", "75", "2026-10-21", "C20")
-    assert write(cw, wb, "--id", "KW-05", "Status=Released") == 0                                        # the row already has its PR # and date
+    assert write(cw, wb, "--id", "KW-05", "Status=Released", "QM-001 Impact=None - fixture item") == 0      # the row already has its PR # and date
+
+
+def test_released_is_refused_when_the_workbook_has_no_impact_column_and_says_what_to_run(cw, tmp_path, capsys):
+    (tmp_path / "ChangeControl").mkdir()
+    p = tmp_path / "ChangeControl" / "LOG_KelpWorks_ChangeControl.xlsx"
+    make(str(p), headers=[h for h in HEADERS if h != "QM-001 Impact"])
+    original = p.read_bytes()
+    assert write(cw, str(p), "--id", "KW-05", "Status=Released") == 2
+    assert "--qm-setup" in capsys.readouterr().out and p.read_bytes() == original
 
 
 def test_rows_are_found_by_id_and_an_unknown_or_repeated_id_is_refused(cw, wb, capsys):
