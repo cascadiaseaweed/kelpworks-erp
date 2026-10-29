@@ -4,6 +4,7 @@
 **This is a library now (KW-66).** It no longer writes the workbook: the change log has ONE writer, tools/changelog_write.py (item updates, Open Decisions with `--decision`, the inbox,
 backups and the read-only SharePoint copy). Running this file only prints that.
 """
+import datetime
 import os
 import re
 import sys
@@ -51,6 +52,49 @@ def cell_text(cell_xml, sst):
         return unescape("".join(re.findall(r"<t[^>]*>([^<]*)</t>", cell_xml)))
     v = re.search(r"<v>([^<]*)</v>", cell_xml)
     return unescape(v.group(1)) if v else ""
+
+
+BUILTIN_DATE_FORMATS = {14, 15, 16, 17, 22, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 45, 46, 47, 50, 51, 52, 53, 54, 55, 56, 57, 58}   # (14 is the short date Excel gives a typed date; 45 to 47 are time-only: see date_style_ids)
+TIME_ONLY_FORMATS = {45, 46, 47}
+
+
+def date_style_ids(styles_xml):
+    """The cell-style numbers (the `s` of a cell) whose number format shows a DATE. A date typed into Excel is stored as a serial number (46324 = 2026-10-29) with such a style;
+    the cell's text is then the number, not the date, so readers must convert it (iso_from_serial)."""
+    custom = {}
+    for m in re.finditer(r'<numFmt\b[^>]*?\bnumFmtId="(\d+)"[^>]*?\bformatCode="([^"]*)"', styles_xml):
+        code = re.sub(r'"[^"]*"|\[[^\]]*\]|\\.', "", unescape(m.group(2))).lower()
+        custom[int(m.group(1))] = bool(re.search(r"[dy]", code)) or (bool(re.search(r"m", code)) and not re.search(r"[hs]", code))        # (a bare m beside h or s is minutes)
+    block = re.search(r"<cellXfs\b.*?</cellXfs>", styles_xml, flags=re.S)
+    out = set()
+    for i, xf in enumerate(re.findall(r"<xf\b[^>]*?(?:/>|>)", block.group(0) if block else "")):
+        m = re.search(r'\bnumFmtId="(\d+)"', xf)
+        fmt = int(m.group(1)) if m else 0
+        if (fmt in BUILTIN_DATE_FORMATS and fmt not in TIME_ONLY_FORMATS) or custom.get(fmt):
+            out.add(i)
+    return out
+
+
+def iso_from_serial(text):
+    """'46324' -> '2026-10-29' (an Excel serial date; any time of day is dropped). Anything that is not a plausible serial is returned unchanged."""
+    try:
+        n = float(text)
+    except (TypeError, ValueError):
+        return text
+    if not 1 <= n < 2958466:                                                          # (1900-01-01 to 9999-12-31)
+        return text
+    return (datetime.date(1899, 12, 30) + datetime.timedelta(days=int(n))).isoformat()
+
+
+def cell_value(cell_xml, sst, date_styles=()):
+    """cell_text, except that a number shown as a date by its style comes back as an ISO date (YYYY-MM-DD), the way the tool itself writes dates."""
+    text = cell_text(cell_xml, sst)
+    if date_styles and text:
+        head = cell_xml.split(">")[0]
+        t, s = re.search(r'\bt="([^"]+)"', head), re.search(r'\bs="(\d+)"', head)
+        if s and int(s.group(1)) in date_styles and (not t or t.group(1) == "n"):
+            return iso_from_serial(text)
+    return text
 
 
 def cells_of(sheet_xml):
