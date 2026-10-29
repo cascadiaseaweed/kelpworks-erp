@@ -233,9 +233,9 @@ def build_tracked(xml, entries, date):
                 results.append({"ref": ref, "applied": False, "reason": "another change (%s) already edits the same paragraph: apply this one by hand after accepting that one" % used[p]})
                 continue
             used[p] = ref
-        plan.append((paras[p][1] if where[0] == "add" else paras[p][0], order, where, entry, parsed, p))
+        plan.append((paras[p][1] if where[0] == "add" else paras[p][0], 0 if where[0] == "add" else 1, order, where, entry, parsed, p))
     edits = []
-    for _pos, order, where, entry, parsed, p in sorted(plan, key=lambda t: (t[0], t[1]), reverse=True):
+    for _pos, _rank, order, where, entry, parsed, p in sorted(plan, key=lambda t: (t[0], t[1], t[2]), reverse=True):
         s_, e_, inner, whole = paras[p]
         if where[0] == "add":
             lines = [x for x in str(entry.get("After", "")).split("\n") if x.strip()]

@@ -128,6 +128,20 @@ def test_two_additions_after_the_same_anchor_keep_their_order():
     assert all(r["applied"] for r in results) and accepted[accepted.index("2.3 Records are kept for two years.") + 1:][:2] == ["First.", "Second."]
 
 
+@pytest.mark.parametrize("swap", [False, True])
+def test_an_addition_and_a_replacement_in_the_next_paragraph_do_not_disturb_each_other(swap):
+    """The paragraph after the anchor starts exactly where the anchor ends: both edits land on the same position, and the replacement has to be cut in first (it once corrupted the document)."""
+    add = e(change="Add", after="Records are also kept in KelpWorks.", insert_after="2.3 Records are kept", ref="C1")
+    replace = e(before="kept by the document owner", after="kept by the Quality Manager", ref="C2")
+    new, results = build(*((replace, add) if swap else (add, replace)))
+    assert all(r["applied"] for r in results)
+    ElementTree.fromstring(new)                                                                                                   # still well-formed
+    accepted = gen.texts_of(new, "accept")
+    at = accepted.index("2.3 Records are kept for two years.")
+    assert accepted[at + 1:at + 3] == ["Records are also kept in KelpWorks.", "Revision history is kept by the Quality Manager."]
+    assert gen.texts_of(new, "reject") == gen.texts_of(DOCUMENT, "plain")
+
+
 @pytest.mark.parametrize("entry_,message", [
     (e(before="Nothing like this anywhere.", after="x"), "was not found in the manual"),
     (e(before="Stock never blocks a run.", after="x"), "found 2 times"),
