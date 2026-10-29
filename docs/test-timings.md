@@ -41,7 +41,11 @@ The top 5 files were 42% of the time, the top 10 files 58%, the top 20 75%. Ther
 | Quick tier (core set of 10 files), this PC | (none) | **55 s** in parallel, 2 min 18 s one test at a time |
 | Quick tier + 3 feature test files | (none) | about 1 min 10 s in parallel |
 
-CI (GitHub, 4 CPUs) used to take 5 to 6 minutes; its new time is recorded in the pull request.
+CI (GitHub, 4 CPUs): the job took **about 9 min 24 s** before KW-70 (the push run for `3402daa`) and **3 min 32 s** on its first run after it (PR 124, 2026-10-29; the cache of the older-release databases was empty and was saved at the end, so later runs
+should be faster; the same code on `main` took 3 min 36 s). That run: the upgrade checks 60 s, the rest of the suite 134 s, 1,014 tests, all passed; the Node syntax check and the timing report ran. The same files take far less time on the runner than on the development PC
+(728 s of test time against about 1,800 s), so judge the files by their share of the suite, not by seconds, as the report does.
+
+**Incident:** PR 123 (the first KW-70 merge) went in with a workflow file GitHub could not read, so no `test` check ran on it or on `main` until PR 124 fixed it. `tests/test_tier_upkeep.py` now flags that kind of error.
 
 How each change helps:
 - **Parallel runs** (`pytest-xdist`, a dev-only tool): the upgrade checks are independent of each other and spread over every worker; the rest of the suite keeps each file's tests together on one worker (`--dist loadfile`).
