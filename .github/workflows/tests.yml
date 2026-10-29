@@ -49,6 +49,6 @@ jobs:
         run: python -m pytest tests/test_migrations.py -n auto --dist load --junitxml=.test_timings/migrations.xml
       - name: Rest of the suite (real server on a throwaway database)
         run: python -m pytest --ignore=tests/test_fresh_db.py --ignore=tests/test_migrations.py -n auto --dist loadfile --junitxml=.test_timings/rest.xml
-      - name: Test timing report (advisory: warns, never fails the run)
+      - name: Test timing report (advisory - it warns and never fails the run)
         if: always()
         run: python tools/tier_health.py .test_timings/*.xml
