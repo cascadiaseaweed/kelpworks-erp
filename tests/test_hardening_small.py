@@ -12,6 +12,8 @@ import pytest
 from factories import finished_run, harvest_totes, sql
 from harness import Server
 
+pytestmark = pytest.mark.slow    # KW-70: skipped by the quick tier (-m "not slow"); CI runs it
+
 
 @pytest.fixture(scope="module")
 def srv():

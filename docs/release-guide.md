@@ -68,10 +68,52 @@ Status in the workbook; the live commit goes into `tests/legacy_commits.txt`.
 1. **Click through it locally.** Open the screen you changed on `localhost:8002` and check it works with no errors in the browser. This is the main test; the automated tests cannot judge a Word form or a screen.
 2. **Run the automated tests.**
    ```bash
-   python -m pip install -r requirements-dev.txt    # once: pytest, a dev-only tool (the shipped app has no dependencies)
-   python -m pytest
+   python -m pip install -r requirements-dev.txt    # once: pytest and pytest-xdist, dev-only tools (the shipped app has no dependencies)
+   py tools/quick_tests.py                          # the quick tier: about 1 to 2 minutes
    ```
    The tests start the real server on a throwaway database (`tests/harness.py`) and drive it over HTTP.
+
+   Three tiers, and when to use each:
+
+   | Tier | Command | Use it |
+   |---|---|---|
+   | Quick | `py tools/quick_tests.py` | While you build, and before you open a pull request. Runs the core tests, the test files you changed and the ones related to what you changed (`--list` shows which and why; `--also name` adds one). |
+   | Full, parallel | `py tools/quick_tests.py --all` | When a change touches migrations, release controls, security or the signed log, or when you want what CI will run (about 5 minutes on a many-core PC). |
+   | Full, one at a time | `python -m pytest` | Slowest (about 20 minutes). Use it to chase a failure that only shows up in parallel. |
+
+   The quick tier skips the heavy files marked `slow` (migrations from older releases, staging / restore, records archive, historical import ...) unless you changed them. It does not replace CI.
+   It runs the whole suite instead, by itself, when you changed the shared test machinery (`tests/harness.py`, `conftest.py`, `factories.py`, `pytest.ini`, the CI workflow) or your change reaches
+   many test files. Timings and what is still slow: `docs/test-timings.md`.
+
+   **Keeping the tiers healthy (automated).** Every full run (`py tools/quick_tests.py --all` locally, and every pull request in CI) ends with a timing report. CI shows it in the job summary
+   of the `test` check, with a warning only when something needs attention:
+
+   | The report says | What to do |
+   |---|---|
+   | a file is slow and not marked `slow` | run `py tools/quick_tests.py --all`, then `py tools/tier_health.py --apply`; review and commit the marker |
+   | a file is marked `slow` but is now quick | the same command removes the marker |
+   | the core set is over its share of the suite (15%) | trim `CORE` in `tools/quick_tests.py` (a judgement) or speed up those tests |
+
+   Nothing else needs doing when tests or features are added: new test files and new code are picked up from the diff. The one decision a person owns is what belongs in `CORE`.
+
+   **Keeping the core set right.** `CORE` (the list at the top of `tools/quick_tests.py`) is the small set of test files the quick tier always runs. A file belongs there only if it guards a rule
+   *any* change can break (not one tied to one feature: the diff already selects those), fails fast and clearly, and is cheap. Today: a fresh database boots, the API answers, sessions and security,
+   release gate and integrity, uploads, request limits, the integrity check, the clean-backup table lists (`test_clean_backup`: a new table must be in `KEEP` or `CLEAR`) and one migration check
+   (`test_upgrade_latest`: the release that is live now still upgrades). `PATH_RULES` (next to it) adds test files for changed files the selector cannot read, such as `public/styles.css`.
+   Review the list when one of these happens, not on a calendar:
+
+   | Trigger | What to do |
+   |---|---|
+   | A new cross-cutting guard test appears (one that "fails if a new table / setting / key is not listed") | Add its file to `CORE`, or a `PATH_RULES` entry if only one kind of file triggers it. |
+   | CI fails on a test file the quick tier did not run for that pull request (the timing report in the job summary says so: "failed here but the quick tier would not have run it") | Add that file to `CORE`, or add a `PATH_RULES` entry for the kind of change. This is the main way the list stays right. |
+   | The timing report says the core set is over its share of the suite (15%) | Trim it, or speed up its slowest tests. |
+   | A core file turns out to be slow or no longer guards anything | Move it out (and, if slow, `py tools/tier_health.py --apply` marks it). |
+
+   The steps: edit `CORE` / `PATH_RULES`, run `py tools/quick_tests.py --list` to see the choice, `py tools/quick_tests.py --all` to see the new core share in the report, and commit the change with its reason in the pull request.
+   `tests/test_tier_tools.py` and `tests/test_tier_upkeep.py` fail if a name in `CORE` or `PATH_RULES` is not a real test file, or if a core file is marked slow.
+
+   **JavaScript syntax.** CI runs `node --check` on every `public/*.js` before the tests (the app itself still has no build step and needs no Node). Nothing in the Python tests can see a JavaScript syntax
+   error, and one blanks the whole screen. Locally there is no Node on the PC, so the browser check in step 1 above covers it.
 3. **Try risky changes on a copy of the data first.** Anything touching the database or the lab Word forms is tried on a throwaway copy, never on live data.
 4. **For something that needs realistic data, use staging** (below).
 
@@ -83,6 +125,8 @@ The single job `test` runs, in order:
 2. **a fresh database boots and restarts** (`tests/test_fresh_db.py`);
 3. **migrations upgrade older databases without losing data** (`tests/test_migrations.py`): for each past version listed in `tests/legacy_commits.txt`, build that version's database, boot the current code on a copy, restart it, and check logins, integrity, no lost rows, no new foreign-key damage;
 4. the rest of the suite (login and access rules, backup and restore, and so on).
+
+CI runs **every** test (nothing is skipped as `slow`), in parallel workers, and keeps the databases of the older releases between runs (`.legacy_cache`) so the upgrade check does not rebuild them. The full suite is still the required check.
 
 **After each release, add the commit that is now live to `tests/legacy_commits.txt`**, so the next change is checked against what is actually deployed.
 

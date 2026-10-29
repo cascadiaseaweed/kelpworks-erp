@@ -2,4 +2,8 @@
 #
 #   python -m pip install -r requirements-dev.txt
 #   python -m pytest
+#   py tools/quick_tests.py        (the quick tier; see docs/release-guide.md)
+#
+# pytest-xdist only makes the suite faster (parallel workers); every test also passes one at a time (python -m pytest -p no:xdist).
 pytest>=8.4,<9
+pytest-xdist>=3.6,<4

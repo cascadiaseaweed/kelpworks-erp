@@ -17,3 +17,5 @@ tools/sync.log
 .claude/launch.json
 # backups (they hold password hashes and every record): never commit one
 *.zip
+.legacy_cache/
+.test_timings/

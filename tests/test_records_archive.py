@@ -19,6 +19,8 @@ import kelp_erp_server as K
 from factories import finalize_run, finished_run, harvest_totes, lab_report, release_run, sql
 from harness import ROOT, Server
 
+pytestmark = pytest.mark.slow    # KW-70: skipped by the quick tier (-m "not slow"); CI runs it
+
 KEY = "archive-key-for-tests-0123456789abcdef"
 TOOL = os.path.join(ROOT, "tools", "kelpworks_archive_sync.py")
 NAME_OK = re.compile(r"^[A-Za-z0-9._-]+$")

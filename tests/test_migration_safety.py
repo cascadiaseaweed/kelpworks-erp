@@ -19,6 +19,8 @@ from factories import finished_run, harvest_totes, finalize_run, release_run, sq
 from harness import ROOT, Server
 from test_migrations import build_legacy_db
 
+pytestmark = pytest.mark.slow    # KW-70: skipped by the quick tier (-m "not slow"); CI runs it
+
 
 def db_rows(path, query, args=()):
     conn = sqlite3.connect(path)

@@ -18,6 +18,8 @@ import kelp_erp_server as K  # noqa: E402
 from factories import harvest_totes, sql  # noqa: E402
 from harness import ADMIN_EMAIL, ADMIN_PASSWORD, Server  # noqa: E402
 
+pytestmark = pytest.mark.slow    # KW-70: skipped by the quick tier (-m "not slow"); CI runs it
+
 IBC = "New 1,000 L IBC Tote"
 JPG = b"\xff\xd8\xff\xe0JFIF-test-photo"
 

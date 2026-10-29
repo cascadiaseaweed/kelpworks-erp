@@ -7,6 +7,8 @@ import pytest
 import kelp_erp_server as K
 from harness import Server
 
+pytestmark = pytest.mark.slow    # KW-70: skipped by the quick tier (-m "not slow"); CI runs it
+
 
 @pytest.fixture(scope="module")
 def srv():

@@ -5,8 +5,10 @@ server on a COPY and check that it starts, keeps every row it had, leaves no new
 
 Locally a commit missing from your clone is skipped; in CI (CI=true) it fails, so the check can never pass by silently testing nothing.
 """
+import hashlib
 import io
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -15,6 +17,8 @@ import tarfile
 import pytest
 
 from harness import ROOT, Server
+
+pytestmark = pytest.mark.slow    # KW-70: skipped by the quick tier (-m "not slow"); CI runs it
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LEGACY_ADMIN, LEGACY_PASSWORD = "admin@kelp.local", "kelp1234"      # the seed admin every old version created
@@ -51,8 +55,40 @@ def legacy_dir(tmp_path_factory):
     return tmp_path_factory.mktemp("legacy")
 
 
+LEGACY_CACHE_DIR = os.environ.get("KELP_ERP_LEGACY_CACHE") or os.path.join(ROOT, ".legacy_cache")
+
+
+def legacy_cache_path(commit):
+    """Where the database an OLD commit builds is kept between runs. A commit never changes, so the key is the commit plus everything else that shapes
+    the database it builds (the build script, the Python minor version, the development flag): change any of them and the old copy is simply not used."""
+    key = hashlib.sha256(("%s|%s|%d.%d|development" % (commit, BUILD_LEGACY, sys.version_info[0], sys.version_info[1])).encode("utf-8")).hexdigest()[:16]
+    return os.path.join(LEGACY_CACHE_DIR, "%s_%s.db" % (commit, key))
+
+
+def _store_legacy_cache(built_db, cached):
+    """Keep a clean single-file copy (sqlite's backup API folds in any WAL), written under a unique name and moved into place, so two test workers that
+    build the same commit at the same moment cannot leave a half-written file."""
+    os.makedirs(os.path.dirname(cached), exist_ok=True)
+    part = "%s.%d.part" % (cached, os.getpid())
+    src, dst = sqlite3.connect(built_db), sqlite3.connect(part)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    os.replace(part, cached)
+
+
 def build_legacy_db(commit, workdir):
-    """Check `commit` out into workdir and boot it on a new database. Returns the database path."""
+    """Check `commit` out into workdir and boot it on a new database. Returns the database path.
+
+    The database is built once per commit and kept under .legacy_cache/ (git-ignored; CI keeps the folder between runs). The path returned is always a COPY in
+    `workdir`, so no test can change the cached file. KELP_ERP_LEGACY_CACHE=off builds every time."""
+    cached = None if LEGACY_CACHE_DIR.lower() == "off" else legacy_cache_path(commit)
+    if cached and os.path.exists(cached):
+        db = os.path.join(str(workdir), commit + ".db")
+        shutil.copyfile(cached, db)
+        return db
     tar = subprocess.run(["git", "archive", "--format=tar", commit], cwd=ROOT, capture_output=True)
     if tar.returncode != 0:
         msg = "commit %s is not in this clone (%s)" % (commit, tar.stderr.decode("utf-8", "replace").strip()[:120])
@@ -68,6 +104,8 @@ def build_legacy_db(commit, workdir):
                KELP_ERP_ENV="development")
     r = subprocess.run([sys.executable, "-c", BUILD_LEGACY], cwd=tree, env=env, capture_output=True)
     assert r.returncode == 0, "the old version (%s) did not build its database:\n%s" % (commit, r.stderr.decode("utf-8", "replace")[-800:])
+    if cached:
+        _store_legacy_cache(db, cached)
     return db
 
 
@@ -98,9 +136,18 @@ def snapshot(path):
         conn.close()
 
 
+def newest_legacy_commit():
+    """The release listed LAST in tests/legacy_commits.txt (the one that is live now): the quick tier's one migration check (tests/test_upgrade_latest.py)."""
+    return _commits()[-1].values[0]
+
+
 @pytest.mark.parametrize("commit", _commits())
 def test_current_code_upgrades_an_older_database(commit, legacy_dir):
-    old_db = build_legacy_db(commit, legacy_dir)
+    check_upgrade(commit, legacy_dir)
+
+
+def check_upgrade(commit, workdir):
+    old_db = build_legacy_db(commit, workdir)
     before = snapshot(old_db)
     assert before["tables"], "the legacy database is empty"
 

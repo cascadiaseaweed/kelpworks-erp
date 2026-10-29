@@ -25,8 +25,10 @@ Follow these steps in order. Do not skip one; say so if one does not apply.
    - uploads -> the upload rules (file types, storage room, daily quota) and the archive;
    - release, Certificate of Analysis, specifications, required fields, records or document control -> a Quality Manager must be told: add it to the Quality Manual (QM-001) change list;
    - anything that changes an audit control -> `docs/data-integrity-statement.md`.
-6. **Build.** Standard library only (no new pip packages). Match the code around it. Add tests in `tests/` (extend the right file or add one) that fail without the change; run the FULL suite
-   (`python -m pytest`) and fix failures. Verify the change in the browser preview (restart the server first) and look at the console for errors. Update `CLAUDE.md` and any guide the change makes
+6. **Build.** Standard library only (no new pip packages). Match the code around it. Add tests in `tests/` (extend the right file or add one) that fail without the change; run the QUICK tier
+   (`py tools/quick_tests.py`, 1-2 minutes: the core tests plus the test files you changed and the ones related to your diff) while building and before reporting, and the FULL suite in
+   parallel (`py tools/quick_tests.py --all`, about 5 minutes) when the change touches migrations, release controls, security or the signed log (see `docs/release-guide.md`; CI runs every
+   test on the pull request and is the required check). A full run ends with a timing report: act on its warnings (`py tools/tier_health.py --apply` marks / unmarks slow files). Fix failures. Verify the change in the browser preview (restart the server first) and look at the console for errors. Update `CLAUDE.md` and any guide the change makes
    untrue.
 7. **Stop and report.** (Keep the workbook current as you go, see step 10.) Summarise: what changed (files), how each acceptance criterion is met, tests run, anything decided on the user's behalf, anything needing the user (decisions, Quality
    Manager, a setting to change on the live site). Do NOT commit, push or open a pull request until the user says so.
