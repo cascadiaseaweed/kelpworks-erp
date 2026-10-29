@@ -10,6 +10,8 @@ import pytest
 from factories import feedstock_detail, finalize_run, finished_run, harvest_totes, sql, stage_payloads
 from harness import Server
 
+pytestmark = pytest.mark.slow    # KW-70: skipped by the quick tier (-m "not slow"); CI runs it
+
 _n = [0]
 
 

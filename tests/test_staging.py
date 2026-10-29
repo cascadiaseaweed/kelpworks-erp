@@ -14,6 +14,8 @@ import pytest
 from harness import Server
 from test_migrations import build_legacy_db
 
+pytestmark = pytest.mark.slow    # KW-70: skipped by the quick tier (-m "not slow"); CI runs it
+
 STAGING_ENV = {"KELP_ERP_ENV": "staging", "KELP_ERP_ALLOW_RESTORE": "1", "KELP_ERP_STAGING_PASSWORD": "staging-pass-9"}
 
 
@@ -143,7 +145,7 @@ def test_restore_copies_live_data_and_resets_passwords(server, admin, staging):
     ("unknown folder", make_zip({"kelp_erp.db": b"x", "other/file.txt": b"x"})),
     ("no database", make_zip({"uploads/a.txt": b"x"})),
     ("damaged database", make_zip({"kelp_erp.db": b"not a sqlite file" * 100})),
-])
+], ids=lambda v: v if isinstance(v, str) else "zip")           # the zip bytes carry a timestamp: as part of the test id they would differ between parallel workers (KW-70)
 def test_bad_backups_are_rejected_and_change_nothing(staging, label, payload):
     keeper, info = staging.make_user(role="user")
     r = staging.admin_client().post_bytes("/api/admin/restore", payload)

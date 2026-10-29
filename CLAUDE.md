@@ -47,9 +47,33 @@ No build step, no install. First run creates + seeds `kelp_erp.db` from `seed.js
 ## Tests
 
 ```bash
-python -m pip install -r requirements-dev.txt    # pytest -- dev/CI only; the shipped app stays standard-library only
-python -m pytest
+python -m pip install -r requirements-dev.txt    # pytest + pytest-xdist -- dev/CI only; the shipped app stays standard-library only
+py tools/quick_tests.py          # the QUICK tier: while building and before opening a PR (about 1-2 minutes)
+py tools/quick_tests.py --all    # the whole suite in parallel (about 5 minutes on a many-core PC)
+python -m pytest                 # the whole suite, one test at a time (about 20 minutes)
 ```
+**Tiers (KW-70; timings in `docs/test-timings.md`).** The quick tier (`tools/quick_tests.py`, standard library only) compiles everything, runs a fixed CORE set
+(fresh database, API smoke, sessions / security, release gate and integrity, uploads, limits and logging, the integrity check), the test files you added or changed,
+and the test files related to the functions your diff touches (a file that mentions one, or shares a word with its name); `--list` shows the choice and why, `--also
+name` adds a file. Files marked `slow` (`pytestmark = pytest.mark.slow`: migrations from older releases, migration safety, staging / restore, records archive, the
+historical import, idle timeout, small hardening) are in the quick tier only when you changed them or ask; `python -m pytest -m "not slow"` is everything else. The
+quick tier is advisory: **CI runs every test on every pull request and stays the required check**, and the full suite is run locally (`--all`) when a change touches
+migrations, release controls or security. **Maintenance is automated** (`tools/tier_health.py`, tests in `tests/test_tier_tools.py`): the quick tier switches to the whole
+suite by itself when the shared test machinery (`tests/harness.py`, `conftest.py`, `factories.py`, `pytest.ini`, `requirements-dev.txt`, the CI workflow) changed or when a change
+reaches more than 12 related test files (`--list` only shows it, `--no-escalate` stops it); `--all` writes every test's time to `.test_timings/*.xml` (git-ignored) and prints the
+timing report; CI writes the same files and puts the report in the job summary (advisory: a `::warning::` per finding, never a failure). The report says which test file to mark
+`slow` (unmarked and over 3% of the suite's test time), which marked file can come back (under 0.7%) and whether the CORE set is over 15% of it (shares, not seconds: a test takes about twice as long when several run at once, so a parallel run's seconds are not comparable with a serial one's); `py tools/tier_health.py --apply` edits the
+`pytestmark = pytest.mark.slow` lines (ast-based, keeps line endings; review the diff). The slow marker must be written in exactly that form. **The one thing a person decides is
+CORE** (the `CORE` list in `tools/quick_tests.py`: what every change can break, plus `PATH_RULES` for changed files the selector cannot read). **Keeping the core set right**
+(details in `docs/release-guide.md`): add a file when a new cross-cutting guard test appears, or when CI fails on a test file the quick tier did not run for that PR (the CI timing
+report says so: `tools/tier_health.py` compares the failures with the quick tier's choice for the branch); trim it when the report says the core set is over its 15% share. The core also
+holds `test_clean_backup` (a new table must be in `KEEP` / `CLEAR`) and `test_upgrade_latest` (the release live now still upgrades: `newest_legacy_commit()`, the last line of
+`tests/legacy_commits.txt`, run through the same `check_upgrade` as the full migration check). CI also runs `node --check` on every `public/*.js` before the tests, because nothing in the
+Python tests detects a JavaScript syntax error (no Node on the PC: the browser check covers it locally). CI's compile step is `python tools/quick_tests.py
+--compile` (every Python file outside `tests/`), so new modules are covered. Parallel runs (`pytest-xdist`): the upgrade checks spread over all workers (`--dist load`), the rest keeps
+each file on one worker (`--dist loadfile`); every test must also pass on its own, and its test id must be the same in every process (no random bytes, timestamps or temp
+paths in a `parametrize` value: give `ids=`; `tests/test_quick_tier.py` checks it). The database each older release builds is cached under `.legacy_cache/` (git-ignored; CI caches the folder;
+`build_legacy_db` always hands out a COPY; `KELP_ERP_LEGACY_CACHE=off` rebuilds every time).
 `tests/harness.py` (stdlib only) boots the REAL server as a subprocess on a free port with its own temporary SQLite database + uploads, seeded like a
 first deploy (`Server`; `restart()` re-boots on the same data; `Server(db_path=...)` boots on a COPY of an existing database), plus a thin urllib
 `ApiClient` (bearer-token `login()`, `admin_client()`, `make_user()`). `tests/conftest.py` turns those into pytest fixtures (`server`, `fresh_server`,

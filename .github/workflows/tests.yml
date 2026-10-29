@@ -26,11 +26,29 @@ jobs:
           cache-dependency-path: requirements-dev.txt
       - name: Install test tools (dev only)
         run: python -m pip install -r requirements-dev.txt
-      - name: Compile (catches syntax errors)
-        run: python -m py_compile kelp_erp_server.py
+      - name: Older-release databases (cached between runs)
+        uses: actions/cache@v4
+        with:
+          path: .legacy_cache           # the database each old commit builds never changes for a given commit (tests/test_migrations.py keys the files)
+          key: legacy-${{ runner.os }}-py3.12-${{ hashFiles('tests/legacy_commits.txt') }}
+          restore-keys: legacy-${{ runner.os }}-py3.12-
+      - name: Compile (catches syntax errors in every Python file outside tests/)
+        run: python tools/quick_tests.py --compile
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"            # only for the syntax check below: the app has no build step and needs no Node
+      - name: JavaScript syntax (node --check on every public/*.js)
+        run: |
+          for f in public/*.js; do
+            echo "checking $f"
+            node --check "$f"
+          done
       - name: Fresh database boots (and restarts)
-        run: python -m pytest tests/test_fresh_db.py
+        run: python -m pytest tests/test_fresh_db.py --junitxml=.test_timings/fresh_db.xml
       - name: Migrations upgrade older databases without losing data
-        run: python -m pytest tests/test_migrations.py
+        run: python -m pytest tests/test_migrations.py -n auto --dist load --junitxml=.test_timings/migrations.xml
       - name: Rest of the suite (real server on a throwaway database)
-        run: python -m pytest --ignore=tests/test_fresh_db.py --ignore=tests/test_migrations.py
+        run: python -m pytest --ignore=tests/test_fresh_db.py --ignore=tests/test_migrations.py -n auto --dist loadfile --junitxml=.test_timings/rest.xml
+      - name: Test timing report (advisory: warns, never fails the run)
+        if: always()
+        run: python tools/tier_health.py .test_timings/*.xml
