@@ -25,6 +25,7 @@ import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import changelog_path                                                             # the ONE place that says where the change log is (KW-62)
+import update_backlog_xlsx as xl                                                  # the XML helpers (date styles)
 
 NS = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
       "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
@@ -52,6 +53,7 @@ def read_sheets(path):
                 shared.append("".join(t.text or "" for t in si.iter("{%s}t" % NS["m"])))
         wb = ET.fromstring(z.read("xl/workbook.xml"))
         rels = {r.get("Id"): r.get("Target") for r in ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))}
+        dates = xl.date_style_ids(z.read("xl/styles.xml").decode("utf-8")) if "xl/styles.xml" in z.namelist() else set()      # a date typed in Excel is a number with a date style: write it as YYYY-MM-DD
         out = {}
         for s in wb.find("m:sheets", NS):
             target = rels[s.get("{%s}id" % NS["r"])].lstrip("/")
@@ -67,6 +69,8 @@ def read_sheets(path):
                         val = "".join(x.text or "" for x in c.iter("{%s}t" % NS["m"]))
                     else:
                         val = v.text if v is not None and v.text is not None else ""
+                        if val and c.get("s") and int(c.get("s")) in dates and t in (None, "n"):
+                            val = xl.iso_from_serial(val)
                     cells[col_index(c.get("r"))] = val.strip()
                 if cells:
                     rows.append([cells.get(i, "") for i in range(max(cells) + 1)])

@@ -180,6 +180,7 @@ class Snapshot:
             raise ValueError("the workbook has no sheet called '%s'" % SHEET)
         self.part = self.paths[SHEET]
         self.sst = xl.shared_strings(self.files)
+        self.date_styles = xl.date_style_ids(self.files["xl/styles.xml"].decode("utf-8")) if "xl/styles.xml" in self.files else set()      # (a date typed in Excel is a number: read it as YYYY-MM-DD)
         self.xml = self.files[self.part].decode("utf-8")
         self.headers = xl.header_columns(self.xml, self.sst)               # {header: column letters}
         self.by_lower = {h.strip().lower(): h for h in self.headers if h}
@@ -224,7 +225,7 @@ class Snapshot:
         for ref, c in xl.cells_of(xml):
             m = re.fullmatch(r"([A-Z]+)(\d+)", ref)
             if m and int(m.group(2)) == row and m.group(1) in letter_to_header:
-                out[letter_to_header[m.group(1)]] = xl.cell_text(c, self.sst).strip()
+                out[letter_to_header[m.group(1)]] = xl.cell_value(c, self.sst, self.date_styles).strip()
         return out
 
     def cell_ref(self, sheet, ref):
@@ -747,7 +748,7 @@ def table_rows(snap, name, xml=None):
     for ref, c in xl.cells_of(xml):
         col_, row_ = split_ref(ref)
         if row_ > 1 and col_ in by_letter:
-            rows.setdefault(row_, {})[by_letter[col_]] = xl.cell_text(c, snap.sst).strip()
+            rows.setdefault(row_, {})[by_letter[col_]] = xl.cell_value(c, snap.sst, snap.date_styles).strip()
     return headers, sorted(rows.items())
 
 
