@@ -3969,6 +3969,39 @@ def qc_section_of(stage, subtitle):
     return stage if stage in QC_SECTIONS else "homogenization"
 
 
+# KW-96: laboratory results that have no Certificate of Analysis specification ("additional analyses") are charted too, for trend monitoring. A chart is one measurement,
+# so the several ways a lab or a person writes the same element ("Iron", "Fe", "Iron (Fe) - ICP-MS ...") must land in ONE chart. The 11 CoA metals have specifications and
+# their own charts, so they are not listed here. symbol -> name; QC_ELEMENT_NAMES maps a lower-case name (and common spellings) back to the symbol.
+QC_ELEMENTS = {
+    "fe": "Iron", "mn": "Manganese", "al": "Aluminum", "ba": "Barium", "ca": "Calcium", "sr": "Strontium", "mg": "Magnesium", "na": "Sodium", "k": "Potassium",
+    "p": "Phosphorus", "s": "Sulfur", "b": "Boron", "si": "Silicon", "li": "Lithium", "sb": "Antimony", "ag": "Silver", "sn": "Tin", "ti": "Titanium",
+    "v": "Vanadium", "tl": "Thallium", "u": "Uranium", "be": "Beryllium", "bi": "Bismuth", "w": "Tungsten", "zr": "Zirconium", "rb": "Rubidium",
+    "cs": "Cesium", "ga": "Gallium", "ge": "Germanium", "te": "Tellurium",
+}
+QC_ELEMENT_NAMES = dict({v.lower(): k for k, v in QC_ELEMENTS.items()}, aluminium="al", caesium="cs", sulphur="s")
+_QC_ANALYTE_RE = re.compile(r"^([a-z]+)\s*(?:\(\s*([a-z]{1,2})\s*\))?(?:\s*[-,:;/]\s*.*)?$")
+
+
+def qc_extra_analyte(name):
+    """(chart key part, display label, is_element) for the text a lab result was entered under. The key part is lower-case letters, digits and underscores, at most 48
+    characters (the control-limit route only accepts `[a-z]+:[a-z_0-9]+`), and the same for every spelling of one element: the WHOLE name is an element name or symbol, optionally
+    followed by its symbol in brackets and / or a separator and more text (a method): "Iron", "Fe", "Iron (Fe)", "Iron (Fe) - ICP-MS after digestion". "Iron oxide" and "Total iron"
+    are different measurements and are not merged. Any other name becomes its own chart, keyed by its letters and digits. No fuzzy matching: a missed merge is visible and is fixed by
+    adding to QC_ELEMENTS; a wrong merge would hide a real difference."""
+    raw = " ".join(str(name or "").split())
+    low = raw.lower()
+    m = _QC_ANALYTE_RE.match(low)
+    if m:
+        word, bracket = m.group(1), m.group(2)
+        sym = word if word in QC_ELEMENTS else QC_ELEMENT_NAMES.get(word)
+        if sym and (bracket is None or bracket == sym):
+            return sym, "%s (%s)" % (QC_ELEMENTS[sym], sym.capitalize()), True
+    slug = re.sub(r"[^a-z0-9]+", "_", low).strip("_") or "analyte"
+    if len(slug) > 48:
+        slug = slug[:40] + "_" + hashlib.sha1(slug.encode("utf-8")).hexdigest()[:7]          # cut names stay unique
+    return slug, raw or "Analyte", False
+
+
 # ---- Previews: a lightweight HTML rendering of a Word / Excel document (stdlib only). Content-faithful (text, bold, tables, merged
 # cells), not layout-faithful -- logos and exact fonts are left out. The result is shown in a sandboxed frame; every text is escaped.
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -17373,6 +17406,44 @@ class Handler(BaseHTTPRequestHandler):
                 v, unit = v * f, "ppm"
             add("lab", "lab:" + sp["code"], sp["name"], unit, True, "lab",
                 {"r": x["run_id"], "v": v, "q": x["qualifier"] or "", "when": x["report_date"] or (x["entered_at"] or "")[:10], "n": x["report_number"]})
+        # KW-96: laboratory results with no specification (the "additional analyses"), charted for trend monitoring only: no specification line, never part of the release gate or
+        # the certificate. Element names are merged (qc_extra_analyte) and converted to ppm like the heavy metals; any other analyte keeps the unit it was reported in (the first
+        # unit entered sets the chart's unit; a result in another unit is left out and counted, never converted). A text result (Negative / Positive) cannot be plotted.
+        extra = {}
+        for x in conn.execute("SELECT * FROM lab_results WHERE voided_at IS NULL AND spec_code IS NULL AND value_num IS NOT NULL ORDER BY id"):
+            if x["run_id"] not in run_ids or not (x["analyte"] or "").strip():
+                continue
+            slug, label, is_element = qc_extra_analyte(x["analyte"])
+            e = extra.setdefault(slug, {"label": label, "element": is_element, "names": {}, "unit": None, "points": [], "skipped": 0, "skippedUnits": set()})
+            spelling = " ".join(str(x["analyte"]).split())
+            e["names"][spelling] = e["names"].get(spelling, 0) + 1
+            unit_in = (x["unit"] or "").strip()
+            v = float(x["value_num"])
+            if is_element:
+                f = COA_PPM_FACTORS.get(unit_in.lower())
+                if f is None:
+                    e["skipped"] += 1
+                    e["skippedUnits"].add(unit_in or "(no unit)")
+                    continue
+                v, unit = v * f, "ppm"
+            else:
+                unit = e["unit"] if e["unit"] is not None else unit_in
+                if unit_in.lower() != unit.lower():
+                    e["skipped"] += 1
+                    e["skippedUnits"].add(unit_in or "(no unit)")
+                    continue
+            e["unit"] = unit
+            e["points"].append({"r": x["run_id"], "v": v, "q": x["qualifier"] or "", "when": x["report_date"] or (x["entered_at"] or "")[:10], "n": x["report_number"]})
+        for slug, e in extra.items():
+            if not e["points"]:
+                continue
+            if not e["element"]:                                   # the spelling used most often names the chart (ties: the first entered)
+                e["label"] = max(e["names"].items(), key=lambda kv: kv[1])[0]
+            for p in e["points"]:
+                add("labx", "labx:" + slug, e["label"], e["unit"] or "", True, "lab", p)
+            measures["labx:" + slug].update(
+                names=[{"name": n, "n": c} for n, c in sorted(e["names"].items(), key=lambda kv: (-kv[1], kv[0]))][:12],
+                skipped={"count": e["skipped"], "units": sorted(e["skippedUnits"])})
         # specification reference lines (the Certificate of Analysis limits, in the chart's unit)
         refs = {}
         rate = float(get_setting_value(conn, "coa_application_rate_kg_ha", 0) or 0)
@@ -17386,7 +17457,7 @@ class Handler(BaseHTTPRequestHandler):
                 refs["lab:%s|lab" % sp["code"]] = {"min": sp["min_val"], "max": sp["max_val"], "exclusive": bool(sp["max_exclusive"]), "label": "CoA specification"}
             elif sp["basis"] == "metal" and sp["max_val"] and rate > 0:
                 refs["lab:%s|lab" % sp["code"]] = {"max": sp["max_val"] * 1e6 / (rate * periods), "label": "CoA limit (as ppm)"}
-        group_order = {"qc": 0, "feedstock": 1, "lab": 2}
+        group_order = {"qc": 0, "feedstock": 1, "lab": 2, "labx": 3}
         out_measures = []
         for m in sorted(measures.values(), key=lambda m: (group_order[m["group"]], m["label"].lower())):
             secs = sorted(m["sections"].values(), key=lambda sct: sct["order"])
