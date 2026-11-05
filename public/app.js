@@ -986,6 +986,13 @@ async function openHarvest() {
 // one form submission each. Parsing/validation/lot-numbering all happen
 // server-side (POST /api/harvest/bulk); this just reads the file as text
 // and shows the row-level error the backend reports if any row is bad.
+function importSummary(r) {
+  const parts = [];
+  if (r.count) parts.push(r.count + ' new tote(s)');
+  if (r.updated) parts.push(r.updated + ' row(s) updating existing totes');
+  if (r.unchanged) parts.push(r.unchanged + ' row(s) with nothing to change');
+  return parts.join(', ') || 'Nothing to import';
+}
 async function openFeedstockImport() {
   let csvText = '';
   const fileInput = el('input', { type: 'file', accept: '.csv,text/csv' });
@@ -1008,8 +1015,14 @@ async function openFeedstockImport() {
   function show(r, ok) {
     report.innerHTML = '';
     if (ok) {
-      report.append(el('div', { class: 'sign-box' }, el('b', {}, '✔ ' + r.count + ' tote(s) can be imported.'),
-        el('div', { class: 'help' }, 'Lot numbers: ' + r.lots.slice(0, 6).join(', ') + (r.lots.length > 6 ? ' … and ' + (r.lots.length - 6) + ' more' : '')),
+      const shownChanges = r.changes || [];
+      const changeRows = [];
+      shownChanges.forEach(c => c.fields.forEach(f => changeRows.push([String(c.row), c.lot, f.field, f.old || '—', f.new || '—',
+        f.historical ? 'Historical reading (' + f.date + '): the current value stays' : (f.date ? 'Reading date ' + f.date : '')])));
+      report.append(el('div', { class: 'sign-box' }, el('b', {}, '✔ ' + importSummary(r) + ' — this file can be imported.'),
+        r.lots && r.lots.length ? el('div', { class: 'help' }, 'New lot numbers: ' + r.lots.slice(0, 6).join(', ') + (r.lots.length > 6 ? ' … and ' + (r.lots.length - 6) + ' more' : '')) : null,
+        changeRows.length ? el('div', { class: 'tablewrap', style: 'max-height:260px;overflow:auto;margin-top:6px' }, table(['Row', 'Lot', 'Field', 'Was', 'Becomes', 'Note'], changeRows, [false, false, false, false, false, false])) : null,
+        (r.changeCount || 0) > shownChanges.length ? el('div', { class: 'help' }, 'Showing the first ' + shownChanges.length + ' of ' + r.changeCount + ' updated totes.') : null,
         ...(r.warnings || []).map(w => el('div', { class: 'help', style: 'color:var(--fg-8a5a00)' }, '⚠ ' + w))));
       return;
     }
@@ -1032,8 +1045,14 @@ async function openFeedstockImport() {
     field('CSV file', fileInput),
     el('div', { style: 'display:flex;gap:10px;align-items:center;margin:6px 0' }, checkBtn, status),
     report,
-    el('div', { class: 'help' }, el('b', {}, 'Required: '), 'site, species, harvestDate (YYYY-MM-DD).'),
-    el('div', { class: 'help' }, el('b', {}, 'Optional: '), 'avgWeightKg (leave blank if the batch is not weighed yet — use “Set values for selected” later), toteNumber, receivedDate, grind (Coarse, Fine or Whole, default Coarse), stabilizationMethod (Citric acid or Fresh), storageUnit (Tote or Bag), storageSource, location, ph, orp, tdsPct, status (in_stock or hold), notes.'),
+    el('div', { class: 'help' }, el('b', {}, 'Required for a new tote: '), 'site, species, harvestDate (YYYY-MM-DD).'),
+    el('div', { class: 'help' }, el('b', {}, 'Optional: '), 'avgWeightKg (leave blank if the batch is not weighed yet — use “Set values for selected” later), toteNumber, receivedDate, grind (Coarse, Fine or Whole, default Coarse), stabilizationMethod (Citric acid or Fresh), storageUnit (Tote or Bag), storageSource, location, ph, phDate, orp, orpDate, tdsPct, tdsDate, status (in_stock or hold), notes, lotNumber (updates that tote), reason (why a received date changed).'),
+    el('div', { class: 'help' }, 'A row with a lotNumber needs none of the required columns.'),
+    el('div', { class: 'help' }, el('b', {}, 'Reading dates: '), 'phDate, orpDate and tdsDate (YYYY-MM-DD, not in the future) give the day each reading was taken; a date needs its reading. Left blank, the import day is used.'),
+    el('div', { class: 'help' }, el('b', {}, 'Updating totes that exist: '), 'put the lot number in lotNumber and only the cells that hold a value change; a blank cell leaves the value alone. '
+      + 'A reading newer than the one on file becomes the current value; an older one (a historical reading) is kept in the tote’s Feedstock Stability log and the current value stays. '
+      + 'Weight, grind, stabilization method, storage and location cannot be changed on a tote that is in a run or consumed. Changing a received date that is already filled in needs a reason. '
+      + 'Site, species, harvest date and tote number are the lot number and never change. A lot may appear on several rows (for example several historical readings); the rows are applied in order. “Check file” lists every change before you import.'),
     el('div', { class: 'help' }, el('b', {}, 'Tote numbers: '), 'the lot number is SITE-SPECIES-YYYYMMDD-NNN, where NNN is the tote number. Leave toteNumber blank to number the totes automatically. If you type one, it must be a whole number from 1 to 999 and unique: '
       + 'it cannot repeat in the file, match a tote already in Feedstock Inventory, or match a tote that was deleted (those numbers are never reused). '
       + 'Calculated columns (lot number, stabilization period, grade, last updated) are not imported. One problem anywhere blocks the whole file, so nothing is half-imported.'));
@@ -1042,7 +1061,7 @@ async function openFeedstockImport() {
     try {
       const r = await api('POST', '/harvest/bulk', { csvText });
       State.ref = await api('GET', '/refdata');
-      toast('Imported ' + r.count + ' tote(s).');
+      toast('Imported: ' + importSummary(r) + '.');
       render();
     } catch (e) {
       if (e.problems) { show(e, false); throw new Error(e.message); }

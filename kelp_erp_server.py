@@ -11488,9 +11488,203 @@ class Handler(BaseHTTPRequestHandler):
     # ---- bulk import of feedstock totes (CSV) -------------------------------- #
     # One row per tote. The whole file is checked FIRST and every problem is reported with its row and column; if there is any, nothing is imported (all or nothing). With
     # dryRun the file is only checked. A lot number is SITE-SPECIES-YYYYMMDD-NNN: toteNumber (NNN) may be given, and then it must be unique; left blank it is assigned automatically.
+    # KW-95: a row with lotNumber filled UPDATES that tote instead (only the cells that hold a value change; the readings pH / ORP / % TDS carry their own reading dates and follow the
+    # newest-reading-date-wins rule of Update feedstock conditions); phDate / orpDate / tdsDate also date the readings of a NEW tote. The check ("dryRun") applies the file inside a
+    # SAVEPOINT and rolls it back, so what it lists is exactly what the import will do.
     BULK_COLUMNS = ["site", "species", "harvestDate", "avgWeightKg", "toteNumber", "receivedDate", "grind", "stabilizationMethod", "storageUnit", "storageSource",
-                    "location", "ph", "orp", "tdsPct", "status", "notes"]
+                    "location", "ph", "orp", "tdsPct", "status", "notes", "lotNumber", "phDate", "orpDate", "tdsDate", "reason"]
     BULK_REQUIRED = ("site", "species", "harvestDate")
+    BULK_READINGS = (("ph", "phDate", "pH", "ph", "ph_updated"), ("orp", "orpDate", "ORP (mV)", "orp", "orp_updated"), ("tdsPct", "tdsDate", "Feedstock TDS (%)", "tds_pct", "tds_updated"))
+    BULK_LOCKED = ("wip", "consumed", "disposed")
+
+    def _bulk_apply_reading(self, conn, user, tid, label, col, dcol, val, date, note):
+        """One reading of an imported row, by the rule of Update feedstock conditions (/ph): an OLDER reading date than the one on file is logged as a historical reading (From blank) and the
+        current value stays; otherwise it becomes the current value. The same value on the same date logs nothing. Returns (old, historical) or None when nothing changed."""
+        it = conn.execute("SELECT %s AS v, %s AS d FROM tote_lots WHERE id=?" % (col, dcol), (tid,)).fetchone()
+        cur, cur_date = it["v"], it["d"]
+        if cur is not None and cur_date == date and _fmtval(cur) == _fmtval(val):
+            return None
+        if cur_date and date < cur_date:
+            self._log_stability(conn, tid, user, label, None, val, "Historical reading (the current value stays %s, taken %s) - %s" % (_fmtval(cur), cur_date, note), reading_date=date)
+            return cur, True
+        self._log_stability(conn, tid, user, label, cur, val, note, reading_date=date)
+        conn.execute("UPDATE tote_lots SET %s=?, %s=? WHERE id=?" % (col, dcol), (val, date, tid))
+        return cur, False
+
+    def _bulk_reading_dates(self, row, rn, problem, today):
+        """The reading date of each reading of a row, {csv key: ISO date}, for the dates that are filled in. A date has to be a real date, not in the future, and needs its reading."""
+        out = {}
+        for key, dkey, _label, _col, _dcol in self.BULK_READINGS:
+            raw = row.get(dkey, "")
+            if not raw:
+                continue
+            try:
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+                    raise ValueError(raw)
+                datetime.date.fromisoformat(raw)
+            except ValueError:
+                problem(rn, dkey, "'%s' is not a date (use YYYY-MM-DD)." % raw)
+                continue
+            if raw > today:
+                problem(rn, dkey, "The reading date %s is in the future." % raw)
+            elif not row.get(key, ""):
+                problem(rn, dkey, "A reading date needs its reading: %s is blank." % key)
+            else:
+                out[key] = raw
+        return out
+
+    def _bulk_update_row(self, conn, rn, row, today, problem, known_locations, new_locs):
+        """KW-95: check one row that names an existing tote (lotNumber) and work out what it asks for. Only the cells that hold a value count; a blank cell leaves the value alone and the
+        defaults of a new tote do not apply. Returns {rn, lot, id, cells, readings, reason}, or None when the row has a problem (each one is reported through `problem`)."""
+        lot = row["lotNumber"].upper()
+        t = conn.execute("SELECT * FROM tote_lots WHERE lot_number=?", (lot,)).fetchone()
+        if t is None:
+            problem(rn, "lotNumber", "%s is not in Feedstock Inventory. (To add a new tote, leave lotNumber blank.)" % lot)
+            return None
+        mine = []
+
+        def prob(col, msg):
+            mine.append(col)
+            problem(rn, col, msg)
+        tote_given = row.get("toteNumber", "")
+        for col, given, same in (("site", row.get("site", "").upper(), row.get("site", "").upper() == t["site_code"]),
+                                 ("species", row.get("species", "").upper(), row.get("species", "").upper() == t["species_code"]),
+                                 ("harvestDate", row.get("harvestDate", ""), row.get("harvestDate", "") == t["checkin_date"]),
+                                 ("toteNumber", tote_given, tote_given.isdigit() and int(tote_given) == t["tote_number"])):
+            if given and not same:
+                prob(col, "'%s' does not match lot %s: the site, species, harvest date and tote number are the lot number and an import cannot change them." % (given, lot))
+        cells = {}
+        v = row.get("avgWeightKg", "")
+        if v:
+            n = numn(v)
+            if n is None or n <= 0 or n > 5000:
+                prob("avgWeightKg", "Weight must be a number above 0 and up to 5000 kg (got '%s')." % v)
+            else:
+                cells["weight"] = n
+        v = row.get("grind", "")
+        if v:
+            if v.capitalize() not in GRINDS:
+                prob("grind", "Must be Coarse, Fine or Whole (got '%s')." % v)
+            else:
+                cells["grind"] = v.capitalize()
+        v = row.get("stabilizationMethod", "")
+        if v:
+            if v.lower() not in ("citric acid", "fresh"):
+                prob("stabilizationMethod", "Must be Citric acid or Fresh (got '%s')." % v)
+            else:
+                cells["stab"] = {"citric acid": "Citric acid", "fresh": "Fresh"}[v.lower()]
+        v = row.get("storageUnit", "")
+        if v:
+            if v.lower() not in ("tote", "bag"):
+                prob("storageUnit", "Must be Tote or Bag (got '%s')." % v)
+            else:
+                cells["unit"] = v.capitalize()
+        if row.get("storageSource"):
+            cells["source"] = row["storageSource"]
+        if row.get("notes"):
+            cells["notes"] = row["notes"]
+        status_in = (row.get("status") or "").strip().lower().replace(" ", "_")
+        loc_in = row.get("location") or None
+        if status_in and status_in not in ("in_stock", "hold"):
+            prob("status", "Only in_stock or hold can be set by an import (got '%s')." % row.get("status"))
+        elif status_in == "hold":
+            if loc_in and loc_in != QAQC_HOLD_LOCATION:
+                prob("location", "A tote on hold sits at '%s': leave the location blank or use that name." % QAQC_HOLD_LOCATION)
+            else:
+                cells["loc"], cells["status"] = QAQC_HOLD_LOCATION, "hold"
+        elif loc_in:
+            cells["loc"], cells["status"] = loc_in, status_for_location(loc_in, t["status"])
+            if status_in == "in_stock" and cells["status"] == "hold":
+                prob("status", "A tote at '%s' is on hold: give the location it moves to to release it." % QAQC_HOLD_LOCATION)
+        elif status_in == "in_stock" and t["status"] == "hold":
+            if t["location"] == QAQC_HOLD_LOCATION:
+                prob("status", "To release %s from QAQC Hold give the location it moves to." % lot)
+            else:
+                cells["status"] = "in_stock"
+        if cells.get("loc") and cells["loc"] not in known_locations:
+            new_locs.add(cells["loc"])
+        cur = {"weight": t["avg_weight_kg"], "grind": t["grind"] or "Coarse", "stab": t["stabilization_method"], "unit": t["storage_unit"], "source": t["storage_source"],
+               "loc": t["location"], "status": t["status"]}
+        names = {"weight": "avgWeightKg", "grind": "grind", "stab": "stabilizationMethod", "unit": "storageUnit", "source": "storageSource", "loc": "location", "status": "status"}
+        changed = [k for k in names if k in cells and cells[k] != cur[k]]
+        if changed and t["status"] in self.BULK_LOCKED:
+            prob(names[changed[0]], "%s is %s (in a production run, consumed or disposed), so its %s cannot be changed by an import. Readings, notes and the received date still can."
+                 % (lot, t["status"], ", ".join(names[k] for k in changed)))
+        elif "grind" in changed and t["preproc_batch_id"] and cells["grind"] != "Fine":
+            prob("grind", "%s is a blend made by Pre-Processing and stays Fine." % lot)
+        reason = row.get("reason", "")
+        rec = row.get("receivedDate", "")
+        if rec:
+            try:
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", rec):
+                    raise ValueError(rec)
+                datetime.date.fromisoformat(rec)
+            except ValueError:
+                prob("receivedDate", "'%s' is not a date (use YYYY-MM-DD)." % rec)
+            else:
+                if rec > today:
+                    prob("receivedDate", "The received date %s is in the future." % rec)
+                elif t["checkin_date"] and rec < t["checkin_date"]:
+                    prob("receivedDate", "Received %s is before the harvest date %s." % (rec, t["checkin_date"]))
+                elif rec != t["received_date"]:
+                    if t["received_date"] and not reason:
+                        prob("reason", "Enter the reason for changing the received date (it is already filled in: %s)." % t["received_date"])
+                    cells["received"] = rec
+        rdates = self._bulk_reading_dates(row, rn, lambda r, c, m: prob(c, m), today)
+        readings = {}
+        for key, (lo, hi, what) in (("ph", (0, 14, "pH")), ("orp", (-1000, 1000, "ORP (mV)")), ("tdsPct", (0, 100, "Feedstock TDS (%)"))):
+            v = row.get(key, "")
+            if v:
+                n = numn(v)
+                if n is None or not (lo <= n <= hi):
+                    prob(key, "%s must be a number between %g and %g (got '%s')." % (what, lo, hi, v))
+                else:
+                    readings[key] = (n, rdates.get(key))
+        if mine:
+            return None
+        return {"rn": rn, "lot": lot, "id": t["id"], "cells": cells, "readings": readings, "reason": reason}
+
+    def _bulk_apply_update(self, conn, user, op, today):
+        """Apply one checked update row to its tote, writing one Feedstock Stability log line per field that changes. Returns what changed, [{field, old, new, historical, date}]."""
+        t = conn.execute("SELECT * FROM tote_lots WHERE id=?", (op["id"],)).fetchone()
+        tid, c, out = t["id"], op["cells"], []
+        note = "Row %d of the bulk import%s" % (op["rn"], (": " + op["reason"]) if op["reason"] else "")
+        sets = {}
+
+        def note_change(label, old, new, **extra):
+            out.append(dict({"field": label, "old": _fmtval(old), "new": _fmtval(new), "historical": False}, **extra))
+        for key, label, col in (("weight", "Weight (kg)", "avg_weight_kg"), ("grind", "Grind", "grind"), ("stab", "Stabilization method", "stabilization_method"),
+                                ("unit", "Storage unit", "storage_unit"), ("source", "Storage source", "storage_source"), ("notes", "Notes", "notes")):
+            old = (t[col] or "Coarse") if col == "grind" else t[col]
+            if key in c and c[key] != old:
+                self._log_stability(conn, tid, user, label, old, c[key], note)
+                sets[col] = c[key]
+                note_change(label, old, c[key])
+        if c.get("loc") and c["loc"] != t["location"]:
+            self._ensure_location(conn, c["loc"])
+            self._log_move(conn, "tote", tid, t["lot_number"], t["location"], c["loc"], None, today, note)
+            self._log_stability(conn, tid, user, "Location", t["location"], c["loc"], note)
+            sets["location"] = c["loc"]
+            note_change("Location", t["location"], c["loc"])
+        if c.get("status") and c["status"] != t["status"]:
+            self._log_stability(conn, tid, user, "Status", t["status"], c["status"], note)
+            sets["status"] = c["status"]
+            note_change("Status", t["status"], c["status"])
+        if c.get("received") and c["received"] != t["received_date"]:
+            self._log_stability(conn, tid, user, "Received date", t["received_date"], c["received"], op["reason"] or "Received date filled in")
+            sets["received_date"] = c["received"]
+            note_change("Received date", t["received_date"], c["received"])
+        if sets:
+            conn.execute("UPDATE tote_lots SET " + ", ".join(k + "=?" for k in sets) + " WHERE id=?", (*sets.values(), tid))
+        for key, _dkey, label, col, dcol in self.BULK_READINGS:
+            if key not in op["readings"]:
+                continue
+            val, date = op["readings"][key]
+            date = date or today
+            res = self._bulk_apply_reading(conn, user, tid, label, col, dcol, val, date, note)
+            if res is not None:
+                note_change(label, res[0], val, historical=res[1], date=date)
+        return out
 
     def _harvest_bulk(self, conn, user):
         d = self._body_json()
@@ -11518,10 +11712,12 @@ class Handler(BaseHTTPRequestHandler):
                 problem(1, c, "This column appears twice.")
             seen.add(c)
             cols.append(c)
+        has_lot = "lotNumber" in seen                                  # KW-95: with a lotNumber column, site / species / harvestDate are needed only by the rows that do not name a lot
         for c in self.BULK_REQUIRED:
-            if c not in seen:
+            if c not in seen and not has_lot:
                 problem(1, c, "Required column is missing.")
-        absent = set(self.BULK_REQUIRED) - seen                      # a missing column is reported once on row 1, not again on every row
+        absent = set() if has_lot else set(self.BULK_REQUIRED) - seen          # a missing column is reported once on row 1, not again on every row
+        req = "Required for a new tote (a row with a lotNumber updates that tote)." if has_lot else "Required."
         data_rows = [(i, r) for i, r in enumerate(table[1:], start=2) if any((x or "").strip() for x in r)]
         if not data_rows:
             raise ApiError(400, "The CSV has no data rows")
@@ -11532,30 +11728,35 @@ class Handler(BaseHTTPRequestHandler):
         known_locations = {r["name"] for r in conn.execute("SELECT name FROM locations")}
         today = today_iso()
         warnings, new_sites, new_locs = [], set(), set()
-        parsed = []
+        parsed, updates = [], []
         for rn, raw in data_rows:
             if len(raw) > len(cols):
                 problem(rn, "", "This row has more cells than the header has columns (a comma inside a value needs quotes).")
                 continue
             row = {c: (raw[k].strip() if k < len(raw) and raw[k] is not None else "") for k, c in enumerate(cols) if c}
+            if row.get("lotNumber"):
+                upd = self._bulk_update_row(conn, rn, row, today, problem, known_locations, new_locs)
+                if upd:
+                    updates.append(upd)
+                continue
             bad = len(problems)
             site, species, date = row.get("site", "").upper(), row.get("species", "").upper(), row.get("harvestDate", "")
             if not site:
                 if "site" not in absent:
-                    problem(rn, "site", "Required.")
+                    problem(rn, "site", req)
             elif not re.fullmatch(r"[A-Z0-9]{2,8}", site):
                 problem(rn, "site", "Site code '%s' should be letters and numbers only (2-8 characters)." % site)
             elif site not in known_sites:
                 problem(rn, "site", "'%s' is not one of the sites: %s." % (site, ", ".join(sorted(known_sites))))
             if not species:
                 if "species" not in absent:
-                    problem(rn, "species", "Required.")
+                    problem(rn, "species", req)
             elif species not in species_codes:
                 problem(rn, "species", "Unknown species code '%s'. Known: %s." % (species, ", ".join(sorted(species_codes))))
             hd = None
             if not date:
                 if "harvestDate" not in absent:
-                    problem(rn, "harvestDate", "Required.")
+                    problem(rn, "harvestDate", req)
             else:
                 try:
                     hd = datetime.date.fromisoformat(date)
@@ -11588,6 +11789,7 @@ class Handler(BaseHTTPRequestHandler):
             if avg_raw and (avg is None or avg <= 0 or avg > 5000):       # optional: blank = weight not known yet (set later with "Set weight for selected")
                 problem(rn, "avgWeightKg", "Weight must be a number above 0 and up to 5000 kg (got '%s')." % avg_raw)
             ph, orp, tds = number("ph", 0, 14, "pH"), number("orp", -1000, 1000, "ORP (mV)"), number("tdsPct", 0, 100, "Feedstock TDS (%)")
+            rdates = self._bulk_reading_dates(row, rn, problem, today)
             tote_raw = row.get("toteNumber", "")
             tote_no = None
             if tote_raw:
@@ -11623,7 +11825,7 @@ class Handler(BaseHTTPRequestHandler):
                 new_locs.add(location)
             parsed.append({"rn": rn, "ok": len(problems) == bad, "site": site, "species": species, "date": date, "received": rec, "avg": avg, "tote": tote_no, "grind": grind,
                            "stab": stab, "unit": unit, "source": row.get("storageSource") or None, "location": location, "ph": ph, "orp": orp, "tds": tds, "status": status,
-                           "notes": row.get("notes") or None})
+                           "notes": row.get("notes") or None, "rdates": rdates, "reason": row.get("reason") or None})
         # tote numbers: explicit ones must be unique (in the file, among totes that exist, among totes that were deleted); the rest are numbered after the highest number in use
         groups = {}
         for p in parsed:
@@ -11659,27 +11861,56 @@ class Handler(BaseHTTPRequestHandler):
                            "import_errors", {"problems": problems[:200], "problemCount": len(problems)})
         planned.sort(key=lambda p: p["rn"])
         lots = ["%s-%s-%s-%03d" % (p["site"], p["species"], p["date"].replace("-", ""), p["tote"]) for p in planned]
+        for p, lot in zip(planned, lots):
+            p["lot"] = lot
         for lc in sorted(new_locs):
             warnings.append("Location '%s' is new and will be added." % lc)
-        if d.get("dryRun"):
-            return {"ok": True, "dryRun": True, "count": len(lots), "lots": lots, "warnings": warnings}
-        ts, who = now_iso(), user["name"] if user else None
+        undated = sum(1 for p in planned for k, v in (("ph", p["ph"]), ("orp", p["orp"]), ("tdsPct", p["tds"])) if v is not None and k not in p["rdates"])             + sum(1 for u in updates for rv in u["readings"].values() if rv[1] is None)
+        if undated:
+            warnings.append("%d reading%s no reading date: the import day (%s) is used. Fill phDate / orpDate / tdsDate to date them." % (undated, " has" if undated == 1 else "s have", today))
+        dry = bool(d.get("dryRun"))
+        if dry:
+            conn.execute("SAVEPOINT bulk_check")                    # the check does the real work and takes it back, so what it lists is exactly what the import will do
+        ts = now_iso()
         common = {r["code"]: (r["common"] or r["code"]) for r in conn.execute("SELECT code, common FROM species")}
         for lc in sorted(new_locs):
             conn.execute("INSERT OR IGNORE INTO locations (name) VALUES (?)", (lc,))
-        for p, lot in zip(planned, lots):
+        changes, updated, unchanged = [], 0, 0
+        for op in sorted(planned + updates, key=lambda o: o["rn"]):
+            if "readings" in op:                                    # a row that updates a tote that exists
+                fields = self._bulk_apply_update(conn, user, op, today)
+                if fields:
+                    updated += 1
+                    changes.append({"row": op["rn"], "lot": op["lot"], "fields": fields})
+                else:
+                    unchanged += 1
+                continue
+            p, lot = op, op["lot"]
+            rd = p["rdates"]
             cur = conn.execute(
                 "INSERT INTO tote_lots (lot_number,site_code,species_code,harvest_year,checkin_date,received_date,tote_number,volume_l,ph,ph_updated,orp,orp_updated,tds_pct,tds_updated,"
                 "avg_weight_kg,location,description,status,stabilization_method,storage_unit,storage_source,notes,created_at,grind)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (lot, p["site"], p["species"], int(p["date"][:4]), p["date"], p["received"], p["tote"], 1000, p["ph"], today_iso() if p["ph"] is not None else None,
-                 p["orp"], today_iso() if p["orp"] is not None else None, p["tds"], today_iso() if p["tds"] is not None else None, p["avg"], p["location"],
+                (lot, p["site"], p["species"], int(p["date"][:4]), p["date"], p["received"], p["tote"], 1000, p["ph"], (rd.get("ph") or today_iso()) if p["ph"] is not None else None,
+                 p["orp"], (rd.get("orp") or today_iso()) if p["orp"] is not None else None, p["tds"], (rd.get("tdsPct") or today_iso()) if p["tds"] is not None else None, p["avg"], p["location"],
                  tote_description(p["grind"], common.get(p["species"], p["species"])), p["status"], p["stab"], p["unit"], p["source"], p["notes"], ts, p["grind"]))
             readings = ", ".join(x for x in ("pH %s" % p["ph"] if p["ph"] is not None else "", "ORP %s" % p["orp"] if p["orp"] is not None else "",
                                               "TDS %s %%" % p["tds"] if p["tds"] is not None else "") if x)
             conn.execute("INSERT INTO tote_stability_log (tote_lot_id,user_name,field,old_value,new_value,note,created_at) VALUES (?,?,?,?,?,?,?)",
-                         (cur.lastrowid, who, "Imported", "", "CSV import", ("Row %d of the bulk import%s" % (p["rn"], (": " + readings) if readings else ""))[:300], ts))
-        return {"created": lots, "count": len(lots), "warnings": warnings}
+                         (cur.lastrowid, user["name"] if user else None, "Imported", "", "CSV import",
+                          ("Row %d of the bulk import%s%s" % (p["rn"], (": " + readings) if readings else "", (" - " + p["reason"]) if p["reason"] else ""))[:300], ts))
+            for key, _dkey, label, _col, _dcol in self.BULK_READINGS:        # a reading that came with its date also gets its own dated line
+                if key in rd:
+                    self._log_stability(conn, cur.lastrowid, user, label, None, {"ph": p["ph"], "orp": p["orp"], "tdsPct": p["tds"]}[key], "Row %d of the bulk import" % p["rn"], reading_date=rd[key])
+        if dry:
+            conn.execute("ROLLBACK TO bulk_check")
+            conn.execute("RELEASE bulk_check")
+        out = {"count": len(lots), "updated": updated, "unchanged": unchanged, "changes": changes[:200], "changeCount": len(changes), "warnings": warnings}
+        if dry:
+            out.update({"ok": True, "dryRun": True, "lots": lots})
+        else:
+            out["created"] = lots
+        return out
 
     # ---- consumables ------------------------------------------------------ #
     def _consumable_public(self, r):
