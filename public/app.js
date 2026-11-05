@@ -9182,6 +9182,18 @@ function table(headers, rows, numCols = [], rowClick = null) {
   });
   return el('div', { class: 'tablewrap' }, el('table', {}, thead, tb));
 }
+// KW-97: a table whose text cells wrap inside the window (long analyte names, laboratory / report numbers) instead of making the table wider than it and pushing the last columns out of sight.
+// `nameCol` / `labCol` get a sensible minimum width; the columns in `keep` (short values, badges) stay on one line. Group-heading rows are left alone.
+function wrapTextTable(wrap, nameCol, labCol, keep) {
+  wrap.classList.add('wrap-text');
+  wrap.querySelectorAll('tbody tr:not(.group-row)').forEach(tr => {
+    if (tr.children[nameCol]) tr.children[nameCol].classList.add('name-col');
+    if (tr.children[labCol]) tr.children[labCol].classList.add('lab-col');
+    (keep || []).forEach(i => tr.children[i] && tr.children[i].classList.add('keep'));
+  });
+  wrap.querySelectorAll('thead th').forEach((th, i) => { if ((keep || []).includes(i)) th.classList.add('keep'); });
+  return wrap;
+}
 function mono(s) { return el('span', { class: 'mono' }, s); }
 function badge(cls, txt) { return el('span', { class: 'badge ' + cls }, txt); }
 function num(s) { return el('span', { class: 'num' }, s); }
@@ -9351,15 +9363,15 @@ async function openLabResults(run) {
       rows.push({ group: el('b', {}, 'Additional analyses') });
       d.coa.additional.forEach(x => rows.push([x.analyte, '—', x.resultText + (x.unit ? ' ' + x.unit : ''), '', [x.labName, x.reportNumber].filter(Boolean).join(' · '), '—']));
     }
-    body.append(table(['Test', 'Specification', 'Result', '', 'Laboratory / report', 'Status'], rows, [false, false, false, 'center', false, false]));
+    body.append(wrapTextTable(table(['Test', 'Specification', 'Result', '', 'Laboratory / report', 'Status'], rows, [false, false, false, 'center', false, false]), 0, 4, [2, 3, 5]));
     body.append(el('div', { class: 'help' }, '* required before Quality can release the lot. TDS and pH come from the Packaging QC check in the production log.'));
     const hist = d.results;
     body.append(el('details', { class: 'accordion', style: 'margin-top:10px' }, el('summary', {}, 'Entry history (' + hist.length + ')'),
-      el('div', { class: 'accordion-body' }, hist.length ? table(['Entered', 'Test', 'Result', 'Report', 'By', ''],
+      el('div', { class: 'accordion-body' }, hist.length ? wrapTextTable(table(['Entered', 'Test', 'Result', 'Report', 'By', ''],
         hist.map(x => [fmtWhen(x.enteredAt), x.analyte, x.voidedAt ? el('s', {}, x.resultText) : x.resultText,
           [x.labName, x.reportNumber, x.reportDate].filter(Boolean).join(' · '),
           x.enteredBy || '—', x.voidedAt ? el('span', { class: 'help' }, 'Voided by ' + (x.voidedBy || '—') + ': ' + (x.voidReason || ''))
-            : (State.user.isQualityManager ? rowActions([['Void', () => voidLabResult(x)]]) : '')]), [false, false, false, false, false, false])
+            : (State.user.isQualityManager ? rowActions([['Void', () => voidLabResult(x)]]) : '')]), [false, false, false, false, false, false]), 1, 3, [0, 2, 4])
         : el('div', { class: 'help' }, 'Nothing entered yet.'))));
   }
   function voidLabResult(x) {
@@ -9374,8 +9386,8 @@ async function openLabResults(run) {
 async function addLabReport(run, d, done) {
   const [{ labs }, { attachments }] = await Promise.all([api('GET', '/labs'), api('GET', '/production/' + run.id + '/attachments')]);
   const labSel = selectFrom('', [['', '— pick the laboratory —'], ...labs.filter(l => l.active).map(l => [String(l.id), l.name]), ['other', 'Other…']]);
-  const labOther = el('input', { placeholder: 'Laboratory name', style: 'display:none;margin-top:4px' });
-  labSel.addEventListener('change', () => { labOther.style.display = labSel.value === 'other' ? '' : 'none'; });
+  const labOther = el('input', { placeholder: 'Laboratory name', class: 'stack-input', style: 'display:none' });                 // KW-97: on its own line under the select
+  labSel.addEventListener('change', () => { labOther.style.display = labSel.value === 'other' ? 'block' : 'none'; });
   const rep = el('input', { placeholder: 'e.g. 26-AU-223.18A or VR26-05008.007' });
   const rdate = el('input', { type: 'date' });
   const sref = el('input', { placeholder: 'Lab’s own sample ID (optional)' });
@@ -9387,7 +9399,7 @@ async function addLabReport(run, d, done) {
   const lines = [];
   function addLine(code, value, extra) {
     const testSel = selectFrom('', [['', '— test —'], ...['microbial', 'metals', 'physical'].flatMap(g => specs.filter(x => x.group === g).map(x => [x.code, x.name])), ['__other', 'Other (additional analysis)…']]);
-    const nameInp = el('input', { placeholder: 'Test name', style: 'display:none;margin-top:4px' });
+    const nameInp = el('textarea', { rows: '2', placeholder: 'Test name', class: 'stack-input', style: 'display:none;resize:vertical' });   // KW-97: two lines on their own row under the test select, so a long metal name shows in full (new lines are removed on save)
     const valInp = el('input', { placeholder: '<20, 100, Negative', style: 'width:120px' });
     const unitSel = el('select', { style: 'display:none;width:80px' }, ...d.metalUnits.map(u => el('option', { value: u }, u)));
     const unitTxt = el('span', { class: 'help' });
@@ -9396,7 +9408,8 @@ async function addLabReport(run, d, done) {
     const line = { testSel, nameInp, valInp, unitSel, unitFree, methInp };
     function sync() {
       const sp = specs.find(x => x.code === testSel.value);
-      nameInp.style.display = testSel.value === '__other' ? '' : 'none';
+      nameInp.style.display = testSel.value === '__other' ? 'block' : 'none';
+      nameInp.title = nameInp.value;
       unitSel.style.display = sp && sp.basis === 'metal' ? '' : 'none';
       unitFree.style.display = testSel.value === '__other' ? '' : 'none';
       unitTxt.textContent = sp && sp.basis !== 'metal' ? sp.unit : '';
@@ -9404,6 +9417,7 @@ async function addLabReport(run, d, done) {
       if (sp) methInp.placeholder = sp.method || 'method';
     }
     testSel.addEventListener('change', () => { methInp.value = ''; sync(); });
+    nameInp.addEventListener('input', () => { nameInp.title = nameInp.value; });                                            // a very long name is still readable on hover
     if (code) testSel.value = code;
     if (value) valInp.value = value;
     if (extra && extra.other) { testSel.value = '__other'; nameInp.value = extra.other; unitFree.value = extra.unit || ''; }
@@ -9471,7 +9485,7 @@ async function addLabReport(run, d, done) {
     const labName = labSel.value === 'other' ? labOther.value : '';
     const results = lines.filter(l => l.testSel.value).map(l => {
       const other = l.testSel.value === '__other';
-      return { specCode: other ? null : l.testSel.value, analyte: other ? l.nameInp.value : null, value: l.valInp.value,
+      return { specCode: other ? null : l.testSel.value, analyte: other ? l.nameInp.value.replace(/\s*[\r\n]+\s*/g, ' ') : null, value: l.valInp.value,
         unit: other ? l.unitFree.value : (l.unitSel.style.display === 'none' ? null : l.unitSel.value), method: l.methInp.value };
     });
     await api('POST', '/production/' + run.id + '/lab-results', { labId: labSel.value && labSel.value !== 'other' ? Number(labSel.value) : null, labName,
