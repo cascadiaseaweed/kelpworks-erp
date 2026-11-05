@@ -2012,6 +2012,13 @@ function qcGroupChart(o) {
   return wrap;
 }
 
+// KW-96: what to know about a laboratory result charted without a CoA specification: it is for trend monitoring only, which spellings were put together, and what was left out.
+function qcExtraNote(m) {
+  if (m.group !== 'labx') return null;
+  const names = (m.names || []).map(x => x.name + (x.n > 1 ? ' (x' + x.n + ')' : '')).join('; ');
+  const sk = m.skipped && m.skipped.count ? ' ' + m.skipped.count + ' result' + (m.skipped.count === 1 ? '' : 's') + ' reported in a unit that cannot be charted with the others (' + m.skipped.units.join(', ') + ') ' + (m.skipped.count === 1 ? 'is' : 'are') + ' left out.' : '';
+  return el('div', { class: 'help', style: 'margin-top:8px' }, el('b', {}, 'No CoA specification: '), 'trend monitoring only. There is no specification line, and these results do not affect release or the certificate. Entered as: ' + names + '.' + sk);
+}
 async function pageQC(v) {
   v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Quality Control'),
     el('div', { class: 'actions' }, el('span', { class: 'help' }, 'Control charts for process QC checks, feedstock and laboratory results'))));
@@ -2172,9 +2179,9 @@ async function pageQC(v) {
     const m = metricByKey(st.metric);
     if (!m.sections.some(s => s.key === st.section)) st.section = defaultSection(m);
     controls.innerHTML = '';
-    const groupNames = { qc: 'Process QC checks (production log)', feedstock: 'Feedstock (per tote)', lab: 'Laboratory results' };
+    const groupNames = { qc: 'Process QC checks (production log)', feedstock: 'Feedstock (per tote)', lab: 'Laboratory results', labx: 'Laboratory - additional analyses (no CoA specification)' };
     const metricSel = el('select', { onchange: e => { st.metric = e.target.value; st.section = null; drawControls(); draw(); } },
-      ...['qc', 'feedstock', 'lab'].map(g => { const ms = D.measures.filter(x => x.group === g); return ms.length ? el('optgroup', { label: groupNames[g] }, ...ms.map(x => el('option', { value: x.key }, x.label + (x.unit ? ' (' + x.unit + ')' : '') + ' — ' + nPts(x) + ' results'))) : null; }));
+      ...['qc', 'feedstock', 'lab', 'labx'].map(g => { const ms = D.measures.filter(x => x.group === g); return ms.length ? el('optgroup', { label: groupNames[g] }, ...ms.map(x => el('option', { value: x.key }, x.label + (x.unit ? ' (' + x.unit + ')' : '') + ' — ' + nPts(x) + ' results'))) : null; }));
     metricSel.value = st.metric;
     const secChips = el('div', { class: 'viewbar', style: 'margin:6px 0 0' }, el('span', { class: 'vb-label' }, 'Process section'),
       ...m.sections.map(s => el('label', { class: 'vb-opt' + (st.section === s.key ? ' on' : ''), onclick: () => { st.section = s.key; drawControls(); draw(); } }, s.label + ' (' + s.points.length + ')')));
@@ -2183,7 +2190,7 @@ async function pageQC(v) {
     const colorSel = el('select', { onchange: e => { st.color = e.target.value; draw(); } }, el('option', { value: 'none' }, 'No colouring'), ...QC_DIMS.map(([k, l]) => el('option', { value: k }, 'Colour by ' + l.toLowerCase()))); colorSel.value = st.color;
     const exclCb = el('input', { type: 'checkbox', checked: st.excluded ? 'checked' : null, onchange: e => { st.excluded = e.target.checked; draw(); } });
     controls.append(el('div', { class: 'card qc-card' },
-      el('div', { style: 'display:flex;gap:12px;align-items:end;flex-wrap:wrap' }, el('div', { style: 'flex:1 1 320px' }, field('Measurement', metricSel)), el('div', {}, field('Colour', colorSel))), secChips,
+      el('div', { style: 'display:flex;gap:12px;align-items:end;flex-wrap:wrap' }, el('div', { style: 'flex:1 1 320px' }, field('Measurement', metricSel)), el('div', {}, field('Colour', colorSel))), secChips, qcExtraNote(m),
       el('div', { class: 'viewbar', style: 'margin:8px 0 0' }, el('span', { class: 'vb-label' }, 'Filter'), el('label', { style: 'margin:0;font-size:12px' }, 'From'), dateIn('from', 'From'), el('label', { style: 'margin:0;font-size:12px' }, 'To'), dateIn('to', 'To'),
         sel('sku', 'All products', D.runs.map(r => [r.sku, r.skuName]).filter((x, i, a) => a.findIndex(y => y[0] === x[0]) === i)),
         sel('species', 'All species', uniq(r => r.species).map(x => [x, x])), sel('farm', 'All farms', uniq(r => r.farms).map(x => [x, x])), sel('stab', 'All stabilization', uniq(r => r.stabilization).map(x => [x, x])),
@@ -7313,6 +7320,13 @@ const CALCULATIONS = [
     description: 'Recommended limits appear once enough results exist (provisional first, then established); a user always sets the real limits by hand. k, the point counts and the signal lengths are the constants listed here.',
     location: 'Quality Control tab → control chart, Control limits card',
     settings: ['qc_chart_sigma', 'qc_chart_min_n_provisional', 'qc_chart_min_n_established', 'qc_chart_run_length', 'qc_chart_trend_length'],
+  },
+  {
+    title: 'Quality Control: laboratory results charted in ppm (metals and minerals)',
+    formula: 'Charted value (ppm) = result × factor, with factor = 1 for ppm, mg/kg and mg/L;  10,000 for %;  1,000 for g/kg;  0.001 for ppb and µg/kg.  A result in any other unit is not charted.  Results entered as one element under different names (for example Iron, Fe, Iron (Fe)) are plotted as one series.',
+    description: 'Used by the Quality Control charts of heavy metals and of other metals / minerals that appear on a lab report without a Certificate of Analysis specification (trend monitoring only: no limit, no release rule). Other analytes keep the unit they were reported in and are never converted.',
+    location: 'Quality Control tab → Laboratory results / Laboratory - additional analyses',
+    settings: [],
   },
   {
     title: 'Quality Control: within-run and between-run standard deviation',
