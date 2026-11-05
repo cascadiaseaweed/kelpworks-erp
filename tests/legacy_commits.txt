@@ -67,3 +67,4 @@ a98b66c  2026-10-27  Retention inventory no longer answers 500: one add_months f
 e6ffb1a  2026-10-28  Release status line, release checklist, hold reasons and a guarded Release from hold on the Product Release screens (KW-94) (PR 119) merged to main and live
 53251a6  2026-10-28  Import tool for the nine historical production runs, Lots 1 to 9 (KW-64) (PR 120) merged to main and live
 50b7ae0  2026-10-29  Tiered tests: a quick tier, parallel runs, cached older-release databases and self-maintaining timing reports (KW-70) (PR 123) merged to main and live
+c6c56ba  2026-11-05  Feedstock CSV import: reading dates for pH / ORP / TDS and updates of existing lots by lot number (KW-95) (PR 130) merged to main and live
