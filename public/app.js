@@ -2179,7 +2179,7 @@ async function pageQC(v) {
     const m = metricByKey(st.metric);
     if (!m.sections.some(s => s.key === st.section)) st.section = defaultSection(m);
     controls.innerHTML = '';
-    const groupNames = { qc: 'Process QC checks (production log)', feedstock: 'Feedstock (per tote)', lab: 'Laboratory results', labx: 'Laboratory - additional analyses (no CoA specification)' };
+    const groupNames = { qc: 'Process QC checks (production log)', feedstock: 'Feedstock (per tote)', lab: 'Laboratory results (CoA specification)', labx: 'Laboratory - additional analyses (no CoA specification)' };
     const metricSel = el('select', { onchange: e => { st.metric = e.target.value; st.section = null; drawControls(); draw(); } },
       ...['qc', 'feedstock', 'lab', 'labx'].map(g => { const ms = D.measures.filter(x => x.group === g); return ms.length ? el('optgroup', { label: groupNames[g] }, ...ms.map(x => el('option', { value: x.key }, x.label + (x.unit ? ' (' + x.unit + ')' : '') + ' — ' + nPts(x) + ' results'))) : null; }));
     metricSel.value = st.metric;
@@ -7325,7 +7325,7 @@ const CALCULATIONS = [
     title: 'Quality Control: laboratory results charted in ppm (metals and minerals)',
     formula: 'Charted value (ppm) = result × factor, with factor = 1 for ppm, mg/kg and mg/L;  10,000 for %;  1,000 for g/kg;  0.001 for ppb and µg/kg.  A result in any other unit is not charted.  Results entered as one element under different names (for example Iron, Fe, Iron (Fe)) are plotted as one series.',
     description: 'Used by the Quality Control charts of heavy metals and of other metals / minerals that appear on a lab report without a Certificate of Analysis specification (trend monitoring only: no limit, no release rule). Other analytes keep the unit they were reported in and are never converted.',
-    location: 'Quality Control tab → Laboratory results / Laboratory - additional analyses',
+    location: 'Quality Control tab → Laboratory results (CoA specification) / Laboratory - additional analyses',
     settings: [],
   },
   {

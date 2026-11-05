@@ -218,5 +218,6 @@ def test_the_certificate_and_the_release_gate_do_not_see_the_extra_analysis(srv,
 
 def test_the_page_lists_the_new_group():
     app = open(os.path.join(ROOT, "public", "app.js"), encoding="utf-8").read()
+    assert "lab: 'Laboratory results (CoA specification)'" in app                                               # the tests that have a specification are named as such, beside the group without one
     assert "labx: 'Laboratory - additional analyses (no CoA specification)'" in app
     assert "['qc', 'feedstock', 'lab', 'labx']" in app and "function qcExtraNote(m)" in app and "qcExtraNote(m)," in app
