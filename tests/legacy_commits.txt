@@ -68,3 +68,4 @@ e6ffb1a  2026-10-28  Release status line, release checklist, hold reasons and a 
 53251a6  2026-10-28  Import tool for the nine historical production runs, Lots 1 to 9 (KW-64) (PR 120) merged to main and live
 50b7ae0  2026-10-29  Tiered tests: a quick tier, parallel runs, cached older-release databases and self-maintaining timing reports (KW-70) (PR 123) merged to main and live
 c6c56ba  2026-11-05  Feedstock CSV import: reading dates for pH / ORP / TDS and updates of existing lots by lot number (KW-95) (PR 130) merged to main and live
+58baf00  2026-11-05  Wrap Status causes and long analyte names instead of clipping them: lab results window, Add lab report form, Product Release and Finished Goods (KW-97) (PR 132) merged to main and live
