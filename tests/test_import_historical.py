@@ -81,8 +81,11 @@ def lot_rows(lot, photos):
     if lot.get("no_passes"):
         R.append(("Dilution", "Passes", "(no passes) nothing recorded on the paper log"))
     for k, tank in enumerate(lot["passes"], 1):
-        if tank is None:                    # KW-98: pH adjustment and a final check, but no tank, no volumes and no preservative on the paper log
-            R += [("", "Pass %d - Tank (not recorded)" % k), ("Dilution", "Measured pH (before citric)", 4.1), ("Dilution", "Citric acid added (kg)", 25),
+        if tank is None:                    # KW-98: pH adjustment and a final check, but no tank and no volumes on the paper log
+            R += [("", "Pass %d - Tank (not recorded)" % k), ("Dilution", "Measured pH (before citric)", 4.1), ("Dilution", "Citric acid added (kg)", 25)]
+            if lot.get("ksorbate_l"):           # KW-98: the preservative was added although the paper log names no tank: entered as the run total
+                R.append(("Dilution", "Ksorbate added (L)", lot["ksorbate_l"]))
+            R += [
                   ("Packaging QC", "Final check: pH / TDS / Brix / Mannitol", "%s / %s%% / %s%% / %s%%" % lot["final"] + (" / %s%%" % lot["final_mc"] if lot.get("final_mc") else "")), ("Samples", "Samples taken", "No")]
             continue
         R += [("", "Pass %d - Tank %s" % (k, tank)), ("Dilution", "Product transferred (L)", 2483), ("Dilution", "Dilution water added (L)", 2483), ("Dilution", "Final level, Tank %s (L)" % tank, 5243),
@@ -417,7 +420,7 @@ def test_a_load_that_would_take_nothing_out_of_inventory_for_a_reagent_added_is_
 # --------------------------------------------------------------------------- #
 @pytest.fixture()
 def special(tmp_path):
-    """Like `world`, with the cases Lots 1 to 9 did not have: lot 10 bypassed extraction, lot 12 bypassed extraction and ONE pass with no tank and no preservative, lot 13 nothing done after the
+    """Like `world`, with the cases Lots 1 to 9 did not have: lot 10 bypassed extraction, lot 12 bypassed extraction and ONE pass with no tank (preservative entered as the run total), lot 13 nothing done after the
     inputs (no extraction, no dilution, no output)."""
     with Server(env={"KELP_ERP_ENV": "staging"}) as srv:
         admin = srv.admin_client()
@@ -426,7 +429,7 @@ def special(tmp_path):
         by_id = {t["id"]: t["lot"] for t in admin.get("/api/totes").json["totes"]}
         lots_of = [by_id[i] for i in ids]
         lots = [dict(no=10, date="2026-10-20", totes=[(lots_of[0], 1009), (lots_of[1], 961)], passes=["6A"], ibcs=3, final=(3.9, 1.8, 2.2, 2.1), final_mc=98.3, slurry=True, homog_tds=2.9, ext_tds=2.9, bypass=True),
-                dict(no=12, date="2026-10-26", totes=[(lots_of[2], 976), (lots_of[3], 1093)], passes=[None], ibcs=4, final=(3.8, 1.8, 2.7, 2.5), homog_tds=3.2, ext_tds=3.2, bypass=True),
+                dict(no=12, date="2026-10-26", totes=[(lots_of[2], 976), (lots_of[3], 1093)], passes=[None], ksorbate_l=120, ibcs=4, final=(3.8, 1.8, 2.7, 2.5), homog_tds=3.2, ext_tds=3.2, bypass=True),
                 dict(no=13, date="2026-10-27", totes=[(lots_of[4], 948), (lots_of[5], 971)], passes=[], no_passes=True, no_output=True, no_extraction=True, ibcs=0, final=(None, None, None, None),
                      homog_tds=3.0, ext_tds=3.0)]
         wb = str(tmp_path / "entry.xlsx")
@@ -513,21 +516,25 @@ def test_a_pass_with_no_tank_is_accepted_only_when_the_sheet_says_not_recorded(s
     p = plans[12]
     assert not p["problems"], p["problems"]
     assert "Dilution pass 1: receiving tank" in p["gaps"] and p["stages"]["pasteurization"]["receivingTanks"] is None
-    assert p["stages"]["dilution"] == {"measuredPh": 4.1, "citricKg": 25.0} and p["passes"] == []
+    assert p["stages"]["dilution"] == {"measuredPh": 4.1, "citricKg": 25.0, "ksorbateAddedL": 120.0, "ksorbateStockPct": 25.0} and p["passes"] == []        # the preservative is the run total: no tank to split it over
     assert p["stages"]["packaging"]["qcPh"] == 3.8                                                                    # the final check still goes to the packaging QC check
     lot = T.parse_lot_sheet(T.read_workbook(special["wb"])["Lot 12"], 12)
     lot["passes"][0]["tankNotRecorded"] = False
     plan = T.build_plan(lot, special["mapping"]["lots"]["12"], 1, special["mapping"]["lotNumberFormat"], special["mapping"])
     assert any("receiving tank is not shown on the pass title" in x for x in plan["problems"])
     lot = T.parse_lot_sheet(T.read_workbook(special["wb"])["Lot 12"], 12)
-    lot["passes"][0]["rows"][("Dilution", "Ksorbate added (L)")] = T.Cell("48")                                         # a preservative needs a tank to be charged to
+    lot["passes"][0]["tankNotRecorded"] = False                                                                         # a preservative on a pass that is not marked "Tank (not recorded)" still needs its tank
     plan = T.build_plan(lot, special["mapping"]["lots"]["12"], 1, special["mapping"]["lotNumberFormat"], special["mapping"])
     assert any("Ksorbate added (L) needs the tank" in x for x in plan["problems"])
+    lot = T.parse_lot_sheet(T.read_workbook(special["wb"])["Lot 12"], 12)
+    lot["passes"].append(dict(lot["passes"][0], n=2))                                                                    # a second pass has to name its tank, so it cannot carry the preservative either
+    plan = T.build_plan(lot, special["mapping"]["lots"]["12"], 1, special["mapping"]["lotNumberFormat"], special["mapping"])
+    assert any("Dilution pass 2: a second or later pass needs its tank" in x for x in plan["problems"])
 
 
 def test_the_special_runs_are_loaded_and_reconcile_with_the_workbook(special, tmp_path):
     admin, srv = special["admin"], special["srv"]
-    citric_before, ibc_before = on_hand(srv, "Citric Acid"), on_hand(srv, IBC)
+    citric_before, ibc_before, sorbate_before = on_hand(srv, "Citric Acid"), on_hand(srv, IBC), on_hand(srv, "Potassium Sorbate")
     report = str(tmp_path / "report.csv")
     code, out = run_tool(special, "--run", report=report)
     assert code == 0, out
@@ -540,7 +547,9 @@ def test_the_special_runs_are_loaded_and_reconcile_with_the_workbook(special, tm
     assert r12["stages"]["dilution"]["citricKg"] == 25 and r12["dilutionPasses"] == [] and r12["stages"]["pasteurization"].get("receivingTanks") in (None, "")
     assert r12["stages"]["packaging"]["qcPh"] == 3.8 and r10["stages"]["dilution"]["ksorbateAddedL6a"] == 52
     assert (r10["stages"]["homogenization"]["tsSlurryPct"], r10["stages"]["homogenization"]["rhoSlurryGMl"], r10["stages"]["packaging"]["tsLiquidPct"]) == (95.6, 1.018, 98.3)       # the sampling record's slurry and final-product moisture
-    assert on_hand(srv, "Citric Acid") == citric_before - 32 - 25                                                    # lot 10 pass (32) + lot 12 (25); lot 13 added none
+    assert r12["stages"]["dilution"]["ksorbateAddedL"] == 120 and r12["stages"]["dilution"]["ksorbateStockPct"] == 25                # the untanked pass's preservative stays the run total as typed
+    assert on_hand(srv, "Potassium Sorbate") == sorbate_before - 52 * 0.25 - 120 * 0.25                                  # lot 10 (52 L) + lot 12 (120 L) of 25 % w/v stock = 13 kg + 30 kg
+    assert on_hand(srv, "Citric Acid") == citric_before - 32 - 25                                                   # lot 10 pass (32) + lot 12 (25); lot 13 added none
     assert on_hand(srv, IBC) == ibc_before - 3 - 4                                                                    # lot 13 produced nothing
     assert r13["release"]["state"] == "legacy" and r10["release"]["state"] == "pending_review"
     assert sql(srv, "SELECT COUNT(*) FROM fg_lots WHERE run_id=?", (r13["id"],))[0][0] == 0

@@ -439,7 +439,12 @@ def build_plan(lot, choice, seq, fmt, global_choice):
         sub = {"stages": {}}
         local = Plan(problems=plan["problems"], gaps=plan["gaps"], stages=sub["stages"], notes=plan["notes"], extra=plan["extra"], documents=plan["documents"])
         for (screen, label), cell in ps["rows"].items():
-            if not tank and label in ("Ksorbate added (L)", "Sodium benzoate added (L)") and cell.kind not in ("blank", NOT_RECORDED):
+            if not tank and label in ("Ksorbate added (L)", "Sodium benzoate added (L)") and cell.kind not in ("blank", NOT_RECORDED) and i == 0 and ps["tankNotRecorded"]:
+                # KW-98: pass 1 of a run whose paper log named no tank (the title says "Tank (not recorded)") may still carry a preservative: it is entered as the run's single total
+                # (`ksorbateAddedL`, the layout of a run with no receiving tank chosen, which the server leaves as typed), never split between 6A and 6B.
+                _put(local, "p", "ksorbateAddedL" if label == "Ksorbate added (L)" else "nabenzoateAddedL", cell, "num", "%s: %s" % (what, label))
+                plan["extra"].append("%s - %s: no tank on the paper log, so it is entered as the run total (no per-tank split)" % (what, label))
+            elif not tank and label in ("Ksorbate added (L)", "Sodium benzoate added (L)") and cell.kind not in ("blank", NOT_RECORDED):
                 plan["problems"].append("%s: %s needs the tank the pass went to (the paper log named none)" % (what, label))
             elif label in PASS_ROWS:
                 _put(local, "p", PASS_ROWS[label], cell, "num", "%s: %s" % (what, label))
