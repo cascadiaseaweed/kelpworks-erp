@@ -4947,7 +4947,7 @@ const RELEASE_STATES = {
   pending_review: ['wip', 'Pending review'], pending_release: ['pending_release', 'Awaiting QA release'],
   released: ['on_hand', 'Released'], returned: ['low', 'Returned for correction'],
   rejected: ['low', 'Rejected — on hold'], legacy: ['sold', 'Released (pre-process)'],
-  amending: ['hold', 'Under amendment'],
+  amending: ['hold', 'Under amendment'], conditional: ['pending_release', 'Conditionally released — heavy metals pending'],
 };
 const releaseBadge = st => { const [c, t] = RELEASE_STATES[st] || ['sold', st || '—']; return badge(c, t); };
 const RELEASE_EVENTS = {
@@ -4959,6 +4959,7 @@ const RELEASE_EVENTS = {
   rebaseline: 'Log hash re-baselined (snapshot format change)', historical_entry: 'Entered retrospectively (historical run)',
   lab_results_added: 'Lab results entered', lab_result_voided: 'Lab result VOIDED',
   fg_lot_edited: 'Finished-goods lot edited', lab_result_hold: 'Lots put on HOLD (lab result changed after release)',
+  conditional_release: 'CONDITIONALLY RELEASED (heavy metals pending)',
 };
 const shortHash = h => h ? h.slice(0, 10) + '…' : '—';
 // ---- KW-94: the release workflow as one status line, a checklist and hold reasons. The server decides all of it (`releaseStatus`, `checklist`, `holdInfo` on each lot); these only draw it. ----
@@ -4970,7 +4971,7 @@ function holdWhy(info) {
   const gate = info.conformsNow === true ? ' · release gate met' : info.conformsNow === false ? ' · release gate NOT met' : '';
   return el('div', { class: 'hold-why ' + info.kind, title: info.summary + gate }, info.summary + gate);
 }
-const fgStatusWithWhy = l => el('div', {}, fgStatusBadge(l.status), holdWhy(l.holdInfo));
+const fgStatusWithWhy = l => el('div', {}, fgStatusBadge(l.status), l.conditional && l.status === 'on_hand' ? el('div', { class: 'hold-why', title: 'Conditionally released: heavy-metals results are pending. Ships only to a destination that does not require them.' }, 'Heavy metals pending') : null, holdWhy(l.holdInfo));
 function releaseStatusBlock(s) {
   const plain = s.tone === 'ok' && !s.heldLots;
   return el('div', { class: 'release-status ' + s.tone },
@@ -5011,29 +5012,32 @@ async function pageRelease(v) {
       } }, 'Verify audit trail'))));
   v.append(el('div', { class: 'help', style: 'margin-bottom:10px' },
     'Finished goods stay Pending Release (cannot be shipped) until the production log is reviewed and signed by a Production Manager, '
-    + 'and then released by a Quality Manager. Heavy metals and microbial tests must pass and TDS must be at or above its lower limit before a run can be released. Your permissions: '
+    + 'and then released by a Quality Manager. Heavy metals and microbial tests must pass and TDS must be at or above its lower limit before a run can be released'
+    + (settingValue('conditional_release_enabled', 0) ? ' (a Quality Manager can release conditionally while only the heavy-metals results are still to come: that product ships only to destinations that do not require them)' : '')
+    + '. Your permissions: '
     + ([r.me.canReview ? 'Production Manager (review)' : '', r.me.canRelease ? 'Quality Manager (release)' : ''].filter(Boolean).join(' + ') || 'none — view only')
     + (r.legacyCount ? '. ' + r.legacyCount + ' earlier run(s) pre-date this process and are treated as released.' : '.')));
   // KW-94: a released run with lots on hold is NOT "Released" as far as anyone needs to act: it gets its own group at the top, with the reason
-  const held = x => x.state === 'released' && (x.heldLots || []).length > 0;
+  const held = x => ['released', 'conditional'].includes(x.state) && (x.heldLots || []).length > 0;
   const groups = [
     ['Released, but lots are on hold — needs attention', x => held(x)],
     ['Under amendment', x => x.state === 'amending'],
     ['Awaiting production-log review', x => x.state === 'pending_review'],
     ['Awaiting Quality release', x => x.state === 'pending_release'],
+    ['Conditionally released — waiting for heavy-metals results', x => x.state === 'conditional' && !held(x)],
     ['Returned for correction / rejected', x => ['returned', 'rejected'].includes(x.state)],
     ['Released', x => x.state === 'released' && !held(x)],
   ];
   for (const [title, pick] of groups) {
     const rows = r.runs.filter(pick);
-    if (!rows.length && title.startsWith('Released, but')) continue;
+    if (!rows.length && (title.startsWith('Released, but') || title.startsWith('Conditionally'))) continue;
     v.append(el('h3', { style: 'margin:16px 0 6px' }, title + ' (' + rows.length + ')'));
     if (!rows.length) { v.append(el('div', { class: 'help' }, 'Nothing here.')); continue; }
     v.append(table(['Run', 'Product', 'Finalized', 'Finished goods', 'Litres', 'Status', 'Checks', 'Lab results', 'Reviewed', 'Released'],
       rows.map(x => [mono(x.lot), skuName(x.sku), fmtWhen(x.finalizedAt) + (x.finalizedBy ? ' · ' + x.finalizedBy : ''),
         x.lots.map(l => fmt(l.qty) + ' × ' + l.packageSize).join(', ') || '—',
         num(fmt(x.lots.reduce((a, l) => a + (l.litres || 0), 0), 0)),
-        el('div', {}, releaseStageBadge(x.releaseStatus), x.releaseStatus.cause && x.state !== 'released' || held(x) ? el('div', { class: 'hold-why', title: x.releaseStatus.text }, x.releaseStatus.cause) : null),
+        el('div', {}, releaseStageBadge(x.releaseStatus), x.releaseStatus.cause && !['released', 'conditional'].includes(x.state) || held(x) ? el('div', { class: 'hold-why', title: x.releaseStatus.text }, x.releaseStatus.cause) : null),
         releaseCheckDots(x.checklist), labBadge(x.lab),
         x.reviewedBy ? x.reviewedBy + ' · ' + fmtWhen(x.reviewedAt) : '—',
         x.releasedBy ? x.releasedBy + ' · ' + fmtWhen(x.releasedAt) : '—']),
@@ -5105,9 +5109,12 @@ async function openRecallReport(d) {
   const body = el('div', {});
   body.append(el('div', { class: 'help' }, 'Every finished-goods lot of ' + d.lot + ', what is still on site and what shipped, so a recall or customer query can be answered in one place.'));
   body.append(el('h4', { style: 'margin:10px 0 4px' }, 'Customers who received this product (' + r.customers.length + ')'));
-  body.append(r.customers.length ? table(['Customer', 'Contact', 'Email', 'Phone', 'Units', 'Lots'],
-    r.customers.map(c => [c.name, c.contact || '—', c.email || '—', c.phone || '—', num(fmt(c.units)), c.lots.join(', ')]), [false, false, false, false, true, false])
+  body.append(r.customers.length ? table(['Customer', 'Destination', 'Contact', 'Email', 'Phone', 'Units', 'Lots'],
+    r.customers.map(c => [c.name, c.destination || '—', c.contact || '—', c.email || '—', c.phone || '—', num(fmt(c.units)) + (c.conditionalUnits ? ' (' + fmt(c.conditionalUnits) + ' under conditional release)' : ''), c.lots.join(', ')]), [false, false, false, false, false, true, false])
     : el('div', { class: 'help' }, 'Nothing from this run has shipped.'));
+  if ((r.shippedUnderConditionalRelease || []).length) body.append(el('div', { class: 'sign-box' }, el('h4', {}, 'Shipped under conditional release (heavy-metals results were pending)'),
+    el('div', { class: 'help' }, 'If a heavy-metals result fails, these are the units to assess for recall.'),
+    table(['Lot', 'Shipment', 'Date', 'Customer', 'Destination', 'Units'], r.shippedUnderConditionalRelease.map(x => [mono(x.lotNumber), x.shipmentNo, x.date, x.customer || '—', x.destination || '—', num(fmt(x.qty))]), [false, false, false, false, false, true])));
   body.append(el('h4', { style: 'margin:12px 0 4px' }, 'By lot'));
   const rows = [];
   r.lots.forEach(l => {
@@ -5135,8 +5142,8 @@ async function openReleaseRun(id) {
     else if (i.action === 'log' || i.action === 'amend') openProcessLog(d.run);
     else (body.querySelector('[data-sign]') || body).scrollIntoView({ behavior: 'smooth', block: 'center' });
   })));
-  if (d.state === 'released' && d.lots.some(l => l.status === 'hold') && me.canRelease) body.append(releaseFromHoldBox());
-  else if (d.state === 'released' && d.lots.some(l => l.status === 'hold')) body.append(el('div', { class: 'help sign-box' }, 'Only a Quality Manager can release these lots from hold.'));
+  if (['released', 'conditional'].includes(d.state) && d.lots.some(l => l.status === 'hold') && me.canRelease) body.append(releaseFromHoldBox());
+  else if (['released', 'conditional'].includes(d.state) && d.lots.some(l => l.status === 'hold')) body.append(el('div', { class: 'help sign-box' }, 'Only a Quality Manager can release these lots from hold.'));
   // KW-30: what QA checks first -- every result on the Certificate of Analysis passes and has its lab report -- then the sign-off; everything else is folded away below
   if ((d.organicConflicts || []).length) body.append(el('div', { class: 'sign-box', style: 'border-color:var(--danger,#b00020)' }, el('b', { style: 'color:var(--danger,#b00020)' }, '⚠ Organic product made with a reagent that is not marked Organic: '),
     d.organicConflicts.map(x => x.reagent + ' (' + x.item + ')').join(', '), el('div', { class: 'help' }, 'Check this before signing: it may need a deviation record.')));
@@ -5196,6 +5203,21 @@ async function openReleaseRun(id) {
       field('Comment', comment), field('Password', pw), err, btn);
   }
   // KW-94: a Quality Manager puts held lots of a RELEASED run back on sale. Enabled only while the release gate is met (the server enforces it too: there is no override).
+  // KW-100: a Quality Manager releases the run conditionally while only the heavy-metals results are still to come (ships only to destinations that do not require them)
+  function conditionalReleaseBox() {
+    const c = d.conditionalRelease, ok = c.eligible;
+    const evidence = (c.recentMetals || []).length ? el('details', { class: 'accordion' },
+      el('summary', {}, 'Recent heavy-metals results from the same site and species (information only)'),
+      el('div', { class: 'accordion-body' }, table(['Run', 'Run date', 'Site / species', 'Heavy-metals results'],
+        c.recentMetals.map(x => [mono(x.lot), x.runDate || '—', x.site + ' / ' + x.species,
+          x.metals.map(m => m.name.replace(/ \(.*\)/, '') + ' ' + m.result + (m.status && m.status !== 'pass' ? ' (' + m.status + ')' : '')).join(', ') || '—']), [false, false, false, false]))) : null;
+    const box = signBox('Conditional release — heavy-metals results pending (Quality Manager)',
+      'By signing I release this product conditionally: the process specifications and indicator-organism tests are met and the heavy-metals results are pending (' + c.pending.join(', ') + '). '
+      + 'It may ship only to destinations that do not require heavy metals, and the unsold lots are held if any heavy-metals result fails.',
+      [['conditional', 'Release conditionally']], 'conditional', { quality: true, button: 'Sign conditional release', commentHint: 'Reason (required): why this product is released before the heavy-metals results' });
+    return el('div', {}, ok ? null : el('div', { class: 'sign-box' }, el('h4', {}, 'Conditional release is not available for this run'),
+        el('ul', { class: 'help' }, ...c.reasons.map(t => el('li', {}, t)))), evidence, ok ? box : null);
+  }
   function releaseFromHoldBox() {
     const gateMet = d.releaseStatus.conformsNow === true;
     const held = d.lots.filter(l => l.status === 'hold');
@@ -5237,8 +5259,16 @@ async function openReleaseRun(id) {
       [['release', 'Release for sale'], ['reject', 'Reject — hold']], 'release', { quality: true, button: 'Sign release',
         commentHint: d.lab.failed.length ? 'REQUIRED to release: why is this lot released with results outside specification (' + d.lab.failed.join(', ') + ')?' : undefined })
       : el('div', { class: 'help sign-box' }, 'Review is complete. Awaiting release by a Quality Manager. You do not have release permission.'));
+    // KW-100: only while the heavy-metals results are the one thing outstanding; the server decides eligibility, this draws the reasons and the evidence
+    if (d.conditionalRelease && d.conditionalRelease.enabled && me.canRelease) body.append(conditionalReleaseBox());
+  } else if (d.state === 'conditional') {
+    body.append(me.canRelease ? signBox('Quality release sign-off (heavy-metals results are in)',
+      'By signing I confirm this product now conforms to specification, including the heavy-metals results, and is released for sale to every destination.',
+      [['release', 'Release for sale']], 'release', { quality: true, button: 'Sign release',
+        commentHint: d.lab.failed.length ? 'REQUIRED to release: why is this lot released with results outside specification (' + d.lab.failed.join(', ') + ')?' : undefined })
+      : el('div', { class: 'help sign-box' }, 'Conditionally released: waiting for the heavy-metals results, then a Quality Manager must release it. You do not have release permission.'));
   }
-  if (['released', 'rejected', 'pending_release', 'returned'].includes(d.state) && me.canRelease) {
+  if (['released', 'rejected', 'pending_release', 'returned', 'conditional'].includes(d.state) && me.canRelease) {
     body.append(el('details', { class: 'accordion' }, el('summary', {}, 'Reopen this run (Quality Manager)'),
       el('div', { class: 'accordion-body' }, el('div', { class: 'help' }, 'Voids the existing review/release and returns unsold lots to Pending Release. Units already shipped are recorded in the trail.'),
         signBox('Reopen', 'By signing I confirm the prior review/release no longer stands and a new review is required.', [['reopen', 'Reopen']], 'reopen', { quality: true, button: 'Sign & reopen', commentHint: 'Reason for reopening (required)' }))));
@@ -5415,7 +5445,18 @@ async function newShipment() {
   if (!State.ref.customers.length) { toast('Add a customer first.', true); return manageCustomers(); }
   const fg = (await api('GET', '/fg?status=on_hand')).fg.filter(f => f.qty > 0);
   if (!fg.length) { return toast('No finished goods on hand to ship.', true); }
-  const custSel = selectFrom('', State.ref.customers.map(c => [c.id, c.name]), null, 'sh_c');
+  const destNote = el('div', { class: 'help' });
+  const custSel = selectFrom('', State.ref.customers.map(c => [c.id, c.name]), () => showDest(), 'sh_c');
+  const hasConditional = fg.some(f => f.conditional);
+  // KW-100: say where the chosen customer is and whether product that is only conditionally released may go there (the server decides; this only warns)
+  function showDest() {
+    const c = State.ref.customers.find(x => x.id === +custSel.value), d = c && (State.ref.destinations || []).find(x => x.id === c.destinationId);
+    destNote.innerHTML = '';
+    destNote.style.color = '';
+    if (!c) return;
+    destNote.append('Destination: ', el('b', {}, d ? d.name : 'not set'), d ? (d.requiresMetals ? ' — heavy-metals results are required before product ships here.' : ' — heavy-metals results are not required.') : ' — a customer with no destination needs the full release.');
+    if (hasConditional && (!d || d.requiresMetals || !d.active)) { destNote.append(el('div', {}, 'Lots marked "Heavy metals pending" cannot be shipped to this customer.')); destNote.style.color = 'var(--danger)'; }
+  }
   const qtyInputs = {};
   const lineHost = el('div', { class: 'tote-pick' });
   const summary = el('div', { class: 'summary-line' });
@@ -5439,7 +5480,7 @@ async function newShipment() {
       skuInputs[f.id] = selectFrom('', skuOptions());
       productCell = el('td', {}, el('div', { class: 'muted' }, skuName(f.madeAs || f.sku) + ' — ships as:'), skuInputs[f.id]);
     }
-    tb.append(el('tr', {}, el('td', { class: 'mono' }, f.lot), productCell,
+    tb.append(el('tr', {}, el('td', { class: 'mono' }, f.lot, f.conditional ? el('div', {}, badge('pending_release', 'Heavy metals pending')) : null), productCell,
       el('td', {}, f.packageSize), el('td', {}, f.location || '—'),
       el('td', { class: 'num' }, fmt(f.qty)), el('td', { class: 'num' }, inp)));
   }
@@ -5449,12 +5490,13 @@ async function newShipment() {
   const body = el('div', {},
     el('div', { class: 'form-row' }, field('Customer', custSel),
       field('Ship date', el('input', { type: 'date', id: 'sh_date', value: todayStr() }))),
+    destNote,
     el('div', { class: 'form-row' }, field('Carrier', el('input', { id: 'sh_carrier', placeholder: 'e.g. truck / courier' })),
       field('Tracking #', el('input', { id: 'sh_track' }))),
     field('Customer PO / reference', el('input', { id: 'sh_ref' })),
     el('h3', { style: 'margin:14px 0 6px;font-size:14px' }, 'Finished goods to ship'), lineHost, summary, signBox,
     field('Notes', el('textarea', { id: 'sh_notes', rows: '2' })));
-  recompute();
+  recompute(); showDest();
   modal('New shipment', body, async () => {
     const lines = fg.map(f => ({ fgLotId: f.id, qty: +qtyInputs[f.id].value || 0, skuCode: skuInputs[f.id] ? skuInputs[f.id].value : undefined })).filter(l => l.qty > 0);
     if (!lines.length) throw new Error('Enter a ship quantity for at least one lot.');
@@ -5561,10 +5603,10 @@ async function manageCustomers() {
     State.ref.customers = cs;
     listHost.innerHTML = '';
     if (!cs.length) { listHost.append(el('div', { class: 'help' }, 'No customers yet.')); }
-    else listHost.append(table(['Customer', 'Contact', 'Email', 'Phone', ''], cs.map(c => [
-      c.name, c.contact || '—', c.email || '—', c.phone || '—',
+    else listHost.append(table(['Customer', 'Destination', 'Contact', 'Email', 'Phone', ''], cs.map(c => [
+      c.name, c.destination || el('span', { class: 'muted', title: 'No destination: product that is only conditionally released cannot ship to this customer' }, 'not set'), c.contact || '—', c.email || '—', c.phone || '—',
       rowActions([['Edit', () => custForm(c, refresh)]])
-    ]), [false, false, false, false, false]));
+    ]), [false, false, false, false, false, false]));
   }
   const body = el('div', {},
     el('div', { class: 'page-head', style: 'margin:0 0 8px' }, el('h3', { style: 'margin:0' }, 'Customers'),
@@ -5574,8 +5616,16 @@ async function manageCustomers() {
   modal('Customers', body, async () => {}, 'Done');
 }
 function custForm(c, after) {
+  // KW-100: where this customer is. Only an administrator or a Quality Manager sets it (the server enforces it); everyone else sees it.
+  const canDest = canIntegrity();
+  const destSel = selectFrom('', [['', '— not set —'], ...(State.ref.destinations || []).filter(d => d.active || (c && c.destinationId === d.id)).map(d => [d.id, d.name + (d.requiresMetals ? ' (heavy-metals results required)' : '')])], null, 'cu_dest');
+  destSel.value = c && c.destinationId ? String(c.destinationId) : '';
+  destSel.disabled = !canDest;
   const body = el('div', {},
     field('Name', el('input', { id: 'cu_name', value: c ? c.name : '' })),
+    field('Destination', destSel),
+    el('div', { class: 'help', style: 'margin:-6px 0 8px' }, 'Where this customer is. Product that is only conditionally released (heavy-metals results pending) ships only to a destination that does not require them; '
+      + (canDest ? 'a customer with no destination needs the full release.' : 'only an administrator or a Quality Manager can set it.')),
     el('div', { class: 'form-row' }, field('Contact', el('input', { id: 'cu_contact', value: c?.contact || '' })),
       field('Email', el('input', { id: 'cu_email', value: c?.email || '' }))),
     field('Phone', el('input', { id: 'cu_phone', value: c?.phone || '' })),
@@ -5583,6 +5633,7 @@ function custForm(c, after) {
   modal(c ? 'Edit customer' : 'Add customer', body, async () => {
     const payload = { name: body.querySelector('#cu_name').value, contact: body.querySelector('#cu_contact').value,
       email: body.querySelector('#cu_email').value, phone: body.querySelector('#cu_phone').value, address: body.querySelector('#cu_addr').value };
+    if (canDest) payload.destinationId = destSel.value ? +destSel.value : null;
     if (!payload.name.trim()) throw new Error('Name is required.');
     if (c) await api('PUT', '/customers/' + c.id, payload); else await api('POST', '/customers', payload);
     State.ref = await api('GET', '/refdata'); toast('Saved'); after();
@@ -7614,7 +7665,7 @@ const SETTING_GROUPS = [
   { title: 'Certificate of Analysis & lab results', note: 'Heavy-metal loading and lab report rules.', keys: ['coa_application_rate_kg_ha', 'coa_application_periods', 'lab_result_require_report'] },
   { title: 'Quality Control charts & reports', note: 'Control-limit rules and the Yield & Usage report.', keys: [
     'qc_chart_sigma', 'qc_chart_min_n_provisional', 'qc_chart_min_n_established', 'qc_chart_run_length', 'qc_chart_trend_length', 'yield_report_min_runs'] },
-  { title: 'Release & sign-off', note: 'Who may review and release a run.', keys: ['release_separate_signers', 'review_not_by_finalizer'] },
+  { title: 'Release & sign-off', note: 'Who may review and release a run.', keys: ['release_separate_signers', 'review_not_by_finalizer', 'conditional_release_enabled'] },
   { title: 'Samples, lots & inventory', note: 'Retention and expiry.', keys: ['sample_retention_months', 'lot_expiry_warning_days'] },
   { title: 'Receiving: reading invoices', note: 'Whether scans and photos of invoices are read, the daily limit and the arithmetic check.', keys: ['invoice_ai_enabled', 'invoice_read_daily_limit', 'invoice_check_tolerance_pct'] },
   { title: 'Run summary card display', note: 'Which figures show on a finished run’s summary card (1 shows, 0 hides).', keys: [
@@ -8423,7 +8474,7 @@ async function drawAdminCoaSpecs(v) {
   v.append(el('div', { class: 'help', style: 'margin:-6px 0 8px' }, 'Limits each run is judged against on its Certificate of Analysis. A test with a release rule must pass before Quality can release a run (there is no override); every change to a limit or rule is logged. '
     + 'Heavy-metal limits are loadings in kg metal per ha; each lab result is converted to kg/ha at the product application rate (' + (applicationRate ? applicationRate + ' kg/ha' : 'not set') + ') × application periods ('
     + applicationPeriods + '), both set on the Calculations page. Changing a limit re-judges every certificate as it is next generated.'));
-  const names = { physical: 'Physical & chemical', metals: 'Heavy metals', microbial: 'Microbiological' };
+  const names = { physical: 'Process specifications (physical & chemical)', metals: 'Heavy metals', microbial: 'Indicator organisms (microbiological)' };      // the three categories of the release gate (KW-100)
   const rows = [];
   for (const g of ['physical', 'metals', 'microbial']) {
     rows.push({ group: el('b', {}, names[g]) });
@@ -8433,7 +8484,7 @@ async function drawAdminCoaSpecs(v) {
   v.append(table(['Test', 'Specification', 'Release rule', 'Default method', 'Status', ''], rows));
 }
 function editCoaSpec(x) {
-  const groupName = { physical: 'Physical & chemical', metals: 'Heavy metals', microbial: 'Microbiological' }[x.group] || x.group;
+  const groupName = { physical: 'Process specifications', metals: 'Heavy metals', microbial: 'Indicator organisms' }[x.group] || x.group;
   const absent = x.basis === 'absent';
   const unit = x.unit ? ' (' + x.unit + ')' : '';
   const mn = el('input', { value: x.minVal ?? '', placeholder: 'No minimum', inputmode: 'decimal' });
@@ -9325,7 +9376,50 @@ async function pageAdmin(v) {
   await drawAdminLabs(v);
   await drawAdminRequisitionContact(v);
   await drawAdminCoaSpecs(v);
+  await drawAdminDestinations(v);
   await drawAdminGradeRules(v);
+}
+// KW-100: where product is sold, and whether heavy-metals results are needed before it ships there. A customer points at one (Customers > Edit); product that is only
+// conditionally released can ship only to a destination that does not require heavy metals. Canada and Mexico start with heavy metals required; every change is logged.
+async function drawAdminDestinations(v) {
+  const { destinations } = await api('GET', '/destinations');
+  State.ref.destinations = destinations;
+  v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Destinations'),
+    el('div', { class: 'actions' }, el('button', { onclick: () => editDestination(null, () => render()) }, '+ Add destination'))));
+  v.append(el('div', { class: 'help', style: 'margin:-6px 0 8px' }, 'Countries and states product is sold into. “Heavy-metals results required” means product for that destination cannot ship until the heavy-metals results are in and Quality has released the run. '
+    + 'Untick it only where that is correct for that destination (conditional release also needs the setting “Release: allow conditional release…” on the Calculations page). A customer with no destination always needs the full release.'));
+  const rows = destinations.map(d => [d.name, d.requiresMetals ? badge('hold', 'Heavy metals required') : badge('on_hand', 'Not required'), d.customers, d.active ? badge('on_hand', 'Active') : badge('disposed', 'Inactive'),
+    rowActions([['Edit', () => editDestination(d, () => render())]])]);
+  v.append(table(['Destination', 'Heavy-metals results', 'Customers', 'Status', ''], rows, [false, false, true, false, false]));
+}
+function editDestination(d, after) {
+  const name = el('input', { value: d ? d.name : '', placeholder: 'e.g. Washington' });
+  const req = el('input', { type: 'checkbox' }); req.checked = d ? d.requiresMetals : true;
+  const act = el('input', { type: 'checkbox' }); act.checked = d ? d.active : true;
+  const option = (cb, title, hint) => {
+    const row = el('label', { class: 'perm-item' + (cb.checked ? ' on' : '') }, cb, el('span', { class: 'perm-text' }, el('b', {}, title), el('small', {}, hint)));
+    cb.addEventListener('change', () => row.classList.toggle('on', cb.checked));
+    return row;
+  };
+  const histBox = el('details', { class: 'accordion' }, el('summary', {}, 'Change history'), el('div', { class: 'accordion-body' }, 'Loading…'));
+  histBox.addEventListener('toggle', async () => {
+    if (!histBox.open || histBox.dataset.loaded || !d) return;
+    histBox.dataset.loaded = '1';
+    const h = (await api('GET', '/destinations/' + d.id + '/log')).log;
+    const hb = histBox.querySelector('.accordion-body'); hb.innerHTML = '';
+    hb.append(h.length ? table(['When', 'Who', 'Field', 'From', 'To'], h.map(e => [fmtWhen(e.at), e.by || '—', e.field, e.old ?? '—', e.new ?? '—'])) : el('div', { class: 'help' }, 'No changes recorded yet.'));
+  });
+  modal(d ? 'Edit destination — ' + d.name : 'Add destination', el('div', {}, field('Name', name),
+    el('div', { class: 'perm-list' },
+      option(req, 'Heavy-metals results required before shipping', 'Ticked (the safe default): product ships here only after the heavy-metals results are in and Quality has released the run. Untick only where that is correct for this destination.'),
+      d ? option(act, 'In use', 'Untick to stop offering it for customers. Product that is only conditionally released cannot ship to a customer whose destination is not in use.') : null),
+    d ? histBox : null),
+    async () => {
+      if (!name.value.trim()) throw new Error('Name is required.');
+      if (d) await api('PUT', '/destinations/' + d.id, { name: name.value, requiresMetals: req.checked, active: act.checked });
+      else await api('POST', '/destinations', { name: name.value, requiresMetals: req.checked });
+      State.ref = await api('GET', '/refdata'); toast('Saved'); after();
+    }, 'Save');
 }
 /* ---------------- Certificate of Analysis: lab results ---------------- */
 const COA_BADGE = { pass: ['on_hand', 'PASS'], fail: ['low', 'FAIL'], review: ['pending_release', 'REVIEW'], not_evaluated: ['pending_release', 'N/E'] };
