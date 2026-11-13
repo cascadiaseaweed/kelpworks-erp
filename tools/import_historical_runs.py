@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""KW-64: load historical production runs into KelpWorks from the prepared entry workbook.
+"""KW-64 / KW-98: load historical production runs into KelpWorks from the prepared entry workbook.
 
 Standard library only. The tool reads the workbook (read-only), builds one plan per lot, checks everything it can WITHOUT touching the server (--check), checks
 the target server's state (--preflight, read-only), and creates the runs through the same API the "+ Historical run" button uses (--run), oldest first.
@@ -122,6 +122,11 @@ def to_date(text):
     return m.group(1) if m else None
 
 
+def to_bool(text):
+    t = (text or "").strip().lower()
+    return True if t in ("yes", "true", "1") else (False if t in ("no", "false", "0") else None)
+
+
 class Cell:
     def __init__(self, value, paper=None, note=None):
         self.kind, self.text = classify(value)
@@ -172,7 +177,8 @@ def parse_lot_sheet(rows, lot_no):
             lot["totes"].append(tote)
             continue
         if not a and re.match(r"^Pass \d+ - ", b):
-            ps = {"label": b, "n": int(re.match(r"^Pass (\d+)", b).group(1)), "tank": (re.search(r"Tank (6[AB])", b) or [None, None])[1], "rows": {}}
+            ps = {"label": b, "n": int(re.match(r"^Pass (\d+)", b).group(1)), "tank": (re.search(r"Tank (6[AB])", b) or [None, None])[1], "rows": {},
+                  "tankNotRecorded": bool(re.search(r"Tank\s*\(not recorded\)", b, re.I))}          # KW-98: the paper log named no tank
             lot["passes"].append(ps)
             continue
         if not a and b.lower().startswith("homogenization qc"):
@@ -226,9 +232,13 @@ HOMOG = {"Started at": ("startedAt", "dt"), "Rinse water (L)": ("rinsingWaterL",
          "Wet-solids-wt (g)": ("wetSolidsWtG", "num"), "Liquid-wt (g)": ("liquidWtG", "num"), "Target %Solids Loading, (w/w)": ("targetPctWetSolids", "num"),
          "Dilution water added (L)": ("dilutionWaterL", "num"), "Post-Dilution Tank Level (L)": ("postDilutionTankL", "num")}
 HOMOG_QC = {"pH": ("qcPh", "num"), "TDS (%)": ("tdsPct", "num"), "Brix (%)": ("brixPct", "num"), "Mannitol (%)": ("mannitolPct", "num"), "TSliquid (%)": ("tsLiquidPct", "num"),
-            RHO: ("rhoLiquidGMl", "num"), "%Moisture solids": ("tsSolidsPct", "num"), "Solids Loading (%)": ("solidsLoadingPct", "num")}
+            RHO: ("rhoLiquidGMl", "num"), "%Moisture solids": ("tsSolidsPct", "num"), "Solids Loading (%)": ("solidsLoadingPct", "num"),
+            # KW-98: the handwritten sampling record also gives the slurry (Moisture Content (slurry), Density (slurry)); KelpWorks has both homogenization QC fields
+            "TSslurry (%)": ("tsSlurryPct", "num"), "ρslurry (g/mL)": ("rhoSlurryGMl", "num")}
 EXTRACTION = {"Started at": ("startedAt", "dt"), "Amplitude (%)": ("amplitudePct", "num"), "Flow rate (L/min)": ("flowrateLpm", "num"), "Pressure (psi)": ("pressurePsi", "num"),
-              "Starting power (W)": ("startingPowerW", "num")}
+              "Starting power (W)": ("startingPowerW", "num"),
+              # KW-98 / KW-15: the extraction was bypassed. Both rows are explicit in the workbook; the reason is never defaulted.
+              "Bypassed": ("bypassed", "bool"), "Reason bypassed": ("bypassComment", "text")}
 EXTRACTION_QC = {"pH": ("qcPh", "num"), "TDS (%)": ("tdsPct", "num"), "Brix (%)": ("brixPct", "num"), "Mannitol (%)": ("mannitolPct", "num"), "TSliquid (%)": ("tsLiquidPct", "num"),
                  RHO: ("rhoLiquidGMl", "num")}
 SEPARATION = {"Started at": ("startedAt", "dt"), "Flow rate (L/min)": ("flowrateLpm", "num"), "Mesh size (micron)": ("meshMicron", "num"),
@@ -267,9 +277,9 @@ def _put(plan, stage, key, cell, kind, what):
     if cell.kind == DECIDE:
         plan["problems"].append('%s: still marked "(decide)"' % what)
     elif cell.kind == "value":
-        v = {"dt": to_datetime, "num": to_number, "date": to_date, "text": lambda t: t.strip()}[kind](cell.text)
+        v = {"dt": to_datetime, "num": to_number, "date": to_date, "text": lambda t: t.strip(), "bool": to_bool}[kind](cell.text)
         if v is None:
-            plan["problems"].append('%s: cannot read "%s" as %s' % (what, cell.text, {"dt": "a date and time", "num": "a number", "date": "a date", "text": "text"}[kind]))
+            plan["problems"].append('%s: cannot read "%s" as %s' % (what, cell.text, {"dt": "a date and time", "num": "a number", "date": "a date", "text": "text", "bool": "yes or no"}[kind]))
         else:
             plan["stages"].setdefault(stage, {})[key] = v
     elif cell.kind in (NOT_RECORDED, "blank"):
@@ -380,6 +390,23 @@ def build_plan(lot, choice, seq, fmt, global_choice):
             plan["notes"].append({"section": "feedstock", "body": cell.text, "photos": []})
     _stage_rows(plan, lot, "homogenization", HOMOG, HOMOG_QC)
     _stage_rows(plan, lot, "extraction", EXTRACTION, EXTRACTION_QC)
+    ex_stage = plan["stages"].get("extraction") or {}
+    if ex_stage.get("bypassed"):
+        # KW-15 / KW-98: a bypassed extraction has no readings of its own (the server clears whatever is typed there and would default the reason): send ONLY the bypass and its reason,
+        # say which workbook values were not entered, and do not call the blank extraction cells "not recorded".
+        plan["bypassed"] = True
+        if not (ex_stage.get("bypassComment") or "").strip():
+            plan["problems"].append("Extraction is bypassed: the workbook must give the reason (the row 'Reason bypassed'); the tool never uses the server's default reason")
+        dropped = {k: v for k, v in ex_stage.items() if k not in ("bypassed", "bypassComment")}
+        if dropped:
+            plan["extra"].append("Extraction was bypassed, so these extraction values in the workbook are not entered: " + ", ".join("%s=%s" % kv for kv in sorted(dropped.items())))
+        plan["stages"]["extraction"] = {k: v for k, v in ex_stage.items() if k in ("bypassed", "bypassComment")}
+        plan["gaps"] = [g for g in plan["gaps"] if not g.startswith("Extraction")]
+    elif "bypassed" in ex_stage or "bypassComment" in ex_stage:
+        if ex_stage.get("bypassed") is not False or ex_stage.get("bypassComment"):
+            plan["problems"].append("Extraction: a reason for bypassing is given but the row 'Bypassed' is not Yes")
+        ex_stage.pop("bypassed", None)
+        ex_stage.pop("bypassComment", None)
     _stage_rows(plan, lot, "separation", SEPARATION)
     _stage_rows(plan, lot, "pasteurization", PASTEURIZATION)
     # receiving tanks, the 5A / 5B levels and the passes
@@ -397,8 +424,14 @@ def build_plan(lot, choice, seq, fmt, global_choice):
         else:
             plan["problems"].append('Pasteurization: cannot read the 5A / 5B levels "%s" (expected two numbers)' % t5.text)
     passes = lot["passes"]
-    if not passes:
-        plan["problems"].append("No dilution pass found on the lot sheet")
+    no_passes = (lot["stages"].get("dilution") or {}).get(("Dilution", "Passes"))
+    says_none = no_passes is not None and no_passes.ok() and no_passes.text.strip().lower().startswith("(no passes")
+    if not passes and says_none:
+        plan["noPasses"] = True                                           # KW-98: the paper log recorded no dilution or preservation at all (explicit in the workbook)
+    elif not passes:
+        plan["problems"].append("No dilution pass found on the lot sheet (a lot with no dilution at all needs the row 'Dilution | Passes | (no passes) <what the paper log says>')")
+    elif says_none:
+        plan["problems"].append("The lot sheet says '(no passes)' but also lists a dilution pass")
     for i, ps in enumerate(passes):
         tank = (ps["tank"] or "").lower()
         what = "Dilution pass %d" % ps["n"]
@@ -406,7 +439,14 @@ def build_plan(lot, choice, seq, fmt, global_choice):
         sub = {"stages": {}}
         local = Plan(problems=plan["problems"], gaps=plan["gaps"], stages=sub["stages"], notes=plan["notes"], extra=plan["extra"], documents=plan["documents"])
         for (screen, label), cell in ps["rows"].items():
-            if label in PASS_ROWS:
+            if not tank and label in ("Ksorbate added (L)", "Sodium benzoate added (L)") and cell.kind not in ("blank", NOT_RECORDED) and i == 0 and ps["tankNotRecorded"]:
+                # KW-98: pass 1 of a run whose paper log named no tank (the title says "Tank (not recorded)") may still carry a preservative: it is entered as the run's single total
+                # (`ksorbateAddedL`, the layout of a run with no receiving tank chosen, which the server leaves as typed), never split between 6A and 6B.
+                _put(local, "p", "ksorbateAddedL" if label == "Ksorbate added (L)" else "nabenzoateAddedL", cell, "num", "%s: %s" % (what, label))
+                plan["extra"].append("%s - %s: no tank on the paper log, so it is entered as the run total (no per-tank split)" % (what, label))
+            elif not tank and label in ("Ksorbate added (L)", "Sodium benzoate added (L)") and cell.kind not in ("blank", NOT_RECORDED):
+                plan["problems"].append("%s: %s needs the tank the pass went to (the paper log named none)" % (what, label))
+            elif label in PASS_ROWS:
                 _put(local, "p", PASS_ROWS[label], cell, "num", "%s: %s" % (what, label))
             elif label == "Final level, Tank 6A (L)" or label == "Final level, Tank 6B (L)":
                 _put(local, "p", "tank%sFinalL" % label[-6:-4].lower(), cell, "num", "%s: %s" % (what, label))
@@ -421,8 +461,10 @@ def build_plan(lot, choice, seq, fmt, global_choice):
                     plan["extra"].append("%s - the paper log shows no preservative time" % what)
             elif label == "Final check: pH / TDS / Brix / Mannitol":
                 parts = [to_number(x) for x in (cell.text or "").split("/")] if cell.ok() else []
-                if i == 0 and len(parts) == 4 and None not in parts:
+                if i == 0 and len(parts) in (4, 5) and None not in parts:
                     plan["stages"].setdefault("packaging", {}).update(qcPh=parts[0], tdsPct=parts[1], brixPct=parts[2], mannitolPct=parts[3])
+                    if len(parts) == 5:                                            # KW-98: an optional fifth value = the final product's Moisture Content (the sampling record), as TSliquid (%) like every other Moisture Content
+                        plan["stages"]["packaging"]["tsLiquidPct"] = parts[4]
                 elif cell.ok():
                     plan["extra"].append("%s - final check pH / TDS / Brix / Mannitol: %s (KelpWorks keeps one final check, from pass 1)" % (what, cell.text))
                 elif cell.kind == DECIDE:
@@ -441,9 +483,13 @@ def build_plan(lot, choice, seq, fmt, global_choice):
         if i == 0:
             plan["stages"].setdefault("dilution", {}).update(got)
             plan["stages"].setdefault("pasteurization", {})["receivingTanks"] = ps["tank"] if ps["tank"] else None
-            if not ps["tank"]:
-                plan["problems"].append("%s: the receiving tank is not shown on the pass title" % what)
+            if not ps["tank"] and ps["tankNotRecorded"]:
+                plan["gaps"].append("%s: receiving tank" % what)                 # KW-98: the paper log named none; left blank, never guessed
+            elif not ps["tank"]:
+                plan["problems"].append("%s: the receiving tank is not shown on the pass title (write 'Tank 6A' / 'Tank 6B', or 'Tank (not recorded)' if the paper log has none)" % what)
         else:
+            if not ps["tank"]:
+                plan["problems"].append("%s: a second or later pass needs its tank on the pass title" % what)
             row = dict(got)
             row["receivingTanks"] = ps["tank"]
             plan["passes"].append(row)
@@ -467,6 +513,12 @@ def build_plan(lot, choice, seq, fmt, global_choice):
         if label in PACKAGING:
             key, kind = PACKAGING[label]
             _put(plan, "packaging", key, cell, kind, "Packaging: " + label)
+        elif label == "Container and quantity" and cell.ok() and cell.text.strip().lower().startswith("(no output"):
+            # KW-98: a run that produced nothing (for example a lost batch) is accepted ONLY when the workbook says so, with the reason the paper log gives
+            reason = re.sub(r"^\(no output\)\s*", "", cell.text.strip(), flags=re.I).strip()
+            plan["noOutput"] = reason or "(no reason given)"
+            if not reason:
+                plan["problems"].append("Packaging: '(no output)' needs the reason the paper log gives, for example '(no output) lost down the drain due to operator error'")
         elif label == "Container and quantity":
             m = re.match(r"^(.*?)\s+x\s+(\d+(?:\.\d+)?)\s*$", cell.text or "")
             if cell.kind == DECIDE:
@@ -480,8 +532,8 @@ def build_plan(lot, choice, seq, fmt, global_choice):
                 plan["notes"].append({"section": "packaging", "body": _with_caption(cell), "photos": photos_from_note(cell.note)})
         elif screen not in IGNORED_SCREENS:
             plan["problems"].append('Packaging: the workbook shows "%s" but the tool has no mapping for it' % label)
-    if not plan["packaging"]:
-        plan["problems"].append("No packaging (container and quantity) found")
+    if not plan["packaging"] and not plan.get("noOutput"):
+        plan["problems"].append("No packaging (container and quantity) found (a run that produced nothing needs the row 'Container and quantity | (no output) <what the paper log says>')")
     # cross-check and the rest
     for label, cell in lot["crosscheck"].items():
         if label == "Performance notes" and cell.ok():
@@ -564,6 +616,12 @@ def split_note(body):
 def compose_run_notes(plan, assumptions, accepted_by, sha):
     lines = ["Historical run entered retrospectively from the paper production log (original paper lot %s) with the KW-64 import tool. KelpWorks processing lot %s." % (plan["paperLot"], plan["processingLot"]),
              "Source workbook SHA-256 %s." % sha[:16]]
+    if plan.get("noOutput"):
+        lines.append("NO OUTPUT: this run produced no finished goods. Paper log: %s." % plan["noOutput"])
+    if plan.get("noPasses"):
+        lines.append("No dilution or preservation was recorded on the paper log for this run.")
+    if plan.get("bypassed"):
+        lines.append("Extraction was bypassed on the paper log (reason entered: %s)." % ((plan["stages"].get("extraction") or {}).get("bypassComment") or "-"))
     if plan["gaps"]:
         lines.append("NOT RECORDED on the paper log (left blank, nothing was filled in): " + "; ".join(plan["gaps"]) + ".")
     if plan["extra"]:
@@ -640,8 +698,14 @@ def print_check(plans, load_problems, out=None):
     total = 0
     for p in plans:
         out.write("Lot %d  %s  %s  (paper %s)  release=%s  inventory=%s  sku=%s\n" % (p["lot"], p["processingLot"], p["runDate"], p["paperLot"], p["release"] or "?", "count" if p["deduct"] else "leave", p["sku"] or "?"))
-        out.write("   totes %d, dilution passes %d, packaging %s, notes %d, documents %d, files %d\n" % (len(p["totes"]), 1 + len(p["passes"]), ", ".join("%s x %g" % (x["containerUnit"], x["qty"]) for x in p["packaging"]) or "-",
+        out.write("   totes %d, dilution passes %d, packaging %s, notes %d, documents %d, files %d\n" % (len(p["totes"]), (0 if p.get("noPasses") else 1) + len(p["passes"]), ", ".join("%s x %g" % (x["containerUnit"], x["qty"]) for x in p["packaging"]) or "-",
                                                                                                          len(p["notes"]), len(p["documents"]), len(plan_files(p))))
+        if p.get("bypassed"):
+            out.write("   extraction BYPASSED (reason: %s)\n" % _ascii((p["stages"].get("extraction") or {}).get("bypassComment") or "-"))
+        if p.get("noOutput"):
+            out.write("   NO OUTPUT (no finished goods): %s\n" % _ascii(p["noOutput"]))
+        if p.get("noPasses"):
+            out.write("   NO dilution passes (the paper log recorded none)\n")
         if p["gaps"]:
             out.write("   not recorded on the paper log (%d): %s\n" % (len(p["gaps"]), "; ".join(_ascii(g) for g in p["gaps"][:6]) + (" ..." if len(p["gaps"]) > 6 else "")))
         for x in p["problems"]:
@@ -873,9 +937,10 @@ def reconcile(api, plan, photos_root=None):
     eff = round((ext_tds - homog_tds) / homog_tds * 100, 1) if homog_tds and ext_tds is not None else None
     rel = (run.get("release") or {}).get("state")
     want_rel = "legacy" if plan["release"] == "grandfather" else "pending_review"
+    base_pass = 0 if plan.get("noPasses") else 1                          # KW-98: pass 1 is the stage-level dilution; a lot with no dilution at all has none
     rows = [("totes", ex.get("totes"), len(run.get("inputs", [])), _close(ex.get("totes"), len(run.get("inputs", [])), 0)),
             ("feedstock kg (measured)", ex.get("feedstockKg"), kg, _close(ex.get("feedstockKg"), kg, 1.0)),
-            ("dilution passes", ex.get("passes"), 1 + len(run.get("dilutionPasses", [])), _close(ex.get("passes"), 1 + len(run.get("dilutionPasses", [])), 0)),
+            ("dilution passes", ex.get("passes"), base_pass + len(run.get("dilutionPasses", [])), _close(ex.get("passes"), base_pass + len(run.get("dilutionPasses", [])), 0)),
             ("IBCs packaged", ex.get("ibcs"), run.get("ibcUsed"), _close(ex.get("ibcs"), run.get("ibcUsed"), 0)),
             ("output L", ex.get("outputL"), run.get("outputLitres"), _close(ex.get("outputL"), run.get("outputLitres"), 1.0)),
             ("final pH", ex.get("finalPh"), (st.get("packaging") or {}).get("qcPh"), _close(ex.get("finalPh"), (st.get("packaging") or {}).get("qcPh"), 0.005)),
@@ -883,6 +948,11 @@ def reconcile(api, plan, photos_root=None):
             ("extraction efficiency %", ex.get("extractionEfficiencyPct"), eff, _close(ex.get("extractionEfficiencyPct"), eff, 0.15)),
             ("run date", plan["runDate"], run.get("runDate"), plan["runDate"] == run.get("runDate")),
             ("release state", want_rel, rel, rel == want_rel)]
+    if plan.get("bypassed"):
+        got_bypass = bool((st.get("extraction") or {}).get("bypassed"))
+        rows.append(("extraction bypassed", "yes", "yes" if got_bypass else "no", got_bypass))
+    if plan.get("noOutput"):
+        rows.append(("no finished goods", 0, len(run.get("fgLots") or run.get("lots") or []), not (run.get("fgLots") or run.get("lots"))))
     out = [(m, e, g, "PASS" if ok else "DIFFERENCE") for m, e, g, ok in rows if not (e is None and m not in ("run date", "release state"))]
     if photos_root:
         by_tote = {i["toteLot"]: i for i in run.get("inputs", [])}

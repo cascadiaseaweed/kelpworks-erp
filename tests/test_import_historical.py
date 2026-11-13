@@ -1,4 +1,4 @@
-"""KW-64: the historical-runs import tool (tools/import_historical_runs.py). SYNTHETIC data only: the real workbook, photos and mapping hold production data and are never in the repository.
+"""KW-64 / KW-98: the historical-runs import tool (tools/import_historical_runs.py). SYNTHETIC data only: the real workbook, photos and mapping hold production data and are never in the repository.
 
 The tool is run in-process against a real server (the harness). The server is a STAGING one (KELP_ERP_ENV=staging), because the tool refuses to run when the kind of site it finds
 is not the kind it was told to expect."""
@@ -31,6 +31,17 @@ def cells(*row):
     return [("t", str(c), 0) if c not in (None, "") else None for c in row]
 
 
+def extraction_rows(lot, d, v):
+    """KW-98: the Extraction rows of a lot sheet: normal, bypassed (explicit rows, the paper values listed as '(no field)') or not done at all."""
+    if lot.get("bypass"):
+        return [("Extraction", "Bypassed", "Yes", "Extraction Notes: Bypassed extraction"), ("Extraction", "Reason bypassed", "Bypassed extraction"),
+                ("(no field)", "Paper extraction parameters", "100% / 15LPM", "", "Not entered: the extraction was bypassed.")]
+    if lot.get("no_extraction"):
+        return [("Extraction", "Started at", "(not recorded)"), ("Extraction", "Amplitude (%)", "(not recorded)"), ("QC Check", "pH", "(not recorded)")]
+    return [("Extraction", "Started at", d + " 12:00"), ("Extraction", "Amplitude (%)", 100), ("Extraction", "Flow rate (L/min)", 15),
+            ("Extraction", "Pressure (psi)", v("pressure", 35)), ("Extraction", "Starting power (W)", 4775), ("QC Check", "pH", 5.15), ("QC Check", "TDS (%)", lot["ext_tds"])]
+
+
 def lot_rows(lot, photos):
     """One 'Lot N' sheet. lot: no, date, totes [(tote lot, kg)], passes [tank, ...], ibcs, final (pH, TDS, Brix, Mannitol), homog_tds, ext_tds, missing [labels left '(not recorded)']."""
     n, d = lot["no"], lot["date"]
@@ -57,21 +68,31 @@ def lot_rows(lot, photos):
           ("(no field)", "Initial pH / Citric added", "5.2 / 0kg", "", "KelpWorks has no Homogenization pH-adjustment fields"),
           ("Homogenization", "Notes", "Did not pH adjust.", "", "Photos: L%d_Homog_note.jpg" % n)]
     photos.append((n, "L%d_Homog_note.jpg" % n))
-    R += [("5. Extraction",), ("Extraction", "Started at", d + " 12:00"), ("Extraction", "Amplitude (%)", 100), ("Extraction", "Flow rate (L/min)", 15),
-          ("Extraction", "Pressure (psi)", v("pressure", 35)), ("Extraction", "Starting power (W)", 4775), ("QC Check", "pH", 5.15), ("QC Check", "TDS (%)", lot["ext_tds"]),
+    if lot.get("slurry"):                    # KW-98: the handwritten sampling record also has the slurry readings (homogenization QC fields)
+        R += [("QC Check", "TSslurry (%)", 95.6), ("QC Check", "\u03c1slurry (g/mL)", 1.018)]
+    R += [("5. Extraction",)] + extraction_rows(lot, d, v) + [
           ("6. Separation",), ("Separation", "Started at", d + " 15:41"), ("Separation", "Flow rate (L/min)", 40), ("Separation", "Mesh size (micron)", 70),
           ("Separation", "Total wet-solids weight (kg)", "(not recorded)"), ("Separation", "%Moisture centrifuge solids", "(not recorded)"), ("(no field)", "Water addition", "0L"),
           ("Documents", "Solids photo 1", "L%d_Solids1.jpg" % n, "", "Upload as a run document."),
           ("7. Pasteurization",), ("Pasteurization", "Started at", d + " 18:00"), ("Pasteurization", "Product set-point (C)", 80), ("Pasteurization", "Boiler set-point (C)", 90),
-          ("Pasteurization", "Receiving tanks", "/".join(lot["passes"])), ("Pasteurization", "Tank 5A / 5B level (L)", "(not recorded)"),
+          ("Pasteurization", "Receiving tanks", "/".join(t for t in lot["passes"] if t) or "(not recorded)"), ("Pasteurization", "Tank 5A / 5B level (L)", "(not recorded)"),
           ("8. Dilution & Preservation",)]
     photos.append((n, "L%d_Solids1.jpg" % n))
+    if lot.get("no_passes"):
+        R.append(("Dilution", "Passes", "(no passes) nothing recorded on the paper log"))
     for k, tank in enumerate(lot["passes"], 1):
+        if tank is None:                    # KW-98: pH adjustment and a final check, but no tank and no volumes on the paper log
+            R += [("", "Pass %d - Tank (not recorded)" % k), ("Dilution", "Measured pH (before citric)", 4.1), ("Dilution", "Citric acid added (kg)", 25)]
+            if lot.get("ksorbate_l"):           # KW-98: the preservative was added although the paper log names no tank: entered as the run total
+                R.append(("Dilution", "Ksorbate added (L)", lot["ksorbate_l"]))
+            R += [
+                  ("Packaging QC", "Final check: pH / TDS / Brix / Mannitol", "%s / %s%% / %s%% / %s%%" % lot["final"] + (" / %s%%" % lot["final_mc"] if lot.get("final_mc") else "")), ("Samples", "Samples taken", "No")]
+            continue
         R += [("", "Pass %d - Tank %s" % (k, tank)), ("Dilution", "Product transferred (L)", 2483), ("Dilution", "Dilution water added (L)", 2483), ("Dilution", "Final level, Tank %s (L)" % tank, 5243),
               ("Dilution", "Ksorbate added (L)", 52), ("Dilution", "Sodium benzoate added (L)", 0), ("Dilution", "Preservatives added at", d + " 15:35"), ("Dilution", "Measured pH (before citric)", 5.8),
-              ("Dilution", "Citric acid added (kg)", 32), ("Packaging QC", "Final check: pH / TDS / Brix / Mannitol", "%s / %s%% / %s%% / %s%%" % lot["final"]), ("Samples", "Samples taken", "Yes")]
-    R += [("9. Packaging",), ("Packaging", "Packaged at", d + " 16:00"), ("Packaging", "Container and quantity", "%s x %d" % (IBC, lot["ibcs"])),
-          ("10. Cross-check against the paper log",), ("Run card", "Extraction efficiency", "-5.3 %"), ("(not in KelpWorks)", "Required-fields override", "Yes"),
+              ("Dilution", "Citric acid added (kg)", 32), ("Packaging QC", "Final check: pH / TDS / Brix / Mannitol", "%s / %s%% / %s%% / %s%%" % lot["final"] + (" / %s%%" % lot["final_mc"] if lot.get("final_mc") else "")), ("Samples", "Samples taken", "Yes")]
+    R += [("9. Packaging",), ("Packaging", "Packaged at", d + " 16:00"), ("Packaging", "Container and quantity", "(no output) lost down the drain due to operator error" if lot.get("no_output") else "%s x %d" % (IBC, lot["ibcs"])),
+          ("10. Cross-check against the paper log",), ("Run card", "Extraction efficiency", "(none - extraction not done)" if lot.get("bypass") or lot.get("no_extraction") else "-5.3 %"), ("(not in KelpWorks)", "Required-fields override", "Yes"),
           ("Things to check before entering",), ("Paper log", "Required-fields override was used. Reason on the log: \"test\".")]
     return R
 
@@ -87,9 +108,9 @@ def make_workbook(path, lots):
     ov.row(cells("Lot (paper)", "Run date", "Operators", "Feedstock site", "Totes", "Feedstock kg", "Pasteurized?", "Dilution passes", "IBCs packaged", "Output L (paper)", "Final pH (pass 1)",
                  "Final TDS % (pass 1)", "Extraction eff. (paper)"))
     for lot in lots:
-        eff = round((lot["ext_tds"] - lot["homog_tds"]) / lot["homog_tds"] * 100, 1)
+        eff = round((lot["ext_tds"] - lot["homog_tds"]) / lot["homog_tds"] * 100, 1) if not lot.get("bypass") and not lot.get("no_extraction") else None
         ov.row(cells(lot["no"], lot["date"], "DP, AL", "JAM", len(lot["totes"]), sum(k for _t, k in lot["totes"]), "Yes", len(lot["passes"]), lot["ibcs"], lot["ibcs"] * 1000,
-                     lot["final"][0], lot["final"][1], "%s%%" % eff))
+                     lot["final"][0], lot["final"][1], "%s%%" % eff if eff is not None else "(none)"))
     sheets.append(ov)
     for lot in lots:
         s = K.XlsxSheet("Lot %d" % lot["no"])
@@ -392,3 +413,153 @@ def test_a_load_that_would_take_nothing_out_of_inventory_for_a_reagent_added_is_
     code = T.main(["--check", "--workbook", world["wb"], "--mapping", world["mp"], "--photos", str(world["tmp"])])
     out = capsys.readouterr().out
     assert code == 2 and "Potassium sorbate was added" in out and "ksorbateStockPct" in out and "nothing would be taken out of inventory" in out
+
+
+# --------------------------------------------------------------------------- #
+# KW-98: bypassed extraction, a pass without a tank, no dilution at all and a run with no output (Lots 10 to 13 of the real load)
+# --------------------------------------------------------------------------- #
+@pytest.fixture()
+def special(tmp_path):
+    """Like `world`, with the cases Lots 1 to 9 did not have: lot 10 bypassed extraction, lot 12 bypassed extraction and ONE pass with no tank (preservative entered as the run total), lot 13 nothing done after the
+    inputs (no extraction, no dilution, no output)."""
+    with Server(env={"KELP_ERP_ENV": "staging"}) as srv:
+        admin = srv.admin_client()
+        assert admin.put("/api/settings/historical_entry_enabled", {"value": 1}).status == 200
+        ids = harvest_totes(admin, n=6, site="JAM", species="SL", date="2026-05-06")
+        by_id = {t["id"]: t["lot"] for t in admin.get("/api/totes").json["totes"]}
+        lots_of = [by_id[i] for i in ids]
+        lots = [dict(no=10, date="2026-10-20", totes=[(lots_of[0], 1009), (lots_of[1], 961)], passes=["6A"], ibcs=3, final=(3.9, 1.8, 2.2, 2.1), final_mc=98.3, slurry=True, homog_tds=2.9, ext_tds=2.9, bypass=True),
+                dict(no=12, date="2026-10-26", totes=[(lots_of[2], 976), (lots_of[3], 1093)], passes=[None], ksorbate_l=120, ibcs=4, final=(3.8, 1.8, 2.7, 2.5), homog_tds=3.2, ext_tds=3.2, bypass=True),
+                dict(no=13, date="2026-10-27", totes=[(lots_of[4], 948), (lots_of[5], 971)], passes=[], no_passes=True, no_output=True, no_extraction=True, ibcs=0, final=(None, None, None, None),
+                     homog_tds=3.0, ext_tds=3.0)]
+        wb = str(tmp_path / "entry.xlsx")
+        photos = make_workbook(wb, lots)
+        for lot_no, fn in photos:
+            d = tmp_path / ("Lot_%d" % lot_no) / "photos"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / fn).write_bytes(JPG)
+        mapping = {"assumptionsAcceptedBy": "N. Wrana 2026-11-12", "ksorbateStockPct": 25, "lotNumberFormat": "PR-{date}-{no:03d}",
+                   "lots": {"10": {"sku": "KELPIVEX", "release": "review"}, "12": {"sku": "KELPIVEX", "release": "review"}, "13": {"sku": "KELPIVEX", "release": "grandfather"}}}
+        mp = str(tmp_path / "mapping.json")
+        with open(mp, "w") as f:
+            json.dump(mapping, f)
+        yield dict(srv=srv, admin=admin, wb=wb, mp=mp, mapping=mapping, lots=lots, tmp=tmp_path, totes=lots_of)
+
+
+def special_plans(special):
+    plans, _sha, problems = T.load_plans(special["wb"], special["mapping"])
+    return {p["lot"]: p for p in plans}, problems
+
+
+def test_check_shows_a_bypassed_extraction_no_output_and_no_dilution(special, capsys):
+    code = T.main(["--check", "--workbook", special["wb"], "--mapping", special["mp"], "--photos", str(special["tmp"])])
+    out = capsys.readouterr().out
+    assert code == 0 and "No problems" in out, out
+    assert "PR-20261020-010" in out and "PR-20261026-012" in out and "PR-20261027-013" in out               # {no}: the paper lot number, not the order in this workbook
+    assert out.count("extraction BYPASSED (reason: Bypassed extraction)") == 2
+    assert "NO OUTPUT (no finished goods): lost down the drain due to operator error" in out and "NO dilution passes" in out
+
+
+def test_a_bypassed_extraction_sends_only_the_bypass_and_its_reason_and_lists_no_extraction_gaps(special):
+    plans, problems = special_plans(special)
+    assert not problems and not plans[10]["problems"], plans[10]["problems"]
+    assert plans[10]["stages"]["extraction"] == {"bypassed": True, "bypassComment": "Bypassed extraction"}
+    assert not [g for g in plans[10]["gaps"] if g.startswith("Extraction")]
+    assert any("Paper extraction parameters" in x for x in plans[10]["extra"])                              # the paper values are kept in the notes, not dropped
+    notes = " ".join(n["body"] for n in plans[10]["notes"])
+    assert "Extraction was bypassed on the paper log (reason entered: Bypassed extraction)" in notes
+    # a value typed on an Extraction row of a bypassed lot is not sent (the server would clear it) and is said so
+    lot = T.parse_lot_sheet(T.read_workbook(special["wb"])["Lot 10"], 10)
+    lot["stages"]["extraction"][("Extraction", "Amplitude (%)")] = T.Cell("100")
+    plan = T.build_plan(lot, special["mapping"]["lots"]["10"], 1, special["mapping"]["lotNumberFormat"], special["mapping"])
+    assert plan["stages"]["extraction"] == {"bypassed": True, "bypassComment": "Bypassed extraction"} and any("amplitudePct=100.0" in x for x in plan["extra"])
+
+
+def test_a_bypass_without_its_reason_stops_and_a_reason_without_a_bypass_too(special):
+    lot = T.parse_lot_sheet(T.read_workbook(special["wb"])["Lot 10"], 10)
+    del lot["stages"]["extraction"][("Extraction", "Reason bypassed")]
+    plan = T.build_plan(lot, special["mapping"]["lots"]["10"], 1, special["mapping"]["lotNumberFormat"], special["mapping"])
+    assert any("Extraction is bypassed" in x and "reason" in x for x in plan["problems"])
+    lot = T.parse_lot_sheet(T.read_workbook(special["wb"])["Lot 10"], 10)
+    lot["stages"]["extraction"][("Extraction", "Bypassed")] = T.Cell("No")
+    plan = T.build_plan(lot, special["mapping"]["lots"]["10"], 1, special["mapping"]["lotNumberFormat"], special["mapping"])
+    assert any("reason for bypassing is given but the row 'Bypassed' is not Yes" in x for x in plan["problems"])
+    lot = T.parse_lot_sheet(T.read_workbook(special["wb"])["Lot 10"], 10)
+    lot["stages"]["extraction"][("Extraction", "Bypassed")] = T.Cell("maybe")
+    plan = T.build_plan(lot, special["mapping"]["lots"]["10"], 1, special["mapping"]["lotNumberFormat"], special["mapping"])
+    assert any("cannot read \"maybe\" as yes or no" in x for x in plan["problems"])
+
+
+def test_no_packaging_and_no_dilution_stop_the_load_unless_the_workbook_says_so_explicitly(special):
+    plans, problems = special_plans(special)
+    assert not plans[13]["problems"] and plans[13]["noOutput"] == "lost down the drain due to operator error" and plans[13]["noPasses"] is True and plans[13]["packaging"] == []
+    lot = T.parse_lot_sheet(T.read_workbook(special["wb"])["Lot 13"], 13)
+    choice, fmt = special["mapping"]["lots"]["13"], special["mapping"]["lotNumberFormat"]
+    del lot["stages"]["packaging"][("Packaging", "Container and quantity")]
+    del lot["stages"]["dilution"][("Dilution", "Passes")]
+    plan = T.build_plan(lot, choice, 1, fmt, special["mapping"])
+    assert any("No packaging" in x for x in plan["problems"]) and any("No dilution pass found" in x for x in plan["problems"])
+    lot = T.parse_lot_sheet(T.read_workbook(special["wb"])["Lot 13"], 13)
+    lot["stages"]["packaging"][("Packaging", "Container and quantity")] = T.Cell("(no output)")                       # the marker alone is not enough: the paper log's reason is required
+    assert any("needs the reason" in x for x in T.build_plan(lot, choice, 1, fmt, special["mapping"])["problems"])
+    lot["stages"]["packaging"][("Packaging", "Container and quantity")] = T.Cell(IBC + " x 2")
+    plan = T.build_plan(lot, choice, 1, fmt, special["mapping"])
+    assert not any("No packaging" in x for x in plan["problems"]) and plan.get("noOutput") is None                  # a real container and quantity is entered as always
+    lot12 = T.parse_lot_sheet(T.read_workbook(special["wb"])["Lot 12"], 12)                                          # '(no passes)' next to a listed pass is a contradiction
+    lot12["stages"]["dilution"] = {("Dilution", "Passes"): T.Cell("(no passes) none")}
+    plan = T.build_plan(lot12, special["mapping"]["lots"]["12"], 1, fmt, special["mapping"])
+    assert any("also lists a dilution pass" in x for x in plan["problems"])
+
+
+def test_a_pass_with_no_tank_is_accepted_only_when_the_sheet_says_not_recorded(special):
+    plans, _ = special_plans(special)
+    p = plans[12]
+    assert not p["problems"], p["problems"]
+    assert "Dilution pass 1: receiving tank" in p["gaps"] and p["stages"]["pasteurization"]["receivingTanks"] is None
+    assert p["stages"]["dilution"] == {"measuredPh": 4.1, "citricKg": 25.0, "ksorbateAddedL": 120.0, "ksorbateStockPct": 25.0} and p["passes"] == []        # the preservative is the run total: no tank to split it over
+    assert p["stages"]["packaging"]["qcPh"] == 3.8                                                                    # the final check still goes to the packaging QC check
+    lot = T.parse_lot_sheet(T.read_workbook(special["wb"])["Lot 12"], 12)
+    lot["passes"][0]["tankNotRecorded"] = False
+    plan = T.build_plan(lot, special["mapping"]["lots"]["12"], 1, special["mapping"]["lotNumberFormat"], special["mapping"])
+    assert any("receiving tank is not shown on the pass title" in x for x in plan["problems"])
+    lot = T.parse_lot_sheet(T.read_workbook(special["wb"])["Lot 12"], 12)
+    lot["passes"][0]["tankNotRecorded"] = False                                                                         # a preservative on a pass that is not marked "Tank (not recorded)" still needs its tank
+    plan = T.build_plan(lot, special["mapping"]["lots"]["12"], 1, special["mapping"]["lotNumberFormat"], special["mapping"])
+    assert any("Ksorbate added (L) needs the tank" in x for x in plan["problems"])
+    lot = T.parse_lot_sheet(T.read_workbook(special["wb"])["Lot 12"], 12)
+    lot["passes"].append(dict(lot["passes"][0], n=2))                                                                    # a second pass has to name its tank, so it cannot carry the preservative either
+    plan = T.build_plan(lot, special["mapping"]["lots"]["12"], 1, special["mapping"]["lotNumberFormat"], special["mapping"])
+    assert any("Dilution pass 2: a second or later pass needs its tank" in x for x in plan["problems"])
+
+
+def test_the_special_runs_are_loaded_and_reconcile_with_the_workbook(special, tmp_path):
+    admin, srv = special["admin"], special["srv"]
+    citric_before, ibc_before, sorbate_before = on_hand(srv, "Citric Acid"), on_hand(srv, IBC), on_hand(srv, "Potassium Sorbate")
+    report = str(tmp_path / "report.csv")
+    code, out = run_tool(special, "--run", report=report)
+    assert code == 0, out
+    runs = runs_by_lot(admin)
+    assert sorted(runs) == ["PR-20261020-010", "PR-20261026-012", "PR-20261027-013"]
+    r10, r12, r13 = (runs[l] for l in ("PR-20261020-010", "PR-20261026-012", "PR-20261027-013"))
+    assert r10["stages"]["extraction"]["bypassed"] is True and r12["stages"]["extraction"]["bypassed"] is True and not r13["stages"]["extraction"].get("bypassed")
+    assert "Bypassed extraction" in (r10["stages"]["extraction"].get("bypassComment") or "") and r10["stages"]["extraction"].get("amplitudePct") is None
+    assert (r10["ibcUsed"], r12["ibcUsed"], r13["ibcUsed"], r13["outputLitres"]) == (3, 4, 0, 0)
+    assert r12["stages"]["dilution"]["citricKg"] == 25 and r12["dilutionPasses"] == [] and r12["stages"]["pasteurization"].get("receivingTanks") in (None, "")
+    assert r12["stages"]["packaging"]["qcPh"] == 3.8 and r10["stages"]["dilution"]["ksorbateAddedL6a"] == 52
+    assert (r10["stages"]["homogenization"]["tsSlurryPct"], r10["stages"]["homogenization"]["rhoSlurryGMl"], r10["stages"]["packaging"]["tsLiquidPct"]) == (95.6, 1.018, 98.3)       # the sampling record's slurry and final-product moisture
+    assert r12["stages"]["dilution"]["ksorbateAddedL"] == 120 and r12["stages"]["dilution"]["ksorbateStockPct"] == 25                # the untanked pass's preservative stays the run total as typed
+    assert on_hand(srv, "Potassium Sorbate") == sorbate_before - 52 * 0.25 - 120 * 0.25                                  # lot 10 (52 L) + lot 12 (120 L) of 25 % w/v stock = 13 kg + 30 kg
+    assert on_hand(srv, "Citric Acid") == citric_before - 32 - 25                                                   # lot 10 pass (32) + lot 12 (25); lot 13 added none
+    assert on_hand(srv, IBC) == ibc_before - 3 - 4                                                                    # lot 13 produced nothing
+    assert r13["release"]["state"] == "legacy" and r10["release"]["state"] == "pending_review"
+    assert sql(srv, "SELECT COUNT(*) FROM fg_lots WHERE run_id=?", (r13["id"],))[0][0] == 0
+    assert sql(srv, "SELECT COALESCE(SUM(qty), 0) FROM fg_lots WHERE run_id=?", (r10["id"],))[0][0] == 3                      # one finished-goods lot of 3 IBCs (a lot per container unit)
+    assert all(t["status"] == "consumed" for t in admin.get("/api/totes").json["totes"] if t["lot"] in special["totes"])      # lot 13's two totes are consumed too, none is left in WIP
+    notes13 = " ".join(n["body"] for n in r13["logNotes"])
+    assert "NO OUTPUT: this run produced no finished goods. Paper log: lost down the drain due to operator error." in notes13 and "No dilution or preservation was recorded" in notes13
+    assert "Extraction was bypassed on the paper log" in " ".join(n["body"] for n in r12["logNotes"])
+    rows = [l.split(",") for l in open(report, encoding="utf-8").read().splitlines()[1:]]
+    assert rows and all(r[5] == "PASS" for r in rows), rows
+    metrics = {(r[0], r[2]) for r in rows}
+    assert ("10", "extraction bypassed") in metrics and ("13", "no finished goods") in metrics and ("13", "dilution passes") in metrics
+    assert admin.get("/api/integrity").json["summary"]["error"] == 0
