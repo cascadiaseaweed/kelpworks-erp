@@ -14826,88 +14826,14 @@ class Handler(BaseHTTPRequestHandler):
                             "logMatchesReview": matches,
                             "chain": release_verify_chain(conn), "gate": gate, "coaRows": coa_rows_for_review(conn, r), "organicConflicts": organic_conflicts(conn, r),
                             "separateSigners": bool(float(get_setting_value(conn, "release_separate_signers", 0) or 0))})
-                out["releaseForShipment"] = self._release_for_shipment_info(conn, r, gate)
                 return out
             if len(seg) == 5 and method == "POST" and seg[4] in ("review", "release", "reopen", "resubmit"):
                 return self._release_action(conn, r, seg[4], self._body_json(), user)
             if len(seg) == 5 and method == "POST" and seg[4] == "release-from-hold":
                 return self._release_from_hold(conn, r, self._body_json(), user)
-            if len(seg) == 5 and method == "POST" and seg[4] == "release-for-shipment":
-                return self._release_for_shipment(conn, r, self._body_json(), user)
             if len(seg) == 5 and method == "GET" and seg[4] == "recall":
                 return self._recall_report(conn, r)
         raise ApiError(404, "Unknown release endpoint")
-
-    def _release_for_shipment_info(self, conn, r, gate):
-        """What the run window needs to offer the release-for-shipment box (KW-100): whether it is on, whether this run qualifies and why not, which customers it may go to, the Pending Release
-        lots and the recent heavy-metals results of the same site and species (information only)."""
-        chk = release_for_shipment_check(conn, r, gate)
-        customers = []
-        for c in conn.execute(self.CUSTOMER_SQL):
-            why = customer_destination_problem(conn, c)
-            customers.append({"id": c["id"], "name": c["name"], "destination": c["destination_name"], "ok": why is None, "why": why})
-        lots = [{"id": l["id"], "lot": l["fg_lot_number"], "packageSize": l["package_size"], "qty": l["qty"], "skuAssigned": l["sku_assigned"] is None or bool(l["sku_assigned"]),
-                 "madeAs": l["made_as"] or l["sku_code"]}
-                for l in conn.execute("SELECT * FROM fg_lots WHERE run_id=? AND status='pending_release' AND qty>0 ORDER BY id", (r["id"],))]
-        on_hand = [{"id": l["id"], "lot": l["fg_lot_number"], "sku": l["sku_code"], "packageSize": l["package_size"], "qty": l["qty"], "location": l["location"],
-                    "skuAssigned": l["sku_assigned"] is None or bool(l["sku_assigned"]), "madeAs": l["made_as"] or l["sku_code"]}
-                   for l in conn.execute(
-                       "SELECT l.* FROM fg_lots l LEFT JOIN production_runs p ON p.id=l.run_id WHERE l.status='on_hand' AND l.qty>0"
-                       " AND (p.id IS NULL OR p.release_state IS NULL OR p.release_state IN ('released','legacy')) ORDER BY l.produced_date, l.fg_lot_number")]
-        chk.update({"customers": customers, "lots": lots, "onHandLots": on_hand, "pendingTests": chk["pending"],
-                    "recentMetals": recent_metals_context(conn, r) if (chk["enabled"] and r["release_state"] == "pending_release") else []})
-        return chk
-
-    def _release_for_shipment(self, conn, r, d, user):
-        """POST /api/release/runs/<id>/release-for-shipment (KW-100). A Quality Manager releases a lot, or part of a lot, of a REVIEWED run for a confirmed shipment to a customer whose destination
-        does not require heavy-metals results, while those results are still to come. Release and shipment are ONE signed act in one transaction: the units leave the lot on a real shipment and
-        the rest of the run stays Pending Release for the normal release. Only heavy metals can be outstanding (release_for_shipment_check); no override; hash-chained `release_for_shipment` event."""
-        if not release_for_shipment_enabled(conn):
-            raise ApiError(403, "Releasing units for shipment is switched off (Calculations page: 'Release: allow units to be released for shipment before the heavy-metals results')", "conditional_off")
-        comment = (d.get("comment") or "").strip()
-        if len(comment) < 3:
-            raise ApiError(400, "Enter the reason for releasing these units before the heavy-metals results (it is recorded in the audit trail)")
-        cust = conn.execute("SELECT * FROM customers WHERE id=? AND active=1", (d.get("customerId"),)).fetchone()
-        if not cust:
-            raise ApiError(400, "Choose the customer this shipment is for")
-        gate = release_gate(conn, r)
-        chk = release_for_shipment_check(conn, r, gate)
-        reasons = list(chk["reasons"])
-        asked = []
-        for ln in d.get("lines") or []:
-            try:
-                lot = conn.execute("SELECT run_id, status FROM fg_lots WHERE id=?", (int(ln.get("fgLotId")),)).fetchone()
-            except (TypeError, ValueError):
-                lot = None
-            if lot and lot["run_id"] == r["id"] and lot["status"] == "pending_release" and (num(ln.get("qty")) or 0) > 0:
-                asked.append(1)
-        if not asked:
-            reasons.append("Choose at least one Pending Release lot of this run, and the units, to release for this shipment")
-        why = customer_destination_problem(conn, cust)
-        if why:
-            reasons.append(why)
-        if reasons:
-            raise ApiError(409, "Release for shipment blocked: " + "; ".join(reasons), "release_for_shipment_blocked")
-        capacity = self._release_signer(conn, user, d, need_quality=True)
-        if float(get_setting_value(conn, "release_separate_signers", 0) or 0):
-            rev = conn.execute("SELECT user_id FROM release_events WHERE run_id=? AND event_type='review_approved' ORDER BY id DESC LIMIT 1", (r["id"],)).fetchone()
-            if rev and rev["user_id"] == user["id"]:
-                raise ApiError(403, "You signed the production-log review of this run, so another Quality Manager must sign this release (setting: reviewer and releaser must differ).", "same_person")
-        now_hash = self._release_snapshot_hash(conn, r["id"])
-        if now_hash != r["release_review_hash"]:
-            self._release_void(conn, r, user, now_hash, "Production log differs from the log that was reviewed")
-            conn.commit()
-            raise ApiError(409, "The production log changed after it was reviewed - it has been returned to review")
-        ship = self._make_shipment(conn, user, d, for_release=r)["shipment"]
-        release_log(conn, r["id"], "release_for_shipment", user, capacity=capacity,
-                    meaning=("I release these units for shipment %s to %s (%s) before the heavy-metals results (%s): the process specifications and indicator-organism tests are met. "
-                             "The rest of the run is not released. Any other line on the shipment is released stock.") % (ship["shipmentNo"], cust["name"], ship["destination"], ", ".join(chk["pending"])),
-                    comment=comment, log_hash=now_hash,
-                    detail={"shipment": ship["shipmentNo"], "customer": cust["name"], "destination": ship["destination"],
-                            "lots": [{"lot": x["lot"], "qty": x["qty"], "releasedEarly": x["beforeMetals"]} for x in ship["lines"]], "pending": chk["pending"],
-                            "gate": [{k: g[k] for k in ("code", "name", "rule", "spec", "result", "status")} for g in gate],
-                            "recentMetals": recent_metals_context(conn, r)})
-        return {"shipment": ship, "release": self._release_summary(conn, conn.execute("SELECT * FROM production_runs WHERE id=?", (r["id"],)).fetchone())}
 
     def _release_from_hold(self, conn, r, d, user):
         """POST /api/release/runs/<id>/release-from-hold {lotIds?, reason} (KW-94). A Quality Manager puts held finished goods of a RELEASED run back on sale once the run conforms again
@@ -17372,6 +17298,9 @@ class Handler(BaseHTTPRequestHandler):
         return out
 
     def route_shipments(self, method, seg, query, conn, user):
+        if seg == ["api", "shipments", "awaiting-qa"] and method == "GET":
+            cid = query.get("customerId", [""])[0]
+            return self._awaiting_qa(conn, user, int(cid) if cid.isdigit() else None)
         if seg == ["api", "shipments"]:
             if method == "GET":
                 cust = query.get("customer", [""])[0]
@@ -17396,10 +17325,122 @@ class Handler(BaseHTTPRequestHandler):
         raise ApiError(404, "Unknown shipments endpoint")
 
     def create_shipment(self, conn, user):
-        return self._make_shipment(conn, user, self._body_json())
+        return self._shipment_with_qa_release(conn, user, self._body_json())
+
+    def _awaiting_qa_lots(self, conn, d):
+        """The Pending Release lots a shipment request asks for, with units: [(lot row, qty)]."""
+        out = []
+        for ln in d.get("lines") or []:
+            try:
+                fid = int(ln.get("fgLotId"))
+            except (TypeError, ValueError):
+                continue
+            q = num(ln.get("qty"))
+            lot = conn.execute("SELECT * FROM fg_lots WHERE id=?", (fid,)).fetchone()
+            if lot and q and q > 0 and lot["status"] == "pending_release":
+                out.append((lot, q))
+        return out
+
+    def _shipment_with_qa_release(self, conn, user, d):
+        """POST /api/shipments (KW-100). A shipment may include Pending Release lots of ANY reviewed run: a Quality Manager releases those units for THIS shipment, before the heavy-metals results,
+        by signing once for the whole shipment (password + reason). Only heavy metals can be outstanding for a run (release_for_shipment_check), the customer's destination must not require
+        them, nothing can be overridden, the rest of each run stays Pending Release. One hash-chained `release_for_shipment` event per run. A shipment with no Pending Release lot is the normal one."""
+        asked = self._awaiting_qa_lots(conn, d)
+        if not asked:
+            return self._make_shipment(conn, user, d)
+        if not release_for_shipment_enabled(conn):
+            raise ApiError(403, "Releasing units for shipment is switched off (Calculations page: 'Release: allow units to be released for shipment before the heavy-metals results')", "conditional_off")
+        self._require_quality_manager(user, "release units for a shipment before the heavy-metals results")
+        comment = (d.get("comment") or "").strip()
+        if len(comment) < 3:
+            raise ApiError(400, "Enter the reason for releasing these units before the heavy-metals results (it is recorded in the audit trail)")
+        cust = conn.execute("SELECT * FROM customers WHERE id=? AND active=1", (d.get("customerId"),)).fetchone()
+        if not cust:
+            raise ApiError(400, "Choose the customer this shipment is for")
+        runs = {}
+        for lot, _q in asked:
+            if lot["run_id"] and lot["run_id"] not in runs:
+                runs[lot["run_id"]] = conn.execute("SELECT * FROM production_runs WHERE id=?", (lot["run_id"],)).fetchone()
+        reasons, gates = [], {}
+        for rid, run in runs.items():
+            gates[rid] = release_gate(conn, run)
+            reasons += ["%s: %s" % (run["processing_lot"], why) for why in release_for_shipment_check(conn, run, gates[rid])["reasons"]]
+        why = customer_destination_problem(conn, cust)
+        if why:
+            reasons.append(why)
+        if len(runs) != len({lot["run_id"] for lot, _q in asked}):
+            reasons.append("A lot with no production run cannot be released for shipment")
+        if reasons:
+            raise ApiError(409, "Release for shipment blocked: " + "; ".join(reasons), "release_for_shipment_blocked")
+        capacity = self._release_signer(conn, user, d, need_quality=True)
+        hashes = {}
+        for rid, run in runs.items():
+            if float(get_setting_value(conn, "release_separate_signers", 0) or 0):
+                rev = conn.execute("SELECT user_id FROM release_events WHERE run_id=? AND event_type='review_approved' ORDER BY id DESC LIMIT 1", (rid,)).fetchone()
+                if rev and rev["user_id"] == user["id"]:
+                    raise ApiError(403, "You signed the production-log review of %s, so another Quality Manager must sign this release (setting: reviewer and releaser must differ)." % run["processing_lot"], "same_person")
+            hashes[rid] = self._release_snapshot_hash(conn, rid)
+            if hashes[rid] != run["release_review_hash"]:
+                self._release_void(conn, run, user, hashes[rid], "Production log differs from the log that was reviewed")
+                conn.commit()
+                raise ApiError(409, "The production log of %s changed after it was reviewed - it has been returned to review" % run["processing_lot"])
+        ship = self._make_shipment(conn, user, d, for_release=runs)["shipment"]
+        by_run = {}
+        for x in conn.execute("SELECT sl.fg_lot_number, sl.qty, sl.released_early, f.run_id FROM shipment_lines sl JOIN fg_lots f ON f.id=sl.fg_lot_id WHERE sl.shipment_id=? ORDER BY sl.id", (ship["id"],)):
+            if x["released_early"]:
+                by_run.setdefault(x["run_id"], []).append({"lot": x["fg_lot_number"], "qty": x["qty"], "releasedEarly": True})
+        for rid, run in runs.items():
+            pending = release_for_shipment_check(conn, run, gates[rid])["pending"]
+            release_log(conn, rid, "release_for_shipment", user, capacity=capacity,
+                        meaning=("I release these units for shipment %s to %s (%s) before the heavy-metals results (%s): the process specifications and indicator-organism tests are met. "
+                                 "The rest of the run is not released.") % (ship["shipmentNo"], cust["name"], ship["destination"], ", ".join(pending)),
+                        comment=comment, log_hash=hashes[rid],
+                        detail={"shipment": ship["shipmentNo"], "customer": cust["name"], "destination": ship["destination"], "lots": by_run.get(rid, []), "pending": pending,
+                                "gate": [{k: g[k] for k in ("code", "name", "rule", "spec", "result", "status")} for g in gates[rid]],
+                                "recentMetals": recent_metals_context(conn, run)})
+        return {"shipment": ship}
+
+    def _awaiting_qa(self, conn, user, customer_id):
+        """GET /api/shipments/awaiting-qa?customerId= (KW-100): every Pending Release lot with whether it can go on a shipment to this customer, and why not. Per run the rule is
+        release_for_shipment_check; per customer customer_destination_problem; the setting and the signer's permission are included so the form can say so."""
+        enabled, can_sign = release_for_shipment_enabled(conn), bool(user["is_quality_manager"])
+        cust = conn.execute("SELECT * FROM customers WHERE id=? AND active=1", (customer_id,)).fetchone() if customer_id else None
+        cust_why = customer_destination_problem(conn, cust) if cust else None
+        run_why, run_info = {}, {}
+        lots = []
+        for l in conn.execute("SELECT * FROM fg_lots WHERE status='pending_release' AND qty>0 ORDER BY run_id, id"):
+            rid = l["run_id"]
+            if rid not in run_why:
+                run = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone() if rid else None
+                if not run:
+                    run_why[rid], run_info[rid] = ["no production run"], {"lot": None, "pending": []}
+                elif run["release_state"] != "pending_release":
+                    run_why[rid] = ["The production log has not been reviewed yet (status: %s)" % RELEASE_LABELS.get(run["release_state"], run["release_state"])]
+                    run_info[rid] = {"lot": run["processing_lot"], "pending": []}
+                else:
+                    chk = release_for_shipment_check(conn, run)
+                    run_why[rid] = list(chk["reasons"])
+                    run_info[rid] = {"lot": run["processing_lot"], "pending": chk["pending"], "run": run}
+            why = list(run_why[rid])
+            if cust_why:
+                why.append(cust_why)
+            if not enabled:
+                why.insert(0, "Releasing units for shipment is switched off")
+            elif not can_sign:
+                why.insert(0, "Needs a Quality Manager to sign the release")
+            lots.append({"id": l["id"], "lot": l["fg_lot_number"], "runId": rid, "runLot": run_info[rid]["lot"], "packageSize": l["package_size"], "sku": l["sku_code"], "qty": l["qty"],
+                         "skuAssigned": l["sku_assigned"] is None or bool(l["sku_assigned"]), "madeAs": l["made_as"] or l["sku_code"], "litresEach": l["litres_each"], "location": l["location"],
+                         "eligible": not why, "why": "; ".join(why)})
+        recent = {}
+        for rid in {x["runId"] for x in lots if x["eligible"]}:
+            run = run_info[rid].get("run")
+            if run:
+                recent[str(rid)] = recent_metals_context(conn, run)
+        return {"enabled": enabled, "canSign": can_sign, "lots": lots, "recentMetals": recent,
+                "pendingTests": sorted({t for i in run_info.values() for t in i["pending"]}), "customerProblem": cust_why}
 
     def _make_shipment(self, conn, user, d, for_release=None):
-        """Create a shipment. `for_release` = the production run (row) whose Pending Release lots are being released for THIS shipment (KW-100, `_release_for_shipment`): those lots go out as
+        """Create a shipment. `for_release` = {run id: run row} of the runs whose Pending Release lots are released for THIS shipment (KW-100, `_shipment_with_qa_release`): those lots go out as
         'early' lines (released_early = 1, and the shipment is marked) and the same shipment may carry any released On-hand stock. Every other line follows the normal rule: On-hand lots of released runs only."""
         cust = conn.execute("SELECT * FROM customers WHERE id=?",
                             (d.get("customerId"),)).fetchone()
@@ -17426,7 +17467,7 @@ class Handler(BaseHTTPRequestHandler):
             if not fg:
                 continue
             per_lot[fid] = per_lot.get(fid, 0) + qty
-            early = for_release is not None and fg["run_id"] == for_release["id"] and fg["status"] == "pending_release"      # KW-100: released for THIS shipment, before the heavy-metals results
+            early = for_release is not None and fg["run_id"] in for_release and fg["status"] == "pending_release"      # KW-100: released for THIS shipment, before the heavy-metals results
             if not early:                                                # everything else ships under the normal rules: On hand, and its run released
                 if fg["status"] != "on_hand":
                     raise ApiError(400, "%s cannot be shipped: it is not released for sale (status: %s)"

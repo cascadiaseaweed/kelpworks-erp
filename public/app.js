@@ -5203,71 +5203,6 @@ async function openReleaseRun(id) {
       field('Comment', comment), field('Password', pw), err, btn);
   }
   // KW-94: a Quality Manager puts held lots of a RELEASED run back on sale. Enabled only while the release gate is met (the server enforces it too: there is no override).
-  // KW-100: a Quality Manager releases a lot, or part of a lot, FOR A CONFIRMED SHIPMENT to a customer whose destination does not require heavy metals, while those results are still to come.
-  // Release and shipment are one signed act: the units leave the lot on a real shipment and the rest of the run stays Pending Release. The server decides eligibility; this draws it.
-  function releaseForShipmentBox() {
-    const c = d.releaseForShipment;
-    const evidence = (c.recentMetals || []).length ? el('details', { class: 'accordion' },
-      el('summary', {}, 'Recent heavy-metals results from the same site and species (information only)'),
-      el('div', { class: 'accordion-body' }, table(['Run', 'Run date', 'Site / species', 'Heavy-metals results'],
-        c.recentMetals.map(x => [mono(x.lot), x.runDate || '—', x.site + ' / ' + x.species,
-          x.metals.map(m => m.name.replace(/ \(.*\)/, '') + ' ' + m.result + (m.status && m.status !== 'pass' ? ' (' + m.status + ')' : '')).join(', ') || '—']), [false, false, false, false]))) : null;
-    if (!c.eligible) {
-      return el('div', {}, el('div', { class: 'sign-box' }, el('h4', {}, 'Releasing units for shipment is not available for this run'),
-        el('ul', { class: 'help' }, ...c.reasons.map(t => el('li', {}, t)))), evidence);
-    }
-    const cust = el('select', {}, el('option', { value: '' }, '— choose the customer —'),
-      ...c.customers.map(x => el('option', x.ok ? { value: x.id } : { value: x.id, disabled: true }, x.name + ' (' + (x.destination || 'no destination') + ')' + (x.ok ? '' : ' — not allowed: ' + x.why))));
-    const qty = {}, skus = {};
-    const lotRows = c.lots.map(l => {
-      qty[l.id] = el('input', { type: 'number', min: '0', max: l.qty, value: '0', style: 'width:80px' });
-      const all = el('button', { type: 'button', class: 'secondary', onclick: () => { qty[l.id].value = l.qty; } }, 'All');
-      if (!l.skuAssigned) skus[l.id] = selectFrom('', skuOptions());
-      return el('tr', {}, el('td', { class: 'mono' }, l.lot), el('td', {}, l.skuAssigned ? l.packageSize : el('div', {}, el('div', { class: 'muted' }, skuName(l.madeAs) + ' — ships as:'), skus[l.id])),
-        el('td', { class: 'num' }, fmt(l.qty)), el('td', { class: 'num' }, qty[l.id], ' ', all));
-    });
-    // the same shipment may also carry released stock (On hand, any run): it ships under the normal rules and is not part of the release
-    const ohQty = {}, ohSku = {};
-    const ohRows = (c.onHandLots || []).map(l => {
-      ohQty[l.id] = el('input', { type: 'number', min: '0', max: l.qty, value: '0', style: 'width:80px' });
-      if (!l.skuAssigned) ohSku[l.id] = selectFrom('', skuOptions());
-      return el('tr', {}, el('td', { class: 'mono' }, l.lot), el('td', {}, l.skuAssigned ? skuName(l.sku) + ' · ' + l.packageSize : el('div', {}, el('div', { class: 'muted' }, skuName(l.madeAs) + ' — ships as:'), ohSku[l.id])),
-        el('td', {}, l.location || '—'), el('td', { class: 'num' }, fmt(l.qty)), el('td', { class: 'num' }, ohQty[l.id]));
-    });
-    const onHandBox = ohRows.length ? el('details', { class: 'accordion' }, el('summary', {}, 'Add released stock to this shipment (' + ohRows.length + ' lot' + (ohRows.length === 1 ? '' : 's') + ' On hand)'),
-      el('div', { class: 'accordion-body' }, el('div', { class: 'help' }, 'Finished goods already released for sale can go on the same shipment. They ship under the normal rules and are not covered by this release.'),
-        el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {}, ...['FG lot', 'Product / SKU', 'Location', 'On hand', 'Units to ship'].map(h => el('th', {}, h)))), el('tbody', {}, ...ohRows))))) : null;
-    const date = el('input', { type: 'date', value: todayStr() }), carrier = el('input', { placeholder: 'e.g. truck / courier' }), track = el('input'), ref = el('input');
-    const reason = el('textarea', { rows: '2', placeholder: 'Reason (required): why these units are released before the heavy-metals results' });
-    const pw = el('input', { type: 'password', autocomplete: 'off', placeholder: 'Re-enter your password to sign' });
-    const err = el('div', { class: 'error' });
-    const btn = el('button', { type: 'button' }, 'Release and ship');
-    btn.addEventListener('click', async () => {
-      err.textContent = '';
-      const lines = c.lots.map(l => ({ fgLotId: l.id, qty: +qty[l.id].value || 0, skuCode: skus[l.id] ? skus[l.id].value : undefined })).filter(l => l.qty > 0);
-      const stock = (c.onHandLots || []).map(l => ({ fgLotId: l.id, qty: +ohQty[l.id].value || 0, skuCode: ohSku[l.id] ? ohSku[l.id].value : undefined })).filter(l => l.qty > 0);
-      if (!cust.value) { err.textContent = 'Choose the customer this shipment is for.'; return; }
-      if (!lines.length) { err.textContent = 'Enter the number of units to release for at least one Pending Release lot.'; return; }
-      const noSku = lines.concat(stock).find(l => l.skuCode === '');
-      if (noSku) { err.textContent = 'Choose the SKU that ' + c.lots.concat(c.onHandLots || []).find(l => l.id === noSku.fgLotId).lot + ' ships as.'; return; }
-      lines.push(...stock);
-      btn.disabled = true;
-      try {
-        const r = await api('POST', '/release/runs/' + id + '/release-for-shipment', { customerId: +cust.value, shipDate: date.value, carrier: carrier.value || null, trackingNo: track.value || null,
-          reference: ref.value || null, comment: reason.value, password: pw.value, lines });
-        toast('Released and shipped: ' + r.shipment.shipmentNo); await refresh();
-      } catch (e) { err.textContent = e.message; btn.disabled = false; }
-    });
-    return el('div', {}, el('div', { class: 'sign-box', 'data-sign': '1' }, el('h4', {}, 'Release units for shipment — heavy-metals results pending (Quality Manager)'),
-      el('div', { class: 'sign-attest' }, 'By signing I release the units below for this shipment before the heavy-metals results (' + c.pending.join(', ') + '): the process specifications and the indicator-organism tests are met. '
-        + 'The rest of the run is not released and still needs the normal release.'),
-      field('Customer (its destination must not require heavy-metals results)', cust),
-      el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {}, ...['FG lot', 'Pack / SKU', 'Pending Release', 'Units to release and ship'].map(h => el('th', {}, h)))), el('tbody', {}, ...lotRows))),
-      onHandBox,
-      el('div', { class: 'form-row' }, field('Ship date', date), field('Carrier', carrier)),
-      el('div', { class: 'form-row' }, field('Tracking #', track), field('Customer PO / reference', ref)),
-      field('Reason', reason), field('Password', pw), err, btn), evidence);
-  }
   function releaseFromHoldBox() {
     const gateMet = d.releaseStatus.conformsNow === true;
     const held = d.lots.filter(l => l.status === 'hold');
@@ -5309,8 +5244,10 @@ async function openReleaseRun(id) {
       [['release', 'Release for sale'], ['reject', 'Reject — hold']], 'release', { quality: true, button: 'Sign release',
         commentHint: d.lab.failed.length ? 'REQUIRED to release: why is this lot released with results outside specification (' + d.lab.failed.join(', ') + ')?' : undefined })
       : el('div', { class: 'help sign-box' }, 'Review is complete. Awaiting release by a Quality Manager. You do not have release permission.'));
-    // KW-100: only while the heavy-metals results are the one thing outstanding; the server decides eligibility, this draws the reasons and the evidence
-    if (d.releaseForShipment && d.releaseForShipment.enabled && me.canRelease) body.append(releaseForShipmentBox());
+    // KW-100: the QA release for a shipment is signed in Shipping > New shipment (lots of any run); this opens it with this run's lots
+    if (settingValue('conditional_release_enabled', 0) && me.canRelease) body.append(el('div', { class: 'sign-box' }, el('h4', {}, 'Release units for a shipment before the heavy-metals results'),
+      el('div', { class: 'help' }, 'While only the heavy-metals results are still to come, units of this run can ship to a customer whose destination does not require them. The Quality Manager signs the release on the shipment, together with lots of any other run.'),
+      el('button', { type: 'button', onclick: () => { body.closest('.modal-bg')?.remove(); newShipment({ runId: id }); } }, 'Ship units of this run…')));
   }
   if (['released', 'rejected', 'pending_release', 'returned'].includes(d.state) && me.canRelease) {
     body.append(el('details', { class: 'accordion' }, el('summary', {}, 'Reopen this run (Quality Manager)'),
@@ -5485,26 +5422,38 @@ async function pageShipping(v) {
 }
 function shipBadge(st) { return st === 'cancelled' ? 'low' : st === 'delivered' ? 'on_hand' : 'hold'; }
 
-async function newShipment() {
+async function newShipment(opts = {}) {
   if (!State.ref.customers.length) { toast('Add a customer first.', true); return manageCustomers(); }
+  const onlyRun = opts && opts.runId ? opts.runId : null;
   const fg = (await api('GET', '/fg?status=on_hand')).fg.filter(f => f.qty > 0);
-  if (!fg.length) { return toast('No finished goods on hand to ship.', true); }
-  const custSel = selectFrom('', State.ref.customers.map(c => [c.id, c.name]), null, 'sh_c');
-  const qtyInputs = {};
+  let qa = await api('GET', '/shipments/awaiting-qa');                       // KW-100: Pending Release lots of any run, with whether they can go to the chosen customer
+  const showQa = () => qa.enabled && qa.lots.some(l => !onlyRun || l.runId === onlyRun);
+  if (!fg.length && !showQa()) { return toast('No finished goods to ship.', true); }
+  const destNote = el('div', { class: 'help' });
+  const custSel = selectFrom('', State.ref.customers.map(c => [c.id, c.name]), () => customerChanged(), 'sh_c');
+  const qtyInputs = {}, qaQty = {}, skuInputs = {}, qaSku = {};
   const lineHost = el('div', { class: 'tote-pick' });
+  const qaHost = el('div', {});
   const summary = el('div', { class: 'summary-line' });
+  const qaLots = () => qa.lots.filter(l => !onlyRun || l.runId === onlyRun);
   function recompute() {
     let units = 0, litres = 0, lines = 0;
     for (const f of fg) { const q = +qtyInputs[f.id].value || 0; if (q > 0) { lines++; units += q; litres += q * f.litresEach; } }
+    for (const l of qaLots()) { const q = qaQty[l.id] ? (+qaQty[l.id].value || 0) : 0; if (q > 0) { lines++; units += q; litres += q * (l.litresEach || 0); } }
     summary.innerHTML = ''; summary.append(sl('Lines', lines), sl('Units', fmt(units)), sl('Litres', fmt(litres, 0) + ' L'));
   }
   const tbl = el('table', {}, el('thead', {}, el('tr', {},
     el('th', {}, 'FG lot'), el('th', {}, 'Product'), el('th', {}, 'Pack'), el('th', {}, 'Location'),
     el('th', { class: 'num' }, 'On hand'), el('th', { class: 'num' }, 'Ship qty'))));
   const tb = el('tbody', {});
-  const skuInputs = {};                              // KW-32: a lot with no SKU yet ships as the SKU chosen here (assigned, and signed, when the shipment is created)
-  const signBox = el('div', { class: 'sign-box hidden' }, el('div', { class: 'help' }, 'These lots have no SKU yet. Shipping assigns the SKU you chose (and deducts its labels): a Production or Quality Manager signs it.'),
-    field('Password', el('input', { type: 'password', id: 'sh_pw', autocomplete: 'off', placeholder: 'Re-enter your password to sign' })));
+  // one password field signs everything that needs a signature: a SKU assignment (KW-32) and the QA release of lots that are not released yet (KW-100)
+  const pw = el('input', { type: 'password', id: 'sh_pw', autocomplete: 'off', placeholder: 'Re-enter your password to sign' });
+  const reason = el('textarea', { id: 'sh_reason', rows: '2', placeholder: 'Reason (required): why these units are released before the heavy-metals results' });
+  const skuHelp = el('div', { class: 'help' }, 'Lots with no SKU yet ship as the SKU you chose: shipping assigns it (and deducts its labels). A Production or Quality Manager signs it.');
+  const qaHelp = el('div', { class: 'help' }, 'QA release for this shipment (Quality Manager): the units below that are not released yet are released for THIS shipment before the heavy-metals results. The process specifications and the indicator organisms are met, '
+    + 'the customer\'s destination does not require heavy metals, and the rest of each run stays Pending Release. One signature covers every lot and run on this shipment.');
+  const evidence = el('div', {});
+  const signBox = el('div', { class: 'sign-box hidden', 'data-sign': '1' }, el('h4', {}, 'Sign'), skuHelp, qaHelp, evidence, field('Reason', reason), field('Password', pw));
   for (const f of fg) {
     const inp = el('input', { type: 'number', min: '0', max: f.qty, value: '0', style: 'width:80px', oninput: () => { recompute(); refreshSign(); } });
     qtyInputs[f.id] = inp;
@@ -5517,28 +5466,87 @@ async function newShipment() {
       el('td', {}, f.packageSize), el('td', {}, f.location || '—'),
       el('td', { class: 'num' }, fmt(f.qty)), el('td', { class: 'num' }, inp)));
   }
-  tbl.append(tb); lineHost.append(tbl);
-  function refreshSign() { signBox.classList.toggle('hidden', !fg.some(f => skuInputs[f.id] && (+qtyInputs[f.id].value || 0) > 0)); }
-  const locs = State.ref.customers.map(c => [c.id, c.name]);
+  tbl.append(tb); lineHost.append(fg.length ? tbl : el('div', { class: 'help' }, 'No released finished goods are on hand.'));
+
+  // Pending Release lots of any run, grouped by run, each with whether it can go to this customer and why not
+  function drawQa() {
+    qaHost.innerHTML = '';
+    for (const k of Object.keys(qaQty)) delete qaQty[k];
+    for (const k of Object.keys(qaSku)) delete qaSku[k];
+    if (!showQa()) { refreshSign(); return; }
+    const lots = qaLots();
+    const head = el('h3', { style: 'margin:14px 0 6px;font-size:14px' }, 'Awaiting QA release (heavy-metals results pending)');
+    qaHost.append(head, el('div', { class: 'help' }, (onlyRun ? 'Showing the lots of one run (open Shipping > New shipment for the lots of every run). ' : '') + 'Pending Release lots of any reviewed run can go on this shipment when a Quality Manager signs the release below.'));
+    const t = el('table', {}, el('thead', {}, el('tr', {}, el('th', {}, 'FG lot'), el('th', {}, 'Product'), el('th', {}, 'Run'), el('th', { class: 'num' }, 'Pending Release'), el('th', { class: 'num' }, 'Release and ship'))));
+    const body2 = el('tbody', {});
+    for (const l of lots) {
+      const inp = el('input', { type: 'number', min: '0', max: l.qty, value: '0', style: 'width:80px', oninput: () => { recompute(); refreshSign(); } });
+      if (!l.eligible) { inp.disabled = true; }
+      qaQty[l.id] = inp;
+      let productCell = el('td', {}, skuName(l.sku) + ' · ' + l.packageSize);
+      if (l.skuAssigned === false) {
+        qaSku[l.id] = selectFrom('', skuOptions());
+        if (!l.eligible) qaSku[l.id].disabled = true;
+        productCell = el('td', {}, el('div', { class: 'muted' }, skuName(l.madeAs || l.sku) + ' — ships as:'), qaSku[l.id]);
+      }
+      body2.append(el('tr', { class: l.eligible ? '' : 'muted-row' }, el('td', { class: 'mono' }, l.lot), productCell, el('td', { class: 'mono' }, l.runLot || '—'), el('td', { class: 'num' }, fmt(l.qty)),
+        el('td', { class: 'num' }, inp, l.eligible ? el('button', { type: 'button', class: 'secondary', style: 'margin-left:6px', onclick: () => { inp.value = l.qty; recompute(); refreshSign(); } }, 'All')
+          : el('div', { class: 'hold-why', title: l.why }, l.why))));
+    }
+    t.append(body2); qaHost.append(el('div', { class: 'tote-pick' }, t));
+    refreshSign();
+  }
+  function qaUnits() { return qaLots().some(l => qaQty[l.id] && (+qaQty[l.id].value || 0) > 0); }
+  function refreshSign() {
+    const needSku = fg.some(f => skuInputs[f.id] && (+qtyInputs[f.id].value || 0) > 0) || qaLots().some(l => qaSku[l.id] && qaQty[l.id] && (+qaQty[l.id].value || 0) > 0);
+    const needQa = qaUnits();
+    signBox.classList.toggle('hidden', !(needSku || needQa));
+    skuHelp.classList.toggle('hidden', !needSku); qaHelp.classList.toggle('hidden', !needQa);
+    reason.closest('.field') ? reason.closest('.field').classList.toggle('hidden', !needQa) : reason.classList.toggle('hidden', !needQa);
+    evidence.innerHTML = '';
+    if (needQa) {
+      const runs = [...new Set(qaLots().filter(l => qaQty[l.id] && (+qaQty[l.id].value || 0) > 0).map(l => String(l.runId)))];
+      const rows = [];
+      for (const rid of runs) for (const x of (qa.recentMetals[rid] || [])) rows.push([mono(x.lot), x.runDate || '—', x.site + ' / ' + x.species,
+        x.metals.map(m => m.name.replace(/ \(.*\)/, '') + ' ' + m.result + (m.status && m.status !== 'pass' ? ' (' + m.status + ')' : '')).join(', ') || '—']);
+      if (rows.length) evidence.append(el('details', { class: 'accordion' }, el('summary', {}, 'Recent heavy-metals results from the same site and species (information only)'),
+        el('div', { class: 'accordion-body' }, table(['Run', 'Run date', 'Site / species', 'Heavy-metals results'], rows, [false, false, false, false]))));
+    }
+  }
+  // where the chosen customer is, and whether units not yet released may go there (the server decides; this only says so)
+  function showDest() {
+    const c = State.ref.customers.find(x => x.id === +custSel.value), d = c && (State.ref.destinations || []).find(x => x.id === c.destinationId);
+    destNote.innerHTML = '';
+    if (!c) return;
+    destNote.append('Destination: ', el('b', {}, d ? d.name : 'not set'), d ? (d.requiresMetals ? ' — heavy-metals results are required before product ships here (lots awaiting QA release cannot go).' : ' — heavy-metals results are not required.')
+      : ' — a customer with no destination needs the normal release (lots awaiting QA release cannot go).');
+  }
+  async function customerChanged() {
+    showDest();
+    if (qa.enabled) { qa = await api('GET', '/shipments/awaiting-qa?customerId=' + custSel.value); drawQa(); recompute(); }
+  }
   const body = el('div', {},
     el('div', { class: 'form-row' }, field('Customer', custSel),
       field('Ship date', el('input', { type: 'date', id: 'sh_date', value: todayStr() }))),
+    destNote,
     el('div', { class: 'form-row' }, field('Carrier', el('input', { id: 'sh_carrier', placeholder: 'e.g. truck / courier' })),
       field('Tracking #', el('input', { id: 'sh_track' }))),
     field('Customer PO / reference', el('input', { id: 'sh_ref' })),
-    el('h3', { style: 'margin:14px 0 6px;font-size:14px' }, 'Finished goods to ship'), lineHost, summary, signBox,
+    el('h3', { style: 'margin:14px 0 6px;font-size:14px' }, 'Finished goods to ship'), lineHost, qaHost, summary, signBox,
     field('Notes', el('textarea', { id: 'sh_notes', rows: '2' })));
-  recompute();
+  drawQa(); recompute(); showDest();
   modal('New shipment', body, async () => {
     const lines = fg.map(f => ({ fgLotId: f.id, qty: +qtyInputs[f.id].value || 0, skuCode: skuInputs[f.id] ? skuInputs[f.id].value : undefined })).filter(l => l.qty > 0);
-    if (!lines.length) throw new Error('Enter a ship quantity for at least one lot.');
-    const unassigned = lines.find(l => l.skuCode === '');
-    if (unassigned) throw new Error('Choose the SKU that ' + fg.find(f => f.id === unassigned.fgLotId).lot + ' ships as.');
+    const qaLines = qaLots().map(l => ({ fgLotId: l.id, qty: qaQty[l.id] ? (+qaQty[l.id].value || 0) : 0, skuCode: qaSku[l.id] ? qaSku[l.id].value : undefined })).filter(l => l.qty > 0);
+    if (!lines.length && !qaLines.length) throw new Error('Enter a ship quantity for at least one lot.');
+    const unassigned = lines.concat(qaLines).find(l => l.skuCode === '');
+    if (unassigned) throw new Error('Choose the SKU that ' + fg.concat(qa.lots).find(f => f.id === unassigned.fgLotId).lot + ' ships as.');
+    if (qaLines.length && !reason.value.trim()) throw new Error('Enter the reason for releasing these units before the heavy-metals results.');
     const r = await api('POST', '/shipments', {
-      password: body.querySelector('#sh_pw') ? body.querySelector('#sh_pw').value : undefined,
+      password: pw.value || undefined, comment: qaLines.length ? reason.value : undefined,
       customerId: +custSel.value, shipDate: body.querySelector('#sh_date').value,
       carrier: body.querySelector('#sh_carrier').value || null, trackingNo: body.querySelector('#sh_track').value || null,
-      reference: body.querySelector('#sh_ref').value || null, notes: body.querySelector('#sh_notes').value || null, lines
+      reference: body.querySelector('#sh_ref').value || null, notes: body.querySelector('#sh_notes').value || null, lines: lines.concat(qaLines)
     });
     toast('Shipment ' + r.shipment.shipmentNo + ' created'); render();
   }, 'Create shipment');
