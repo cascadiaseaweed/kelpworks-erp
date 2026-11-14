@@ -269,6 +269,9 @@ SETTINGS_DEFAULTS = [
      "Documents and photos together. A person who reaches it is told to try again later; an administrator can raise it."),
     ("release_separate_signers", 0, "Release: reviewer and releaser must be different people (1 = yes)",
      "When 1, the person who signed a run's production-log review cannot also sign its Quality release."),
+    ("conditional_release_enabled", 0, "Release: allow units to be released for shipment before the heavy-metals results (1 = yes)",
+     "When 1, a Quality Manager can release a lot, or part of a lot, of a reviewed run for a confirmed shipment to a customer whose destination does not require heavy metals (Admin > Destinations), "
+     "while the process and microbial tests pass and the heavy-metals results are still to come. The rest of the run stays Pending Release. Leave at 0 until the Quality Manager has approved the written procedure."),
     ("review_not_by_finalizer", 0, "Review: the person who finalized a run cannot review it (1 = yes)",
      "When 1, a Production Manager cannot review a production log they finalized themselves."),
     ("lab_result_require_report", 1, "Lab results: a lab report must be attached for tests with a release rule (1 = yes)",
@@ -912,6 +915,16 @@ CREATE TABLE IF NOT EXISTS qc_field_log (
     UNIQUE (run_id, field_id)
 );
 CREATE INDEX IF NOT EXISTS idx_qcfieldlog_run ON qc_field_log(run_id);
+
+-- Where product is sold (Canada, Mexico, each US state ...) and whether it needs heavy-metals results before it ships there (KW-100). Maintained by an administrator
+-- (history in config_log, area 'destination'); a customer points at one (customers.destination_id, added in migrate()).
+CREATE TABLE IF NOT EXISTS destinations (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT NOT NULL UNIQUE,
+    requires_metals INTEGER NOT NULL DEFAULT 1,   -- 1 = heavy-metals results must be on file (full release) before product ships here
+    active         INTEGER NOT NULL DEFAULT 1,
+    created_at     TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS customers (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2380,6 +2393,7 @@ def init_db():
             ensure_reagent_types(conn)
             ensure_reagent_defaults(conn)
             ensure_site_list(conn)
+            ensure_destinations(conn)
             ensure_suppliers(conn)
             ensure_sds_supplier_links(conn)
             ensure_grade_rules(conn)
@@ -2865,6 +2879,9 @@ def parse_lab_report(lines):
 # converted to a loading (kg metal / ha) at the application rate x application periods and compared with the kg/ha limit,
 # absent = qualitative (Negative / Positive).
 COA_GROUPS = (("physical", "Physical & chemical"), ("metals", "Heavy metals"), ("microbial", "Microbiological"))
+# KW-100: the release gate's three categories are the specification groups, named as the Quality procedure names them. Only "metals" can be outstanding under a conditional release.
+GATE_CATEGORIES = (("physical", "Process specifications"), ("metals", "Heavy metals"), ("microbial", "Indicator organisms"))
+CONDITIONAL_CATEGORY = "metals"
 COA_SPEC_SEED = [
     # code, name, group, unit, basis, min, max, max_exclusive, required for release, sort, default method, regulatory limit kg/ha (metals)
     ("tds", "TDS", "physical", "%", "run", 1, 2, 0, 0, 10, "", None),
@@ -3253,7 +3270,8 @@ def release_gate(conn, r):
     out = []
     for s in conn.execute("SELECT * FROM coa_specs WHERE release_rule IN ('pass','min') ORDER BY sort, code").fetchall():
         row = rows[s["code"]]
-        item = {"code": s["code"], "name": s["name"], "group": s["grp"], "rule": s["release_rule"], "ruleText": RELEASE_RULE_TEXT[s["release_rule"]],
+        item = {"code": s["code"], "name": s["name"], "group": s["grp"], "category": dict(GATE_CATEGORIES).get(s["grp"], s["grp"]),
+                "rule": s["release_rule"], "ruleText": RELEASE_RULE_TEXT[s["release_rule"]],
                 "spec": row["specText"], "result": row["resultText"] or None, "status": row["status"], "ok": False, "reason": ""}
         has = bool(row["resultText"]) if s["basis"] == "run" else bool(row["result"])
         if not has:
@@ -3315,6 +3333,88 @@ def release_conformance_problems(conn, run, gate=None, lab=None):
     return problems
 
 
+def gate_unmet_categories(gate):
+    """Names of the gate categories (Process specifications / Heavy metals / Indicator organisms) with at least one test not met."""
+    unmet = {g["group"] for g in gate if not g["ok"]}
+    return [name for code, name in GATE_CATEGORIES if code in unmet]
+
+
+def release_for_shipment_enabled(conn):
+    return bool(float(get_setting_value(conn, "conditional_release_enabled", 0) or 0))
+
+
+def recent_metals_context(conn, run, limit=5):
+    """For the signing window: the heavy-metals results of the most recent RELEASED runs made from the same site + species (information only, nothing is decided from it)."""
+    pairs = {(x["site_code"], x["species_code"]) for x in conn.execute(
+        "SELECT t.site_code, t.species_code FROM run_inputs ri JOIN tote_lots t ON t.id=ri.tote_lot_id WHERE ri.run_id=?", (run["id"],))}
+    if not pairs:
+        return []
+    out = []
+    seen = set()
+    for pair in sorted(pairs):
+        for o in conn.execute(
+                "SELECT DISTINCT p.id FROM production_runs p JOIN run_inputs ri ON ri.run_id=p.id JOIN tote_lots t ON t.id=ri.tote_lot_id"
+                " WHERE p.release_state='released' AND p.id!=? AND t.site_code=? AND t.species_code=? ORDER BY p.id DESC LIMIT ?", (run["id"], pair[0], pair[1], limit)):
+            if o["id"] in seen:
+                continue
+            seen.add(o["id"])
+            other = conn.execute("SELECT * FROM production_runs WHERE id=?", (o["id"],)).fetchone()
+            rows = [x for x in coa_evaluate(conn, other)["rows"] if x["group"] == CONDITIONAL_CATEGORY and x["resultText"]]
+            out.append({"lot": other["processing_lot"], "runDate": other["run_date"], "site": pair[0], "species": pair[1],
+                        "metals": [{"name": x["name"], "result": x["resultText"], "spec": x["specText"], "status": x["status"]} for x in rows]})
+    out.sort(key=lambda x: x["runDate"] or "", reverse=True)
+    return out[:limit]
+
+
+def customer_destination_problem(conn, cust):
+    """KW-100: may heavy-metals-pending product go to this customer? -> the plain-language reason it may not, or None. The customer's destination must exist, be in use and NOT require
+    heavy-metals results; a customer with no destination is refused (the fail-safe is a full release)."""
+    name = cust["name"] if cust else "this customer"
+    dest = conn.execute("SELECT * FROM destinations WHERE id=?", (cust["destination_id"],)).fetchone() if cust and cust["destination_id"] else None
+    if not dest:
+        return "%s has no destination set (heavy-metals results are required unless an administrator or Quality Manager sets a destination that does not require them)" % name
+    if not dest["active"]:
+        return "%s's destination (%s) is not in use" % (name, dest["name"])
+    if dest["requires_metals"]:
+        return "%s's destination (%s) requires the heavy-metals results before product ships" % (name, dest["name"])
+    return None
+
+
+def release_for_shipment_check(conn, r, gate=None):
+    """Can a Quality Manager release units of this run for a shipment before its heavy-metals results? -> {enabled, eligible, reasons[], pending[]} (the customer is checked separately).
+    Heavy metals is the ONLY category that may be outstanding: the process specifications (TDS) and the indicator organisms must already be met (the release gate, no override),
+    no heavy-metals result may have failed, and at least one must still be missing (otherwise release the run normally). No lab requisition is needed: a run sold only where
+    heavy metals are not required never has to be tested."""
+    enabled = release_for_shipment_enabled(conn)
+    reasons = []
+    if r["release_state"] != "pending_release":
+        reasons.append("The production log must be reviewed first (status: %s)" % RELEASE_LABELS.get(r["release_state"], r["release_state"]))
+    if gate is None:
+        gate = release_gate(conn, r)
+    for g in gate:
+        if g["group"] != CONDITIONAL_CATEGORY and not g["ok"]:
+            reasons.append("%s - %s: %s" % (g["category"], g["name"], g["reason"]))
+    metals = [g for g in gate if g["group"] == CONDITIONAL_CATEGORY]
+    pending = [g["name"] for g in metals if not g["ok"]]
+    if not metals:
+        reasons.append("No heavy-metals test has a release rule, so there is nothing to wait for: release the product normally")
+    for g in metals:
+        if g["status"] == "fail":
+            reasons.append("Heavy metals - %s: %s. A failed result cannot be released for shipment" % (g["name"], g["reason"]))
+    if metals and not pending:
+        reasons.append("Every heavy-metals test is already met: release the product normally")
+    return {"enabled": enabled, "eligible": enabled and not reasons, "reasons": reasons, "pending": pending}
+
+
+def early_shipments(conn, run_id):
+    """Units of this run that left on a release-for-shipment (heavy-metals results were still to come), on shipments not cancelled."""
+    return [{"lot": x["fg_lot_number"], "qty": x["qty"], "shipmentNo": x["shipment_no"], "date": x["ship_date"], "customer": x["customer"], "destination": x["destination_name"]}
+            for x in conn.execute(
+                "SELECT l.fg_lot_number, l.qty, s.shipment_no, s.ship_date, s.destination_name, c.name customer FROM shipment_lines l JOIN shipments s ON s.id=l.shipment_id"
+                " JOIN fg_lots f ON f.id=l.fg_lot_id LEFT JOIN customers c ON c.id=s.customer_id WHERE f.run_id=? AND l.released_early=1 AND s.status!='cancelled' ORDER BY s.id, l.id",
+                (run_id,))]
+
+
 HOLD_EVENT_TYPES = ("lab_result_hold", "release_rejected", "fg_lot_edited", "released", "reopened")
 
 
@@ -3373,13 +3473,25 @@ def fg_public_list(conn, rows, conform=None):
     """fg_public for each row, plus `holdInfo` (why it is on hold) on the lots that are on hold."""
     rows = list(rows)
     info = hold_info_for_lots(conn, rows, conform)
+    sold = {}
+    ids = [r["id"] for r in rows]
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        for x in conn.execute("SELECT sl.fg_lot_id, SUM(sl.qty) q FROM shipment_lines sl JOIN shipments s ON s.id=sl.shipment_id WHERE s.status!='cancelled' AND sl.fg_lot_id IN (%s) GROUP BY sl.fg_lot_id"
+                              % ",".join("?" * len(chunk)), chunk):
+            sold[x["fg_lot_id"]] = x["q"]
     out = []
     for r in rows:
         d = fg_public(r)
+        d["unitsSold"] = sold.get(r["id"], 0)                         # a Sold lot shows the units sold, not the (zero) units left
         if r["id"] in info:
             d["holdInfo"] = info[r["id"]]
         out.append(d)
     return out
+
+
+def fmt_units(n):
+    return "%g" % n
 
 
 def release_checklist(conn, r, gate, lab, problems, amendment, log_matches=None, lots=()):
@@ -3401,7 +3513,16 @@ def release_checklist(conn, r, gate, lab, problems, amendment, log_matches=None,
     else:
         add("review", "Production log reviewed", "ok")
     blocked = [g for g in gate if not g["ok"]]
-    if not gate:
+    # KW-100: every unit already left on a release for shipment to destinations that do not require heavy metals, so there is nothing left to release and no result is expected:
+    # the gate is not "not met", it is not needed (it turns red again only if a heavy-metals result is entered and fails)
+    early_all = early_shipments(conn, r["id"])
+    metals_all = [g for g in gate if g["group"] == CONDITIONAL_CATEGORY]
+    nothing_left = state == "pending_release" and bool(early_all) and sum(l["qty"] for l in lots if l["status"] == "pending_release") <= 0
+    metals_not_needed = nothing_left and not any(g["status"] == "fail" for g in metals_all) and not (metals_all and all(g["ok"] for g in metals_all))
+    shipped_to = ", ".join(dict.fromkeys(e["destination"] or "no destination" for e in early_all))
+    if metals_not_needed:
+        add("gate", "Release gate: not needed for what was shipped", "na", "Every unit shipped to a destination that does not require heavy-metals results (%s)" % shipped_to)
+    elif not gate:
         add("gate", "Release gate: no test has a release rule", "ok")
     else:
         label = "Release gate: %d of %d tests met" % (len(gate) - len(blocked), len(gate))
@@ -3435,7 +3556,9 @@ def release_checklist(conn, r, gate, lab, problems, amendment, log_matches=None,
         if no_report:
             waiting.append("No lab report attached for: " + ", ".join(no_report))
     wait_text = ". ".join(waiting)
-    if not failed:
+    if metals_not_needed:
+        add("comment", "Out-of-specification results have a release comment", "na", "Nothing is left to release")
+    elif not failed:
         if waiting:
             add("comment", "Out-of-specification results have a release comment", "warn", "Not known yet. " + wait_text, "lab")
         else:
@@ -3471,6 +3594,25 @@ def release_checklist(conn, r, gate, lab, problems, amendment, log_matches=None,
             dict.fromkeys((l.get("holdInfo") or {}).get("summary", "") for l in held))), "hold")
     else:
         add("hold", "No finished-goods lot on hold", "ok")
+    early = early_shipments(conn, r["id"])                                    # KW-100: units released for a shipment before the heavy-metals results
+    if early:
+        metals = [g for g in gate if g["group"] == CONDITIONAL_CATEGORY]
+        units = sum(e["qty"] for e in early)
+        plural = "" if units == 1 else "s"
+        where = ", ".join(dict.fromkeys("%s (%s)" % (e["customer"] or "?", e["destination"] or "no destination") for e in early))
+        if any(g["status"] == "fail" for g in metals):
+            add("early", "Units shipped before the heavy-metals results", "fail",
+                "A heavy-metals result FAILED and %s unit%s already shipped to %s: assess them for recall (Where did this product go?)" % (fmt_units(units), plural, where), "lab")
+        elif metals and all(g["ok"] for g in metals):
+            add("early", "Units shipped before the heavy-metals results", "ok",
+                "%s unit%s shipped to %s before the results; the heavy-metals results are now in and pass" % (fmt_units(units), plural, where))
+        elif metals_not_needed:
+            add("early", "Units shipped before the heavy-metals results", "ok",
+                "Heavy metals are not required for the destination%s shipped to (%s) and none are expected. If a result is entered and fails, assess these %s unit%s for recall" % (
+                    "" if len(set(e["destination"] for e in early)) == 1 else "s", shipped_to, fmt_units(units), plural))
+        else:
+            add("early", "Units shipped before the heavy-metals results", "warn",
+                "%s unit%s shipped to %s before the heavy-metals results; if a result fails they must be assessed for recall" % (fmt_units(units), plural, where), "lab")
     return items
 
 
@@ -3553,7 +3695,8 @@ def build_coa_pdf(S, logo_path=None):
     M, W = pdf.M, pdf.W
     pdf.text(M, 84, "Certificate of Analysis", 20, True, pdf.TEAL)
     pdf.text(M, 102, S["lot"] + "  ·  " + (S["product"] or "-"), 11, True, (0.15, 0.15, 0.15))
-    lab = "RELEASED" if S["released"] else "PRELIMINARY - NOT RELEASED"
+    early = bool(S.get("earlyShipped"))                            # KW-100: units were released for a shipment before the heavy-metals results
+    lab = "RELEASED" if S["released"] else ("PRELIMINARY - HEAVY METALS PENDING" if early else "PRELIMINARY - NOT RELEASED")
     cw = pdf_text_width(_pdf_safe(lab), 8, True) + 14
     pdf.chip(W - M - cw, 72, lab, pdf.GREEN if S["released"] else pdf.AMBER)
     pdf.y = 112
@@ -3576,7 +3719,7 @@ def build_coa_pdf(S, logo_path=None):
         out = []
         for x in grp:
             res = x["result"]
-            rtxt = x["resultText"] or ("Not tested" if not x["required"] else "PENDING")
+            rtxt = x["resultText"] or ("PENDING" if (x["required"] or (early and gcode == "metals")) else "Not tested")
             if res:
                 src = " - ".join(p for p in (res["labName"], res["reportNumber"]) if p)
                 if res["reportDate"]:
@@ -3609,6 +3752,9 @@ def build_coa_pdf(S, logo_path=None):
     pdf.heading("Release")
     if S["released"]:
         pdf.kv_grid([("Released by", S["releasedBy"]), ("Release date", S["releasedAt"]), ("Statement", "Conforms to specification")], cols=3)
+    elif early:
+        pdf.note("This certificate is preliminary. Units of this lot were released by the Quality Manager for shipment before the heavy-metals results; it is NOT stated to conform to "
+                 "specification. It becomes valid when the heavy-metals results are in and the Quality Manager releases the lot.", 8.2, pdf.AMBER, False)
     else:
         pdf.note("This certificate is preliminary. It becomes valid when the Quality Manager releases the lot.", 8.2, pdf.AMBER, False)
     if S["failed"]:
@@ -5135,6 +5281,18 @@ def migrate(conn):
             conn.execute("ALTER TABLE consumable_lots ADD COLUMN %s %s" % (col, decl))
     if "active" not in {r["name"] for r in conn.execute("PRAGMA table_info(sites)")}:        # a site that is not active is not offered for a new tote; its old totes keep it
         conn.execute("ALTER TABLE sites ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+    # KW-100: a customer's destination decides whether units may be released for a shipment before the heavy-metals results (shipments.conditional_release = 1 means that); a shipment keeps the destination it was made to
+    if "destination_id" not in {r["name"] for r in conn.execute("PRAGMA table_info(customers)")}:
+        conn.execute("ALTER TABLE customers ADD COLUMN destination_id INTEGER REFERENCES destinations(id)")
+    shcols = {r["name"] for r in conn.execute("PRAGMA table_info(shipments)")}
+    for col, decl in (("destination_id", "INTEGER"), ("destination_name", "TEXT"), ("conditional_release", "INTEGER NOT NULL DEFAULT 0")):
+        if col not in shcols:
+            conn.execute("ALTER TABLE shipments ADD COLUMN %s %s" % (col, decl))
+    if "release_basis" not in {r["name"] for r in conn.execute("PRAGMA table_info(fg_lots)")}:           # KW-100: 'no_metals' = released for a shipment before / without the heavy-metals results
+        conn.execute("ALTER TABLE fg_lots ADD COLUMN release_basis TEXT")
+    if "released_early" not in {r["name"] for r in conn.execute("PRAGMA table_info(shipment_lines)")}:        # KW-100: this line left before the heavy-metals results (a shipment can also carry released stock)
+        conn.execute("ALTER TABLE shipment_lines ADD COLUMN released_early INTEGER NOT NULL DEFAULT 0")
+        conn.execute("UPDATE shipment_lines SET released_early=1 WHERE shipment_id IN (SELECT id FROM shipments WHERE conditional_release=1)")
     racols = {r["name"] for r in conn.execute("PRAGMA table_info(run_attachments)")}
     if "purpose" not in racols:
         conn.execute("ALTER TABLE run_attachments ADD COLUMN purpose TEXT")          # KW-02: 'feedstock_photo' for a photo taken for a feedstock characterization card
@@ -6275,6 +6433,16 @@ def likely_duplicate_items(conn, chemical, manufacturer, grade, form, organic):
     return out
 
 
+def ensure_destinations(conn):
+    """KW-100: the destinations every database starts with. Canada and Mexico need heavy-metals results before product ships (full release). INSERT OR IGNORE, so an
+    administrator's later edits (and a destination added by hand, for example a US state) are never overwritten."""
+    for name in ("Canada", "Mexico"):
+        conn.execute("INSERT OR IGNORE INTO destinations (name, requires_metals, active, created_at) VALUES (?,1,1,?)", (name, now_iso()))
+    for key, _default, label, desc in SETTINGS_DEFAULTS:                  # the wording of the switch (a staging database seeded with an earlier wording is brought in step; the value is never touched)
+        if key == "conditional_release_enabled":
+            conn.execute("UPDATE settings SET label=?, description=? WHERE key=?", (label, desc, key))
+
+
 def ensure_site_list(conn):
     """Once: only the six sites in SITE_LIST are offered. Cordova used to be COR (now Cormorant) and Seagrove used to be ASG: their existing totes keep their lot numbers (the labels on
     the totes) but move to the new site code (CDV, SGR). Every other old site stays, inactive. Recorded in the configuration log; later edits are never overwritten."""
@@ -6489,7 +6657,8 @@ def fg_public(r):
             "litresEach": r["litres_each"], "litres": round((r["qty"] or 0) * (r["litres_each"] or 0), 2),
             "producedDate": r["produced_date"], "tds": r["tds"], "ph": r["ph"], "location": r["location"],
             "status": r["status"], "madeAs": r["made_as"] or r["sku_code"], "skuAssigned": r["sku_assigned"] is None or bool(r["sku_assigned"]),
-            "parentLotId": r["parent_lot_id"], "assignedBy": r["assigned_by"], "assignedAt": r["assigned_at"]}
+            "parentLotId": r["parent_lot_id"], "assignedBy": r["assigned_by"], "assignedAt": r["assigned_at"],
+            "releaseBasis": r["release_basis"] if "release_basis" in r.keys() else None}
 
 
 def run_public(r):
@@ -9125,6 +9294,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.route_labs(method, seg, conn, user)
         if seg[:2] == ["api", "coa-specs"]:
             return self.route_coa_specs(method, seg, conn, user)
+        if seg[:2] == ["api", "destinations"]:
+            return self.route_destinations(method, seg, conn, user)
         if seg == ["api", "requisition-contact"] and method == "GET":
             return requisition_contact_get(conn)
         if seg == ["api", "requisition-contact"] and method == "PUT":
@@ -9187,7 +9358,7 @@ class Handler(BaseHTTPRequestHandler):
         if seg[:2] == ["api", "fg"]:
             return self.route_fg(method, seg, query, conn, user)
         if seg[:2] == ["api", "customers"]:
-            return self.route_customers(method, seg, conn)
+            return self.route_customers(method, seg, conn, user)
         if seg[:2] == ["api", "shipments"]:
             return self.route_shipments(method, seg, query, conn, user)
         if seg[:2] == ["api", "qc-charts"]:
@@ -9391,8 +9562,8 @@ class Handler(BaseHTTPRequestHandler):
                     ksorbateTarget=r["ksorbate_target"], nabenzoateTarget=r["nabenzoate_target"], usesLabels=bool(r["uses_labels"] is None or r["uses_labels"]),
                     organic=sku_is_organic(r["name"], r["code"]))
                 for r in conn.execute("SELECT * FROM fg_skus ORDER BY (active != 1), code")]
-        customers = [self._customer_public(r) for r in conn.execute(
-            "SELECT * FROM customers WHERE active=1 ORDER BY name")]
+        customers = [self._customer_public(r) for r in conn.execute(self.CUSTOMER_SQL)]
+        destinations = self._destinations_list(conn)
         # Lightweight, app-wide so any production-log QC Check can resolve its
         # SOP link by its stable key (not name -- a name can be renamed by an
         # admin at any time; matching by key means that rename is picked up
@@ -9413,7 +9584,8 @@ class Handler(BaseHTTPRequestHandler):
         qc_fields = [dict(id=f[0], stage=f[1], stageLabel=f[2], subtitle=f[3], label=f[4], unit=f[5])
                      for f in QC_FIELD_REGISTRY]
         return {"species": species, "sites": sites, "locations": locations,
-                "skus": skus, "customers": customers, "sops": sops, "libraryPending": library_pending_count(conn),
+                "skus": skus, "customers": customers, "destinations": destinations, "gateCategories": [{"code": c, "name": n} for c, n in GATE_CATEGORIES],
+                "sops": sops, "libraryPending": library_pending_count(conn),
                 "sopSpots": list(SOP_SPOT_INFO.values()), "sopLinks": self._sop_links_by_spot(conn),
                 "settings": get_settings(conn), "containers": containers, "containerAliases": container_name_aliases(conn),
                 "qcFields": qc_fields, "requiredFields": required_keys_by_stage()}
@@ -10346,9 +10518,10 @@ class Handler(BaseHTTPRequestHandler):
         rel = self._release_summary(conn, r)
         sku = conn.execute("SELECT * FROM fg_skus WHERE code=?", (r["sku_code"],)).fetchone()
         released = r["release_state"] in ("released", "legacy")
+        early = (not released) and bool(early_shipments(conn, rid))        # KW-100: units already left before the heavy-metals results
         return {"lot": r["processing_lot"], "product": sku["name"] if sku else r["sku_code"], "runDate": r["run_date"],
                 "fgLots": ", ".join(x["lot"] for x in rel["lots"]) or "-", "releaseLabel": RELEASE_LABELS.get(r["release_state"], "-"),
-                "released": released,
+                "released": released, "earlyShipped": early,
                 "releasedBy": rel.get("releasedBy") or ("Before release workflow" if r["release_state"] == "legacy" else ""),
                 "releasedAt": (rel.get("releasedAt") or "")[:10], "releasedComment": rel.get("releasedComment") or "",
                 # only the tests flagged "listed on the certificate" are printed (the Lab results window shows them all)
@@ -10512,7 +10685,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def route_coa_specs(self, method, seg, conn, user):
         def pub(s):
-            return {"code": s["code"], "name": s["name"], "group": s["grp"], "unit": s["unit"], "basis": s["basis"],
+            return {"code": s["code"], "name": s["name"], "group": s["grp"], "category": dict(GATE_CATEGORIES).get(s["grp"], s["grp"]), "unit": s["unit"], "basis": s["basis"],
                     "minVal": s["min_val"], "maxVal": s["max_val"], "maxExclusive": bool(s["max_exclusive"]),
                     "required": bool(s["required"]), "active": bool(s["active"]), "method": s["method"], "specText": coa_spec_text(s),
                     "releaseRule": s["release_rule"] or "", "releaseRuleText": RELEASE_RULE_TEXT.get(s["release_rule"] or "", "None")}
@@ -10564,6 +10737,65 @@ class Handler(BaseHTTPRequestHandler):
             return {"log": [{"field": r["field"], "old": r["old_value"], "new": r["new_value"], "by": r["changed_by"], "at": r["changed_at"]}
                             for r in conn.execute("SELECT * FROM config_log WHERE area='spec' AND key=? ORDER BY id DESC LIMIT 100", (seg[2],))]}
         raise ApiError(404, "Unknown endpoint")
+
+    # ---- destinations (KW-100): where product is sold and whether heavy-metals results are needed before it ships there ---------------------------------- #
+    @staticmethod
+    def _destination_public(r, n_customers=None):
+        out = {"id": r["id"], "name": r["name"], "requiresMetals": bool(r["requires_metals"]), "active": bool(r["active"])}
+        if n_customers is not None:
+            out["customers"] = n_customers
+        return out
+
+    def _destinations_list(self, conn):
+        counts = {x["destination_id"]: x["n"] for x in conn.execute("SELECT destination_id, COUNT(*) n FROM customers WHERE destination_id IS NOT NULL GROUP BY destination_id")}
+        return [self._destination_public(r, counts.get(r["id"], 0)) for r in conn.execute("SELECT * FROM destinations ORDER BY name COLLATE NOCASE")]
+
+    def route_destinations(self, method, seg, conn, user):
+        if seg == ["api", "destinations"] and method == "GET":
+            return {"destinations": self._destinations_list(conn)}
+        if seg == ["api", "destinations"] and method == "POST":
+            self._require_admin(user)
+            d = self._body_json()
+            name = (d.get("name") or "").strip()
+            if not name:
+                raise ApiError(400, "Destination name is required")
+            if conn.execute("SELECT 1 FROM destinations WHERE name=? COLLATE NOCASE", (name,)).fetchone():
+                raise ApiError(409, "A destination with that name already exists")
+            req = 0 if d.get("requiresMetals") in (False, 0, "0") else 1          # fail-safe: heavy metals required unless an administrator says otherwise
+            cur = conn.execute("INSERT INTO destinations (name, requires_metals, active, created_at) VALUES (?,?,1,?)", (name, req, now_iso()))
+            conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('destination',?,?,?,?,?,?)",
+                         (str(cur.lastrowid), "Destination added: %s" % name, None, "Heavy metals required: %s" % ("yes" if req else "no"), user["name"], now_iso()))
+            return {"destinations": self._destinations_list(conn), "id": cur.lastrowid}
+        if len(seg) == 3 and seg[2].isdigit() and method == "PUT":
+            self._require_admin(user)
+            r = conn.execute("SELECT * FROM destinations WHERE id=?", (int(seg[2]),)).fetchone()
+            if not r:
+                raise ApiError(404, "Destination not found")
+            d = self._body_json()
+            name = (d.get("name") or r["name"]).strip()
+            if not name:
+                raise ApiError(400, "Destination name is required")
+            if name.lower() != r["name"].lower() and conn.execute("SELECT 1 FROM destinations WHERE name=? COLLATE NOCASE AND id!=?", (name, r["id"])).fetchone():
+                raise ApiError(409, "A destination with that name already exists")
+            new = {"name": name,
+                   "requires_metals": (1 if d["requiresMetals"] not in (False, 0, "0") else 0) if "requiresMetals" in d else r["requires_metals"],
+                   "active": (1 if d["active"] not in (False, 0, "0") else 0) if "active" in d else r["active"]}
+            labels = {"name": "Name", "requires_metals": "Heavy-metals results required before shipping", "active": "Active"}
+            for col, label in labels.items():
+                if new[col] != r[col]:
+                    show = (lambda v: ("yes" if v else "no")) if col != "name" else (lambda v: v)
+                    conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('destination',?,?,?,?,?,?)",
+                                 (str(r["id"]), label, str(show(r[col])), str(show(new[col])), user["name"], now_iso()))
+            conn.execute("UPDATE destinations SET name=?, requires_metals=?, active=? WHERE id=?", (new["name"], new["requires_metals"], new["active"], r["id"]))
+            return {"destinations": self._destinations_list(conn)}
+        if len(seg) == 4 and seg[2].isdigit() and seg[3] == "log" and method == "GET":
+            self._require_admin(user)
+            r = conn.execute("SELECT * FROM destinations WHERE id=?", (int(seg[2]),)).fetchone()
+            if not r:
+                raise ApiError(404, "Destination not found")
+            return {"log": [{"field": x["field"], "old": x["old_value"], "new": x["new_value"], "by": x["changed_by"], "at": x["changed_at"]}
+                            for x in conn.execute("SELECT * FROM config_log WHERE area='destination' AND key=? ORDER BY id DESC LIMIT 100", (str(r["id"]),))]}
+        raise ApiError(404, "Unknown destinations endpoint")
 
     # ---- Samples: catalogue, retention inventory, cart, lab requisitions ---------------- #
     SAMPLE_SQL = (
@@ -14575,11 +14807,27 @@ class Handler(BaseHTTPRequestHandler):
         problems = release_conformance_problems(conn, r, gate, lab_ev)       # does a RELEASED run still conform? (None: not applicable)
         lots = self._release_lots(conn, r["id"], {r["id"]: problems})
         am = self._open_amendment(conn, r["id"])
+        early = early_shipments(conn, r["id"])
+        status = release_status(r, lots, last, am, gate, problems)
+        all_early = r["release_state"] == "pending_release" and bool(early) and sum(l["qty"] for l in lots if l["status"] == "pending_release") <= 0
+        if all_early:                                                          # KW-100: nothing is left to release: every unit left on a release for shipment
+            failed_metal = any(g["status"] == "fail" for g in gate if g["group"] == CONDITIONAL_CATEGORY)
+            where = ", ".join(dict.fromkeys(e["destination"] or "no destination" for e in early))
+            nxt = ("A heavy-metals result FAILED and every unit has shipped (%s): assess the units for recall (Where did this product go?)." % where if failed_metal else
+                   "Nothing is left to release. Heavy metals are not required for where this product went (%s). If heavy-metals results are entered and a result fails, assess the units for recall; "
+                   "if they pass, release the run normally for the final certificate." % where)
+            status.update(stage="Conditional release - all units shipped", tone="danger" if failed_metal else "info", waitingOn=None, cause=None, next=nxt)
+            status["text"] = status["stage"] + ". " + nxt
+        elif early:
+            status["text"] += " Units released for shipment before the heavy-metals results: %s." % "; ".join(
+                "%s x %s to %s" % (fmt_units(e["qty"]), e["lot"], e["customer"] or "?") for e in early)
         return {"id": r["id"], "lot": r["processing_lot"], "sku": r["sku_code"], "runDate": r["run_date"],
                 "outputLitres": r["output_litres"], "finalizedAt": r["finalized_at"], "finalizedBy": r["finalized_by"],
                 "state": r["release_state"], "label": RELEASE_LABELS.get(r["release_state"], "—"),
-                "lots": lots,
-                "releaseStatus": release_status(r, lots, last, am, gate, problems),
+                "lots": lots, "earlyShipments": early, "allShippedEarly": all_early,
+                "pendingUnits": sum(l["qty"] for l in lots if l["status"] == "pending_release"), "earlyUnits": sum(e["qty"] for e in early),
+                "conditionsBy": (last.get("release_for_shipment") or {}).get("user"), "conditionsAt": (last.get("release_for_shipment") or {}).get("at"),
+                "releaseStatus": status,
                 "checklist": release_checklist(conn, r, gate, lab_ev, problems, am, log_matches, lots),
                 "heldLots": [{"id": l["id"], "lot": l["lot"], "qty": l["qty"]} for l in lots if l["status"] == "hold"],
                 "amendment": self._amendment_public(am) if am else None,
@@ -14666,9 +14914,11 @@ class Handler(BaseHTTPRequestHandler):
         hold_info = hold_info_for_lots(conn, fg_rows)
         for l in fg_rows:
             ships = [{"shipmentNo": x["shipment_no"], "date": x["ship_date"], "status": x["status"], "customer": x["customer"], "contact": x["contact"],
-                      "email": x["email"], "phone": x["phone"], "reference": x["reference"], "carrier": x["carrier"], "tracking": x["tracking_no"], "qty": x["qty"]}
+                      "email": x["email"], "phone": x["phone"], "reference": x["reference"], "carrier": x["carrier"], "tracking": x["tracking_no"], "qty": x["qty"],
+                      "destination": x["destination_name"], "beforeMetals": bool(x["released_early"])}
                      for x in conn.execute(
-                         "SELECT s.shipment_no, s.ship_date, s.status, s.reference, s.carrier, s.tracking_no, c.name customer, c.contact, c.email, c.phone, sl.qty"
+                         "SELECT s.shipment_no, s.ship_date, s.status, s.reference, s.carrier, s.tracking_no, s.destination_name, sl.released_early,"
+                         " c.name customer, c.contact, c.email, c.phone, sl.qty"
                          " FROM shipment_lines sl JOIN shipments s ON s.id=sl.shipment_id LEFT JOIN customers c ON c.id=s.customer_id"
                          " WHERE sl.fg_lot_id=? ORDER BY s.ship_date, s.id", (l["id"],))]
             lots.append({"lotNumber": l["fg_lot_number"], "status": l["status"], "qtyOnHand": l["qty"], "location": l["location"],
@@ -14677,10 +14927,17 @@ class Handler(BaseHTTPRequestHandler):
         for l in lots:
             for x in l["shipments"]:
                 if x["status"] != "cancelled" and x["customer"]:
-                    customers.setdefault(x["customer"], {"name": x["customer"], "contact": x["contact"], "email": x["email"], "phone": x["phone"], "units": 0, "lots": set()})
+                    customers.setdefault(x["customer"], {"name": x["customer"], "contact": x["contact"], "email": x["email"], "phone": x["phone"], "units": 0, "lots": set(),
+                                                         "destination": x["destination"], "earlyUnits": 0})
                     customers[x["customer"]]["units"] += x["qty"]
                     customers[x["customer"]]["lots"].add(l["lotNumber"])
+                    if x["beforeMetals"]:
+                        customers[x["customer"]]["earlyUnits"] += x["qty"]
+        # KW-100: units released for a shipment before the heavy-metals results: the Quality Manager's recall assessment starts here if a result fails
+        early = [{"lotNumber": l["lotNumber"], "shipmentNo": x["shipmentNo"], "date": x["date"], "customer": x["customer"], "destination": x["destination"], "qty": x["qty"]}
+                       for l in lots for x in l["shipments"] if x["status"] != "cancelled" and x["beforeMetals"]]
         return {"run": {"id": r["id"], "processingLot": r["processing_lot"], "sku": r["sku_code"], "releaseState": r["release_state"]}, "lots": lots,
+                "shippedBeforeHeavyMetals": early,
                 "customers": [dict(c, lots=sorted(c["lots"])) for c in sorted(customers.values(), key=lambda c: c["name"])],
                 "materials": self._run_materials(conn, r)}
 
@@ -14734,7 +14991,7 @@ class Handler(BaseHTTPRequestHandler):
                 blocked = [g for g in gate if not g["ok"]]
                 if blocked:                                       # heavy metals, microbial and TDS must pass: there is no override
                     raise ApiError(409, "Release blocked - these must pass before a run can be released: " + "; ".join("%s: %s" % (g["name"], g["reason"]) for g in blocked)
-                                   + ". Enter or correct them with the run's Lab results button.", "release_gate")
+                                   + ". Enter or correct them with the run's Lab results button. Not met: " + ", ".join(gate_unmet_categories(gate)) + ".", "release_gate")
                 lab = coa_evaluate(conn, r)["summary"]
                 gated = {g["name"] for g in gate if g["rule"] == "pass"}       # judged by the gate already; a 'min' test can still be over its upper limit
                 missing = [m for m in lab["missingRequired"] if m not in gated]
@@ -16175,14 +16432,14 @@ class Handler(BaseHTTPRequestHandler):
         if not verify_password(d.get("password") or "", user["password_hash"]):
             raise ApiError(400, "Password is incorrect - your signature was not recorded")
 
-    def _assign_sku(self, conn, lot, sku_code, qty, user, why):
+    def _assign_sku(self, conn, lot, sku_code, qty, user, why, for_release=False):
         """KW-32: give `qty` units of an unassigned finished-goods lot the SKU they ship as. The whole lot is renamed in place (the lot number stays: it is on the IBCs);
         part of a lot is split into a child lot (linked to its parent and the same run). The labels of that SKU + package are deducted (stock never blocks), the act is
         written to the hash-chained audit trail. Returns the lot row that now carries the SKU."""
         who = user["name"] if user else None
         if lot["sku_assigned"] is not None and lot["sku_assigned"]:
             raise ApiError(409, "%s already has its SKU (%s)" % (lot["fg_lot_number"], lot["sku_code"]))
-        if lot["status"] != "on_hand":
+        if lot["status"] != "on_hand" and not (for_release and lot["status"] == "pending_release"):          # KW-100: the units of a release for shipment are still Pending Release
             raise ApiError(400, "%s cannot be assigned a SKU: it is not released for sale (status: %s)" % (
                 lot["fg_lot_number"], "Pending Release" if lot["status"] == "pending_release" else lot["status"]))
         sku = conn.execute("SELECT * FROM fg_skus WHERE code=? AND active=1", (sku_code,)).fetchone()
@@ -16961,15 +17218,50 @@ class Handler(BaseHTTPRequestHandler):
         raise ApiError(404, "Unknown fg endpoint")
 
     # ---- customers -------------------------------------------------------- #
-    def _customer_public(self, r):
-        return {"id": r["id"], "name": r["name"], "contact": r["contact"], "email": r["email"],
-                "phone": r["phone"], "address": r["address"]}
+    CUSTOMER_SQL = ("SELECT c.*, d.name AS destination_name FROM customers c LEFT JOIN destinations d ON d.id=c.destination_id"
+                    " WHERE c.active=1 ORDER BY c.name")
 
-    def route_customers(self, method, seg, conn):
+    def _customer_public(self, r):
+        keys = r.keys()
+        return {"id": r["id"], "name": r["name"], "contact": r["contact"], "email": r["email"],
+                "phone": r["phone"], "address": r["address"],
+                "destinationId": r["destination_id"] if "destination_id" in keys else None,
+                "destination": r["destination_name"] if "destination_name" in keys else None}
+
+    def _customer_destination(self, conn, user, d, current=None):
+        """KW-100: a customer's destination decides whether units may be released for a shipment before the heavy-metals results, so only an administrator or a Quality Manager sets or changes it.
+        -> the destination id to store (None = none). `current` = the stored value: a request that leaves it unchanged needs no permission (the rest of the customer stays open to everyone)."""
+        if "destinationId" not in d:
+            return current
+        raw = d.get("destinationId")
+        new = None if raw in (None, "", 0, "0") else raw
+        try:
+            new = int(new) if new is not None else None
+        except (TypeError, ValueError):
+            raise ApiError(400, "Choose a destination from the list")
+        if new == current:
+            return current
+        if not (user and (user["role"] == "admin" or user["is_quality_manager"])):
+            raise ApiError(403, "Only an administrator or a Quality Manager can set or change a customer's destination")
+        if new is not None:
+            dest = conn.execute("SELECT * FROM destinations WHERE id=?", (new,)).fetchone()
+            if not dest:
+                raise ApiError(400, "Choose a destination from the list")
+            if not dest["active"] and new != current:
+                raise ApiError(400, "That destination is no longer in use: choose another")
+        return new
+
+    def _log_customer_destination(self, conn, user, cname, old_id, new_id):
+        if old_id == new_id:
+            return
+        names = {x["id"]: x["name"] for x in conn.execute("SELECT id, name FROM destinations")}
+        conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('customer-destination',?,?,?,?,?,?)",
+                     (cname, "Customer destination", names.get(old_id) if old_id else None, names.get(new_id) if new_id else None, user["name"], now_iso()))
+
+    def route_customers(self, method, seg, conn, user=None):
         if seg == ["api", "customers"]:
             if method == "GET":
-                return {"customers": [self._customer_public(r) for r in conn.execute(
-                    "SELECT * FROM customers WHERE active=1 ORDER BY name")]}
+                return {"customers": [self._customer_public(r) for r in conn.execute(self.CUSTOMER_SQL)]}
             if method == "POST":
                 d = self._body_json()
                 name = (d.get("name") or "").strip()
@@ -16977,25 +17269,28 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(400, "Customer name is required")
                 if conn.execute("SELECT 1 FROM customers WHERE name=?", (name,)).fetchone():
                     raise ApiError(409, "A customer with that name already exists")
+                dest = self._customer_destination(conn, user, d, None)
                 conn.execute(
-                    "INSERT INTO customers (name,contact,email,phone,address,created_at)"
-                    " VALUES (?,?,?,?,?,?)",
-                    (name, d.get("contact"), d.get("email"), d.get("phone"), d.get("address"), now_iso()))
-                return {"customers": [self._customer_public(r) for r in conn.execute(
-                    "SELECT * FROM customers WHERE active=1 ORDER BY name")]}
+                    "INSERT INTO customers (name,contact,email,phone,address,created_at,destination_id)"
+                    " VALUES (?,?,?,?,?,?,?)",
+                    (name, d.get("contact"), d.get("email"), d.get("phone"), d.get("address"), now_iso(), dest))
+                self._log_customer_destination(conn, user, name, None, dest)
+                return {"customers": [self._customer_public(r) for r in conn.execute(self.CUSTOMER_SQL)]}
         if len(seg) == 3 and seg[2].isdigit() and method == "PUT":
             cid = int(seg[2])
             c = conn.execute("SELECT * FROM customers WHERE id=?", (cid,)).fetchone()
             if not c:
                 raise ApiError(404, "Customer not found")
             d = self._body_json()
+            dest = self._customer_destination(conn, user, d, c["destination_id"])
             conn.execute(
-                "UPDATE customers SET name=?, contact=?, email=?, phone=?, address=? WHERE id=?",
+                "UPDATE customers SET name=?, contact=?, email=?, phone=?, address=?, destination_id=? WHERE id=?",
                 ((d["name"].strip() if d.get("name") else c["name"]),
                  d.get("contact") if "contact" in d else c["contact"],
                  d.get("email") if "email" in d else c["email"],
                  d.get("phone") if "phone" in d else c["phone"],
-                 d.get("address") if "address" in d else c["address"], cid))
+                 d.get("address") if "address" in d else c["address"], dest, cid))
+            self._log_customer_destination(conn, user, c["name"], c["destination_id"], dest)
             return {"ok": True}
         raise ApiError(404, "Unknown customers endpoint")
 
@@ -17014,7 +17309,7 @@ class Handler(BaseHTTPRequestHandler):
                     totes = [r["lot_number"] for r in conn.execute(
                         "SELECT t.lot_number FROM run_inputs ri JOIN tote_lots t ON t.id=ri.tote_lot_id "
                         "WHERE ri.run_id=? ORDER BY t.lot_number", (run["id"],))]
-            lines.append({"id": ln["id"], "lot": ln["fg_lot_number"], "sku": ln["sku_code"],
+            lines.append({"id": ln["id"], "lot": ln["fg_lot_number"], "sku": ln["sku_code"], "beforeMetals": bool(ln["released_early"]),
                           "packageSize": ln["package_size"], "qty": ln["qty"],
                           "litresEach": ln["litres_each"],
                           "litres": round((ln["qty"] or 0) * (ln["litres_each"] or 0), 2),
@@ -17032,6 +17327,7 @@ class Handler(BaseHTTPRequestHandler):
                "shipDate": r["ship_date"], "status": r["status"], "carrier": r["carrier"],
                "trackingNo": r["tracking_no"], "reference": r["reference"], "shipTo": r["ship_to"],
                "notes": r["notes"], "createdBy": r["created_by"],
+               "destination": r["destination_name"], "beforeMetals": bool(r["conditional_release"]),
                "lineCount": agg["lines"], "units": agg["units"],
                "litres": round(agg["litres"] or 0, 1)}
         if with_lines:
@@ -17039,6 +17335,9 @@ class Handler(BaseHTTPRequestHandler):
         return out
 
     def route_shipments(self, method, seg, query, conn, user):
+        if seg == ["api", "shipments", "awaiting-qa"] and method == "GET":
+            cid = query.get("customerId", [""])[0]
+            return self._awaiting_qa(conn, user, int(cid) if cid.isdigit() else None)
         if seg == ["api", "shipments"]:
             if method == "GET":
                 cust = query.get("customer", [""])[0]
@@ -17063,7 +17362,141 @@ class Handler(BaseHTTPRequestHandler):
         raise ApiError(404, "Unknown shipments endpoint")
 
     def create_shipment(self, conn, user):
-        d = self._body_json()
+        return self._shipment_with_qa_release(conn, user, self._body_json())
+
+    def _release_unit_lot(self, conn, lot, qty):
+        """KW-100: the units released for a shipment become a lot of their own, marked as released without the heavy-metals results (`release_basis` = 'no_metals'). The whole lot is
+        marked in place; part of a lot is split into a child lot (linked to its parent, same run, number `<lot>-NHM`); the rest stays Pending Release in the parent. -> the lot row that ships."""
+        lot = conn.execute("SELECT * FROM fg_lots WHERE id=?", (lot["id"],)).fetchone()
+        if qty >= lot["qty"]:
+            conn.execute("UPDATE fg_lots SET release_basis='no_metals' WHERE id=?", (lot["id"],))
+            return conn.execute("SELECT * FROM fg_lots WHERE id=?", (lot["id"],)).fetchone()
+        cur = conn.execute("UPDATE fg_lots SET qty=qty-? WHERE id=? AND qty>=?", (qty, lot["id"], qty))
+        if cur.rowcount != 1:
+            raise ApiError(409, "%s no longer has %g units" % (lot["fg_lot_number"], qty))
+        number = self._unique_fg_lot(conn, "%s-NHM" % lot["fg_lot_number"])
+        child = conn.execute(
+            "INSERT INTO fg_lots (fg_lot_number,sku_code,run_id,package_size,qty,litres_each,produced_date,tds,ph,location,status,created_at,"
+            "made_as,sku_assigned,parent_lot_id,assigned_by,assigned_at,release_basis) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (number, lot["sku_code"], lot["run_id"], lot["package_size"], qty, lot["litres_each"], lot["produced_date"], lot["tds"], lot["ph"], lot["location"],
+             lot["status"], now_iso(), lot["made_as"], lot["sku_assigned"], lot["id"], lot["assigned_by"], lot["assigned_at"], "no_metals")).lastrowid
+        return conn.execute("SELECT * FROM fg_lots WHERE id=?", (child,)).fetchone()
+
+    def _awaiting_qa_lots(self, conn, d):
+        """The Pending Release lots a shipment request asks for, with units: [(lot row, qty)]."""
+        out = []
+        for ln in d.get("lines") or []:
+            try:
+                fid = int(ln.get("fgLotId"))
+            except (TypeError, ValueError):
+                continue
+            q = num(ln.get("qty"))
+            lot = conn.execute("SELECT * FROM fg_lots WHERE id=?", (fid,)).fetchone()
+            if lot and q and q > 0 and lot["status"] == "pending_release":
+                out.append((lot, q))
+        return out
+
+    def _shipment_with_qa_release(self, conn, user, d):
+        """POST /api/shipments (KW-100). A shipment may include Pending Release lots of ANY reviewed run: a Quality Manager releases those units for THIS shipment, before the heavy-metals results,
+        by signing once for the whole shipment (password + reason). Only heavy metals can be outstanding for a run (release_for_shipment_check), the customer's destination must not require
+        them, nothing can be overridden, the rest of each run stays Pending Release. One hash-chained `release_for_shipment` event per run. A shipment with no Pending Release lot is the normal one."""
+        asked = self._awaiting_qa_lots(conn, d)
+        if not asked:
+            return self._make_shipment(conn, user, d)
+        if not release_for_shipment_enabled(conn):
+            raise ApiError(403, "Releasing units for shipment is switched off (Calculations page: 'Release: allow units to be released for shipment before the heavy-metals results')", "conditional_off")
+        self._require_quality_manager(user, "release units for a shipment before the heavy-metals results")
+        comment = (d.get("comment") or "").strip()
+        if len(comment) < 3:
+            raise ApiError(400, "Enter the reason for releasing these units before the heavy-metals results (it is recorded in the audit trail)")
+        cust = conn.execute("SELECT * FROM customers WHERE id=? AND active=1", (d.get("customerId"),)).fetchone()
+        if not cust:
+            raise ApiError(400, "Choose the customer this shipment is for")
+        runs = {}
+        for lot, _q in asked:
+            if lot["run_id"] and lot["run_id"] not in runs:
+                runs[lot["run_id"]] = conn.execute("SELECT * FROM production_runs WHERE id=?", (lot["run_id"],)).fetchone()
+        reasons, gates = [], {}
+        for rid, run in runs.items():
+            gates[rid] = release_gate(conn, run)
+            reasons += ["%s: %s" % (run["processing_lot"], why) for why in release_for_shipment_check(conn, run, gates[rid])["reasons"]]
+        why = customer_destination_problem(conn, cust)
+        if why:
+            reasons.append(why)
+        if len(runs) != len({lot["run_id"] for lot, _q in asked}):
+            reasons.append("A lot with no production run cannot be released for shipment")
+        if reasons:
+            raise ApiError(409, "Release for shipment blocked: " + "; ".join(reasons), "release_for_shipment_blocked")
+        capacity = self._release_signer(conn, user, d, need_quality=True)
+        hashes = {}
+        for rid, run in runs.items():
+            if float(get_setting_value(conn, "release_separate_signers", 0) or 0):
+                rev = conn.execute("SELECT user_id FROM release_events WHERE run_id=? AND event_type='review_approved' ORDER BY id DESC LIMIT 1", (rid,)).fetchone()
+                if rev and rev["user_id"] == user["id"]:
+                    raise ApiError(403, "You signed the production-log review of %s, so another Quality Manager must sign this release (setting: reviewer and releaser must differ)." % run["processing_lot"], "same_person")
+            hashes[rid] = self._release_snapshot_hash(conn, rid)
+            if hashes[rid] != run["release_review_hash"]:
+                self._release_void(conn, run, user, hashes[rid], "Production log differs from the log that was reviewed")
+                conn.commit()
+                raise ApiError(409, "The production log of %s changed after it was reviewed - it has been returned to review" % run["processing_lot"])
+        ship = self._make_shipment(conn, user, d, for_release=runs)["shipment"]
+        by_run = {}
+        for x in conn.execute("SELECT sl.fg_lot_number, sl.qty, sl.released_early, f.run_id FROM shipment_lines sl JOIN fg_lots f ON f.id=sl.fg_lot_id WHERE sl.shipment_id=? ORDER BY sl.id", (ship["id"],)):
+            if x["released_early"]:
+                by_run.setdefault(x["run_id"], []).append({"lot": x["fg_lot_number"], "qty": x["qty"], "releasedEarly": True})
+        for rid, run in runs.items():
+            pending = release_for_shipment_check(conn, run, gates[rid])["pending"]
+            release_log(conn, rid, "release_for_shipment", user, capacity=capacity,
+                        meaning=("I release these units for shipment %s to %s (%s) before the heavy-metals results (%s): the process specifications and indicator-organism tests are met. "
+                                 "The rest of the run is not released.") % (ship["shipmentNo"], cust["name"], ship["destination"], ", ".join(pending)),
+                        comment=comment, log_hash=hashes[rid],
+                        detail={"shipment": ship["shipmentNo"], "customer": cust["name"], "destination": ship["destination"], "lots": by_run.get(rid, []), "pending": pending,
+                                "gate": [{k: g[k] for k in ("code", "name", "rule", "spec", "result", "status")} for g in gates[rid]],
+                                "recentMetals": recent_metals_context(conn, run)})
+        return {"shipment": ship}
+
+    def _awaiting_qa(self, conn, user, customer_id):
+        """GET /api/shipments/awaiting-qa?customerId= (KW-100): every Pending Release lot with whether it can go on a shipment to this customer, and why not. Per run the rule is
+        release_for_shipment_check; per customer customer_destination_problem; the setting and the signer's permission are included so the form can say so."""
+        enabled, can_sign = release_for_shipment_enabled(conn), bool(user["is_quality_manager"])
+        cust = conn.execute("SELECT * FROM customers WHERE id=? AND active=1", (customer_id,)).fetchone() if customer_id else None
+        cust_why = customer_destination_problem(conn, cust) if cust else None
+        run_why, run_info = {}, {}
+        lots = []
+        for l in conn.execute("SELECT * FROM fg_lots WHERE status='pending_release' AND qty>0 ORDER BY run_id, id"):
+            rid = l["run_id"]
+            if rid not in run_why:
+                run = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone() if rid else None
+                if not run:
+                    run_why[rid], run_info[rid] = ["no production run"], {"lot": None, "pending": []}
+                elif run["release_state"] != "pending_release":
+                    run_why[rid] = ["The production log has not been reviewed yet (status: %s)" % RELEASE_LABELS.get(run["release_state"], run["release_state"])]
+                    run_info[rid] = {"lot": run["processing_lot"], "pending": []}
+                else:
+                    chk = release_for_shipment_check(conn, run)
+                    run_why[rid] = list(chk["reasons"])
+                    run_info[rid] = {"lot": run["processing_lot"], "pending": chk["pending"], "run": run}
+            why = list(run_why[rid])
+            if cust_why:
+                why.append(cust_why)
+            if not enabled:
+                why.insert(0, "Releasing units for shipment is switched off")
+            elif not can_sign:
+                why.insert(0, "Needs a Quality Manager to sign the release")
+            lots.append({"id": l["id"], "lot": l["fg_lot_number"], "runId": rid, "runLot": run_info[rid]["lot"], "packageSize": l["package_size"], "sku": l["sku_code"], "qty": l["qty"],
+                         "skuAssigned": l["sku_assigned"] is None or bool(l["sku_assigned"]), "madeAs": l["made_as"] or l["sku_code"], "litresEach": l["litres_each"], "location": l["location"],
+                         "eligible": not why, "why": "; ".join(why)})
+        recent = {}
+        for rid in {x["runId"] for x in lots if x["eligible"]}:
+            run = run_info[rid].get("run")
+            if run:
+                recent[str(rid)] = recent_metals_context(conn, run)
+        return {"enabled": enabled, "canSign": can_sign, "lots": lots, "recentMetals": recent,
+                "pendingTests": sorted({t for i in run_info.values() for t in i["pending"]}), "customerProblem": cust_why}
+
+    def _make_shipment(self, conn, user, d, for_release=None):
+        """Create a shipment. `for_release` = {run id: run row} of the runs whose Pending Release lots are released for THIS shipment (KW-100, `_shipment_with_qa_release`): those lots go out as
+        'early' lines (released_early = 1, and the shipment is marked) and the same shipment may carry any released On-hand stock. Every other line follows the normal rule: On-hand lots of released runs only."""
         cust = conn.execute("SELECT * FROM customers WHERE id=?",
                             (d.get("customerId"),)).fetchone()
         if not cust:
@@ -17089,47 +17522,52 @@ class Handler(BaseHTTPRequestHandler):
             if not fg:
                 continue
             per_lot[fid] = per_lot.get(fid, 0) + qty
-            if fg["status"] != "on_hand":
-                raise ApiError(400, "%s cannot be shipped: it is not released for sale (status: %s)"
-                               % (fg["fg_lot_number"], "Pending Release" if fg["status"] == "pending_release" else fg["status"]))
-            rs = conn.execute("SELECT release_state FROM production_runs WHERE id=?", (fg["run_id"],)).fetchone()
-            if rs and rs["release_state"] not in (None, "legacy", "released"):
-                raise ApiError(400, "%s cannot be shipped: its production run has not been released" % fg["fg_lot_number"])
+            early = for_release is not None and fg["run_id"] in for_release and fg["status"] == "pending_release"      # KW-100: released for THIS shipment, before the heavy-metals results
+            if not early:                                                # everything else ships under the normal rules: On hand, and its run released
+                if fg["status"] != "on_hand":
+                    raise ApiError(400, "%s cannot be shipped: it is not released for sale (status: %s)"
+                                   % (fg["fg_lot_number"], "Pending Release" if fg["status"] == "pending_release" else fg["status"]))
+                rs = conn.execute("SELECT release_state FROM production_runs WHERE id=?", (fg["run_id"],)).fetchone()
+                if rs and rs["release_state"] not in (None, "legacy", "released"):
+                    raise ApiError(400, "%s cannot be shipped: its production run has not been released" % fg["fg_lot_number"])
             if per_lot[fid] > fg["qty"]:
                 raise ApiError(400, "Only %g of %s on hand (asked %g)"
                                % (fg["qty"], fg["fg_lot_number"], per_lot[fid]))
             if fg["sku_assigned"] is not None and not fg["sku_assigned"]:
                 if not sku:
                     raise ApiError(400, "%s has no SKU yet (it was made as %s): choose the SKU it ships as" % (fg["fg_lot_number"], fg["made_as"] or fg["sku_code"]))
-                assign_jobs.append((fg, sku, qty))
+                assign_jobs.append((fg, sku, qty, early))
             else:
-                prepared.append((fg, qty))
+                prepared.append((fg, qty, early))
         if not prepared and not assign_jobs:
             raise ApiError(400, "Add at least one finished-goods line to ship")
         if assign_jobs:                                           # assigning is a signed act, done in the same transaction as the shipment
             self._require_sku_signer(conn, user, d)
-            for fg, sku, qty in assign_jobs:
+            for fg, sku, qty, early in assign_jobs:
                 current = conn.execute("SELECT * FROM fg_lots WHERE id=?", (fg["id"],)).fetchone()
-                prepared.append((self._assign_sku(conn, current, sku, qty, user, "Assigned when shipping"), qty))
+                prepared.append((self._assign_sku(conn, current, sku, qty, user, "Assigned when shipping", for_release=early), qty, early))
 
+        prepared = [(self._release_unit_lot(conn, fg, qty) if early else fg, qty, early) for fg, qty, early in prepared]        # released units are a lot of their own
         seq = conn.execute("SELECT COUNT(*) c FROM shipments").fetchone()["c"] + 1
         ship_no = (d.get("shipmentNo") or "").strip() or "SH-%s-%03d" % (ship_date.replace("-", ""), seq)
         if conn.execute("SELECT 1 FROM shipments WHERE shipment_no=?", (ship_no,)).fetchone():
             raise ApiError(409, "Shipment %s already exists" % ship_no)
         ship_to = (d.get("shipTo") or cust["address"] or "")
+        dest = conn.execute("SELECT * FROM destinations WHERE id=?", (cust["destination_id"],)).fetchone() if cust["destination_id"] else None
         cur = conn.cursor()
-        cur.execute(
+        cur.execute(                                              # the destination is kept as it was when the shipment was made (a later edit of the customer cannot change it)
             "INSERT INTO shipments (shipment_no,customer_id,ship_date,status,carrier,tracking_no,"
-            "reference,ship_to,notes,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "reference,ship_to,notes,created_by,created_at,destination_id,destination_name,conditional_release) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (ship_no, cust["id"], ship_date, "shipped", d.get("carrier"), d.get("trackingNo"),
-             d.get("reference"), ship_to, d.get("notes"), user["name"] if user else None, now_iso()))
+             d.get("reference"), ship_to, d.get("notes"), user["name"] if user else None, now_iso(),
+             dest["id"] if dest else None, dest["name"] if dest else None, 1 if any(e for _f, _q, e in prepared) else 0))
         sid = cur.lastrowid
-        for fg, qty in prepared:
+        for fg, qty, early in prepared:
             cur.execute(
                 "INSERT INTO shipment_lines (shipment_id,fg_lot_id,fg_lot_number,sku_code,"
-                "package_size,qty,litres_each) VALUES (?,?,?,?,?,?,?)",
+                "package_size,qty,litres_each,released_early) VALUES (?,?,?,?,?,?,?,?)",
                 (sid, fg["id"], fg["fg_lot_number"], fg["sku_code"], fg["package_size"], qty,
-                 fg["litres_each"]))
+                 fg["litres_each"], 1 if early else 0))
             # relative and conditional: stock can never go below zero, whatever else ran in between
             cur.execute("UPDATE fg_lots SET qty=qty-?, status=CASE WHEN qty-?<=0 THEN 'sold' ELSE status END WHERE id=? AND qty>=?",
                         (qty, qty, fg["id"], qty))
@@ -17156,7 +17594,14 @@ class Handler(BaseHTTPRequestHandler):
                     back = "on_hand" if (not rs or rs["release_state"] in (None, "legacy", "released")) else "pending_release"
                     # units coming back to a lot that was disposed in the meantime need a Quality decision: hold them
                     status = back if fg["status"] == "sold" and nq > 0 else ("hold" if fg["status"] == "disposed" and nq > 0 else fg["status"])
-                    conn.execute("UPDATE fg_lots SET qty=?, status=? WHERE id=?", (nq, status, fg["id"]))
+                    parent = conn.execute("SELECT * FROM fg_lots WHERE id=?", (fg["parent_lot_id"],)).fetchone() if (ln["released_early"] and fg["parent_lot_id"]) else None
+                    if parent and parent["release_basis"] is None and parent["sku_code"] == fg["sku_code"] and parent["status"] == "pending_release":
+                        # KW-100: units released for a shipment from a split lot go back to the lot they were split from; the released lot keeps only what is still sold
+                        conn.execute("UPDATE fg_lots SET qty=qty+? WHERE id=?", (ln["qty"] or 0, parent["id"]))
+                    else:
+                        conn.execute("UPDATE fg_lots SET qty=?, status=? WHERE id=?", (nq, status, fg["id"]))
+                        if ln["released_early"]:                          # the units are back, and no longer released without the heavy-metals results
+                            conn.execute("UPDATE fg_lots SET release_basis=NULL WHERE id=?", (fg["id"],))
         elif old_status == "cancelled" and new_status != "cancelled":
             for ln in conn.execute("SELECT * FROM shipment_lines WHERE shipment_id=?", (r["id"],)):
                 fg = conn.execute("SELECT * FROM fg_lots WHERE id=?", (ln["fg_lot_id"],)).fetchone()
