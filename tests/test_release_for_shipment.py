@@ -466,7 +466,7 @@ def test_a_run_with_nothing_left_to_release_has_its_own_state_and_no_red_gate(sr
     assert ship(people, cid, [(lot, 1)]).status == 200
     d = detail(people, rid)
     assert state(srv, rid) == "pending_release" and d["allShippedEarly"] is True
-    assert d["releaseStatus"]["stage"] == "All units shipped before the heavy-metals results" and d["releaseStatus"]["tone"] == "info" and "Nothing is left to release" in d["releaseStatus"]["text"]
+    assert d["releaseStatus"]["stage"] == "Conditional release - all units shipped" and d["releaseStatus"]["tone"] == "info" and "Nothing is left to release" in d["releaseStatus"]["text"]
     ck = {i["key"]: i for i in d["checklist"]}
     assert ck["gate"]["state"] == "na" and "not needed" in ck["gate"]["label"] and "Washington" in ck["gate"]["reason"]
     assert ck["comment"]["state"] == "na" and ck["early"]["state"] == "ok" and "not required" in ck["early"]["reason"]
@@ -516,12 +516,53 @@ def test_a_whole_lot_is_marked_in_place_and_nothing_is_split(srv, people):
     assert fg[lot["number"]]["releaseBasis"] == "no_metals" and fg[lot["number"]]["status"] == "sold" and lot["number"] + "-NHM" not in fg
 
 
-def test_cancelling_returns_the_released_lot_to_pending_release_without_the_mark(srv, people):
+def test_cancelling_returns_the_units_to_the_lot_they_were_split_from(srv, people):
     enable(srv)
     rid = pending_run(srv, people, packs=3)
     lot = lots_of(srv, rid)[0]
     sid = ship(people, customer(people, "Washington"), [(lot, 1)]).json["shipment"]["id"]
     assert people["plain"].put("/api/shipments/%d" % sid, {"status": "cancelled"}).status == 200
-    child = fg_by_number(people)[lot["number"] + "-NHM"]
-    assert child["status"] == "pending_release" and child["qty"] == 1 and child["releaseBasis"] is None
+    fg = fg_by_number(people)
+    assert fg[lot["number"]]["qty"] == 3 and fg[lot["number"]]["status"] == "pending_release"       # back in the lot they came from: one Pending Release line again
+    assert fg[lot["number"] + "-NHM"]["unitsSold"] == 0 and fg[lot["number"] + "-NHM"]["status"] == "sold"      # the released lot has nothing sold, so Finished Goods does not list it
     assert detail(people, rid)["earlyShipments"] == []
+
+
+# ---- Finished Goods and Product Release: units sold, and the two stages ----
+
+def test_lot_of_10_units_5_to_one_customer_2_to_another_leaves_7_sold_and_3_pending(srv, people):
+    enable(srv)
+    rid = pending_run(srv, people, packs=10)
+    lot = lots_of(srv, rid)[0]
+    a, b = customer(people, "Washington"), customer(people, "Washington")
+    assert ship(people, a, [(lot, 5)]).status == 200
+    assert ship(people, b, [(lot, 2)]).status == 200
+    fg = [l for l in people["qm"].get("/api/fg").json["fg"] if l["runId"] == rid]
+    sold = [l for l in fg if l["status"] == "sold" and l["unitsSold"] > 0]
+    assert sum(l["unitsSold"] for l in sold) == 7 and all(l["releaseBasis"] == "no_metals" and l["parentLotId"] == lot["id"] for l in sold)
+    left = [l for l in fg if l["status"] == "pending_release"]
+    assert len(left) == 1 and left[0]["qty"] == 3 and left[0]["releaseBasis"] is None and left[0]["unitsSold"] == 0
+    # Product Release: the 7 units are in Conditional release, the 3 stay in Awaiting Quality release (the same run is in both)
+    run = {r["id"]: r for r in people["qm"].get("/api/release").json["runs"]}[rid]
+    assert run["state"] == "pending_release" and run["earlyUnits"] == 7 and run["pendingUnits"] == 3 and run["allShippedEarly"] is False
+    assert run["conditionsBy"] and run["conditionsAt"]
+    assert run["releaseStatus"]["stage"] == "Awaiting QA release"
+
+
+def test_a_sold_lot_shows_the_units_sold_and_a_cancelled_shipment_takes_them_off(srv, people):
+    enable(srv)
+    rid = pending_run(srv, people, packs=4)
+    lot = lots_of(srv, rid)[0]
+    wa = customer(people, "Washington")
+    first = ship(people, wa, [(lot, 1)]).json["shipment"]["id"]
+    ship(people, wa, [(lot, 3)])                                                    # the rest of the lot: the lot itself is marked, nothing left Pending Release
+    fg = {l["lot"]: l for l in people["qm"].get("/api/fg").json["fg"]}
+    assert fg[lot["number"]]["status"] == "sold" and fg[lot["number"]]["unitsSold"] == 3 and fg[lot["number"] + "-NHM"]["unitsSold"] == 1
+    run = {r["id"]: r for r in people["qm"].get("/api/release").json["runs"]}[rid]
+    assert run["earlyUnits"] == 4 and run["pendingUnits"] == 0 and run["allShippedEarly"] is True
+    assert people["plain"].put("/api/shipments/%d" % first, {"status": "cancelled"}).status == 200
+    fg = {l["lot"]: l for l in people["qm"].get("/api/fg").json["fg"]}
+    # the parent was marked in place (it is itself a released lot now), so the 1 cancelled unit comes back as its own Pending Release lot, unmarked
+    child = fg[lot["number"] + "-NHM"]
+    assert child["status"] == "pending_release" and child["qty"] == 1 and child["releaseBasis"] is None and child["unitsSold"] == 0
+    assert fg[lot["number"]]["unitsSold"] == 3

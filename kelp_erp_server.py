@@ -3473,9 +3473,17 @@ def fg_public_list(conn, rows, conform=None):
     """fg_public for each row, plus `holdInfo` (why it is on hold) on the lots that are on hold."""
     rows = list(rows)
     info = hold_info_for_lots(conn, rows, conform)
+    sold = {}
+    ids = [r["id"] for r in rows]
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        for x in conn.execute("SELECT sl.fg_lot_id, SUM(sl.qty) q FROM shipment_lines sl JOIN shipments s ON s.id=sl.shipment_id WHERE s.status!='cancelled' AND sl.fg_lot_id IN (%s) GROUP BY sl.fg_lot_id"
+                              % ",".join("?" * len(chunk)), chunk):
+            sold[x["fg_lot_id"]] = x["q"]
     out = []
     for r in rows:
         d = fg_public(r)
+        d["unitsSold"] = sold.get(r["id"], 0)                         # a Sold lot shows the units sold, not the (zero) units left
         if r["id"] in info:
             d["holdInfo"] = info[r["id"]]
         out.append(d)
@@ -14808,7 +14816,7 @@ class Handler(BaseHTTPRequestHandler):
             nxt = ("A heavy-metals result FAILED and every unit has shipped (%s): assess the units for recall (Where did this product go?)." % where if failed_metal else
                    "Nothing is left to release. Heavy metals are not required for where this product went (%s). If heavy-metals results are entered and a result fails, assess the units for recall; "
                    "if they pass, release the run normally for the final certificate." % where)
-            status.update(stage="All units shipped before the heavy-metals results", tone="danger" if failed_metal else "info", waitingOn=None, cause=None, next=nxt)
+            status.update(stage="Conditional release - all units shipped", tone="danger" if failed_metal else "info", waitingOn=None, cause=None, next=nxt)
             status["text"] = status["stage"] + ". " + nxt
         elif early:
             status["text"] += " Units released for shipment before the heavy-metals results: %s." % "; ".join(
@@ -14817,6 +14825,8 @@ class Handler(BaseHTTPRequestHandler):
                 "outputLitres": r["output_litres"], "finalizedAt": r["finalized_at"], "finalizedBy": r["finalized_by"],
                 "state": r["release_state"], "label": RELEASE_LABELS.get(r["release_state"], "—"),
                 "lots": lots, "earlyShipments": early, "allShippedEarly": all_early,
+                "pendingUnits": sum(l["qty"] for l in lots if l["status"] == "pending_release"), "earlyUnits": sum(e["qty"] for e in early),
+                "conditionsBy": (last.get("release_for_shipment") or {}).get("user"), "conditionsAt": (last.get("release_for_shipment") or {}).get("at"),
                 "releaseStatus": status,
                 "checklist": release_checklist(conn, r, gate, lab_ev, problems, am, log_matches, lots),
                 "heldLots": [{"id": l["id"], "lot": l["lot"], "qty": l["qty"]} for l in lots if l["status"] == "hold"],
@@ -17584,9 +17594,14 @@ class Handler(BaseHTTPRequestHandler):
                     back = "on_hand" if (not rs or rs["release_state"] in (None, "legacy", "released")) else "pending_release"
                     # units coming back to a lot that was disposed in the meantime need a Quality decision: hold them
                     status = back if fg["status"] == "sold" and nq > 0 else ("hold" if fg["status"] == "disposed" and nq > 0 else fg["status"])
-                    conn.execute("UPDATE fg_lots SET qty=?, status=? WHERE id=?", (nq, status, fg["id"]))
-                    if ln["released_early"]:                              # KW-100: the units are back, and no longer released without the heavy-metals results
-                        conn.execute("UPDATE fg_lots SET release_basis=NULL WHERE id=?", (fg["id"],))
+                    parent = conn.execute("SELECT * FROM fg_lots WHERE id=?", (fg["parent_lot_id"],)).fetchone() if (ln["released_early"] and fg["parent_lot_id"]) else None
+                    if parent and parent["release_basis"] is None and parent["sku_code"] == fg["sku_code"] and parent["status"] == "pending_release":
+                        # KW-100: units released for a shipment from a split lot go back to the lot they were split from; the released lot keeps only what is still sold
+                        conn.execute("UPDATE fg_lots SET qty=qty+? WHERE id=?", (ln["qty"] or 0, parent["id"]))
+                    else:
+                        conn.execute("UPDATE fg_lots SET qty=?, status=? WHERE id=?", (nq, status, fg["id"]))
+                        if ln["released_early"]:                          # the units are back, and no longer released without the heavy-metals results
+                            conn.execute("UPDATE fg_lots SET release_basis=NULL WHERE id=?", (fg["id"],))
         elif old_status == "cancelled" and new_status != "cancelled":
             for ln in conn.execute("SELECT * FROM shipment_lines WHERE shipment_id=?", (r["id"],)):
                 fg = conn.execute("SELECT * FROM fg_lots WHERE id=?", (ln["fg_lot_id"],)).fetchone()

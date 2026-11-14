@@ -4959,7 +4959,7 @@ const RELEASE_EVENTS = {
   rebaseline: 'Log hash re-baselined (snapshot format change)', historical_entry: 'Entered retrospectively (historical run)',
   lab_results_added: 'Lab results entered', lab_result_voided: 'Lab result VOIDED',
   fg_lot_edited: 'Finished-goods lot edited', lab_result_hold: 'Lots put on HOLD (lab result changed after release)',
-  release_for_shipment: 'RELEASED for a shipment (heavy metals pending)',
+  release_for_shipment: 'CONDITIONAL RELEASE for a shipment (heavy metals pending)',
 };
 const shortHash = h => h ? h.slice(0, 10) + '…' : '—';
 // ---- KW-94: the release workflow as one status line, a checklist and hold reasons. The server decides all of it (`releaseStatus`, `checklist`, `holdInfo` on each lot); these only draw it. ----
@@ -4971,7 +4971,21 @@ function holdWhy(info) {
   const gate = info.conformsNow === true ? ' · release gate met' : info.conformsNow === false ? ' · release gate NOT met' : '';
   return el('div', { class: 'hold-why ' + info.kind, title: info.summary + gate }, info.summary + gate);
 }
-const fgStatusWithWhy = l => el('div', {}, fgStatusBadge(l.status), l.releaseBasis === 'no_metals' ? el('div', { class: 'hold-why', title: 'Released by a Quality Manager for a shipment to a destination that does not require heavy-metals results' }, 'Released — no heavy metals required') : null, holdWhy(l.holdInfo));
+// KW-100: Sold lots show the units SOLD, and lots split off one parent for the same SKU / release basis are one line (a lot of 10 with 5 sold to A and 2 to B is one Sold line of 7 and one line for the 3 left).
+function fgDisplayRows(lots) {
+  const out = [], groups = new Map();
+  for (const l of lots) {
+    if (l.status !== 'sold') { out.push(l); continue; }
+    if (!(l.unitsSold > 0)) continue;
+    const key = [l.parentLotId || l.id, l.sku, l.packageSize, l.releaseBasis || ''].join('|');
+    if (groups.has(key)) { const g = groups.get(key); g.unitsSold += l.unitsSold; g.members.push(l); continue; }
+    const g = Object.assign({}, l, { members: [l] }); groups.set(key, g); out.push(g);
+  }
+  return out;
+}
+const fgUnits = l => l.status === 'sold' ? l.unitsSold : l.qty;
+const fgLitres = l => l.status === 'sold' ? (l.unitsSold || 0) * (l.litresEach || 0) : (l.litres || 0);
+const fgStatusWithWhy = l => el('div', {}, fgStatusBadge(l.status), l.releaseBasis === 'no_metals' ? el('div', { class: 'hold-why', title: 'Conditional release: released by a Quality Manager for a shipment to a destination that does not require heavy-metals results' }, 'Conditional release — metals not required') : null, holdWhy(l.holdInfo));
 function releaseStatusBlock(s) {
   const plain = s.tone === 'ok' && !s.heldLots;
   return el('div', { class: 'release-status ' + s.tone },
@@ -5023,25 +5037,31 @@ async function pageRelease(v) {
     ['Released, but lots are on hold — needs attention', x => held(x)],
     ['Under amendment', x => x.state === 'amending'],
     ['Awaiting production-log review', x => x.state === 'pending_review'],
-    ['Awaiting Quality release', x => x.state === 'pending_release' && !x.allShippedEarly],
-    ['All units shipped before the heavy-metals results (nothing left to release)', x => x.state === 'pending_release' && x.allShippedEarly],
+    ['Awaiting Quality release', x => x.state === 'pending_release' && (x.pendingUnits > 0 || !(x.earlyUnits > 0)), 'await'],
+    ['Conditional release', x => x.state === 'pending_release' && x.earlyUnits > 0, 'cond'],
     ['Returned for correction / rejected', x => ['returned', 'rejected'].includes(x.state)],
     ['Released', x => x.state === 'released' && !held(x)],
   ];
-  for (const [title, pick] of groups) {
+  for (const [title, pick, kind] of groups) {
     const rows = r.runs.filter(pick);
-    if (!rows.length && (title.startsWith('Released, but') || title.startsWith('All units shipped'))) continue;
+    if (!rows.length && (title.startsWith('Released, but') || title.startsWith('Conditional release'))) continue;
+    // a run can be in both stages: the units that left on a release for shipment are in Conditional release, the balance stays in Awaiting Quality release
+    const lotsOf = x => kind === 'await' ? x.lots.filter(l => l.status === 'pending_release') : kind === 'cond' ? fgDisplayRows(x.lots.filter(l => l.releaseBasis === 'no_metals')) : x.lots;
     v.append(el('h3', { style: 'margin:16px 0 6px' }, title + ' (' + rows.length + ')'));
+    if (kind === 'cond') v.append(el('div', { class: 'help', style: 'margin:-4px 0 6px' }, 'Units a Quality Manager released for a shipment before the heavy-metals results, to a destination that does not require them. If the run has units left, they stay in Awaiting Quality release.'));
     if (!rows.length) { v.append(el('div', { class: 'help' }, 'Nothing here.')); continue; }
     v.append(table(['Run', 'Product', 'Finalized', 'Finished goods', 'Litres', 'Status', 'Checks', 'Lab results', 'Reviewed', 'Released'],
       rows.map(x => [mono(x.lot), skuName(x.sku), fmtWhen(x.finalizedAt) + (x.finalizedBy ? ' · ' + x.finalizedBy : ''),
-        x.lots.map(l => fmt(l.qty) + ' × ' + l.packageSize).join(', ') || '—',
-        num(fmt(x.lots.reduce((a, l) => a + (l.litres || 0), 0), 0)),
-        el('div', {}, releaseStageBadge(x.releaseStatus), x.releaseStatus.cause && x.state !== 'released' || held(x) ? el('div', { class: 'hold-why', title: x.releaseStatus.text }, x.releaseStatus.cause) : null,
-          (x.earlyShipments || []).length ? el('div', { class: 'hold-why', title: x.releaseStatus.text }, fmt(x.earlyShipments.reduce((a, e) => a + e.qty, 0)) + ' unit(s) shipped before heavy metals') : null),
+        lotsOf(x).map(l => fmt(fgUnits(l)) + ' × ' + l.packageSize).join(', ') || '—',
+        num(fmt(lotsOf(x).reduce((a, l) => a + fgLitres(l), 0), 0)),
+        kind === 'cond'
+          ? el('div', {}, badge('pending_release', 'Conditional release'), el('div', { class: 'hold-why', title: x.releaseStatus.text }, fmt(x.earlyUnits) + ' unit(s) shipped before heavy metals'
+            + (x.pendingUnits > 0 ? ' · ' + fmt(x.pendingUnits) + ' still awaiting QA release' : '')))
+          : el('div', {}, releaseStageBadge(x.releaseStatus), x.releaseStatus.cause && x.state !== 'released' || held(x) ? el('div', { class: 'hold-why', title: x.releaseStatus.text }, x.releaseStatus.cause) : null,
+            kind === 'await' && (x.earlyShipments || []).length ? el('div', { class: 'hold-why', title: x.releaseStatus.text }, fmt(x.earlyUnits) + ' unit(s) already released for shipment (see Conditional release)') : null),
         releaseCheckDots(x.checklist), labBadge(x.lab),
         x.reviewedBy ? x.reviewedBy + ' · ' + fmtWhen(x.reviewedAt) : '—',
-        x.releasedBy ? x.releasedBy + ' · ' + fmtWhen(x.releasedAt) : '—']),
+        kind === 'cond' ? (x.conditionsBy ? x.conditionsBy + ' · ' + fmtWhen(x.conditionsAt) : '—') : x.releasedBy ? x.releasedBy + ' · ' + fmtWhen(x.releasedAt) : '—']),
       [false, false, false, false, true, false, false, false, false, false], i => openReleaseRun(rows[i].id)));
   }
   v.append(el('div', { class: 'help', style: 'margin-top:10px' }, 'Click a row to review the production log, sign, and see the full audit trail.'));
@@ -5257,7 +5277,8 @@ async function openReleaseRun(id) {
   }
   // the supporting detail, folded away so the lab results and the sign-off are what is in front of the reviewer
   body.append(fold('Run notes', runNotesPanel(d.run, d.events, { emptyText: 'No notes were written on this run.' })));
-  body.append(fold('Finished goods lots (' + d.lots.length + ')', table(['FG lot', 'Pack', 'Units', 'Litres', 'Status'], d.lots.map(l => [mono(l.lot), l.packageSize, fmt(l.qty), num(fmt(l.litres, 0)), fgStatusWithWhy(l)]), [false, false, true, true, false])));
+  const lotRows = fgDisplayRows(d.lots);
+  body.append(fold('Finished goods lots (' + lotRows.length + ')', table(['FG lot', 'Pack', 'Units', 'Litres', 'Status'], lotRows.map(l => [mono(l.lot), l.packageSize, fmt(fgUnits(l)), num(fmt(fgLitres(l), 0)), fgStatusWithWhy(l)]), [false, false, true, true, false])));
   body.append(fold('Materials used and their lots', await materialsCard(id)));
   body.append(fold('Production log summary', releaseLogSummary(d.run)));
   body.append(el('h3', { style: 'margin:14px 0 6px;font-size:14px' }, 'Audit trail'));
@@ -5300,7 +5321,8 @@ async function pageFG(v) {
       el('button', { class: 'secondary', onclick: () => { selected.clear(); draw(); } }, 'Clear'));
   }
   function draw() {
-    const movable = r.fg.filter(f => f.status !== 'sold');
+    const shown = fgDisplayRows(r.fg);
+    const movable = shown.filter(f => f.status !== 'sold');
     [...selected].forEach(id => { if (!movable.some(f => f.id === id)) selected.delete(id); });
     host.innerHTML = '';
     const allCb = el('input', { type: 'checkbox', title: 'Select all', onchange: () => {
@@ -5309,9 +5331,10 @@ async function pageFG(v) {
     allCb.checked = movable.length > 0 && movable.every(f => selected.has(f.id));
     host.append(table(
       [allCb, 'FG lot', 'SKU', 'Pack', 'Units', 'Litres', 'TDS', 'pH', 'Produced', 'Location', 'Status', ''],
-      r.fg.map(f => [
+      shown.map(f => [
         rowCheck(f, selected, updateBulk),
-        mono(f.lot), fgSkuText(f), f.packageSize, fmt(f.qty), num(fmt(f.litres, 0)),
+        f.members && f.members.length > 1 ? el('span', {}, mono(f.lot), ' ', el('span', { class: 'muted', title: f.members.map(m => m.lot + ' (' + fmt(m.unitsSold) + ')').join('\n') }, '+' + (f.members.length - 1) + ' more'))
+          : mono(f.lot), fgSkuText(f), f.packageSize, fmt(fgUnits(f)), num(fmt(fgLitres(f), 0)),
         f.tds != null ? fmt(f.tds, 2) + '%' : '—', f.ph != null ? fmt(f.ph, 2) : '—', f.producedDate || '—', f.location || '—',
         fgStatusWithWhy(f), rowActions([
           f.status !== 'sold' ? ['Move', () => moveFG(f)] : null,
