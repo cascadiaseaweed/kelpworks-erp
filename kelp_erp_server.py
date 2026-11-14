@@ -3505,7 +3505,16 @@ def release_checklist(conn, r, gate, lab, problems, amendment, log_matches=None,
     else:
         add("review", "Production log reviewed", "ok")
     blocked = [g for g in gate if not g["ok"]]
-    if not gate:
+    # KW-100: every unit already left on a release for shipment to destinations that do not require heavy metals, so there is nothing left to release and no result is expected:
+    # the gate is not "not met", it is not needed (it turns red again only if a heavy-metals result is entered and fails)
+    early_all = early_shipments(conn, r["id"])
+    metals_all = [g for g in gate if g["group"] == CONDITIONAL_CATEGORY]
+    nothing_left = state == "pending_release" and bool(early_all) and sum(l["qty"] for l in lots if l["status"] == "pending_release") <= 0
+    metals_not_needed = nothing_left and not any(g["status"] == "fail" for g in metals_all) and not (metals_all and all(g["ok"] for g in metals_all))
+    shipped_to = ", ".join(dict.fromkeys(e["destination"] or "no destination" for e in early_all))
+    if metals_not_needed:
+        add("gate", "Release gate: not needed for what was shipped", "na", "Every unit shipped to a destination that does not require heavy-metals results (%s)" % shipped_to)
+    elif not gate:
         add("gate", "Release gate: no test has a release rule", "ok")
     else:
         label = "Release gate: %d of %d tests met" % (len(gate) - len(blocked), len(gate))
@@ -3539,7 +3548,9 @@ def release_checklist(conn, r, gate, lab, problems, amendment, log_matches=None,
         if no_report:
             waiting.append("No lab report attached for: " + ", ".join(no_report))
     wait_text = ". ".join(waiting)
-    if not failed:
+    if metals_not_needed:
+        add("comment", "Out-of-specification results have a release comment", "na", "Nothing is left to release")
+    elif not failed:
         if waiting:
             add("comment", "Out-of-specification results have a release comment", "warn", "Not known yet. " + wait_text, "lab")
         else:
@@ -3587,6 +3598,10 @@ def release_checklist(conn, r, gate, lab, problems, amendment, log_matches=None,
         elif metals and all(g["ok"] for g in metals):
             add("early", "Units shipped before the heavy-metals results", "ok",
                 "%s unit%s shipped to %s before the results; the heavy-metals results are now in and pass" % (fmt_units(units), plural, where))
+        elif metals_not_needed:
+            add("early", "Units shipped before the heavy-metals results", "ok",
+                "Heavy metals are not required for the destination%s shipped to (%s) and none are expected. If a result is entered and fails, assess these %s unit%s for recall" % (
+                    "" if len(set(e["destination"] for e in early)) == 1 else "s", shipped_to, fmt_units(units), plural))
         else:
             add("early", "Units shipped before the heavy-metals results", "warn",
                 "%s unit%s shipped to %s before the heavy-metals results; if a result fails they must be assessed for recall" % (fmt_units(units), plural, where), "lab")
@@ -14783,13 +14798,22 @@ class Handler(BaseHTTPRequestHandler):
         am = self._open_amendment(conn, r["id"])
         early = early_shipments(conn, r["id"])
         status = release_status(r, lots, last, am, gate, problems)
-        if early:                                                              # KW-100
+        all_early = r["release_state"] == "pending_release" and bool(early) and sum(l["qty"] for l in lots if l["status"] == "pending_release") <= 0
+        if all_early:                                                          # KW-100: nothing is left to release: every unit left on a release for shipment
+            failed_metal = any(g["status"] == "fail" for g in gate if g["group"] == CONDITIONAL_CATEGORY)
+            where = ", ".join(dict.fromkeys(e["destination"] or "no destination" for e in early))
+            nxt = ("A heavy-metals result FAILED and every unit has shipped (%s): assess the units for recall (Where did this product go?)." % where if failed_metal else
+                   "Nothing is left to release. Heavy metals are not required for where this product went (%s). If heavy-metals results are entered and a result fails, assess the units for recall; "
+                   "if they pass, release the run normally for the final certificate." % where)
+            status.update(stage="All units shipped before the heavy-metals results", tone="danger" if failed_metal else "info", waitingOn=None, cause=None, next=nxt)
+            status["text"] = status["stage"] + ". " + nxt
+        elif early:
             status["text"] += " Units released for shipment before the heavy-metals results: %s." % "; ".join(
                 "%s x %s to %s" % (fmt_units(e["qty"]), e["lot"], e["customer"] or "?") for e in early)
         return {"id": r["id"], "lot": r["processing_lot"], "sku": r["sku_code"], "runDate": r["run_date"],
                 "outputLitres": r["output_litres"], "finalizedAt": r["finalized_at"], "finalizedBy": r["finalized_by"],
                 "state": r["release_state"], "label": RELEASE_LABELS.get(r["release_state"], "—"),
-                "lots": lots, "earlyShipments": early,
+                "lots": lots, "earlyShipments": early, "allShippedEarly": all_early,
                 "releaseStatus": status,
                 "checklist": release_checklist(conn, r, gate, lab_ev, problems, am, log_matches, lots),
                 "heldLots": [{"id": l["id"], "lot": l["lot"], "qty": l["qty"]} for l in lots if l["status"] == "hold"],

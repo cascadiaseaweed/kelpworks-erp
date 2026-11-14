@@ -451,3 +451,35 @@ def test_every_shipment_keeps_the_destination_it_was_made_to(srv, people):
     people["admin"].put("/api/customers/%d" % cid, {"destinationId": people["dests"]["Canada"]}).raise_for_status()
     again = [x for x in people["plain"].get("/api/shipments").json["shipments"] if x["id"] == s.json["shipment"]["id"]][0]
     assert again["destination"] == "Washington"
+
+
+# ---- a run whose every unit has shipped on a release for shipment ----
+
+def test_a_run_with_nothing_left_to_release_has_its_own_state_and_no_red_gate(srv, people):
+    enable(srv)
+    rid = pending_run(srv, people, packs=2)
+    lot, cid = lots_of(srv, rid)[0], customer(people, "Washington")
+    assert ship(people, cid, [(lot, 1)]).status == 200
+    d = detail(people, rid)
+    assert d["allShippedEarly"] is False and d["releaseStatus"]["stage"] == "Awaiting QA release"          # one unit is still Pending Release
+    assert ship(people, cid, [(lot, 1)]).status == 200
+    d = detail(people, rid)
+    assert state(srv, rid) == "pending_release" and d["allShippedEarly"] is True
+    assert d["releaseStatus"]["stage"] == "All units shipped before the heavy-metals results" and d["releaseStatus"]["tone"] == "info" and "Nothing is left to release" in d["releaseStatus"]["text"]
+    ck = {i["key"]: i for i in d["checklist"]}
+    assert ck["gate"]["state"] == "na" and "not needed" in ck["gate"]["label"] and "Washington" in ck["gate"]["reason"]
+    assert ck["comment"]["state"] == "na" and ck["early"]["state"] == "ok" and "not required" in ck["early"]["reason"]
+    assert not [i for i in d["checklist"] if i["state"] == "fail"]
+    listed = {r["id"]: r for r in people["qm"].get("/api/release").json["runs"]}
+    assert listed[rid]["allShippedEarly"] is True
+
+
+def test_a_failed_metal_turns_it_red_again_even_when_nothing_is_left(srv, people):
+    enable(srv)
+    rid = pending_run(srv, people, packs=1)
+    assert ship(people, customer(people, "Washington"), [(lots_of(srv, rid)[0], 1)]).status == 200
+    add_metals(srv, people, rid, metals={"pb": "900000"}, report="F-3")
+    d = detail(people, rid)
+    assert d["allShippedEarly"] is True and d["releaseStatus"]["tone"] == "danger" and "FAILED" in d["releaseStatus"]["text"]
+    ck = {i["key"]: i for i in d["checklist"]}
+    assert ck["early"]["state"] == "fail" and ck["gate"]["state"] == "fail"

@@ -5023,13 +5023,14 @@ async function pageRelease(v) {
     ['Released, but lots are on hold — needs attention', x => held(x)],
     ['Under amendment', x => x.state === 'amending'],
     ['Awaiting production-log review', x => x.state === 'pending_review'],
-    ['Awaiting Quality release', x => x.state === 'pending_release'],
+    ['Awaiting Quality release', x => x.state === 'pending_release' && !x.allShippedEarly],
+    ['All units shipped before the heavy-metals results (nothing left to release)', x => x.state === 'pending_release' && x.allShippedEarly],
     ['Returned for correction / rejected', x => ['returned', 'rejected'].includes(x.state)],
     ['Released', x => x.state === 'released' && !held(x)],
   ];
   for (const [title, pick] of groups) {
     const rows = r.runs.filter(pick);
-    if (!rows.length && title.startsWith('Released, but')) continue;
+    if (!rows.length && (title.startsWith('Released, but') || title.startsWith('All units shipped'))) continue;
     v.append(el('h3', { style: 'margin:16px 0 6px' }, title + ' (' + rows.length + ')'));
     if (!rows.length) { v.append(el('div', { class: 'help' }, 'Nothing here.')); continue; }
     v.append(table(['Run', 'Product', 'Finalized', 'Finished goods', 'Litres', 'Status', 'Checks', 'Lab results', 'Reviewed', 'Released'],
