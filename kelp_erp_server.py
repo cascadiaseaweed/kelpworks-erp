@@ -5280,6 +5280,8 @@ def migrate(conn):
     for col, decl in (("destination_id", "INTEGER"), ("destination_name", "TEXT"), ("conditional_release", "INTEGER NOT NULL DEFAULT 0")):
         if col not in shcols:
             conn.execute("ALTER TABLE shipments ADD COLUMN %s %s" % (col, decl))
+    if "release_basis" not in {r["name"] for r in conn.execute("PRAGMA table_info(fg_lots)")}:           # KW-100: 'no_metals' = released for a shipment before / without the heavy-metals results
+        conn.execute("ALTER TABLE fg_lots ADD COLUMN release_basis TEXT")
     if "released_early" not in {r["name"] for r in conn.execute("PRAGMA table_info(shipment_lines)")}:        # KW-100: this line left before the heavy-metals results (a shipment can also carry released stock)
         conn.execute("ALTER TABLE shipment_lines ADD COLUMN released_early INTEGER NOT NULL DEFAULT 0")
         conn.execute("UPDATE shipment_lines SET released_early=1 WHERE shipment_id IN (SELECT id FROM shipments WHERE conditional_release=1)")
@@ -6647,7 +6649,8 @@ def fg_public(r):
             "litresEach": r["litres_each"], "litres": round((r["qty"] or 0) * (r["litres_each"] or 0), 2),
             "producedDate": r["produced_date"], "tds": r["tds"], "ph": r["ph"], "location": r["location"],
             "status": r["status"], "madeAs": r["made_as"] or r["sku_code"], "skuAssigned": r["sku_assigned"] is None or bool(r["sku_assigned"]),
-            "parentLotId": r["parent_lot_id"], "assignedBy": r["assigned_by"], "assignedAt": r["assigned_at"]}
+            "parentLotId": r["parent_lot_id"], "assignedBy": r["assigned_by"], "assignedAt": r["assigned_at"],
+            "releaseBasis": r["release_basis"] if "release_basis" in r.keys() else None}
 
 
 def run_public(r):
@@ -17351,6 +17354,24 @@ class Handler(BaseHTTPRequestHandler):
     def create_shipment(self, conn, user):
         return self._shipment_with_qa_release(conn, user, self._body_json())
 
+    def _release_unit_lot(self, conn, lot, qty):
+        """KW-100: the units released for a shipment become a lot of their own, marked as released without the heavy-metals results (`release_basis` = 'no_metals'). The whole lot is
+        marked in place; part of a lot is split into a child lot (linked to its parent, same run, number `<lot>-NHM`); the rest stays Pending Release in the parent. -> the lot row that ships."""
+        lot = conn.execute("SELECT * FROM fg_lots WHERE id=?", (lot["id"],)).fetchone()
+        if qty >= lot["qty"]:
+            conn.execute("UPDATE fg_lots SET release_basis='no_metals' WHERE id=?", (lot["id"],))
+            return conn.execute("SELECT * FROM fg_lots WHERE id=?", (lot["id"],)).fetchone()
+        cur = conn.execute("UPDATE fg_lots SET qty=qty-? WHERE id=? AND qty>=?", (qty, lot["id"], qty))
+        if cur.rowcount != 1:
+            raise ApiError(409, "%s no longer has %g units" % (lot["fg_lot_number"], qty))
+        number = self._unique_fg_lot(conn, "%s-NHM" % lot["fg_lot_number"])
+        child = conn.execute(
+            "INSERT INTO fg_lots (fg_lot_number,sku_code,run_id,package_size,qty,litres_each,produced_date,tds,ph,location,status,created_at,"
+            "made_as,sku_assigned,parent_lot_id,assigned_by,assigned_at,release_basis) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (number, lot["sku_code"], lot["run_id"], lot["package_size"], qty, lot["litres_each"], lot["produced_date"], lot["tds"], lot["ph"], lot["location"],
+             lot["status"], now_iso(), lot["made_as"], lot["sku_assigned"], lot["id"], lot["assigned_by"], lot["assigned_at"], "no_metals")).lastrowid
+        return conn.execute("SELECT * FROM fg_lots WHERE id=?", (child,)).fetchone()
+
     def _awaiting_qa_lots(self, conn, d):
         """The Pending Release lots a shipment request asks for, with units: [(lot row, qty)]."""
         out = []
@@ -17516,6 +17537,7 @@ class Handler(BaseHTTPRequestHandler):
                 current = conn.execute("SELECT * FROM fg_lots WHERE id=?", (fg["id"],)).fetchone()
                 prepared.append((self._assign_sku(conn, current, sku, qty, user, "Assigned when shipping", for_release=early), qty, early))
 
+        prepared = [(self._release_unit_lot(conn, fg, qty) if early else fg, qty, early) for fg, qty, early in prepared]        # released units are a lot of their own
         seq = conn.execute("SELECT COUNT(*) c FROM shipments").fetchone()["c"] + 1
         ship_no = (d.get("shipmentNo") or "").strip() or "SH-%s-%03d" % (ship_date.replace("-", ""), seq)
         if conn.execute("SELECT 1 FROM shipments WHERE shipment_no=?", (ship_no,)).fetchone():
@@ -17563,6 +17585,8 @@ class Handler(BaseHTTPRequestHandler):
                     # units coming back to a lot that was disposed in the meantime need a Quality decision: hold them
                     status = back if fg["status"] == "sold" and nq > 0 else ("hold" if fg["status"] == "disposed" and nq > 0 else fg["status"])
                     conn.execute("UPDATE fg_lots SET qty=?, status=? WHERE id=?", (nq, status, fg["id"]))
+                    if ln["released_early"]:                              # KW-100: the units are back, and no longer released without the heavy-metals results
+                        conn.execute("UPDATE fg_lots SET release_basis=NULL WHERE id=?", (fg["id"],))
         elif old_status == "cancelled" and new_status != "cancelled":
             for ln in conn.execute("SELECT * FROM shipment_lines WHERE shipment_id=?", (r["id"],)):
                 fg = conn.execute("SELECT * FROM fg_lots WHERE id=?", (ln["fg_lot_id"],)).fetchone()

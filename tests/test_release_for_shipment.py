@@ -290,10 +290,11 @@ def test_lots_of_two_runs_go_on_one_shipment_with_one_signature(srv, people):
     assert r.status == 200, r.text
     s = r.json["shipment"]
     assert n_shipments(srv) == before + 1 and s["units"] == 4
-    assert {l["lot"]: l["beforeMetals"] for l in s["lines"]} == {lot_a["number"]: True, lot_b["number"]: True, stock["number"]: False}
-    for rid, lot, units in ((run_a, lot_a, 1), (run_b, lot_b, 2)):
+    name_a = lot_a["number"] + "-NHM"                                              # 1 of 2 units: the released part is a lot of its own; all 2 units of lot B: the lot itself
+    assert {l["lot"]: l["beforeMetals"] for l in s["lines"]} == {name_a: True, lot_b["number"]: True, stock["number"]: False}
+    for rid, name, units in ((run_a, name_a, 1), (run_b, lot_b["number"], 2)):
         ev = events(people, rid)
-        assert len(ev) == 1 and ev[0]["detail"]["shipment"] == s["shipmentNo"] and ev[0]["detail"]["lots"] == [{"lot": lot["number"], "qty": units, "releasedEarly": True}]
+        assert len(ev) == 1 and ev[0]["detail"]["shipment"] == s["shipmentNo"] and ev[0]["detail"]["lots"] == [{"lot": name, "qty": units, "releasedEarly": True}]
         assert state(srv, rid) == "pending_release" and detail(people, rid)["chain"]["ok"] is True
     assert events(people, other) == [] and detail(people, other)["earlyShipments"] == []          # released stock is not part of any release
     assert lot_row(srv, stock["id"])["qty"] == 1
@@ -395,7 +396,7 @@ def test_the_integrity_check_and_reopen_account_for_the_shipped_units(srv, peopl
     r = people["qm"].post("/api/release/runs/%d/reopen" % rid, {"password": people["qm_pw"], "comment": "log needs correction"})
     assert r.status == 200
     ev = [e for e in detail(people, rid)["events"] if e["type"] == "reopened"][0]
-    assert ev["detail"]["alreadyShippedLots"] and ev["detail"]["alreadyShippedLots"][0]["lot"] == lot["number"]
+    assert ev["detail"]["alreadyShippedLots"] and ev["detail"]["alreadyShippedLots"][0]["lot"] == lot["number"] + "-NHM"
 
 
 def test_the_certificate_says_heavy_metals_pending_once_units_have_shipped(srv, people):
@@ -483,3 +484,44 @@ def test_a_failed_metal_turns_it_red_again_even_when_nothing_is_left(srv, people
     assert d["allShippedEarly"] is True and d["releaseStatus"]["tone"] == "danger" and "FAILED" in d["releaseStatus"]["text"]
     ck = {i["key"]: i for i in d["checklist"]}
     assert ck["early"]["state"] == "fail" and ck["gate"]["state"] == "fail"
+
+
+# ---- the released units are a lot of their own ----
+
+def fg_by_number(people):
+    return {l["lot"]: l for l in people["qm"].get("/api/fg").json["fg"]}
+
+
+def test_part_of_a_lot_becomes_its_own_lot_marked_released_without_heavy_metals(srv, people):
+    enable(srv)
+    rid = pending_run(srv, people, packs=3)
+    lot, cid = lots_of(srv, rid)[0], customer(people, "Washington")
+    assert ship(people, cid, [(lot, 1)]).status == 200
+    fg = fg_by_number(people)
+    child, parent = fg[lot["number"] + "-NHM"], fg[lot["number"]]
+    assert child["releaseBasis"] == "no_metals" and child["parentLotId"] == lot["id"] and child["runId"] == rid
+    assert child["status"] == "sold" and child["qty"] == 0
+    assert parent["status"] == "pending_release" and parent["qty"] == 2 and parent["releaseBasis"] is None            # the rest is still waiting for QA release
+    assert ship(people, cid, [(lot, 1)]).status == 200                              # a second release makes a second lot
+    fg = fg_by_number(people)
+    assert lot["number"] + "-NHM#2" in fg and fg[lot["number"] + "-NHM#2"]["releaseBasis"] == "no_metals" and fg[lot["number"]]["qty"] == 1
+
+
+def test_a_whole_lot_is_marked_in_place_and_nothing_is_split(srv, people):
+    enable(srv)
+    rid = pending_run(srv, people, packs=2)
+    lot = lots_of(srv, rid)[0]
+    assert ship(people, customer(people, "Washington"), [(lot, 2)]).status == 200
+    fg = fg_by_number(people)
+    assert fg[lot["number"]]["releaseBasis"] == "no_metals" and fg[lot["number"]]["status"] == "sold" and lot["number"] + "-NHM" not in fg
+
+
+def test_cancelling_returns_the_released_lot_to_pending_release_without_the_mark(srv, people):
+    enable(srv)
+    rid = pending_run(srv, people, packs=3)
+    lot = lots_of(srv, rid)[0]
+    sid = ship(people, customer(people, "Washington"), [(lot, 1)]).json["shipment"]["id"]
+    assert people["plain"].put("/api/shipments/%d" % sid, {"status": "cancelled"}).status == 200
+    child = fg_by_number(people)[lot["number"] + "-NHM"]
+    assert child["status"] == "pending_release" and child["qty"] == 1 and child["releaseBasis"] is None
+    assert detail(people, rid)["earlyShipments"] == []

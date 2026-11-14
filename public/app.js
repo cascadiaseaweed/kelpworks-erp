@@ -4971,7 +4971,7 @@ function holdWhy(info) {
   const gate = info.conformsNow === true ? ' · release gate met' : info.conformsNow === false ? ' · release gate NOT met' : '';
   return el('div', { class: 'hold-why ' + info.kind, title: info.summary + gate }, info.summary + gate);
 }
-const fgStatusWithWhy = l => el('div', {}, fgStatusBadge(l.status), holdWhy(l.holdInfo));
+const fgStatusWithWhy = l => el('div', {}, fgStatusBadge(l.status), l.releaseBasis === 'no_metals' ? el('div', { class: 'hold-why', title: 'Released by a Quality Manager for a shipment to a destination that does not require heavy-metals results' }, 'Released — no heavy metals required') : null, holdWhy(l.holdInfo));
 function releaseStatusBlock(s) {
   const plain = s.tone === 'ok' && !s.heldLots;
   return el('div', { class: 'release-status ' + s.tone },
