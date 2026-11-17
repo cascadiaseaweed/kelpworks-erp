@@ -4971,15 +4971,27 @@ function holdWhy(info) {
   const gate = info.conformsNow === true ? ' · release gate met' : info.conformsNow === false ? ' · release gate NOT met' : '';
   return el('div', { class: 'hold-why ' + info.kind, title: info.summary + gate }, info.summary + gate);
 }
-// KW-100: Sold lots show the units SOLD, and lots split off one parent for the same SKU / release basis are one line (a lot of 10 with 5 sold to A and 2 to B is one Sold line of 7 and one line for the 3 left).
+// KW-100: ONE line per parent lot, SKU, pack, status and release basis. Sold lots show the units SOLD (a lot of 10 with 5 sold to A and 2 to B is one Sold line of 7 and one line for the 3 left); lots
+// split off a parent for the same SKU are merged on screen (the data keeps each lot and its number). The original lot (the number on the IBCs) leads; `members` lists them all. Held and disposed
+// lots are never merged (each has its own reason), and a sold lot with nothing sold is not listed.
 function fgDisplayRows(lots) {
   const out = [], groups = new Map();
+  const mergeable = ['sold', 'on_hand', 'pending_release'];
   for (const l of lots) {
-    if (l.status !== 'sold') { out.push(l); continue; }
-    if (!(l.unitsSold > 0)) continue;
-    const key = [l.parentLotId || l.id, l.sku, l.packageSize, l.releaseBasis || ''].join('|');
-    if (groups.has(key)) { const g = groups.get(key); g.unitsSold += l.unitsSold; g.members.push(l); continue; }
-    const g = Object.assign({}, l, { members: [l] }); groups.set(key, g); out.push(g);
+    if (l.status === 'sold' && !(l.unitsSold > 0)) continue;
+    if (!mergeable.includes(l.status)) { out.push(l); continue; }
+    const key = [l.parentLotId || l.id, l.sku, l.packageSize, l.status, l.releaseBasis || ''].join('|');
+    if (groups.has(key)) { groups.get(key).members.push(l); continue; }
+    const g = Object.assign({}, l, { members: [l], key }); groups.set(key, g); out.push(g);
+  }
+  for (const g of groups.values()) {
+    if (g.members.length < 2) continue;
+    g.members.sort((x, y) => (x.parentLotId ? 1 : 0) - (y.parentLotId ? 1 : 0) || x.id - y.id);       // the original lot first
+    const lead = g.members[0];
+    Object.assign(g, { id: lead.id, lot: lead.lot, qty: g.members.reduce((a, m) => a + (m.qty || 0), 0), litres: g.members.reduce((a, m) => a + (m.litres || 0), 0),
+      unitsSold: g.members.reduce((a, m) => a + (m.unitsSold || 0), 0) });
+    const locs = [...new Set(g.members.map(m => m.location || '—'))];
+    g.location = locs.length === 1 ? (locs[0] === '—' ? null : locs[0]) : locs.length + ' locations';
   }
   return out;
 }
@@ -5304,6 +5316,7 @@ async function pageFG(v) {
     el('div', { class: 'actions' }, el('button', { class: 'secondary', onclick: () => printLabelsFromFG() }, 'Print all on-hand labels'))));
   const r = await api('GET', '/fg');
   window.__fg = r.fg;
+  const expanded = new Set();                                          // merged lines whose lots are listed
   if (!r.fg.length) { v.append(el('div', { class: 'empty card' }, 'No finished goods yet.')); return; }
   const bulkBar = el('div', { class: 'bulkbar hidden' });
   const host = el('div', {});
@@ -5322,27 +5335,42 @@ async function pageFG(v) {
   }
   function draw() {
     const shown = fgDisplayRows(r.fg);
+    const idsOf = f => (f.members || [f]).map(m => m.id);
     const movable = shown.filter(f => f.status !== 'sold');
-    [...selected].forEach(id => { if (!movable.some(f => f.id === id)) selected.delete(id); });
+    const movableIds = new Set(movable.flatMap(idsOf));
+    [...selected].forEach(id => { if (!movableIds.has(id)) selected.delete(id); });
     host.innerHTML = '';
     const allCb = el('input', { type: 'checkbox', title: 'Select all', onchange: () => {
-      movable.forEach(f => allCb.checked ? selected.add(f.id) : selected.delete(f.id)); draw();
+      movable.forEach(f => idsOf(f).forEach(id => allCb.checked ? selected.add(id) : selected.delete(id))); draw();
     } });
-    allCb.checked = movable.length > 0 && movable.every(f => selected.has(f.id));
-    host.append(table(
-      [allCb, 'FG lot', 'SKU', 'Pack', 'Units', 'Litres', 'TDS', 'pH', 'Produced', 'Location', 'Status', ''],
-      shown.map(f => [
-        rowCheck(f, selected, updateBulk),
-        f.members && f.members.length > 1 ? el('span', {}, mono(f.lot), ' ', el('span', { class: 'muted', title: f.members.map(m => m.lot + ' (' + fmt(m.unitsSold) + ')').join('\n') }, '+' + (f.members.length - 1) + ' more'))
-          : mono(f.lot), fgSkuText(f), f.packageSize, fmt(fgUnits(f)), num(fmt(fgLitres(f), 0)),
-        f.tds != null ? fmt(f.tds, 2) + '%' : '—', f.ph != null ? fmt(f.ph, 2) : '—', f.producedDate || '—', f.location || '—',
-        fgStatusWithWhy(f), rowActions([
+    allCb.checked = movable.length > 0 && movable.every(f => idsOf(f).every(id => selected.has(id)));
+    const lotCell = (f, merged) => merged ? el('span', {}, mono(f.lot), ' ', el('span', { class: 'muted', title: f.members.map(m => m.lot + ' (' + fmt(f.status === 'sold' ? m.unitsSold : m.qty) + ')').join('\n') }, '+' + (f.members.length - 1) + ' more')) : mono(f.lot);
+    const common = f => [f.tds != null ? fmt(f.tds, 2) + '%' : '—', f.ph != null ? fmt(f.ph, 2) : '—', f.producedDate || '—', f.location || '—'];
+    const rows = [];
+    for (const f of shown) {
+      const merged = !!(f.members && f.members.length > 1), open = merged && expanded.has(f.key);
+      let check = rowCheck(f, selected, updateBulk);
+      if (merged && f.status !== 'sold') {                              // one checkbox for every lot on the line
+        const ids = idsOf(f), cb = el('input', { type: 'checkbox', class: 'rowcheck', onclick: e => e.stopPropagation(), onchange: () => { ids.forEach(id => cb.checked ? selected.add(id) : selected.delete(id)); draw(); } });
+        cb.checked = ids.every(id => selected.has(id)); check = cb;
+      }
+      rows.push([check, lotCell(f, merged), fgSkuText(f), f.packageSize, fmt(fgUnits(f)), num(fmt(fgLitres(f), 0)), ...common(f), fgStatusWithWhy(f),
+        merged ? rowActions([[open ? 'Hide lots' : 'Show lots', () => { open ? expanded.delete(f.key) : expanded.add(f.key); draw(); }]]) : rowActions([
           f.status !== 'sold' ? ['Move', () => moveFG(f)] : null,
           ['Label', () => printLabels([fgLabel(f)])],
           f.skuAssigned === false && f.status === 'on_hand' && f.qty > 0 ? ['Assign SKU', () => assignSkuModal(f)] : null,
           ['Edit', () => editFG(f)]
-        ])
-      ]), [false, false, false, false, true, true, false, false, false, false, false]));
+        ])]);
+      if (open) for (const m of f.members) {
+        rows.push([rowCheck(m, selected, updateBulk), el('span', { class: 'muted' }, '↳ ', mono(m.lot)), fgSkuText(m), m.packageSize, fmt(fgUnits(m)), num(fmt(fgLitres(m), 0)), ...common(m), fgStatusWithWhy(m), rowActions([
+          m.status !== 'sold' ? ['Move', () => moveFG(m)] : null,
+          ['Label', () => printLabels([fgLabel(m)])],
+          m.skuAssigned === false && m.status === 'on_hand' && m.qty > 0 ? ['Assign SKU', () => assignSkuModal(m)] : null,
+          ['Edit', () => editFG(m)]
+        ])]);
+      }
+    }
+    host.append(table([allCb, 'FG lot', 'SKU', 'Pack', 'Units', 'Litres', 'TDS', 'pH', 'Produced', 'Location', 'Status', ''], rows, [false, false, false, false, true, true, false, false, false, false, false]));
     updateBulk();
   }
   draw();
