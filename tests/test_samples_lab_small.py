@@ -45,5 +45,5 @@ def test_the_screen_pieces_are_in_place():
     assert "!f.statuses) f.statuses = Object.keys(SAMPLE_STATUS_LABELS).filter(k => k !== 'submitted')" in js                                        # KW-35
     assert "function sampleContainerTotals" in js and "Containers to collect" in js and "function buildSampleSummaryCard" in js                        # KW-14 / KW-27
     flat = " ".join(js.split())
-    assert "notesSection.box, sampleSummary.box);" in flat                              # KW-27: the summary comes after the Notes section
+    assert "notesSection.box, sampleSummary.box," in flat                               # KW-27: the summary comes after the Notes section (KW-99 adds the "finish as a loss" box after it)
     assert "sampleSummary.refresh(draftId)" in js

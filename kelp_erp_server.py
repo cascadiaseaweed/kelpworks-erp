@@ -277,6 +277,14 @@ SETTINGS_DEFAULTS = [
      "while the process and microbial tests pass and the heavy-metals results are still to come. The rest of the run stays Pending Release. Leave at 0 until the Quality Manager has approved the written procedure."),
     ("review_not_by_finalizer", 0, "Review: the person who finalized a run cannot review it (1 = yes)",
      "When 1, a Production Manager cannot review a production log they finalized themselves."),
+    ("loss_report_min_feedstock_kg", 0, "Loss report: feedstock loss above which a report is required (kg)",
+     "A loss of feedstock of MORE than this many kg must be reported (Losses tab). 0 = every loss. A smaller loss may still be reported; it is never refused. The Quality Manager sets the real value."),
+    ("loss_report_min_product_l", 0, "Loss report: in-process or finished product loss above which a report is required (L)",
+     "A loss of in-process or finished product of MORE than this many litres must be reported (Losses tab). 0 = every loss. A smaller loss may still be reported; it is never refused. The Quality Manager sets the real value."),
+    ("loss_repeat_count", 3, "Loss report: reports with the same cause and stage that force a corrective action",
+     "When a report is the Nth (or later) with the same cause and stage within the number of days below, the Quality Manager must record a corrective action to close it. 0 = never forced."),
+    ("loss_repeat_days", 180, "Loss report: window for repeated causes (days)",
+     "How far back reports with the same cause and stage are counted for the repeat rule above."),
     ("lab_result_require_report", 1, "Lab results: a lab report must be attached for tests with a release rule (1 = yes)",
      "When 1, a result for a heavy-metal, microbial or TDS test (a test that must pass for release) can only be entered with the lab report attached to the run."),
 ]
@@ -1426,7 +1434,7 @@ CREATE TABLE IF NOT EXISTS release_events (
     run_id       INTEGER NOT NULL,
     event_type   TEXT NOT NULL,     -- submitted | review_approved | review_returned | resubmitted |
                                     -- released | release_rejected | reopened | voided | legacy_release |
-                                    -- fg_lot_edited | lab_result_hold
+                                    -- fg_lot_edited | lab_result_hold | loss_opened | loss_confirmed | loss_closed (KW-99, run_id 0 when the report has no run)
     user_id      INTEGER,
     user_name    TEXT,
     user_email   TEXT,
@@ -1973,6 +1981,58 @@ CREATE TABLE IF NOT EXISTS config_log (
     changed_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_config_log_key ON config_log(area, key);
+
+-- KW-99 loss reports: feedstock, in-process or finished product that was lost (not shipped, not disposed through a normal process). RECORDS: a report is never edited or
+-- deleted; a mistake is corrected by a NEW report that points at the old one (corrects_id). The only changes are the status (open -> confirmed -> closed) made by the server
+-- when a signature is added, and each signature is a row in loss_report_steps. Every state change is also a hash-chained release_events line (loss_opened / loss_confirmed /
+-- loss_closed) carrying a SHA-256 of the report and its steps. Nothing here touches stock, the ledger, or a tote / lot status.
+CREATE TABLE IF NOT EXISTS loss_causes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    active      INTEGER NOT NULL DEFAULT 1,
+    sort_order  INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS loss_reports (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_no        TEXT NOT NULL UNIQUE,            -- LR-YYYYMMDD-NNN
+    status           TEXT NOT NULL DEFAULT 'open',    -- open | confirmed | closed
+    run_id           INTEGER REFERENCES production_runs(id),
+    tote_lot_id      INTEGER REFERENCES tote_lots(id),
+    fg_lot_id        INTEGER REFERENCES fg_lots(id),
+    ref_text         TEXT,                            -- free description / lot number as written by the reporter
+    stage            TEXT NOT NULL,
+    lost_kind        TEXT NOT NULL,                   -- feedstock | in_process | finished
+    qty              REAL NOT NULL,
+    unit             TEXT NOT NULL,                   -- kg (feedstock) | L
+    occurred_at      TEXT NOT NULL,
+    found_at         TEXT NOT NULL,
+    cause_id         INTEGER REFERENCES loss_causes(id),
+    cause_name       TEXT NOT NULL,                   -- the cause as named when the report was opened
+    description      TEXT NOT NULL,
+    disposal_route   TEXT NOT NULL,
+    disposal_other   TEXT,
+    may_affect_other INTEGER NOT NULL DEFAULT 0,
+    reportable       INTEGER NOT NULL DEFAULT 1,      -- the quantity was above the threshold for its kind when opened
+    threshold_used   REAL NOT NULL DEFAULT 0,
+    corrects_id      INTEGER REFERENCES loss_reports(id),
+    opened_by        TEXT NOT NULL,
+    opened_by_id     INTEGER,
+    opened_at        TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS loss_report_steps (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id   INTEGER NOT NULL REFERENCES loss_reports(id),
+    step        TEXT NOT NULL,                        -- confirm | close
+    by_name     TEXT NOT NULL,
+    by_id       INTEGER,
+    capacity    TEXT,
+    note        TEXT,
+    fields_json TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT NOT NULL
+);
 """
 
 
@@ -2237,6 +2297,7 @@ STATUS_RULES = [
     ("preproc_batches", ("draft", "completed")),
     ("sop_documents", ("current", "withdrawn", "retired")),
     ("sds_documents", ("current", "withdrawn")),
+    ("loss_reports", ("open", "confirmed", "closed")),
 ]
 
 
@@ -2400,6 +2461,7 @@ def init_db():
             ensure_suppliers(conn)
             ensure_sds_supplier_links(conn)
             ensure_grade_rules(conn)
+            ensure_loss_causes(conn)
             soft_step(conn, "feedstock grades", lambda: sync_tote_grades(conn, None, "Start-up check", quiet=True))
             soft_step(conn, "foreign-key indexes", lambda: ensure_indexes(conn))
             # one tote number per site / species / harvest date (the lot number is unique already; this guards the parts it is built from). Not for pre-processing blends, which are numbered per batch.
@@ -3267,7 +3329,10 @@ def release_gate(conn, r):
     """What stands between this run and Quality release: every specification with a release rule, judged now.
     -> [{code, name, group, rule, ruleText, spec, result, status, ok, reason}]. A run can be released only when every item is ok.
     Rule 'pass': a result is on file and it passes the specification (a heavy metal that cannot be judged, for example because the application rate is not set,
-    does not pass). Rule 'min': a result is on file and it is at or above the specification's lower limit (the upper limit is not a release condition)."""
+    does not pass). Rule 'min': a result is on file and it is at or above the specification's lower limit (the upper limit is not a release condition).
+    A run finished as a loss (KW-99, `no_output`) made no product, so there is nothing to release: no gate."""
+    if r["release_state"] == "no_output":
+        return []
     ev = coa_evaluate(conn, r)
     rows = {x["code"]: x for x in ev["rows"]}
     out = []
@@ -3507,6 +3572,9 @@ def release_checklist(conn, r, gate, lab, problems, amendment, log_matches=None,
     def add(key, label, st, reason="", action=None):
         items.append({"key": key, "label": label, "state": st, "reason": reason, "action": action})
 
+    if state == "no_output":                                               # KW-99: finished as a loss: no review, no release; the Quality Manager's decision is the loss close-out
+        add("loss", "Finished as a loss", "na", "No product was made, so there is no production-log review or release. The loss report is closed out in Losses.")
+        return items
     if state == "pending_review":
         add("review", "Production log reviewed", "fail", "Waiting for the Production Manager's review", "review")
     elif state == "returned":
@@ -3631,7 +3699,9 @@ def release_status(r, lots, last, amendment, gate, problems):
     def by(ev):
         return "%s on %s" % (ev["user"], (ev["at"] or "")[:10]) if ev else ""
 
-    if state == "pending_review":
+    if state == "no_output":
+        st.update(tone="info", next="This run was finished as a loss and made no product: there is nothing to review or release. The loss report (Losses tab) is closed out by a Quality Manager.")
+    elif state == "pending_review":
         st.update(tone="warn", waitingOn="Production Manager", next="Review the production log, then approve it or return it for correction.")
     elif state == "returned":
         ev = last.get("review_returned")
@@ -5246,7 +5316,9 @@ def migrate(conn):
         ("hist_release", "TEXT"),                          # review (normal release) | grandfather (released as of entry, no gate)
         ("hist_note", "TEXT"),                             # the required fields that were missing at finalize
         ("hist_entered_by", "TEXT"), ("hist_entered_at", "TEXT"),
-        ("release_state", "TEXT"),          # pending_review | pending_release | released | returned | rejected | legacy
+        ("release_state", "TEXT"),          # pending_review | pending_release | released | returned | rejected | legacy | amending | no_output (KW-99: finished as a loss)
+        ("loss_report_id", "INTEGER"),      # KW-99: the loss report this run was finished with (no output, no packaging)
+        ("loss_missing", "TEXT"),           # KW-99: the required fields that were missing when it was finished as a loss
         ("release_review_hash", "TEXT"),    # log snapshot hash the approving review signed
         ("packaging_started_at", "TEXT"), ("packaging_packaged_at", "TEXT"),
         ("packaging_qc_ph", "REAL"), ("packaging_tds_pct", "REAL"), ("packaging_brix_pct", "REAL"),
@@ -6650,8 +6722,51 @@ def release_verify_chain(conn):
 RELEASE_LABELS = {
     "pending_review": "Pending review", "pending_release": "Awaiting QA release", "released": "Released",
     "returned": "Returned for correction", "rejected": "Rejected - on hold", "legacy": "Released (pre-process)",
-    "amending": "Under amendment",
+    "amending": "Under amendment", "no_output": "No product (loss)",
 }
+
+# KW-99 loss reports: the code lists (also sent to the screen in refdata), the audit-trail event types and the pure helpers.
+LOSS_STAGES = ["Feedstock", "Homogenization", "Extraction", "Separation", "Pasteurization", "Dilution & Preservation", "Packaging", "Storage", "Other"]
+LOSS_KINDS = [("feedstock", "Feedstock", "kg"), ("in_process", "In-process product", "L"), ("finished", "Finished product", "L")]
+LOSS_DISPOSAL = ["Liquid waste", "Solids waste", "Reprocess", "Other"]
+LOSS_CAUSE_SEED = ["Operator error", "Equipment failure", "Feedstock quality", "Process deviation", "Spill / leak", "Other"]
+LOSS_EVENT_TYPES = ("loss_opened", "loss_confirmed", "loss_closed")
+LOSS_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(T\d{2}:\d{2})?$")
+
+
+def loss_report_hash(conn, report_id):
+    """SHA-256 of a loss report (every stored column) and its signature steps as they stand now; each loss event carries the value at the time it was written."""
+    r = conn.execute("SELECT * FROM loss_reports WHERE id=?", (report_id,)).fetchone()
+    if not r:
+        return None
+    steps = [dict(x) for x in conn.execute("SELECT * FROM loss_report_steps WHERE report_id=? ORDER BY id", (report_id,))]
+    return hashlib.sha256(_canon({"report": dict(r), "steps": steps}).encode("utf-8")).hexdigest()
+
+
+def loss_events(conn, report_no=None):
+    """The loss events in the audit trail: {report no: [event rows oldest first]} (or the list for one report number)."""
+    out = {}
+    sql = "SELECT * FROM release_events WHERE event_type IN (%s)" % ",".join("?" * len(LOSS_EVENT_TYPES))
+    args = list(LOSS_EVENT_TYPES)
+    if report_no:
+        sql += " AND detail LIKE ?"
+        args.append('%"reportNo":"' + report_no.replace("%", "").replace("_", "") + '"%')
+    for e in conn.execute(sql + " ORDER BY id", args):
+        try:
+            no = (json.loads(e["detail"]) if e["detail"] else {}).get("reportNo")
+        except ValueError:
+            continue
+        if no:
+            out.setdefault(no, []).append(e)
+    return out.get(report_no, []) if report_no else out
+
+
+def ensure_loss_causes(conn):
+    """KW-99: the causes every database starts with (once: a cause an administrator renamed or switched off is never put back)."""
+    def seed_causes():
+        for i, name in enumerate(LOSS_CAUSE_SEED, 1):
+            conn.execute("INSERT OR IGNORE INTO loss_causes (name, active, sort_order, created_at) VALUES (?,1,?,?)", (name, i * 10, now_iso()))
+    run_once(conn, "loss_causes_seed", seed_causes)
 
 
 def fg_public(r):
@@ -9367,6 +9482,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.route_coa_specs(method, seg, conn, user)
         if seg[:2] == ["api", "destinations"]:
             return self.route_destinations(method, seg, conn, user)
+        if seg[:2] == ["api", "losses"]:
+            return self.route_losses(method, seg, query, conn, user)
+        if seg[:2] == ["api", "loss-causes"]:
+            return self.route_loss_causes(method, seg, conn, user)
         if seg == ["api", "requisition-contact"] and method == "GET":
             return requisition_contact_get(conn)
         if seg == ["api", "requisition-contact"] and method == "PUT":
@@ -9659,7 +9778,10 @@ class Handler(BaseHTTPRequestHandler):
                 "sops": sops, "libraryPending": library_pending_count(conn),
                 "sopSpots": list(SOP_SPOT_INFO.values()), "sopLinks": self._sop_links_by_spot(conn),
                 "settings": get_settings(conn), "containers": containers, "containerAliases": container_name_aliases(conn),
-                "qcFields": qc_fields, "requiredFields": required_keys_by_stage()}
+                "qcFields": qc_fields, "requiredFields": required_keys_by_stage(),
+                "lossStages": LOSS_STAGES, "lossKinds": [{"code": c, "name": n, "unit": u} for c, n, u in LOSS_KINDS], "lossDisposal": LOSS_DISPOSAL,
+                "lossCauses": [{"id": r["id"], "name": r["name"]} for r in conn.execute("SELECT id, name FROM loss_causes WHERE active=1 ORDER BY sort_order, id")],
+                "lossOpenCount": conn.execute("SELECT COUNT(*) c FROM loss_reports WHERE status!='closed'").fetchone()["c"]}
 
     # ---- settings: admin-editable constants used by calculated fields ----- #
     def route_settings(self, method, seg, conn, user):
@@ -10867,6 +10989,410 @@ class Handler(BaseHTTPRequestHandler):
             return {"log": [{"field": x["field"], "old": x["old_value"], "new": x["new_value"], "by": x["changed_by"], "at": x["changed_at"]}
                             for x in conn.execute("SELECT * FROM config_log WHERE area='destination' AND key=? ORDER BY id DESC LIMIT 100", (str(r["id"]),))]}
         raise ApiError(404, "Unknown destinations endpoint")
+
+    # ---- loss reports (KW-99): feedstock, in-process or finished product that was lost ---------------------------------------------------------------- #
+    # A loss report is a RECORD: there is no edit and no delete. Open (anyone) -> Confirm (Production Manager) -> Close (Quality Manager); each signature re-checks the
+    # password, is a row in loss_report_steps and a hash-chained release_events line (loss_opened / loss_confirmed / loss_closed). A Production Manager who opens a report
+    # also confirms it. A mistake is corrected by a NEW report that points at the old one. NOTHING here moves stock, the ledger, or a tote / lot status.
+    LOSS_SQL = ("SELECT l.*, p.processing_lot, t.lot_number AS tote_lot, f.fg_lot_number AS fg_lot_number, c.report_no AS corrects_no FROM loss_reports l"
+                " LEFT JOIN production_runs p ON p.id=l.run_id LEFT JOIN tote_lots t ON t.id=l.tote_lot_id LEFT JOIN fg_lots f ON f.id=l.fg_lot_id"
+                " LEFT JOIN loss_reports c ON c.id=l.corrects_id")
+
+    @staticmethod
+    def _loss_threshold(conn, kind):
+        return num(get_setting_value(conn, "loss_report_min_feedstock_kg" if kind == "feedstock" else "loss_report_min_product_l", 0), 0.0)
+
+    @staticmethod
+    def _loss_yes_no(v, what):
+        s = str(v).strip().lower() if v is not None else ""
+        if s in ("yes", "true", "1"):
+            return "yes"
+        if s in ("no", "false", "0"):
+            return "no"
+        raise ApiError(400, "Answer yes or no: %s" % what)
+
+    @staticmethod
+    def _loss_check_password(user, d):
+        if not verify_password(d.get("password") or "", user["password_hash"]):
+            raise ApiError(400, "Password is incorrect - your signature was not recorded")
+
+    @staticmethod
+    def _loss_date(v, what):
+        s = str(v or "").strip()
+        m = LOSS_DATE_RE.match(s)
+        if not m:
+            raise ApiError(400, "Enter %s as a date (and optionally a time)" % what)
+        try:
+            datetime.date.fromisoformat(m.group(1))
+            if m.group(2):
+                hh, mm = int(m.group(2)[1:3]), int(m.group(2)[4:6])
+                if hh > 23 or mm > 59:
+                    raise ValueError
+        except ValueError:
+            raise ApiError(400, "Enter %s as a valid date" % what)
+        if m.group(1) > today_iso():
+            raise ApiError(400, "%s cannot be in the future" % (what[:1].upper() + what[1:]))
+        return s
+
+    def _loss_steps(self, conn, rid):
+        out = []
+        for x in conn.execute("SELECT * FROM loss_report_steps WHERE report_id=? ORDER BY id", (rid,)):
+            try:
+                fields = json.loads(x["fields_json"]) if x["fields_json"] else {}
+            except ValueError:
+                fields = {}
+            out.append({"step": x["step"], "by": x["by_name"], "capacity": x["capacity"], "at": x["created_at"], "note": x["note"], "fields": fields})
+        return out
+
+    def _loss_public(self, conn, r, with_steps=True):
+        steps = self._loss_steps(conn, r["id"])
+        confirm = next((s for s in reversed(steps) if s["step"] == "confirm"), None)
+        close = next((s for s in reversed(steps) if s["step"] == "close"), None)
+        age = None
+        if r["status"] != "closed":
+            try:
+                age = max(0, (utcnow() - datetime.datetime.strptime(r["opened_at"][:19], "%Y-%m-%dT%H:%M:%S")).days)
+            except ValueError:
+                age = None
+        cf = (confirm or {}).get("fields") or {}
+        cl = (close or {}).get("fields") or {}
+        out = {"id": r["id"], "reportNo": r["report_no"], "status": r["status"],
+               "runId": r["run_id"], "processingLot": r["processing_lot"], "toteId": r["tote_lot_id"], "toteLot": r["tote_lot"],
+               "fgLotId": r["fg_lot_id"], "fgLotNumber": r["fg_lot_number"], "refText": r["ref_text"],
+               "stage": r["stage"], "lostKind": r["lost_kind"], "qty": r["qty"], "unit": r["unit"], "occurredAt": r["occurred_at"], "foundAt": r["found_at"],
+               "causeId": r["cause_id"], "causeName": r["cause_name"], "description": r["description"], "disposalRoute": r["disposal_route"],
+               "disposalOther": r["disposal_other"], "mayAffectOther": bool(r["may_affect_other"]),
+               "reportable": bool(r["reportable"]), "thresholdUsed": r["threshold_used"],
+               "correctsId": r["corrects_id"], "correctsNo": r["corrects_no"], "openedBy": r["opened_by"], "openedAt": r["opened_at"], "ageDays": age,
+               "confirmedQty": cf.get("qty") if confirm else None, "confirmedCauseName": cf.get("causeName") if confirm else None,
+               "close": ({"nonconformance": cl.get("nonconformance"), "otherLotsAffected": cl.get("otherLotsAffected"), "otherLotsNote": cl.get("otherLotsNote"),
+                          "capaRequired": bool(cl.get("capaRequired")), "capaText": cl.get("capaText"), "capaOwner": cl.get("capaOwner"), "capaDue": cl.get("capaDue")}
+                         if close else None)}
+        if with_steps:
+            out["steps"] = steps
+        return out
+
+    def _loss_effective(self, conn):
+        """{report id: (quantity, cause id, cause name)} as confirmed: the Production Manager may correct the quantity and the cause when signing; the report itself is never changed."""
+        eff = {r["id"]: (r["qty"], r["cause_id"], r["cause_name"]) for r in conn.execute("SELECT id, qty, cause_id, cause_name FROM loss_reports")}
+        for s in conn.execute("SELECT report_id, fields_json FROM loss_report_steps WHERE step='confirm' ORDER BY id"):
+            try:
+                f = json.loads(s["fields_json"] or "{}")
+            except ValueError:
+                continue
+            q, cid, cname = eff.get(s["report_id"], (None, None, None))
+            eff[s["report_id"]] = (f.get("qty", q), f.get("causeId", cid), f.get("causeName", cname))
+        return eff
+
+    def _loss_repeat(self, conn, r):
+        """The repeat rule for a report: how many reports (this one included) have the same cause and stage within `loss_repeat_days` before it, and is that enough
+        (`loss_repeat_count`) to force a corrective action. A report that a later report corrects is not counted twice."""
+        limit = int(num(get_setting_value(conn, "loss_repeat_count", 3), 3))
+        days = int(num(get_setting_value(conn, "loss_repeat_days", 180), 180))
+        eff = self._loss_effective(conn)
+        _q, cid, cname = eff[r["id"]]
+        try:
+            opened = datetime.datetime.strptime(r["opened_at"][:19], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            opened = utcnow()
+        cutoff = (opened - datetime.timedelta(days=days)).isoformat() + "Z"
+        corrected = {x["corrects_id"] for x in conn.execute("SELECT corrects_id FROM loss_reports WHERE corrects_id IS NOT NULL")}
+        count = 0
+        for x in conn.execute("SELECT id, opened_at FROM loss_reports WHERE stage=? AND id<=? AND opened_at>=?", (r["stage"], r["id"], cutoff)):
+            _q2, cid2, cname2 = eff[x["id"]]
+            same = (cid2 == cid) if (cid2 is not None and cid is not None) else (cname2 == cname)
+            if same and (x["id"] == r["id"] or x["id"] not in corrected):
+                count += 1
+        return {"count": count, "needed": limit > 0 and count >= limit, "windowDays": days, "limit": limit, "cause": cname, "stage": r["stage"]}
+
+    def _loss_event(self, conn, r, user, event_type, capacity, meaning, comment, extra=None):
+        """Append the audit-trail line for the report as it stands now (the hash covers the report and every step, so it is written AFTER the step and status change)."""
+        qty, _cid, cname = self._loss_effective(conn)[r["id"]]
+        detail = {"reportNo": r["report_no"], "qty": qty, "unit": r["unit"], "cause": cname, "stage": r["stage"], "status": conn.execute(
+            "SELECT status FROM loss_reports WHERE id=?", (r["id"],)).fetchone()["status"], "reportHash": loss_report_hash(conn, r["id"])}
+        detail.update(extra or {})
+        release_log(conn, r["run_id"] or 0, event_type, user, capacity=capacity, meaning=meaning, comment=comment, detail=detail)
+
+    @staticmethod
+    def _loss_capacity(user):
+        return "Production Manager" if user["is_production_manager"] else ("Quality Manager" if user["is_quality_manager"] else "Reporter")
+
+    def _loss_do_confirm(self, conn, r, user, qty=None, cause_id=None, note=None, at_opening=False):
+        orig_qty, orig_cid, orig_cname = r["qty"], r["cause_id"], r["cause_name"]
+        new_qty = orig_qty if qty is None else qty
+        cid, cname = orig_cid, orig_cname
+        if cause_id is not None and cause_id != orig_cid:
+            c = conn.execute("SELECT * FROM loss_causes WHERE id=?", (cause_id,)).fetchone()
+            if not c or not c["active"]:
+                raise ApiError(400, "Choose a cause from the list")
+            cid, cname = c["id"], c["name"]
+        fields = {"qty": new_qty, "causeId": cid, "causeName": cname, "originalQty": orig_qty, "originalCauseName": orig_cname,
+                  "changed": bool(new_qty != orig_qty or cid != orig_cid)}
+        if at_opening:
+            note = "confirmed at opening by the reporting Production Manager"
+        conn.execute("INSERT INTO loss_report_steps (report_id,step,by_name,by_id,capacity,note,fields_json,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                     (r["id"], "confirm", user["name"], user["id"], "Production Manager", note, _canon(fields), now_iso()))
+        conn.execute("UPDATE loss_reports SET status='confirmed' WHERE id=?", (r["id"],))
+        self._loss_event(conn, r, user, "loss_confirmed", "Production Manager",
+                         "I confirm that %s %s of %s was lost (%s, %s) as recorded in loss report %s." % (("%g" % new_qty), r["unit"], r["lost_kind"].replace("_", " "), cname, r["stage"], r["report_no"]),
+                         note, {"changed": fields["changed"], "originalQty": orig_qty} if fields["changed"] else None)
+
+    def _loss_open(self, conn, d, user):
+        self._loss_check_password(user, d)
+        link = {}
+        for key, table, label in (("runId", "production_runs", "production run"), ("toteId", "tote_lots", "tote"), ("fgLotId", "fg_lots", "finished-goods lot")):
+            if d.get(key) not in (None, "", 0):
+                try:
+                    i = int(d[key])
+                except (TypeError, ValueError):
+                    raise ApiError(400, "Choose a valid %s" % label)
+                if not conn.execute("SELECT 1 FROM %s WHERE id=?" % table, (i,)).fetchone():
+                    raise ApiError(400, "The %s was not found" % label)
+                link[key] = i
+        ref_text = (d.get("refText") or "").strip() or None
+        if not link and not ref_text:
+            raise ApiError(400, "Say what was lost: link a production run, tote or finished-goods lot, or describe it in the reference box")
+        stage = (d.get("stage") or "").strip()
+        if stage not in LOSS_STAGES:
+            raise ApiError(400, "Choose the process stage where the loss happened")
+        kinds = {c: (n, u) for c, n, u in LOSS_KINDS}
+        kind = (d.get("lostKind") or "").strip()
+        if kind not in kinds:
+            raise ApiError(400, "Choose what was lost (feedstock, in-process product or finished product)")
+        unit = kinds[kind][1]
+        qty = numn(d.get("qty"))
+        if qty is None or qty <= 0:
+            raise ApiError(400, "Enter how much was lost, a number greater than zero (%s)" % unit)
+        occurred = self._loss_date(d.get("occurredAt"), "the date the loss happened")
+        found = self._loss_date(d.get("foundAt"), "the date the loss was found")
+        if (occurred[10:] and found[10:] and found < occurred) or ((not occurred[10:] or not found[10:]) and found[:10] < occurred[:10]):
+            raise ApiError(400, "The date found cannot be before the date the loss happened")
+        try:
+            cid = int(d.get("causeId"))
+        except (TypeError, ValueError):
+            raise ApiError(400, "Choose the cause of the loss")
+        cause = conn.execute("SELECT * FROM loss_causes WHERE id=?", (cid,)).fetchone()
+        if not cause or not cause["active"]:
+            raise ApiError(400, "Choose the cause of the loss from the list")
+        desc = (d.get("description") or "").strip()
+        if len(desc) < 3:
+            raise ApiError(400, "Describe what happened")
+        route = (d.get("disposalRoute") or "").strip()
+        if route not in LOSS_DISPOSAL:
+            raise ApiError(400, "Choose how the lost material was disposed of")
+        route_other = (d.get("disposalOther") or "").strip() or None
+        if route == "Other" and not route_other:
+            raise ApiError(400, "Say how the lost material was disposed of (Other)")
+        if route != "Other":
+            route_other = None
+        corrects = None
+        if d.get("correctsId") not in (None, "", 0):
+            try:
+                corrects = int(d["correctsId"])
+            except (TypeError, ValueError):
+                raise ApiError(400, "Choose a valid report to correct")
+            if not conn.execute("SELECT 1 FROM loss_reports WHERE id=?", (corrects,)).fetchone():
+                raise ApiError(400, "The report to correct was not found")
+        threshold = self._loss_threshold(conn, kind)
+        reportable = qty > threshold
+        prefix = "LR-%s-" % today_iso().replace("-", "")
+        last = conn.execute("SELECT report_no FROM loss_reports WHERE report_no LIKE ? ORDER BY report_no DESC LIMIT 1", (prefix + "%",)).fetchone()
+        seq = (int(last["report_no"][len(prefix):]) + 1) if last and last["report_no"][len(prefix):].isdigit() else 1
+        no = "%s%03d" % (prefix, seq)
+        ts = now_iso()
+        cur = conn.execute(
+            "INSERT INTO loss_reports (report_no,status,run_id,tote_lot_id,fg_lot_id,ref_text,stage,lost_kind,qty,unit,occurred_at,found_at,cause_id,cause_name,description,"
+            "disposal_route,disposal_other,may_affect_other,reportable,threshold_used,corrects_id,opened_by,opened_by_id,opened_at) VALUES (?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (no, link.get("runId"), link.get("toteId"), link.get("fgLotId"), ref_text, stage, kind, qty, unit, occurred, found, cause["id"], cause["name"], desc,
+             route, route_other, 1 if d.get("mayAffectOther") in (True, 1, "1", "true", "yes") else 0, 1 if reportable else 0, threshold, corrects, user["name"], user["id"], ts))
+        r = conn.execute("SELECT * FROM loss_reports WHERE id=?", (cur.lastrowid,)).fetchone()
+        self._loss_event(conn, r, user, "loss_opened", self._loss_capacity(user),
+                         "I report that %s %s of %s was lost at %s (%s), as recorded in loss report %s." % (("%g" % qty), unit, kind.replace("_", " "), stage, cause["name"], no),
+                         None, {"reportable": reportable, "thresholdUsed": threshold, "correctsNo": conn.execute("SELECT report_no FROM loss_reports WHERE id=?", (corrects,)).fetchone()["report_no"] if corrects else None})
+        if user["is_production_manager"]:
+            self._loss_do_confirm(conn, r, user, at_opening=True)
+        note =("This loss is above the reporting threshold (%s %s), so a report is required." % (("%g" % threshold), unit) if reportable else
+                "This loss is at or below the reporting threshold (%s %s): a report is not required, but it has been recorded." % (("%g" % threshold), unit))
+        return {"loss": self._loss_public(conn, conn.execute(self.LOSS_SQL + " WHERE l.id=?", (r["id"],)).fetchone()), "requiredNote": note}
+
+    def _loss_confirm(self, conn, r, d, user):
+        self._loss_check_password(user, d)
+        if not user["is_production_manager"]:
+            raise ApiError(403, "Only a Production Manager can confirm a loss report")
+        if r["status"] == "closed":
+            raise ApiError(409, "This loss report is closed and cannot be changed. Open a new report that corrects it if something was wrong.", "closed")
+        if r["status"] != "open":
+            raise ApiError(409, "This loss report has already been confirmed")
+        qty = None
+        if d.get("qty") not in (None, ""):
+            qty = numn(d.get("qty"))
+            if qty is None or qty <= 0:
+                raise ApiError(400, "Enter the confirmed quantity, a number greater than zero")
+        cause_id = None
+        if d.get("causeId") not in (None, ""):
+            try:
+                cause_id = int(d["causeId"])
+            except (TypeError, ValueError):
+                raise ApiError(400, "Choose the cause of the loss from the list")
+        self._loss_do_confirm(conn, r, user, qty, cause_id, (d.get("note") or "").strip() or None)
+        return self._loss_detail(conn, r["id"], user)
+
+    def _loss_close(self, conn, r, d, user):
+        self._loss_check_password(user, d)
+        if not user["is_quality_manager"]:
+            raise ApiError(403, "Only a Quality Manager can close a loss report")
+        if r["status"] == "closed":
+            raise ApiError(409, "This loss report is already closed and cannot be changed. Open a new report that corrects it if something was wrong.", "closed")
+        if r["status"] != "confirmed":
+            raise ApiError(409, "A Production Manager must confirm this loss report before it can be closed")
+        if float(get_setting_value(conn, "release_separate_signers", 0) or 0):
+            conf = conn.execute("SELECT by_id FROM loss_report_steps WHERE report_id=? AND step='confirm' ORDER BY id DESC LIMIT 1", (r["id"],)).fetchone()
+            if conf and conf["by_id"] == user["id"]:
+                raise ApiError(403, "You confirmed this loss report, so another Quality Manager must close it (setting: reviewer and releaser must differ).", "same_person")
+        nonconf = self._loss_yes_no(d.get("nonconformance"), "is this a non-conformance?")
+        other = self._loss_yes_no(d.get("otherLotsAffected"), "could other lots be affected?")
+        capa = self._loss_yes_no(d.get("capaRequired"), "is a corrective action required?") == "yes"
+        rep = self._loss_repeat(conn, r)
+        if rep["needed"] and not capa:
+            raise ApiError(400, "This is report %d with the same cause (%s) and stage (%s) within %d days (a corrective action is required from %d). Record a corrective action to close it."
+                           % (rep["count"], rep["cause"], rep["stage"], rep["windowDays"], rep["limit"]), "capa_required")
+        capa_text, capa_owner, capa_due = (d.get("capaText") or "").strip(), (d.get("capaOwner") or "").strip(), (d.get("capaDue") or "").strip()
+        if capa:
+            if not capa_text or not capa_owner or not capa_due:
+                raise ApiError(400, "A corrective action needs a description, an owner and a due date")
+            try:
+                datetime.date.fromisoformat(capa_due)
+            except ValueError:
+                raise ApiError(400, "Enter the corrective action due date as a date")
+        else:
+            capa_text = capa_owner = capa_due = None
+        fields = {"nonconformance": nonconf, "otherLotsAffected": other, "otherLotsNote": (d.get("otherLotsNote") or "").strip() or None,
+                  "capaRequired": capa, "capaText": capa_text or None, "capaOwner": capa_owner or None, "capaDue": capa_due or None}
+        note = (d.get("note") or "").strip() or None
+        conn.execute("INSERT INTO loss_report_steps (report_id,step,by_name,by_id,capacity,note,fields_json,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                     (r["id"], "close", user["name"], user["id"], "Quality Manager", note, _canon(fields), now_iso()))
+        conn.execute("UPDATE loss_reports SET status='closed' WHERE id=?", (r["id"],))
+        self._loss_event(conn, r, user, "loss_closed", "Quality Manager",
+                         "I have reviewed loss report %s and record the non-conformance assessment%s." % (r["report_no"], " and the corrective action" if capa else ""),
+                         note, {"nonconformance": nonconf, "otherLotsAffected": other, "capaRequired": capa})
+        return self._loss_detail(conn, r["id"], user)
+
+    def _loss_detail(self, conn, rid, user):
+        r = conn.execute(self.LOSS_SQL + " WHERE l.id=?", (rid,)).fetchone()
+        if not r:
+            raise ApiError(404, "Loss report not found")
+        run = conn.execute("SELECT * FROM production_runs WHERE id=?", (r["run_id"],)).fetchone() if r["run_id"] else None
+        events = [{"id": e["id"], "type": e["event_type"], "user": e["user_name"], "capacity": e["capacity"], "at": e["created_at"], "comment": e["comment"], "meaning": e["meaning"],
+                   "detail": json.loads(e["detail"]) if e["detail"] else None, "entryHash": e["entry_hash"]} for e in loss_events(conn, r["report_no"])]
+        rep = self._loss_repeat(conn, r)
+        return {"loss": self._loss_public(conn, r), "events": events, "recall": self._recall_report(conn, run) if run else None,
+                "repeat": {"count": rep["count"], "needed": rep["needed"], "windowDays": rep["windowDays"], "cause": rep["cause"], "stage": rep["stage"]},
+                "me": {"canConfirm": bool(user["is_production_manager"]), "canClose": bool(user["is_quality_manager"])}}
+
+    def _loss_by_run(self, conn, run_id=None):
+        """{run id: {count, open, feedstockKg, productL}}: every run that has a loss report (quantities as confirmed). Read from the loss tables, never from the signed production-log snapshot."""
+        eff = self._loss_effective(conn)
+        out = {}
+        for r in conn.execute("SELECT id, run_id, lost_kind, status FROM loss_reports WHERE run_id IS NOT NULL" + (" AND run_id=%d" % int(run_id) if run_id is not None else "")):
+            b = out.setdefault(r["run_id"], {"count": 0, "open": 0, "feedstockKg": 0.0, "productL": 0.0})
+            b["count"] += 1
+            b["open"] += 1 if r["status"] != "closed" else 0
+            b["feedstockKg" if r["lost_kind"] == "feedstock" else "productL"] = round(b["feedstockKg" if r["lost_kind"] == "feedstock" else "productL"] + (eff[r["id"]][0] or 0), 4)
+        return out
+
+    def _loss_run_summary(self, conn, run_id):
+        return self._loss_by_run(conn, run_id).get(run_id) or {"count": 0, "open": 0, "feedstockKg": 0.0, "productL": 0.0}
+
+    def route_losses(self, method, seg, query, conn, user):
+        if seg == ["api", "losses"] and method == "GET":
+            where, params = [], []
+            st = (query.get("status", [""])[0] or "").strip()
+            if st:
+                if st not in ("open", "confirmed", "closed"):
+                    raise ApiError(400, "Unknown status")
+                where.append("l.status=?"); params.append(st)
+            rid = (query.get("runId", [""])[0] or "").strip()
+            if rid:
+                if not rid.isdigit():
+                    raise ApiError(400, "Unknown run")
+                where.append("l.run_id=?"); params.append(int(rid))
+            rows = conn.execute(self.LOSS_SQL + (" WHERE " + " AND ".join(where) if where else ""), params).fetchall()
+            rows = (sorted([x for x in rows if x["status"] != "closed"], key=lambda x: (x["opened_at"], x["id"]))
+                    + sorted([x for x in rows if x["status"] == "closed"], key=lambda x: (x["opened_at"], x["id"]), reverse=True))        # not closed first, oldest first; then closed, newest first
+            return {"losses": [self._loss_public(conn, r, with_steps=False) for r in rows],
+                    "thresholds": {"feedstockKg": self._loss_threshold(conn, "feedstock"), "productL": self._loss_threshold(conn, "in_process")},
+                    "repeat": {"count": int(num(get_setting_value(conn, "loss_repeat_count", 3), 3)), "days": int(num(get_setting_value(conn, "loss_repeat_days", 180), 180))},
+                    "me": {"canConfirm": bool(user["is_production_manager"]), "canClose": bool(user["is_quality_manager"])}}
+        if seg == ["api", "losses"] and method == "POST":
+            return self._loss_open(conn, self._body_json(), user)
+        if seg == ["api", "losses", "summary"] and method == "GET":
+            return {"byRun": {str(k): v for k, v in self._loss_by_run(conn).items()}}
+        if seg == ["api", "losses", "stats"] and method == "GET":
+            eff = self._loss_effective(conn)
+            agg = {}
+            for r in conn.execute("SELECT id, stage, lost_kind, unit, occurred_at FROM loss_reports"):
+                qty, _cid, cname = eff[r["id"]]
+                k = (r["occurred_at"][:7], cname, r["stage"], r["lost_kind"], r["unit"])
+                a = agg.setdefault(k, [0, 0.0])
+                a[0] += 1
+                a[1] += qty or 0
+            return {"rows": [{"month": k[0], "cause": k[1], "stage": k[2], "kind": k[3], "unit": k[4], "count": v[0], "qty": round(v[1], 4)} for k, v in sorted(agg.items())]}
+        if len(seg) >= 3 and seg[2].isdigit():
+            rid = int(seg[2])
+            r = conn.execute("SELECT * FROM loss_reports WHERE id=?", (rid,)).fetchone()
+            if not r:
+                raise ApiError(404, "Loss report not found")
+            if len(seg) == 3 and method == "GET":
+                return self._loss_detail(conn, rid, user)
+            if len(seg) == 4 and method == "POST" and seg[3] == "confirm":
+                return self._loss_confirm(conn, r, self._body_json(), user)
+            if len(seg) == 4 and method == "POST" and seg[3] == "close":
+                return self._loss_close(conn, r, self._body_json(), user)
+        raise ApiError(404, "Unknown loss report endpoint")
+
+    def _loss_causes_list(self, conn):
+        counts = {x["cause_id"]: x["n"] for x in conn.execute("SELECT cause_id, COUNT(*) n FROM loss_reports GROUP BY cause_id")}
+        return [{"id": r["id"], "name": r["name"], "active": bool(r["active"]), "sortOrder": r["sort_order"], "reports": counts.get(r["id"], 0)}
+                for r in conn.execute("SELECT * FROM loss_causes ORDER BY sort_order, id")]
+
+    def route_loss_causes(self, method, seg, conn, user):
+        if seg == ["api", "loss-causes"] and method == "GET":
+            return {"causes": self._loss_causes_list(conn)}
+        if seg == ["api", "loss-causes"] and method == "POST":
+            self._require_admin(user)
+            name = (self._body_json().get("name") or "").strip()
+            if not name:
+                raise ApiError(400, "Cause name is required")
+            if conn.execute("SELECT 1 FROM loss_causes WHERE name=? COLLATE NOCASE", (name,)).fetchone():
+                raise ApiError(409, "A cause with that name already exists")
+            top = conn.execute("SELECT COALESCE(MAX(sort_order),0) m FROM loss_causes").fetchone()["m"]
+            cur = conn.execute("INSERT INTO loss_causes (name, active, sort_order, created_at) VALUES (?,1,?,?)", (name, top + 10, now_iso()))
+            conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('loss-cause',?,?,?,?,?,?)",
+                         (str(cur.lastrowid), "Cause added: %s" % name, None, "active", user["name"], now_iso()))
+            return {"causes": self._loss_causes_list(conn), "id": cur.lastrowid}
+        if len(seg) == 3 and seg[2].isdigit() and method == "PUT":
+            self._require_admin(user)
+            r = conn.execute("SELECT * FROM loss_causes WHERE id=?", (int(seg[2]),)).fetchone()
+            if not r:
+                raise ApiError(404, "Cause not found")
+            d = self._body_json()
+            name = (d.get("name") if "name" in d else r["name"]) or ""
+            name = name.strip()
+            if not name:
+                raise ApiError(400, "Cause name is required")
+            if name.lower() != r["name"].lower() and conn.execute("SELECT 1 FROM loss_causes WHERE name=? COLLATE NOCASE AND id!=?", (name, r["id"])).fetchone():
+                raise ApiError(409, "A cause with that name already exists")
+            new = {"name": name, "active": (1 if d["active"] not in (False, 0, "0") else 0) if "active" in d else r["active"],
+                   "sort_order": int(num(d["sortOrder"], r["sort_order"])) if "sortOrder" in d else r["sort_order"]}
+            labels = {"name": "Name", "active": "Active", "sort_order": "Sort order"}
+            for col, label in labels.items():
+                if new[col] != r[col]:
+                    show = (lambda v: "yes" if v else "no") if col == "active" else (lambda v: v)
+                    conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('loss-cause',?,?,?,?,?,?)",
+                                 (str(r["id"]), label, str(show(r[col])), str(show(new[col])), user["name"], now_iso()))
+            conn.execute("UPDATE loss_causes SET name=?, active=?, sort_order=? WHERE id=?", (new["name"], new["active"], new["sort_order"], r["id"]))
+            return {"causes": self._loss_causes_list(conn)}
+        raise ApiError(404, "Unknown loss cause endpoint")
 
     # ---- Samples: catalogue, retention inventory, cart, lab requisitions ---------------- #
     SAMPLE_SQL = (
@@ -14164,6 +14690,8 @@ class Handler(BaseHTTPRequestHandler):
                         "finalizedBy": r["finalized_by"]}
         am = self._open_amendment(conn, r["id"])
         d["amendment"] = self._amendment_public(am) if am else None
+        d["lossReportId"] = r["loss_report_id"]                 # KW-99 (not part of the signed log: see _RELEASE_HASH_SKIP)
+        d["lossMissing"] = r["loss_missing"]
         d["progress"] = self._run_progress(conn, r)
         d["revisions"] = self._run_revisions_public(conn, r)
         d["revision"] = d["revisions"][-1]["rev"] if d["revisions"] else 1
@@ -14381,7 +14909,7 @@ class Handler(BaseHTTPRequestHandler):
     # Documents are not production-log entries, so they never change the log hash
     # (and never need an amendment).
     _RELEASE_HASH_SKIP = ("edits", "fgLots", "release", "excludeFromStats", "excludeReason",
-                          "progress", "revisions", "revision", "attachments", "amendment", "logNoteImages")
+                          "progress", "revisions", "revision", "attachments", "amendment", "logNoteImages", "lossReportId", "lossMissing")
 
     def _release_snapshot(self, conn, rid):
         r = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
@@ -14486,6 +15014,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _amend_open_new(self, conn, r, user, d):
         rid, state = r["id"], r["release_state"]
+        if state == "no_output":
+            raise ApiError(409, "This run was finished as a loss and made no product, so its production log is not amended. If the loss report is wrong, open a new loss report that corrects it.", "no_output")
         if state == "amending" or self._open_amendment(conn, rid):
             raise ApiError(409, "This run already has an open amendment")
         category = (d.get("category") or "").strip()
@@ -14654,6 +15184,12 @@ class Handler(BaseHTTPRequestHandler):
         no_entries, incomplete = [], []
         for r in conn.execute("SELECT * FROM production_runs WHERE status='completed' ORDER BY id").fetchall():
             rid, state = r["id"], r["release_state"]
+            if state == "no_output":                                      # KW-99: finished as a loss: no packaging, lots or review to cross-check; its loss report is checked below
+                if not r["loss_report_id"] or not conn.execute("SELECT 1 FROM loss_reports WHERE id=? AND run_id=?", (r["loss_report_id"], rid)).fetchone():
+                    add("error", "Loss reports", r, "This run was finished as a loss but has no loss report of its own.")
+                if conn.execute("SELECT 1 FROM fg_lots WHERE run_id=?", (rid,)).fetchone():
+                    add("error", "Loss reports", r, "This run was finished as a loss (no product) but finished-goods lots exist for it.")
+                continue
             acct = self._units_accounting(conn, rid)
             has_entries = any(u["entries"] for u in acct.values())
             if not has_entries:
@@ -14721,6 +15257,19 @@ class Handler(BaseHTTPRequestHandler):
             issues.append({"severity": "error", "area": "Audit trail", "runId": chain["runId"], "run": None,
                            "message": "The release audit trail hash chain is broken at event #%s." % chain["brokenAtEventId"],
                            "action": "Restore from a backup and investigate; this indicates the audit table was altered.", "repair": None})
+        events_by_report = loss_events(conn)
+        for lr in conn.execute("SELECT id, report_no, run_id FROM loss_reports ORDER BY id").fetchall():     # KW-99: each report and its steps must still hash to what its newest audit-trail event recorded
+            evs = events_by_report.get(lr["report_no"]) or []
+            run = conn.execute("SELECT id, processing_lot FROM production_runs WHERE id=?", (lr["run_id"],)).fetchone() if lr["run_id"] else None
+            try:
+                recorded = json.loads(evs[-1]["detail"]).get("reportHash") if evs else None
+            except (ValueError, AttributeError):
+                recorded = None
+            if not evs:
+                add("error", "Loss reports", run, "Loss report %s has no entry in the audit trail." % lr["report_no"])
+            elif recorded != loss_report_hash(conn, lr["id"]):
+                add("error", "Loss reports", run, "Loss report %s no longer matches what the audit trail recorded: it was changed outside the application." % lr["report_no"],
+                    "A Quality Manager should investigate; restore from a backup if needed. A mistake in a report is corrected with a new report, never by editing it.")
         if incomplete:
             issues.append({"severity": "info", "area": "Required fields", "runId": None, "run": None,
                            "message": "%d finalized run(s) are missing required production-log fields: %s."
@@ -14895,6 +15444,7 @@ class Handler(BaseHTTPRequestHandler):
         return {"id": r["id"], "lot": r["processing_lot"], "sku": r["sku_code"], "runDate": r["run_date"],
                 "outputLitres": r["output_litres"], "finalizedAt": r["finalized_at"], "finalizedBy": r["finalized_by"],
                 "state": r["release_state"], "label": RELEASE_LABELS.get(r["release_state"], "—"),
+                "lossReportId": r["loss_report_id"], "lossMissing": r["loss_missing"], "losses": self._loss_run_summary(conn, r["id"]),
                 "lots": lots, "earlyShipments": early, "allShippedEarly": all_early,
                 "pendingUnits": sum(l["qty"] for l in lots if l["status"] == "pending_release"), "earlyUnits": sum(e["qty"] for e in early),
                 "conditionsBy": (last.get("release_for_shipment") or {}).get("user"), "conditionsAt": (last.get("release_for_shipment") or {}).get("at"),
@@ -15017,6 +15567,8 @@ class Handler(BaseHTTPRequestHandler):
         comment = (d.get("comment") or "").strip() or None
         decision = (d.get("decision") or "").strip()
 
+        if state == "no_output":                                          # KW-99: nothing was made, so there is nothing to review or release
+            raise ApiError(409, "This run was finished as a loss and made no product, so it has no production-log review or release. The loss report is closed out in Losses.", "no_output")
         if action == "review":
             if state != "pending_review":
                 raise ApiError(409, "This run is not awaiting production-log review (status: %s)" % RELEASE_LABELS.get(state, state))
@@ -16744,13 +17296,26 @@ class Handler(BaseHTTPRequestHandler):
         # draft) has no run_id yet to have attached any to, so it's simply
         # empty in that path.
         packaging_entries = []
-        if existing:
+        loss = None                                    # KW-99: finishing the run as a loss (no output, no packaging, no finished-goods lots)
+        if d.get("lossReportId") not in (None, "", 0):
+            try:
+                loss = conn.execute("SELECT * FROM loss_reports WHERE id=?", (int(d["lossReportId"]),)).fetchone()
+            except (TypeError, ValueError):
+                loss = None
+            if not loss:
+                raise ApiError(400, "The loss report was not found")
+            if not existing or loss["run_id"] != existing["id"]:
+                raise ApiError(400, "That loss report is not for this run: open the report from this run (Report a loss) and finish the run with it")
+            if existing["is_historical"]:
+                raise ApiError(400, "A historical run cannot be finished as a loss here")
+        if existing and not loss:
             packaging_entries = [dict(r) for r in conn.execute(
                 "SELECT container_unit, qty FROM run_packaging_entries WHERE run_id=?", (existing["id"],))]
             # Finalizing implicitly "saves" the Packaging table too, in case
             # the operator never clicked its Save button -- the ledger still
             # only gets one net-change line per container, same as a normal save.
             self._commit_packaging_stock(conn, existing["id"], user["name"] if user else None, sku=sku)
+        if existing:
             # Same for the Dilution & Preservation reagents (citric acid,
             # potassium sorbate, sodium benzoate).
             self._commit_reagent_usage(conn, existing["id"], user["name"] if user else None)
@@ -16769,7 +17334,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "A historical run cannot be dated in the future")
         grandfather = hist and existing["hist_release"] == "grandfather"
         lot_status = "on_hand" if grandfather else "pending_release"
-        run_state = "legacy" if grandfather else "pending_review"
+        run_state = "no_output" if loss else ("legacy" if grandfather else "pending_review")
 
         # A tote that was rejected from THIS run is on QAQC Hold and no longer part of it: if the request still lists it, leave it out (KW-51) instead of failing the finalize.
         if existing:
@@ -16874,6 +17439,8 @@ class Handler(BaseHTTPRequestHandler):
             cur.execute("UPDATE production_runs SET processing_lot=? WHERE id=?", (lot, run_id))
         cur.execute("UPDATE production_runs SET orp_required=? WHERE id=?", (0 if hist else 1, run_id))        # KW-59: a run finalized from now on is held to the ORP rule
         cur.execute("UPDATE production_runs SET separation_rules_v2=? WHERE id=?", (0 if hist else 1, run_id))        # KW-63: ... and to both moisture readings and the recovered liquid weight
+        if loss:                                                         # KW-99: no product: out of the yield statistics, tied to its loss report
+            cur.execute("UPDATE production_runs SET loss_report_id=?, exclude_from_stats=1, exclude_reason=? WHERE id=?", (loss["id"], "Loss report %s" % loss["report_no"], run_id))
 
         # Log every selected tote's receiving inspection, carrying over any
         # characterization staged while this was still a draft (photos already
@@ -16929,12 +17496,16 @@ class Handler(BaseHTTPRequestHandler):
         # so a run missing data is never half-finalized.
         problems = self._required_problems(
             conn, conn.execute("SELECT * FROM production_runs WHERE id=?", (run_id,)).fetchone())
-        if problems and not hist:
+        if problems and not hist and not loss:
             raise ApiError(400, "Cannot finalize - required fields are missing:" + problems)
         if hist:                                                         # a historical log is as complete as the old records are: what is missing is written down, not enforced
             conn.execute("UPDATE production_runs SET hist_note=? WHERE id=?", ((problems or "").strip()[:2000] or None, run_id))
-        self._add_revision(conn, run_id, "finalized", user, "Run finalized (original record)" if not hist else "Historical run entered (original record)", [],
-                           self._release_snapshot_hash(conn, run_id))
+        if loss:                                                         # a run lost part-way has an unfinished log: what is missing is written down, not enforced
+            conn.execute("UPDATE production_runs SET loss_missing=? WHERE id=?", ((problems or "").strip()[:2000] or None, run_id))
+        self._add_revision(conn, run_id, "finalized", user, ("Run finalized as a loss, loss report %s (original record)" % loss["report_no"]) if loss else (
+            "Run finalized (original record)" if not hist else "Historical run entered (original record)"), [], self._release_snapshot_hash(conn, run_id))
+        if loss:
+            return {"processingLot": lot, "runId": run_id, "inputKg": input_kg, "outputLitres": 0, "fgLots": [], "lossReportId": loss["id"], "releaseState": "no_output"}
         if not grandfather:
             # Hold the finished goods for release: the run enters the review queue
             # (its FG lots were created 'pending_release' above).
@@ -17110,6 +17681,9 @@ class Handler(BaseHTTPRequestHandler):
         r = conn.execute("SELECT * FROM production_runs WHERE id=? AND status='draft'", (rid,)).fetchone()
         if not r:
             raise ApiError(404, "Draft not found")
+        lr = conn.execute("SELECT report_no FROM loss_reports WHERE run_id=? ORDER BY id LIMIT 1", (rid,)).fetchone()
+        if lr:                                              # KW-99: a loss report is a record and never deleted; finish the run as a loss instead of discarding it
+            raise ApiError(409, "This run has a loss report (%s), which is a permanent record, so the draft cannot be discarded. Finish the run as a loss instead." % lr["report_no"], "has_loss_report")
         # Any tote this draft had locked to WIP is released back to stock --
         # otherwise it'd be stuck WIP forever, tied to a run that no longer exists.
         note = "Production run %s discarded" % r["processing_lot"]

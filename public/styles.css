@@ -936,3 +936,21 @@ html[data-theme="dark"] svg [stroke="#fff"] { stroke: var(--card); }
 html[data-theme="dark"] svg [fill="#fff"] { fill: var(--card); }
 html[data-theme="dark"] svg text[fill="#4b5f5c"], html[data-theme="dark"] svg text[fill="#2b3f3c"] { fill: #c5d6d3; }
 html[data-theme="dark"] .modal iframe { color-scheme: light; }
+
+/* KW-99: loss reports (themed through the existing variables, so the dark theme follows) */
+.loss-age { display: inline-block; min-width: 26px; padding: 1px 7px; border-radius: 999px; font-weight: 600; text-align: center; color: var(--muted); }
+.loss-age.old { background: var(--bg-fff1c2); color: var(--fg-8a5a00); }
+.loss-age.late { background: var(--bg-fbe3df); color: var(--danger); }
+.badge.loss-badge { cursor: pointer; }
+.hold-why.loss-line { color: var(--danger); }
+.loss-banner { border: 1px solid var(--danger); background: var(--bg-fbe3df); border-radius: 8px; padding: 8px 12px; margin: 8px 0; font-size: 13px; }
+.loss-banner button { margin-left: 8px; }
+.loss-repeat { border: 1px solid var(--danger); background: var(--bg-fbe3df); color: var(--danger); border-radius: 8px; padding: 8px 12px; margin: 6px 0 10px; font-size: 13px; }
+.help.loss-required { color: var(--danger); font-weight: 600; }
+.loss-qty { display: flex; align-items: center; gap: 8px; }
+.loss-qty input { flex: 1 1 auto; }
+.loss-datetime { display: flex; gap: 8px; }
+.loss-datetime input[type=date] { flex: 1 1 60%; }
+.loss-datetime input[type=time] { flex: 1 1 40%; }
+.loss-stats td small { white-space: nowrap; }
+.loss-finish-box { margin-top: 14px; }
