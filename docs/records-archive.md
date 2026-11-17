@@ -68,10 +68,26 @@ KelpWorks-Records/
 5. **Schedule it** (after the server's backup, so about 4:30 am Pacific):
    `schtasks /Create /TN "KelpWorks records sync" /TR "C:\KelpWorks\tools\run_archive_sync.bat" /SC DAILY /ST 04:30`
    The log is `sync.log` next to the script; the last line is `SYNC OK` when everything copied.
+   **Set the task's conditions so a sleeping or unplugged laptop still runs it** (KW-72: in October 2026 the task missed at least five nights because the laptop was asleep, the task did not
+   catch up after a missed start, and it would not run on battery). In Task Scheduler open the task > Settings and Conditions and make sure that:
+   - "Run task as soon as possible after a scheduled start is missed" is ticked;
+   - "Wake the computer to run this task" is ticked (Windows power settings must allow wake timers);
+   - "Start the task only if the computer is on AC power" is NOT ticked, and "Stop if the computer switches to battery power" is NOT ticked.
+   The same from PowerShell (run once as the user the task runs as):
+   `Set-ScheduledTask -TaskName "KelpWorks records sync" -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries)`
 6. **Limit access in SharePoint:** `01_System-Backups` to administrators (the backups hold password hashes and all business data); the other folders as you see fit.
 
 Check it any time on **Admin > Records archive & backups**: whether the nightly backup is on, the last backup, the backups on the server disk, and whether the key is set.
 A backup that could not be made (for example the disk is nearly full) shows there and in the Render log.
+
+## When the sync stops: the off-server copy warning (KW-72)
+
+The server remembers when the sync script last made a request (**Last sync contact**) and when a nightly backup was last downloaded in full (**Newest backup copied off the server**; an
+administrator downloading one by hand counts too). When either is older than the setting **Backups: warn when nothing has been copied off the server** (`archive_sync_warn_hours`,
+Calculations page, default 36 hours, 0 = no warning), or has never been seen, the two lines on the Admin page turn into a red notice and every administrator sees a red banner at the top of
+the app (checked when a page is drawn, at most every 5 minutes). It clears by itself after the next sync. It is not active on a server that makes no nightly backup and has no sync key
+(development). What to do: open `sync.log` on the office PC, check the task's conditions above and that the PC was awake, run `run_archive_sync.bat` by hand, and open Admin to confirm the notice cleared.
+Until a backup is copied off, only the newest `KELP_ERP_BACKUP_KEEP` backups exist, on the server disk.
 
 ## The server disk is small
 

@@ -42,6 +42,9 @@ lot / first run number are 001. Also restore the full backup the same way to pro
 **5. Clear the old records archive.** In `KelpWorks-Records` delete the contents of `02_Production-Runs`, `06_Receiving` and `01_System-Backups`, and delete
 `_sync-state.json` in the library root. Never `03_SOPs`, `04_Safety-Data-Sheets` or `00_Pre-Go-Live`. The change log is elsewhere and untouched. Do this immediately before
 step 6: the nightly sync could otherwise copy the old run back before the restore.
+**Also delete the old backups on the server disk before the first sync after the reset** (KW-72): the nightly backups (`/var/data/backups/nightly/*.zip`) and the pre-update snapshots
+(`/var/data/backups/pre-migrate-*.db.gz`) made before the reset are still on the Render disk, and the first sync would copy them straight back into the freshly cleared `01_System-Backups`.
+Delete the ones dated before the restore (over SSH, as in step 6); keep the pre-go-live archive made in step 3.
 
 **6. Put the clean file on the Render disk.** Over SSH from PowerShell (key set up once, address from Render > live service > Connect > SSH):
 

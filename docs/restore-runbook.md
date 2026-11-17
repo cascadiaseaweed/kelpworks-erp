@@ -112,6 +112,8 @@ every start. **One entry** (`system / clean_start`) is added to the change histo
    In the SharePoint library `KelpWorks-Records` delete the contents of `02_Production-Runs`, `06_Receiving` and `01_System-Backups`, and delete `_sync-state.json` in the library root (it is only the sync
    script's memory of what it copied: the files and backup days). **Do not** delete `03_SOPs` or `04_Safety-Data-Sheets` (the controlled masters KelpWorks mirrors), the pre-go-live backup, or anything
    outside this library: the change log lives in `QAQC > KelpWorks ERP > Change_Control` and `C:\KelpWorks\ChangeControl` and is not involved. The first sync after the reset rebuilds the indexes.
+   **Also delete the old nightly and pre-update backups on the server disk** (`/var/data/backups/nightly/*.zip` and `/var/data/backups/pre-migrate-*.db.gz`, the ones made before the reset, over SSH)
+   before the first sync after the reset: they are still on the Render disk and the sync would copy the old data back into the cleared `01_System-Backups`.
 5. **Restore on live** with the steps above, using `kelpworks-CLEAN.zip`. Checks afterwards: Product Release lists no runs, Verify audit trail says the chain is intact, the
    Calculations page still shows your settings, the change history shows the `clean_start` entry, and the first harvest check-in works. Then add the inventory items again (KW-64).
 6. **Tidy up:** delete `kelpworks-CLEAN.zip` and the temporary SharePoint link (both contain every user's password hash), and remove the two restore variables from Render.
