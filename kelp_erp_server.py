@@ -16432,6 +16432,34 @@ class Handler(BaseHTTPRequestHandler):
         if not verify_password(d.get("password") or "", user["password_hash"]):
             raise ApiError(400, "Password is incorrect - your signature was not recorded")
 
+    def _child_lot_number(self, conn, parent):
+        """The number of a lot split off `parent`: <parent number>-1, -2 ... The SKU is NOT part of the number (it is a column); the parent's own number stays on the IBCs."""
+        n = conn.execute("SELECT COUNT(*) FROM fg_lots WHERE parent_lot_id=?", (parent["id"],)).fetchone()[0]
+        while True:
+            n += 1
+            cand = "%s-%d" % (parent["fg_lot_number"], n)
+            if not conn.execute("SELECT 1 FROM fg_lots WHERE fg_lot_number=?", (cand,)).fetchone():
+                return cand
+
+    def _move_units_to_child(self, conn, parent, qty, sku_code, basis, who, now, assigned):
+        """Take `qty` units out of `parent` into ONE child row for this SKU and release basis ('no_metals' or None): the existing row of the same parent, SKU and basis when there is one
+        (units are added to it), otherwise a new row `<lot>-n`. -> (child lot id, True when a new row was made). `assigned` = the SKU was assigned now (else the parent's assignment is copied)."""
+        cur = conn.execute("UPDATE fg_lots SET qty=qty-? WHERE id=? AND qty>=?", (qty, parent["id"], qty))
+        if cur.rowcount != 1:
+            raise ApiError(409, "%s no longer has %g units" % (parent["fg_lot_number"], qty))
+        have = conn.execute("SELECT * FROM fg_lots WHERE parent_lot_id=? AND sku_code=? AND COALESCE(release_basis,'')=? AND (status='sold' OR status=?) ORDER BY id LIMIT 1",
+                            (parent["id"], sku_code, basis or "", parent["status"])).fetchone()
+        if have:
+            conn.execute("UPDATE fg_lots SET qty=qty+?, status=? WHERE id=?", (qty, parent["status"], have["id"]))
+            return have["id"], False
+        child = conn.execute(
+            "INSERT INTO fg_lots (fg_lot_number,sku_code,run_id,package_size,qty,litres_each,produced_date,tds,ph,location,status,created_at,"
+            "made_as,sku_assigned,parent_lot_id,assigned_by,assigned_at,release_basis) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (self._child_lot_number(conn, parent), sku_code, parent["run_id"], parent["package_size"], qty, parent["litres_each"], parent["produced_date"], parent["tds"], parent["ph"],
+             parent["location"], parent["status"], now, parent["made_as"] or parent["sku_code"], 1 if assigned else parent["sku_assigned"], parent["id"],
+             who if assigned else parent["assigned_by"], now if assigned else parent["assigned_at"], basis)).lastrowid
+        return child, True
+
     def _assign_sku(self, conn, lot, sku_code, qty, user, why, for_release=False):
         """KW-32: give `qty` units of an unassigned finished-goods lot the SKU they ship as. The whole lot is renamed in place (the lot number stays: it is on the IBCs);
         part of a lot is split into a child lot (linked to its parent and the same run). The labels of that SKU + package are deducted (stock never blocks), the act is
@@ -16457,15 +16485,8 @@ class Handler(BaseHTTPRequestHandler):
             conn.execute("UPDATE fg_lots SET sku_code=?, sku_assigned=1, assigned_by=?, assigned_at=? WHERE id=?", (sku_code, who, now, lot["id"]))
             target = lot["id"]
         else:
-            cur = conn.execute("UPDATE fg_lots SET qty=qty-? WHERE id=? AND qty>=?", (qty, lot["id"], qty))
-            if cur.rowcount != 1:
-                raise ApiError(409, "%s no longer has %d units on hand" % (lot["fg_lot_number"], qty))
-            number = self._unique_fg_lot(conn, "%s-%s" % (lot["fg_lot_number"], re.sub(r"[^A-Z0-9]", "", sku_code.upper())[:10]))
-            target = conn.execute(
-                "INSERT INTO fg_lots (fg_lot_number,sku_code,run_id,package_size,qty,litres_each,produced_date,tds,ph,location,status,created_at,"
-                "made_as,sku_assigned,parent_lot_id,assigned_by,assigned_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (number, sku_code, lot["run_id"], lot["package_size"], qty, lot["litres_each"], lot["produced_date"], lot["tds"], lot["ph"], lot["location"],
-                 lot["status"], now, lot["made_as"] or lot["sku_code"], 1, lot["id"], who, now)).lastrowid
+            # part of a lot: ONE row per assigned SKU (and release basis). The first units make a child `<lot>-n` (no SKU name in the number); more units of the same SKU join it.
+            target, _made = self._move_units_to_child(conn, lot, qty, sku_code, "no_metals" if for_release else None, who, now, True)
         new = conn.execute("SELECT * FROM fg_lots WHERE id=?", (target,)).fetchone()
         release_log(conn, lot["run_id"] or 0, "fg_lot_sku_assigned", user,
                     capacity="Quality Manager" if self._is_quality_manager(user) else "Production Manager",
@@ -17366,20 +17387,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _release_unit_lot(self, conn, lot, qty):
         """KW-100: the units released for a shipment become a lot of their own, marked as released without the heavy-metals results (`release_basis` = 'no_metals'). The whole lot is
-        marked in place; part of a lot is split into a child lot (linked to its parent, same run, number `<lot>-NHM`); the rest stays Pending Release in the parent. -> the lot row that ships."""
+        marked in place; part of a lot goes into ONE child row for that SKU and basis (`_move_units_to_child`, number `<lot>-n`, more released units join it); the rest stays Pending Release in the parent. -> the lot row that ships."""
         lot = conn.execute("SELECT * FROM fg_lots WHERE id=?", (lot["id"],)).fetchone()
         if qty >= lot["qty"]:
             conn.execute("UPDATE fg_lots SET release_basis='no_metals' WHERE id=?", (lot["id"],))
             return conn.execute("SELECT * FROM fg_lots WHERE id=?", (lot["id"],)).fetchone()
-        cur = conn.execute("UPDATE fg_lots SET qty=qty-? WHERE id=? AND qty>=?", (qty, lot["id"], qty))
-        if cur.rowcount != 1:
-            raise ApiError(409, "%s no longer has %g units" % (lot["fg_lot_number"], qty))
-        number = self._unique_fg_lot(conn, "%s-NHM" % lot["fg_lot_number"])
-        child = conn.execute(
-            "INSERT INTO fg_lots (fg_lot_number,sku_code,run_id,package_size,qty,litres_each,produced_date,tds,ph,location,status,created_at,"
-            "made_as,sku_assigned,parent_lot_id,assigned_by,assigned_at,release_basis) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (number, lot["sku_code"], lot["run_id"], lot["package_size"], qty, lot["litres_each"], lot["produced_date"], lot["tds"], lot["ph"], lot["location"],
-             lot["status"], now_iso(), lot["made_as"], lot["sku_assigned"], lot["id"], lot["assigned_by"], lot["assigned_at"], "no_metals")).lastrowid
+        child, _made = self._move_units_to_child(conn, lot, qty, lot["sku_code"], "no_metals", None, now_iso(), False)
         return conn.execute("SELECT * FROM fg_lots WHERE id=?", (child,)).fetchone()
 
     def _awaiting_qa_lots(self, conn, d):

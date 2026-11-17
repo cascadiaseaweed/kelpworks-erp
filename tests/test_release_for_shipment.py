@@ -290,7 +290,7 @@ def test_lots_of_two_runs_go_on_one_shipment_with_one_signature(srv, people):
     assert r.status == 200, r.text
     s = r.json["shipment"]
     assert n_shipments(srv) == before + 1 and s["units"] == 4
-    name_a = lot_a["number"] + "-NHM"                                              # 1 of 2 units: the released part is a lot of its own; all 2 units of lot B: the lot itself
+    name_a = lot_a["number"] + "-1"                                              # 1 of 2 units: the released part is a lot of its own; all 2 units of lot B: the lot itself
     assert {l["lot"]: l["beforeMetals"] for l in s["lines"]} == {name_a: True, lot_b["number"]: True, stock["number"]: False}
     for rid, name, units in ((run_a, name_a, 1), (run_b, lot_b["number"], 2)):
         ev = events(people, rid)
@@ -396,7 +396,7 @@ def test_the_integrity_check_and_reopen_account_for_the_shipped_units(srv, peopl
     r = people["qm"].post("/api/release/runs/%d/reopen" % rid, {"password": people["qm_pw"], "comment": "log needs correction"})
     assert r.status == 200
     ev = [e for e in detail(people, rid)["events"] if e["type"] == "reopened"][0]
-    assert ev["detail"]["alreadyShippedLots"] and ev["detail"]["alreadyShippedLots"][0]["lot"] == lot["number"] + "-NHM"
+    assert ev["detail"]["alreadyShippedLots"] and ev["detail"]["alreadyShippedLots"][0]["lot"] == lot["number"] + "-1"
 
 
 def test_the_certificate_says_heavy_metals_pending_once_units_have_shipped(srv, people):
@@ -498,13 +498,13 @@ def test_part_of_a_lot_becomes_its_own_lot_marked_released_without_heavy_metals(
     lot, cid = lots_of(srv, rid)[0], customer(people, "Washington")
     assert ship(people, cid, [(lot, 1)]).status == 200
     fg = fg_by_number(people)
-    child, parent = fg[lot["number"] + "-NHM"], fg[lot["number"]]
+    child, parent = fg[lot["number"] + "-1"], fg[lot["number"]]
     assert child["releaseBasis"] == "no_metals" and child["parentLotId"] == lot["id"] and child["runId"] == rid
     assert child["status"] == "sold" and child["qty"] == 0
     assert parent["status"] == "pending_release" and parent["qty"] == 2 and parent["releaseBasis"] is None            # the rest is still waiting for QA release
-    assert ship(people, cid, [(lot, 1)]).status == 200                              # a second release makes a second lot
+    assert ship(people, cid, [(lot, 1)]).status == 200                              # a second release joins the SAME row: one row per release basis
     fg = fg_by_number(people)
-    assert lot["number"] + "-NHM#2" in fg and fg[lot["number"] + "-NHM#2"]["releaseBasis"] == "no_metals" and fg[lot["number"]]["qty"] == 1
+    assert lot["number"] + "-2" not in fg and fg[lot["number"] + "-1"]["unitsSold"] == 2 and fg[lot["number"] + "-1"]["releaseBasis"] == "no_metals" and fg[lot["number"]]["qty"] == 1
 
 
 def test_a_whole_lot_is_marked_in_place_and_nothing_is_split(srv, people):
@@ -513,7 +513,7 @@ def test_a_whole_lot_is_marked_in_place_and_nothing_is_split(srv, people):
     lot = lots_of(srv, rid)[0]
     assert ship(people, customer(people, "Washington"), [(lot, 2)]).status == 200
     fg = fg_by_number(people)
-    assert fg[lot["number"]]["releaseBasis"] == "no_metals" and fg[lot["number"]]["status"] == "sold" and lot["number"] + "-NHM" not in fg
+    assert fg[lot["number"]]["releaseBasis"] == "no_metals" and fg[lot["number"]]["status"] == "sold" and lot["number"] + "-1" not in fg
 
 
 def test_cancelling_returns_the_units_to_the_lot_they_were_split_from(srv, people):
@@ -524,7 +524,7 @@ def test_cancelling_returns_the_units_to_the_lot_they_were_split_from(srv, peopl
     assert people["plain"].put("/api/shipments/%d" % sid, {"status": "cancelled"}).status == 200
     fg = fg_by_number(people)
     assert fg[lot["number"]]["qty"] == 3 and fg[lot["number"]]["status"] == "pending_release"       # back in the lot they came from: one Pending Release line again
-    assert fg[lot["number"] + "-NHM"]["unitsSold"] == 0 and fg[lot["number"] + "-NHM"]["status"] == "sold"      # the released lot has nothing sold, so Finished Goods does not list it
+    assert fg[lot["number"] + "-1"]["unitsSold"] == 0 and fg[lot["number"] + "-1"]["status"] == "sold"      # the released lot has nothing sold, so Finished Goods does not list it
     assert detail(people, rid)["earlyShipments"] == []
 
 
@@ -557,12 +557,48 @@ def test_a_sold_lot_shows_the_units_sold_and_a_cancelled_shipment_takes_them_off
     first = ship(people, wa, [(lot, 1)]).json["shipment"]["id"]
     ship(people, wa, [(lot, 3)])                                                    # the rest of the lot: the lot itself is marked, nothing left Pending Release
     fg = {l["lot"]: l for l in people["qm"].get("/api/fg").json["fg"]}
-    assert fg[lot["number"]]["status"] == "sold" and fg[lot["number"]]["unitsSold"] == 3 and fg[lot["number"] + "-NHM"]["unitsSold"] == 1
+    assert fg[lot["number"]]["status"] == "sold" and fg[lot["number"]]["unitsSold"] == 3 and fg[lot["number"] + "-1"]["unitsSold"] == 1
     run = {r["id"]: r for r in people["qm"].get("/api/release").json["runs"]}[rid]
     assert run["earlyUnits"] == 4 and run["pendingUnits"] == 0 and run["allShippedEarly"] is True
     assert people["plain"].put("/api/shipments/%d" % first, {"status": "cancelled"}).status == 200
     fg = {l["lot"]: l for l in people["qm"].get("/api/fg").json["fg"]}
     # the parent was marked in place (it is itself a released lot now), so the 1 cancelled unit comes back as its own Pending Release lot, unmarked
-    child = fg[lot["number"] + "-NHM"]
+    child = fg[lot["number"] + "-1"]
     assert child["status"] == "pending_release" and child["qty"] == 1 and child["releaseBasis"] is None and child["unitsSold"] == 0
     assert fg[lot["number"]]["unitsSold"] == 3
+
+
+# ---- the SKU assigned to part of a lot: one row per SKU, no SKU name in the number, the same on the button and in a shipment ----
+
+def assign_button(people, lot, sku, qty, who="pm"):
+    pw = people["pm_pw"] if who == "pm" else people["qm_pw"]
+    return people[who].post("/api/fg/%d/assign-sku" % lot["id"], {"skuCode": sku, "qty": qty, "password": pw, "note": "test"})
+
+
+def test_assigning_a_sku_to_part_of_a_lot_makes_one_row_per_sku_without_the_sku_in_the_number(srv, people):
+    rid = finished_run(people["admin"], sku="SACC-LKE", n_totes=1)
+    sql(srv, "UPDATE production_runs SET release_state='legacy' WHERE id=?", (rid,))
+    sql(srv, "UPDATE fg_lots SET status='on_hand', qty=10, sku_assigned=0 WHERE run_id=?", (rid,))
+    lot = lots_of(srv, rid)[0]
+    assert assign_button(people, lot, "KELPIVEX", 4).status == 200
+    assert assign_button(people, lot, "KELPIVEX", 3).status == 200                  # more units of the same SKU join the same row
+    assert assign_button(people, lot, "FIELDKELP", 2).status == 200                 # another SKU is another row
+    rows = {l["lot"]: l for l in people["qm"].get("/api/fg").json["fg"] if l["runId"] == rid}
+    assert sorted(rows) == sorted([lot["number"], lot["number"] + "-1", lot["number"] + "-2"]), sorted(rows)
+    by_sku = {l["sku"]: l for l in rows.values()}
+    assert by_sku["KELPIVEX"]["qty"] == 7 and by_sku["FIELDKELP"]["qty"] == 2 and by_sku["SACC-LKE"]["qty"] == 1
+    assert by_sku["KELPIVEX"]["lot"] == lot["number"] + "-1" and "KELPIVEX" not in by_sku["KELPIVEX"]["lot"] and "FIELDKELP" not in by_sku["FIELDKELP"]["lot"]
+
+
+def test_a_sku_chosen_in_a_shipment_is_numbered_and_merged_the_same_way(srv, people):
+    enable(srv)
+    rid = pending_run(srv, people, packs=6, sku="SACC-LKE")
+    lot, cid = lots_of(srv, rid)[0], customer(people, "Washington")
+    assert ship(people, cid, [(lot, 2, "KELPIVEX")]).status == 200
+    assert ship(people, cid, [(lot, 1, "KELPIVEX")]).status == 200                  # the same SKU again: the same row
+    assert ship(people, cid, [(lot, 1, "FIELDKELP")]).status == 200                 # another SKU: another row
+    rows = {l["lot"]: l for l in people["qm"].get("/api/fg").json["fg"] if l["runId"] == rid}
+    assert sorted(rows) == sorted([lot["number"], lot["number"] + "-1", lot["number"] + "-2"]), sorted(rows)
+    assert rows[lot["number"] + "-1"]["sku"] == "KELPIVEX" and rows[lot["number"] + "-1"]["unitsSold"] == 3
+    assert rows[lot["number"] + "-2"]["sku"] == "FIELDKELP" and rows[lot["number"] + "-2"]["unitsSold"] == 1
+    assert rows[lot["number"]]["qty"] == 2 and rows[lot["number"]]["sku"] == "SACC-LKE" and rows[lot["number"]]["status"] == "pending_release"
