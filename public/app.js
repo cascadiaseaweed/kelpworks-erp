@@ -341,10 +341,12 @@ function render() {
   const v = $('#view'); v.innerHTML = '';
   const docTab = document.querySelector('#tabs button[data-tab="documents"]');       // the number of changes waiting in the SharePoint folders, for administrators
   if (docTab) docTab.textContent = 'Documents' + (State.user && State.user.role === 'admin' && State.ref && State.ref.libraryPending ? ' (' + State.ref.libraryPending + ')' : '');
+  const lossTab = document.querySelector('#tabs button[data-tab="losses"]');          // KW-99: the number of loss reports that are not closed yet
+  if (lossTab) lossTab.textContent = 'Losses' + (State.ref && State.ref.lossOpenCount > 0 ? ' (' + State.ref.lossOpenCount + ')' : '');
   v.classList.toggle('wrap-wide', State.tab === 'stabilized');   // scopes the Feedstock Inventory table styling (page width stays the standard .wrap, like Inventory Items)
   ({ dashboard: pageDashboard, stabilized: pageStabilized, preproc: pagePreproc, samples: pageSamples, production: pageProduction, cip: pageCIP,
      qc: pageQC, fg: pageFG, shipping: pageShipping, consumables: pageConsumables, suppliers: pageSuppliers, reports: pageReports,
-     yieldusage: pageYield, release: pageRelease, calculations: pageCalculations, admin: pageAdmin, documents: pageDocuments }[State.tab])(v);
+     yieldusage: pageYield, release: pageRelease, calculations: pageCalculations, admin: pageAdmin, documents: pageDocuments, losses: pageLosses }[State.tab])(v);
 }
 
 /* ---------------- Dashboard ---------------- */
@@ -650,6 +652,7 @@ async function pageStabilized(v) {
           movable ? ['Move', () => moveTote(t)] : null,
           movable ? ['Update', () => updateCondition(t)] : null,
           ['Label', () => printLabels([toteLabel(t)])],
+          ['Report loss', () => newLossReport({ toteId: t.id })],
           (t.grind === 'Fine' || (t.status === 'consumed' && !t.runId)) ? ['Trace', () => showPreprocTrace(t)] : null,
           movable ? ['Delete', () => delTote(t), 'danger'] : null,
           t.status === 'wip' && State.user && State.user.role === 'admin' ? ['Free tote…', () => freeTote(t), 'danger'] : null
@@ -1098,10 +1101,10 @@ async function pageProduction(v) {
     el('div', { class: 'actions' },
       State.user.role === 'admin' && settingValue('historical_entry_enabled', 0) ? el('button', { class: 'secondary', onclick: () => openHistoricalRun(), title: 'Enter a run that already happened, with its original lot number and date' }, '+ Historical run') : null,
       el('button', { onclick: () => openNewRun() }, '+ New production run'))));
-  const [r, dr] = await Promise.all([api('GET', '/production'), api('GET', '/production/drafts')]);
+  const [r, dr, lossSum] = await Promise.all([api('GET', '/production'), api('GET', '/production/drafts'), lossSummary()]);       // KW-99: the loss summary is fetched once per page draw
   if (dr.drafts.length) {
     v.append(el('h3', { style: 'margin:0 0 8px' }, 'In progress'));
-    for (const d of dr.drafts) v.append(draftCard(d));
+    for (const d of dr.drafts) v.append(draftCard(d, lossSum));
   }
   if (!r.runs.length && !dr.drafts.length) { v.append(el('div', { class: 'empty card' }, 'No production runs yet. Click “New production run” to process stabilized totes into finished goods.')); return; }
   if (!r.runs.length) return;
@@ -1112,8 +1115,9 @@ async function pageProduction(v) {
           run.excludeFromStats ? el('span', { class: 'pill', style: 'margin-left:6px', title: run.excludeReason || '' }, 'Excluded from analysis') : null,
           run.historical ? el('span', { class: 'pill', style: 'margin-left:6px', title: 'Entered retrospectively by ' + (run.historical.enteredBy || '—') + '. ' + (run.historical.release === 'grandfather' ? 'Grandfathered as released. ' : '') + (run.historical.deductInventory ? '' : 'Did not move inventory. ') + (run.historical.note ? 'Log was incomplete at entry.' : '') }, 'Historical') : null,
           run.release && run.release.state && run.release.state !== 'legacy' ? [' ', releaseBadge(run.release.state)] : null,
-          ' ', analysisInfoButton(run), ' ', presenceBadge('run:' + run.id)),
+          ' ', lossBadge(lossSum, run.id, run.processingLot), ' ', analysisInfoButton(run), ' ', presenceBadge('run:' + run.id)),
         el('div', { class: 'actions' },
+          el('button', { class: 'secondary', onclick: () => newLossReport({ runId: run.id }), title: 'Report product lost from this run' }, 'Report a loss'),
           canAmendLog() ? (run.amendment
             ? el('button', { onclick: () => openRunLog(run.id) }, '✏️ Continue amendment')
             : el('button', { onclick: () => openAmendDialog(run) }, '✏️ Amend run')) : null,
@@ -1126,6 +1130,7 @@ async function pageProduction(v) {
           el('button', { class: 'secondary', onclick: () => printLabels(run.fgLots.map(f => fgLabel(f, run))) }, 'Print FG labels'),
           el('button', { class: 'secondary', onclick: () => openSampleLabels(run) }, 'Print sample labels'))),
       run.amendment ? amendBanner(run) : null,
+      lossRunBanner(run),
       runSummaryGrid(run),
       runNotesPanel(run),
       stageProgress(run, { onSelect: key => openProcessLog(run, key) }),
@@ -1471,13 +1476,14 @@ function revisionTracker(run) {
   });
   return wrap;
 }
-function draftCard(d) {
+function draftCard(d, lossSum) {
   const pkgSummary = (d.packages || []).filter(p => p.qty > 0).map(p => `${fmt(p.qty)} × ${p.size}`).join(', ') || '—';
   return el('div', { class: 'card' },
     el('div', { class: 'page-head', style: 'margin:0 0 8px' },
-      el('h3', { style: 'margin:0' }, mono(d.processingLot), '  ', el('span', { class: 'badge hold' }, 'Not yet submitted'), d.historical ? [' ', el('span', { class: 'pill' }, 'Historical')] : null, ' ', presenceBadge('run:' + d.id)),
+      el('h3', { style: 'margin:0' }, mono(d.processingLot), '  ', el('span', { class: 'badge hold' }, 'Not yet submitted'), d.historical ? [' ', el('span', { class: 'pill' }, 'Historical')] : null, ' ', lossBadge(lossSum, d.id, d.processingLot), ' ', presenceBadge('run:' + d.id)),
       el('div', { class: 'actions' },
         el('button', { onclick: () => openRun(d) }, 'Resume'),
+        el('button', { class: 'secondary', onclick: () => newLossReport({ runId: d.id }), title: 'Report product lost from this run' }, 'Report a loss'),
         el('button', { class: 'secondary', onclick: () => openSampleLabels(d) }, 'Print sample labels'),
         el('button', { class: 'danger', onclick: () => discardDraft(d) }, 'Discard'))),
     el('div', { class: 'summary-line' },
@@ -2044,6 +2050,8 @@ async function pageQC(v) {
   v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Quality Control'),
     el('div', { class: 'actions' }, el('span', { class: 'help' }, 'Control charts for process QC checks, feedstock and laboratory results'))));
   const host = el('div', {}); v.append(host);
+  const lossHost = el('div', {}); v.append(lossHost);                       // KW-99: the Losses card sits under the charts and is fetched on its own, so it shows even when there are no QC measures yet
+  lossStatsCard().then(c => { if (c) lossHost.append(c); });
   let D;
   async function load() { D = await api('GET', '/qc-charts'); }
   await load();
@@ -4670,7 +4678,11 @@ async function openRun(draftSummary, opts) {
         packagingEntriesSection.box,
         el('div', { style: 'margin-top:6px' }, packagingSaveBtn, packagingStatus))),
     notesSection.box,
-    sampleSummary.box);
+    sampleSummary.box,
+    el('div', { class: 'sign-box loss-finish-box' }, el('h4', {}, 'Finish this run as a loss'),
+      el('div', { class: 'help' }, 'Use this when the run produced no product (for example the feedstock was lost). Nothing is packaged and the other required fields are not needed; the run is closed against a loss report and Quality decides on it there. '
+        + 'To finish the run normally, use “Finalize run” below.'),
+      el('div', { style: 'margin-top:8px' }, el('button', { type: 'button', class: 'danger', onclick: () => finishAsLoss() }, 'Finish this run as a loss…'))));
   notesSection.attach(body);
   filterTotes();
   renderFeedstockCards();
@@ -4742,6 +4754,19 @@ async function openRun(draftSummary, opts) {
       : await api('POST', '/production', payload);
     toast(`Run ${r.processingLot}: ${fmt(r.inputKg, 0)} kg → ${fmt(r.outputLitres, 0)} L`);
     render();
+  }
+  // KW-99: finish the run with no product. The draft is saved first (so the totes are locked to it and everything typed is kept), then a loss report of THIS run is picked or filed,
+  // and the same finalize request goes out with `lossReportId` (no packaged quantity and none of the other required fields are asked for).
+  async function finishAsLoss() {
+    try {
+      const payload = buildPayload();
+      if (!payload.toteIds.length) throw new Error('Select at least one tote: the loss report is filed against the run and its feedstock.');
+      await saveDraft(true);
+      const failed = await pressSectionSaves(body);
+      if (failed.length) throw new Error('A section could not be saved: ' + failed[0]);
+      const run = (await api('GET', '/production/drafts/' + draftId)).run;
+      await finishAsLossDialog(draftId, run.processingLot, payload);
+    } catch (e) { toast(e.message, true); }
   }
   // "Save & close" = the run header + feedstock, then every section's own Save, so entries not yet saved with their section's button are kept.
   // A section that cannot be saved keeps the window open with its message instead of silently dropping the entry.
@@ -4968,7 +4993,7 @@ const RELEASE_STATES = {
   pending_review: ['wip', 'Pending review'], pending_release: ['pending_release', 'Awaiting QA release'],
   released: ['on_hand', 'Released'], returned: ['low', 'Returned for correction'],
   rejected: ['low', 'Rejected — on hold'], legacy: ['sold', 'Released (pre-process)'],
-  amending: ['hold', 'Under amendment'],
+  amending: ['hold', 'Under amendment'], no_output: ['low', 'No product (loss)'],
 };
 const releaseBadge = st => { const [c, t] = RELEASE_STATES[st] || ['sold', st || '—']; return badge(c, t); };
 const RELEASE_EVENTS = {
@@ -4981,6 +5006,7 @@ const RELEASE_EVENTS = {
   lab_results_added: 'Lab results entered', lab_result_voided: 'Lab result VOIDED',
   fg_lot_edited: 'Finished-goods lot edited', lab_result_hold: 'Lots put on HOLD (lab result changed after release)',
   release_for_shipment: 'CONDITIONAL RELEASE for a shipment (heavy metals pending)',
+  loss_opened: 'LOSS REPORT opened', loss_confirmed: 'LOSS confirmed by Production', loss_closed: 'LOSS closed by Quality',
 };
 const shortHash = h => h ? h.slice(0, 10) + '…' : '—';
 // ---- KW-94: the release workflow as one status line, a checklist and hold reasons. The server decides all of it (`releaseStatus`, `checklist`, `holdInfo` on each lot); these only draw it. ----
@@ -5074,10 +5100,19 @@ async function pageRelease(v) {
     ['Conditional release', x => x.state === 'pending_release' && x.earlyUnits > 0, 'cond'],
     ['Returned for correction / rejected', x => ['returned', 'rejected'].includes(x.state)],
     ['Released', x => x.state === 'released' && !held(x)],
+    ['No product (loss)', x => x.state === 'no_output', 'nooutput'],           // KW-99: a run finished as a loss: nothing to review or release, its decision is the loss report's close-out
   ];
   for (const [title, pick, kind] of groups) {
     const rows = r.runs.filter(pick);
-    if (!rows.length && (title.startsWith('Released, but') || title.startsWith('Conditional release'))) continue;
+    if (!rows.length && (title.startsWith('Released, but') || title.startsWith('Conditional release') || kind === 'nooutput')) continue;
+    if (kind === 'nooutput') {
+      v.append(el('h3', { style: 'margin:16px 0 6px' }, title + ' (' + rows.length + ')'));
+      v.append(el('div', { class: 'help', style: 'margin:-4px 0 6px' }, 'These runs were finished as a loss: no finished goods were made, so there is no sign-off to give here. The Quality Manager closes the loss report on the Losses tab.'));
+      v.append(table(['Run', 'Product', 'Finalized', 'Status', 'Losses'],
+        rows.map(x => [mono(x.lot), skuName(x.sku), fmtWhen(x.finalizedAt) + (x.finalizedBy ? ' · ' + x.finalizedBy : ''), releaseBadge('no_output'), lossLine(x.losses) || '—']),
+        [false, false, false, false, false], i => openReleaseRun(rows[i].id)));
+      continue;
+    }
     // a run can be in both stages: the units that left on a release for shipment are in Conditional release, the balance stays in Awaiting Quality release
     const lotsOf = x => kind === 'await' ? x.lots.filter(l => l.status === 'pending_release') : kind === 'cond' ? fgDisplayRows(x.lots.filter(l => l.releaseBasis === 'no_metals')) : x.lots;
     v.append(el('h3', { style: 'margin:16px 0 6px' }, title + ' (' + rows.length + ')'));
@@ -5089,9 +5124,9 @@ async function pageRelease(v) {
         num(fmt(lotsOf(x).reduce((a, l) => a + fgLitres(l), 0), 0)),
         kind === 'cond'
           ? el('div', {}, badge('pending_release', 'Conditional release'), el('div', { class: 'hold-why', title: x.releaseStatus.text }, fmt(x.earlyUnits) + ' unit(s) shipped before heavy metals'
-            + (x.pendingUnits > 0 ? ' · ' + fmt(x.pendingUnits) + ' still awaiting QA release' : '')))
+            + (x.pendingUnits > 0 ? ' · ' + fmt(x.pendingUnits) + ' still awaiting QA release' : '')), lossLine(x.losses))
           : el('div', {}, releaseStageBadge(x.releaseStatus), x.releaseStatus.cause && x.state !== 'released' || held(x) ? el('div', { class: 'hold-why', title: x.releaseStatus.text }, x.releaseStatus.cause) : null,
-            kind === 'await' && (x.earlyShipments || []).length ? el('div', { class: 'hold-why', title: x.releaseStatus.text }, fmt(x.earlyUnits) + ' unit(s) already released for shipment (see Conditional release)') : null),
+            kind === 'await' && (x.earlyShipments || []).length ? el('div', { class: 'hold-why', title: x.releaseStatus.text }, fmt(x.earlyUnits) + ' unit(s) already released for shipment (see Conditional release)') : null, lossLine(x.losses)),
         releaseCheckDots(x.checklist), labBadge(x.lab),
         x.reviewedBy ? x.reviewedBy + ' · ' + fmtWhen(x.reviewedAt) : '—',
         kind === 'cond' ? (x.conditionsBy ? x.conditionsBy + ' · ' + fmtWhen(x.conditionsAt) : '—') : x.releasedBy ? x.releasedBy + ' · ' + fmtWhen(x.releasedAt) : '—']),
@@ -5160,6 +5195,11 @@ function printReleaseRecord(d) {
 }
 async function openRecallReport(d) {
   const r = await api('GET', '/release/runs/' + d.id + '/recall');
+  modal('Where did ' + d.lot + ' go?', recallReportBody(r, d.lot), async () => {}, 'Close', { wide: true, noCancel: true });
+}
+// The recall trace of a run (customers, lots, shipments, supplier lots), drawn by the recall window and by the loss report (KW-99).
+function recallReportBody(r, lot) {
+  const d = { lot };
   const body = el('div', {});
   body.append(el('div', { class: 'help' }, 'Every finished-goods lot of ' + d.lot + ', what is still on site and what shipped, so a recall or customer query can be answered in one place.'));
   body.append(el('h4', { style: 'margin:10px 0 4px' }, 'Customers who received this product (' + r.customers.length + ')'));
@@ -5180,17 +5220,19 @@ async function openRecallReport(d) {
   const mrows = [];
   r.materials.forEach(x => (x.lots.length ? x.lots : [null]).forEach(l => mrows.push([x.item, num(fmt(l ? l.qty : x.used, 2) + ' ' + x.unit), l ? l.supplierLot : '—', l ? (l.supplier || '—') : '—', l ? (l.expiryDate || '—') : '—'])));
   body.append(mrows.length ? table(['Item', 'Used', 'Supplier lot', 'Supplier', 'Expiry'], mrows, [false, true, false, false, false]) : el('div', { class: 'help' }, 'No inventory usage is recorded against this run.'));
-  modal('Where did ' + d.lot + ' go?', body, async () => {}, 'Close', { wide: true, noCancel: true });
+  return body;
 }
 async function openReleaseRun(id) {
   const d = await api('GET', '/release/runs/' + id);
   const me = d.me;
+  if (d.state === 'no_output') return openNoOutputRun(d, id);              // KW-99: nothing to review or release
   const body = el('div', {});
   const refresh = async () => { body.closest('.modal-bg')?.remove(); await openReleaseRun(id); if (State.tab === 'release') { /* list refreshes on next visit */ } };
   body.append(el('div', { class: 'summary-line' }, sl('Run', d.lot), sl('Product', skuName(d.sku)), el('span', {}, 'Status: ', releaseStageBadge(d.releaseStatus)),
     sl('Finalized', fmtWhen(d.finalizedAt) + (d.finalizedBy ? ' by ' + d.finalizedBy : ''))));
   // KW-94: where the run stands, what it is waiting for, why any lot is on hold, and the checklist -- before anything else
   body.append(releaseStatusBlock(d.releaseStatus));
+  body.append(await lossesBox(id));                                           // KW-99: loss reports of this run
   body.append(el('div', { class: 'sign-box' }, el('h4', {}, 'Release checklist'), releaseChecklistView(d.checklist, i => {
     if (i.action === 'lab') openLabResults(d.run);
     else if (i.action === 'log' || i.action === 'amend') openProcessLog(d.run);
@@ -5331,6 +5373,461 @@ async function openReleaseRun(id) {
   modal('Product release — ' + d.lot, body, async () => { render(); }, 'Close', { wide: true, noCancel: true });
 }
 
+/* ---------------- Loss reports (KW-99) ---------------- */
+// A loss report records product that was lost (feedstock, in-process product or finished product): what, when, who, why, what happened to it. The SERVER owns the rules (the list of
+// stages / kinds / causes in `refdata`, who may confirm and close, the repeat rule, the hash-chained audit trail); these functions only draw it and send the signatures.
+// A report never moves stock: the tote / lot is written off through the usual screens.
+const LOSS_STATUS = { open: ['hold', 'Open'], confirmed: ['wip', 'Confirmed'], closed: ['on_hand', 'Closed'] };
+const lossStatusBadge = s => { const [c, t] = LOSS_STATUS[s] || ['sold', s || '—']; return badge(c, t); };
+const lossKinds = () => (State.ref && State.ref.lossKinds) || [{ code: 'feedstock', name: 'Feedstock', unit: 'kg' }, { code: 'in_process', name: 'In-process product', unit: 'L' }, { code: 'finished', name: 'Finished product', unit: 'L' }];
+const lossKindOf = code => lossKinds().find(k => k.code === code) || null;
+const lossNum = n => n == null ? '—' : Number(n).toLocaleString(undefined, { maximumFractionDigits: 2 });
+const lossKindName = l => (lossKindOf(l.lostKind) || {}).name || l.lostKind || '—';
+const lossQtyText = l => lossNum(l.qty) + ' ' + (l.unit || (lossKindOf(l.lostKind) || {}).unit || '');
+const lossWhen = s => s ? String(s).replace('T', ' ') : '—';
+const lossYesNo = x => x === true || x === 'yes' ? 'Yes' : x === false || x === 'no' ? 'No' : '—';
+const lossCauseOptions = () => (State.ref && State.ref.lossCauses || []).map(c => [String(c.id), c.name]);
+const LOSS_AGE_OLD_DAYS = 7, LOSS_AGE_LATE_DAYS = 30;          // colour of the age number in the list only (amber, then red); nothing is calculated from them
+function lossAgeCell(l) {
+  if (l.status === 'closed' || l.ageDays == null) return el('span', { class: 'muted' }, '—');
+  return el('span', { class: 'loss-age' + (l.ageDays >= LOSS_AGE_LATE_DAYS ? ' late' : l.ageDays >= LOSS_AGE_OLD_DAYS ? ' old' : ''), title: 'Days since the report was opened, while it is not closed' }, String(l.ageDays));
+}
+function lossLinks(l) {
+  const out = [];
+  if (l.processingLot) out.push('Run ' + l.processingLot);
+  if (l.toteLot) out.push('Tote ' + l.toteLot);
+  if (l.fgLotNumber) out.push('Lot ' + l.fgLotNumber);
+  if (!out.length && l.refText) out.push(l.refText);
+  return out;
+}
+const lossSummary = () => api('GET', '/losses/summary').then(x => x.byRun || {}).catch(() => ({}));
+function lossQtyParts(s) {
+  const parts = [];
+  if (s.feedstockKg > 0) parts.push(lossNum(s.feedstockKg) + ' kg');
+  if (s.productL > 0) parts.push(lossNum(s.productL) + ' L');
+  return parts.join(' + ');
+}
+// "Loss 3,882 kg · 1 open" on a run card; a click lists the run's reports.
+function lossBadge(sum, runId, lot) {
+  const s = sum && sum[String(runId)];
+  if (!s || !s.count) return null;
+  return el('span', { class: 'badge low loss-badge', role: 'button', tabindex: '0', title: s.count + ' loss report(s)' + (s.open ? ', ' + s.open + ' not closed yet' : '') + ' (click to list them)',
+    onclick: () => openRunLosses(runId, lot) }, 'Loss ' + (lossQtyParts(s) || s.count + ' report(s)') + (s.open ? ' · ' + s.open + ' open' : ''));
+}
+function lossLine(s) {          // the same, as a small note under a status badge (Product Release)
+  if (!s || !s.count) return null;
+  return el('div', { class: 'hold-why loss-line', title: s.count + ' loss report(s)' }, 'Loss: ' + (lossQtyParts(s) || s.count + ' report(s)') + (s.open ? ' · ' + s.open + ' open' : ''));
+}
+function lossRunBanner(run) {
+  if (!run.lossReportId) return null;
+  const m = run.lossMissing, missing = Array.isArray(m) ? m.join('; ') : (m ? String(m) : '');
+  return el('div', { class: 'loss-banner' }, el('b', {}, 'Finished as a loss. '), 'No product was packaged and the run has no sign-off; Quality decides on the loss report. ',
+    el('button', { type: 'button', class: 'secondary', onclick: () => openLossReport(run.lossReportId) }, 'Open the loss report'),
+    missing ? el('div', { class: 'help' }, 'Required fields still blank when the run was finished: ' + missing) : null);
+}
+// The loss reports of one run (Product Release window, run card badge).
+async function lossesBox(runId) {
+  let list = [];
+  try { list = (await api('GET', '/losses?runId=' + runId)).losses || []; } catch (e) { return el('div', { class: 'sign-box' }, el('h4', {}, 'Losses'), el('div', { class: 'error' }, e.message)); }
+  return el('div', { class: 'sign-box' }, el('h4', {}, 'Losses reported against this run (' + list.length + ')'),
+    list.length ? table(['Report', 'Found', 'What', 'Cause', 'Status', ''], list.map(l => [mono(l.reportNo), lossWhen(l.foundAt), lossKindName(l) + ' · ' + lossQtyText(l), l.causeName || '—', lossStatusBadge(l.status),
+      rowActions([['Open', () => openLossReport(l.id)]])]), [false, false, false, false, false, false]) : el('div', { class: 'help' }, 'No loss has been reported for this run.'),
+    el('div', { style: 'margin-top:8px' }, el('button', { type: 'button', class: 'secondary', onclick: () => newLossReport({ runId }) }, 'Report a loss…')));
+}
+async function openRunLosses(runId, lot) {
+  modal('Losses — ' + (lot || 'run'), await lossesBox(runId), async () => { render(); }, 'Close', { wide: true, noCancel: true });
+}
+// A run finished as a loss has no review or release to sign.
+async function openNoOutputRun(d, id) {
+  const body = el('div', {});
+  body.append(el('div', { class: 'summary-line' }, sl('Run', d.lot), sl('Product', skuName(d.sku)), el('span', {}, 'Status: ', releaseBadge('no_output')),
+    sl('Finalized', fmtWhen(d.finalizedAt) + (d.finalizedBy ? ' by ' + d.finalizedBy : ''))));
+  body.append(el('div', { class: 'release-status danger' }, el('div', { class: 'rs-head' }, badge('low', 'No product (loss)')),
+    el('div', { class: 'rs-line' }, 'This run was finished as a loss, so no finished goods were made and there is no production-log review or release to sign. The Quality Manager decides on it by closing the loss report.')));
+  body.append(await lossesBox(id));
+  if (d.run) body.append(el('div', { style: 'margin:6px 0' }, el('button', { type: 'button', class: 'secondary', onclick: () => openProcessLog(d.run) }, '📋 Open full process log')));
+  if ((d.events || []).length) {
+    body.append(el('h3', { style: 'margin:14px 0 6px;font-size:14px' }, 'Audit trail'));
+    body.append(el('div', { class: 'tablewrap' }, el('table', {},
+      el('thead', {}, el('tr', {}, ...['#', 'When', 'Event', 'Signed by', 'Statement / comment'].map(h => el('th', {}, h)))),
+      el('tbody', {}, ...d.events.map(e => el('tr', {}, el('td', { class: 'muted' }, e.id), el('td', { class: 'muted' }, fmtWhen(e.at)), el('td', {}, el('b', {}, RELEASE_EVENTS[e.type] || e.type)),
+        el('td', {}, e.user || '—', e.capacity ? el('div', { class: 'muted' }, e.capacity) : null), el('td', {}, e.meaning || '', e.comment ? el('div', {}, '“' + e.comment + '”') : null)))))));
+  }
+  modal('Product release — ' + d.lot, body, async () => { render(); }, 'Close', { wide: true, noCancel: true });
+}
+
+/* The Losses tab: every report, the ones not closed first with their age. */
+const LOSS_FILTERS = [['notclosed', 'Not closed'], ['open', 'Open'], ['confirmed', 'Confirmed'], ['closed', 'Closed'], ['all', 'All']];
+async function pageLosses(v) {
+  State.lossFilter = State.lossFilter || 'notclosed';
+  v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Loss Reports'),
+    el('div', { class: 'actions' }, el('button', { onclick: () => newLossReport({}) }, '+ New loss report'))));
+  const d = await api('GET', '/losses');
+  const thr = d.thresholds || {};
+  v.append(el('div', { class: 'help', style: 'margin-bottom:10px' },
+    'A loss report records product that was lost: what, when, who, why and what happened to it. A Production Manager confirms it, then a Quality Manager closes it. A report is required for a loss above '
+    + lossNum(thr.feedstockKg != null ? thr.feedstockKg : settingValue('loss_report_min_feedstock_kg', 0)) + ' kg of feedstock or '
+    + lossNum(thr.productL != null ? thr.productL : settingValue('loss_report_min_product_l', 0)) + ' L of product (Calculations > Loss reports); a smaller loss can still be reported. A report does not change stock.'));
+  const filterSel = selectFrom('', LOSS_FILTERS, () => { State.lossFilter = filterSel.value; draw(); });
+  filterSel.value = State.lossFilter;
+  const countEl = el('span', { class: 'muted' });
+  v.append(el('div', { class: 'toolbar' }, el('span', {}, 'Show'), filterSel, countEl));
+  const host = el('div', {});
+  v.append(host);
+  function draw() {
+    const f = State.lossFilter;
+    const rows = (d.losses || []).filter(l => f === 'all' || (f === 'notclosed' ? l.status !== 'closed' : l.status === f));
+    countEl.textContent = rows.length + ' report' + (rows.length === 1 ? '' : 's');
+    host.replaceChildren(table(['Report', 'Found', 'Age (days)', 'Stage', 'What', 'Cause', 'Linked to', 'Status', ''],
+      rows.map(l => [mono(l.reportNo), lossWhen(l.foundAt), lossAgeCell(l), l.stage || '—', lossKindName(l) + ' · ' + lossQtyText(l), l.causeName || '—', lossLinks(l).join(' · ') || '—',
+        el('div', {}, lossStatusBadge(l.status), l.reportable === false ? el('div', { class: 'hold-why', title: 'The quantity was at or below the reporting threshold when the report was opened' }, 'Not required') : null),
+        rowActions([['Open', () => openLossReport(l.id)]])]),
+      [false, false, 'center', false, false, false, false, false, false], i => openLossReport(rows[i].id)));
+  }
+  draw();
+}
+
+/* One report: the details, the steps, the audit events, the recall trace of its run, and the signatures its status allows. A closed report is read-only. */
+async function openLossReport(id) {
+  const d = await api('GET', '/losses/' + id);
+  const l = d.loss, me = d.me || {}, rep = d.repeat || {};
+  const body = el('div', {});
+  const refresh = async () => {
+    body.closest('.modal-bg')?.remove();
+    try { State.ref = await api('GET', '/refdata'); } catch (e) { /* the tab count catches up on the next load */ }
+    await openLossReport(id);
+  };
+  body.append(el('div', { class: 'summary-line' }, sl('Report', mono(l.reportNo)), el('span', {}, 'Status: ', lossStatusBadge(l.status)),
+    l.reportable === false ? el('span', { class: 'pill', title: 'The quantity was at or below the reporting threshold when the report was opened' }, 'Report not required') : null,
+    l.status !== 'closed' && l.ageDays != null ? sl('Age', l.ageDays + ' day' + (l.ageDays === 1 ? '' : 's')) : null));
+  const unit = l.lostKind === 'feedstock' ? 'kg' : 'L';
+  const links = lossLinks(l);
+  const rows = [
+    ['Stage', l.stage || '—'],
+    ['What was lost', lossKindName(l) + ' · ' + lossQtyText(l)],
+    l.confirmedQty != null && Number(l.confirmedQty) !== Number(l.qty) ? ['Quantity confirmed by Production', lossNum(l.confirmedQty) + ' ' + (l.unit || unit)] : null,
+    ['Happened', lossWhen(l.occurredAt)], ['Found', lossWhen(l.foundAt)],
+    ['Cause', (l.causeName || '—') + (l.confirmedCauseName && l.confirmedCauseName !== l.causeName ? ' (confirmed as ' + l.confirmedCauseName + ')' : '')],
+    ['Description', el('div', { style: 'white-space:pre-wrap' }, l.description || '—')],
+    ['Disposal', (l.disposalRoute || '—') + (l.disposalOther ? ': ' + l.disposalOther : '')],
+    ['Other product may be affected', lossYesNo(l.mayAffectOther)],
+    ['Linked to', links.length ? links.join(' · ') : '—'],
+    l.correctsNo ? ['Corrects report', el('button', { type: 'button', class: 'secondary', onclick: () => openLossReport(l.correctsId) }, l.correctsNo)] : null,
+    ['Reported by', (l.openedBy || '—') + (l.openedAt ? ' · ' + fmtWhen(l.openedAt) : '')],
+    ['Reporting threshold', l.thresholdUsed == null ? (l.reportable === false ? 'Not required' : 'Required')
+      : (l.reportable === false ? 'At or below ' : 'Above ') + lossNum(l.thresholdUsed) + ' ' + unit + ' when opened: a report was ' + (l.reportable === false ? 'not ' : '') + 'required'],
+  ].filter(Boolean);
+  body.append(table(['Field', 'Value'], rows));
+
+  const fieldsText = f => Object.entries(f || {}).filter(([, x]) => x !== null && x !== undefined && x !== '' && typeof x !== 'object').map(([k, x]) => humanKey(k) + ': ' + (lossYesNo(x) !== '—' ? lossYesNo(x) : x)).join(' · ');
+  const stepName = s => s === 'confirm' ? 'Confirmed by Production' : s === 'close' ? 'Closed by Quality' : s;
+  body.append(el('h4', { style: 'margin:12px 0 4px' }, 'Signatures'));
+  body.append((l.steps || []).length ? table(['When', 'Step', 'By', 'Note', 'Recorded'],
+    l.steps.map(s => [fmtWhen(s.at), stepName(s.step), el('span', {}, s.by || '—', s.capacity ? el('div', { class: 'muted' }, s.capacity) : null), s.note || '—', fieldsText(s.fields) || '—']), [false, false, false, false, false])
+    : el('div', { class: 'help' }, 'Not confirmed yet.'));
+  if (l.close) {
+    const c = l.close;
+    body.append(el('h4', { style: 'margin:12px 0 4px' }, 'Quality close-out'));
+    body.append(table(['Field', 'Value'], [
+      ['Non-conformance', lossYesNo(c.nonconformance)],
+      ['Other lots affected', lossYesNo(c.otherLotsAffected) + (c.otherLotsNote ? ': ' + c.otherLotsNote : '')],
+      ['Corrective action required', lossYesNo(c.capaRequired)],
+      c.capaRequired ? ['Corrective action', el('div', { style: 'white-space:pre-wrap' }, c.capaText || '—')] : null,
+      c.capaRequired ? ['Owner / due date', (c.capaOwner || '—') + ' · ' + (c.capaDue || '—')] : null].filter(Boolean)));
+  }
+  if (d.recall) {
+    const open = l.status === 'confirmed' && me.canClose;
+    body.append(el('details', { class: 'accordion', ...(open ? { open: '' } : {}) }, el('summary', {}, 'Where did the product of run ' + (l.processingLot || '') + ' go? (' + ((d.recall.customers || []).length) + ' customer(s))'),
+      el('div', { class: 'accordion-body' }, recallReportBody(d.recall, l.processingLot || ''))));
+  } else if (l.status !== 'closed') {
+    body.append(el('div', { class: 'help', style: 'margin:8px 0' }, 'This loss is not linked to a production run, so there is no automatic trace: check by hand whether other product could be affected.'));
+  }
+
+  // A signature: the controls, the password (re-checked by the server) and the button. A refused signature (wrong password, wrong role, wrong state) shows the server's message and nothing changes.
+  function lossSignBox(title, attest, controls, doSign, button) {
+    const pw = el('input', { type: 'password', autocomplete: 'off', placeholder: 'Re-enter your password to sign' });
+    const err = el('div', { class: 'error' });
+    const btn = el('button', { type: 'button' }, button);
+    btn.addEventListener('click', async () => {
+      err.textContent = ''; btn.disabled = true;
+      try { await doSign(pw.value); toast('Signature recorded'); await refresh(); }
+      catch (e) { err.textContent = e.message; btn.disabled = false; }
+    });
+    return el('div', { class: 'sign-box', 'data-sign': '1' }, el('h4', {}, title), el('div', { class: 'sign-attest' }, attest), ...controls, field(reqLabel('Password'), pw), err, btn);
+  }
+  function confirmBox() {
+    const qty = el('input', { type: 'number', min: '0', step: 'any', placeholder: 'Leave blank to keep ' + lossQtyText(l) });
+    const cause = selectFrom('', [['', 'Keep: ' + (l.causeName || '—')], ...lossCauseOptions()]);
+    const note = el('textarea', { rows: '2', placeholder: 'Note (optional)' });
+    return lossSignBox('Production confirmation', 'By signing I confirm that this loss happened as described (or as corrected here) and that the quantity and cause are right. The original entry stays on record.',
+      [el('div', { class: 'form-row' }, field('Corrected quantity (' + (l.unit || unit) + ')', qty), field('Corrected cause', cause)), field('Note', note)],
+      async pw => {
+        if (qty.value !== '' && !(Number(qty.value) > 0)) throw new Error('The corrected quantity must be a number above 0.');
+        await api('POST', '/losses/' + id + '/confirm', { password: pw, qty: qty.value === '' ? undefined : Number(qty.value), causeId: cause.value ? Number(cause.value) : undefined, note: note.value.trim() || undefined });
+      }, 'Sign confirmation');
+  }
+  function closeBox() {
+    const yesNo = () => selectFrom('', [['', 'Choose…'], ['yes', 'Yes'], ['no', 'No']]);
+    const nc = yesNo(), other = yesNo();
+    const otherNote = el('textarea', { rows: '2', placeholder: 'Which lots or product, and what was checked' });
+    const needed = !!rep.needed;
+    const capa = el('input', { type: 'checkbox' }); capa.checked = needed; capa.disabled = needed;
+    const capaText = el('textarea', { rows: '3', placeholder: 'The corrective action that will be taken' });
+    const capaOwner = el('input', { placeholder: 'Who is responsible' });
+    const capaDue = el('input', { type: 'date' });
+    const capaFields = el('div', {}, field(reqLabel('Corrective action'), capaText), el('div', { class: 'form-row' }, field(reqLabel('Owner'), capaOwner), field(reqLabel('Due date'), capaDue)));
+    const sync = () => capaFields.classList.toggle('hidden', !capa.checked);
+    capa.addEventListener('change', sync); sync();
+    const row = el('label', { class: 'perm-item' + (capa.checked ? ' on' : '') }, capa, el('span', { class: 'perm-text' }, el('b', {}, 'A corrective action is required'),
+      el('small', {}, needed ? 'Forced on: this cause keeps coming back (see above).' : 'Tick when something has to change so this does not happen again.')));
+    capa.addEventListener('change', () => row.classList.toggle('on', capa.checked));
+    const note = el('textarea', { rows: '2', placeholder: 'Note (optional)' });
+    const windowDays = rep.windowDays != null ? rep.windowDays : settingValue('loss_repeat_days', 180);
+    const repeatNote = needed ? el('div', { class: 'loss-repeat' }, el('b', {}, 'Repeated cause. '), 'This is report ' + rep.count + ' with the cause “' + (rep.cause || l.causeName || '') + '” at the stage “' + (rep.stage || l.stage || '')
+        + '” within ' + windowDays + ' days, so a corrective action must be recorded before it can be closed.')
+      : (rep.count > 1 ? el('div', { class: 'help' }, 'Reports with this cause and stage in the last ' + windowDays + ' days, including this one: ' + rep.count + '.') : null);
+    return lossSignBox('Quality close-out', 'By signing I confirm I have assessed this loss (including the trace above) and that the answers below are right. A closed report cannot be changed.',
+      [repeatNote, el('div', { class: 'form-row' }, field(reqLabel('Non-conformance?'), nc), field(reqLabel('Other lots affected?'), other)), field('If other lots are affected: which, and what was checked', otherNote),
+        el('div', { class: 'perm-list', style: 'margin:8px 0' }, row), capaFields, field('Note', note)],
+      async pw => {
+        if (!nc.value) throw new Error('Say whether this is a non-conformance.');
+        if (!other.value) throw new Error('Say whether other lots are affected.');
+        if (capa.checked && !capaText.value.trim()) throw new Error('Describe the corrective action.');
+        if (capa.checked && !capaOwner.value.trim()) throw new Error('Say who is responsible for the corrective action.');
+        if (capa.checked && !capaDue.value) throw new Error('Enter the due date of the corrective action.');
+        await api('POST', '/losses/' + id + '/close', { password: pw, nonconformance: nc.value, otherLotsAffected: other.value, otherLotsNote: otherNote.value.trim() || undefined,
+          capaRequired: capa.checked, capaText: capa.checked ? capaText.value.trim() : undefined, capaOwner: capa.checked ? (capaOwner.value.trim() || undefined) : undefined,
+          capaDue: capa.checked ? (capaDue.value || undefined) : undefined, note: note.value.trim() || undefined });
+      }, 'Sign and close the report');
+  }
+  if (l.status === 'open') body.append(me.canConfirm ? confirmBox() : el('div', { class: 'help sign-box' }, 'Waiting for confirmation by a Production Manager. You do not have confirm permission.'));
+  else if (l.status === 'confirmed') body.append(me.canClose ? closeBox() : el('div', { class: 'help sign-box' }, 'Confirmed. Waiting for the Quality Manager to close it. You do not have close permission.'));
+  else body.append(el('div', { class: 'help' }, 'This report is closed and cannot be changed. If something in it was wrong, file a correction: it is a new report that points at this one.'));
+
+  body.append(el('h3', { style: 'margin:14px 0 6px;font-size:14px' }, 'Audit trail'));
+  body.append((d.events || []).length ? el('div', { class: 'tablewrap' }, el('table', {},
+    el('thead', {}, el('tr', {}, ...['When', 'Event', 'By', 'Comment', 'Entry hash'].map(h => el('th', {}, h)))),
+    el('tbody', {}, ...d.events.map(e => el('tr', {}, el('td', { class: 'muted' }, fmtWhen(e.at)), el('td', {}, el('b', {}, RELEASE_EVENTS[e.type] || e.type)),
+      el('td', {}, e.user || '—', e.capacity ? el('div', { class: 'muted' }, e.capacity) : null), el('td', {}, e.comment ? '“' + e.comment + '”' : ''),
+      el('td', { class: 'hashtxt', title: e.entryHash || '' }, shortHash(e.entryHash)))))))
+    : el('div', { class: 'help' }, 'No events yet.'));
+  body.append(el('div', { style: 'margin-top:8px' }, el('button', { type: 'button', class: 'secondary', onclick: () => newLossReport({ correctsId: l.id, from: l }) }, 'File a correction…')));
+  body.append(el('div', { class: 'help', style: 'margin-top:6px' }, 'A loss report does not change stock. To take a tote or a finished-goods lot out of inventory, use “Dispose / write off” on Feedstock Inventory or Finished Goods.'));
+  modal('Loss report — ' + l.reportNo, body, async () => { render(); }, 'Close', { wide: true, noCancel: true });
+}
+
+/* Open a loss report. opts: runId / toteId / fgLotId pre-select what it is about; `from` (an earlier report) pre-fills a correction; onCreated(loss) replaces the default (open the new report). */
+async function newLossReport(opts = {}) {
+  const from = opts.from || null;
+  const L = { run: null, tote: null, fg: null };
+  const picker = placeholder => {
+    const filter = el('input', { placeholder: 'Type to filter the list…' });
+    const sel = el('select', {});
+    let items = [];
+    const fill = () => {
+      const q = filter.value.trim().toLowerCase(), keep = sel.value;
+      sel.replaceChildren(el('option', { value: '' }, placeholder), ...items.filter(i => !q || i.label.toLowerCase().includes(q) || String(i.id) === keep).map(i => el('option', { value: String(i.id) }, i.label)));
+      sel.value = keep;
+    };
+    filter.addEventListener('input', fill);
+    return { box: el('div', {}, filter, sel), set(list, pre) { items = list; fill(); if (pre != null) sel.value = String(pre); }, value: () => sel.value ? Number(sel.value) : null };
+  };
+  const runPick = picker('Choose the production run…'), totePick = picker('Choose the feedstock tote…'), fgPick = picker('Choose the finished-goods lot…');
+  const textInp = el('input', { placeholder: 'What was lost, and where (for example "tank 3 in the wash room")', value: from && !from.processingLot && !from.toteLot && !from.fgLotNumber ? (from.refText || '') : '' });
+  async function ensure(kind) {
+    try {
+      if (kind === 'run' && !L.run) {
+        const [a, b] = await Promise.all([api('GET', '/production'), api('GET', '/production/drafts')]);
+        L.run = [...(b.drafts || []).map(x => ({ id: x.id, label: x.processingLot + (x.runDate ? ' · ' + x.runDate : '') + ' (in progress)' })), ...(a.runs || []).map(x => ({ id: x.id, label: x.processingLot + (x.runDate ? ' · ' + x.runDate : '') }))];
+        runPick.set(L.run, opts.runId != null ? opts.runId : from && from.runId);
+      } else if (kind === 'tote' && !L.tote) {
+        L.tote = (await api('GET', '/totes')).totes.slice().sort((x, y) => String(y.lot).localeCompare(String(x.lot)))
+          .map(x => ({ id: x.id, label: x.lot + ' · ' + statusLabel(x.status) + (x.avgWeightKg != null ? ' · ' + fmt(x.avgWeightKg, 0) + ' kg' : '') }));
+        totePick.set(L.tote, opts.toteId != null ? opts.toteId : from && from.toteId);
+      } else if (kind === 'fg' && !L.fg) {
+        L.fg = (await api('GET', '/fg')).fg.slice().sort((x, y) => String(y.lot).localeCompare(String(x.lot)))
+          .map(x => ({ id: x.id, label: x.lot + ' · ' + x.packageSize + ' · ' + fgStatusLabel(x.status) + ' · ' + fmt(x.qty) + ' on hand' }));
+        fgPick.set(L.fg, opts.fgLotId != null ? opts.fgLotId : from && from.fgLotId);
+      }
+    } catch (e) { toast('The list could not be loaded: ' + e.message, true); }
+  }
+  const linkSel = selectFrom('', [['run', 'A production run'], ['tote', 'A feedstock tote'], ['fg', 'A finished-goods lot'], ['text', 'Something else (describe it)']]);
+  linkSel.value = opts.toteId != null || (from && from.toteId) ? 'tote' : opts.fgLotId != null || (from && from.fgLotId) ? 'fg' : opts.runId != null || (from && from.runId) ? 'run'
+    : from && from.refText ? 'text' : 'run';
+  const blocks = { run: runPick.box, tote: totePick.box, fg: fgPick.box, text: textInp };
+  const showLink = async () => { Object.entries(blocks).forEach(([k, n]) => n.classList.toggle('hidden', k !== linkSel.value)); await ensure(linkSel.value); };
+  linkSel.addEventListener('change', showLink);
+  await showLink();
+
+  const stageSel = selectFrom('', [['', 'Choose the stage…'], ...(State.ref.lossStages || []).map(s => [s, s])]);
+  const kindSel = selectFrom('', [['', 'Choose…'], ...lossKinds().map(k => [k.code, k.name + ' (' + k.unit + ')'])]);
+  const qty = el('input', { type: 'number', min: '0', step: 'any', placeholder: 'Quantity lost' });
+  const unitEl = el('span', { class: 'muted' }, '');
+  const thrNote = el('div', { class: 'help' });
+  function syncQty() {
+    const k = lossKindOf(kindSel.value);
+    unitEl.textContent = k ? k.unit : '';
+    const q = Number(qty.value);
+    if (!k || !(q > 0)) { thrNote.textContent = ''; thrNote.className = 'help'; return; }
+    const thr = Number(k.code === 'feedstock' ? settingValue('loss_report_min_feedstock_kg', 0) : settingValue('loss_report_min_product_l', 0)) || 0;
+    const needed = q > thr;
+    thrNote.className = 'help' + (needed ? ' loss-required' : '');
+    thrNote.textContent = needed ? 'Report required for losses above ' + lossNum(thr) + ' ' + k.unit + (thr === 0 ? ' (every loss).' : '.')
+      : 'Below the reporting threshold (' + lossNum(thr) + ' ' + k.unit + '): a report is not required, but you can still file one.';
+  }
+  kindSel.addEventListener('change', syncQty); qty.addEventListener('input', syncQty);
+  const split = s => s ? [String(s).slice(0, 10), String(s).length > 10 ? String(s).slice(11, 16) : ''] : ['', ''];
+  const [od, ot] = split(from && from.occurredAt), [fd, ft] = split(from && from.foundAt);
+  const occDate = el('input', { type: 'date', max: todayStr(), value: od }), occTime = el('input', { type: 'time', value: ot });
+  const foundDate = el('input', { type: 'date', max: todayStr(), value: fd || todayStr() }), foundTime = el('input', { type: 'time', value: ft });
+  const causeSel = selectFrom('', [['', 'Choose the cause…'], ...lossCauseOptions()]);
+  const description = el('textarea', { rows: '3', placeholder: 'What happened, in plain words' }, '');
+  const dispSel = selectFrom('', [['', 'Choose…'], ...(State.ref.lossDisposal || []).map(x => [x, x])]);
+  const dispOther = el('input', { placeholder: 'Describe the disposal route', class: 'hidden' });
+  dispSel.addEventListener('change', () => dispOther.classList.toggle('hidden', dispSel.value !== 'Other'));
+  const mayAffect = el('input', { type: 'checkbox' });
+  const mayRow = el('label', { class: 'perm-item' }, mayAffect, el('span', { class: 'perm-text' }, el('b', {}, 'Product on hand or already shipped may be affected'),
+    el('small', {}, 'Tick when the cause could also have touched other product (the same equipment, feedstock or batch). Quality looks at this when closing the report.')));
+  mayAffect.addEventListener('change', () => mayRow.classList.toggle('on', mayAffect.checked));
+  const correctsSel = selectFrom('', [['', 'No: this is a new loss']]);
+  try {
+    const all = (await api('GET', '/losses')).losses || [];
+    correctsSel.append(...all.map(x => el('option', { value: String(x.id) }, x.reportNo + ' · ' + (x.stage || '') + ' · ' + lossQtyText(x))));
+    if (opts.correctsId != null) correctsSel.value = String(opts.correctsId);
+  } catch (e) { /* the optional link is simply not offered */ }
+  const pw = el('input', { type: 'password', autocomplete: 'off', placeholder: 'Re-enter your password to sign' });
+  if (from) {
+    stageSel.value = from.stage || ''; kindSel.value = from.lostKind || ''; qty.value = from.qty != null ? from.qty : ''; causeSel.value = from.causeId != null ? String(from.causeId) : '';
+    description.value = from.description || ''; dispSel.value = from.disposalRoute || '';
+    if (from.disposalRoute === 'Other') { dispOther.classList.remove('hidden'); dispOther.value = from.disposalOther || ''; }
+    mayAffect.checked = !!from.mayAffectOther; mayRow.classList.toggle('on', mayAffect.checked);
+  } else if (opts.toteId != null) kindSel.value = 'feedstock';
+  else if (opts.fgLotId != null) kindSel.value = 'finished';
+  syncQty();
+  const isPm = !!(State.user && State.user.isProductionManager);
+  const body = el('div', {},
+    from ? el('div', { class: 'help' }, 'This is a correction of ' + from.reportNo + '. It is a new report; the earlier one stays as it is.') : null,
+    el('div', { class: 'help' }, isPm ? 'You are a Production Manager: filing this report also records your confirmation. A Quality Manager then closes it.'
+      : 'A Production Manager confirms the report, then a Quality Manager closes it.'),
+    field(reqLabel('What is the loss about?'), el('div', {}, linkSel, runPick.box, totePick.box, fgPick.box, textInp)),
+    el('div', { class: 'form-row' }, field(reqLabel('Stage'), stageSel), field(reqLabel('What was lost'), kindSel)),
+    field(reqLabel('Quantity'), el('div', { class: 'loss-qty' }, qty, unitEl)), thrNote,
+    el('div', { class: 'form-row' },
+      field(reqLabel('When it happened (date, time optional)'), el('div', { class: 'loss-datetime' }, occDate, occTime)),
+      field(reqLabel('When it was found (date, time optional)'), el('div', { class: 'loss-datetime' }, foundDate, foundTime))),
+    field(reqLabel('Cause'), causeSel), field(reqLabel('Description'), description),
+    el('div', { class: 'form-row' }, field(reqLabel('What happened to the product'), el('div', {}, dispSel, dispOther)), field('Corrects an earlier report?', correctsSel)),
+    el('div', { class: 'perm-list', style: 'margin:8px 0' }, mayRow),
+    field(reqLabel('Password'), pw));
+  modal('New loss report', body, async () => {
+    const payload = {};
+    const link = linkSel.value;
+    if (link === 'run') { payload.runId = runPick.value(); if (!payload.runId) throw new Error('Choose the production run.'); }
+    else if (link === 'tote') { payload.toteId = totePick.value(); if (!payload.toteId) throw new Error('Choose the feedstock tote.'); }
+    else if (link === 'fg') { payload.fgLotId = fgPick.value(); if (!payload.fgLotId) throw new Error('Choose the finished-goods lot.'); }
+    else { payload.refText = textInp.value.trim(); if (!payload.refText) throw new Error('Describe what the loss is about.'); }
+    if (!stageSel.value) throw new Error('Choose the stage.');
+    if (!kindSel.value) throw new Error('Choose what was lost.');
+    if (!(Number(qty.value) > 0)) throw new Error('Enter the quantity lost (above 0).');
+    if (!occDate.value) throw new Error('Enter the date it happened.');
+    if (!foundDate.value) throw new Error('Enter the date it was found.');
+    const future = (d, t) => d && new Date(d + 'T' + (t || '00:00')) > new Date();
+    if (future(occDate.value, occTime.value) || future(foundDate.value, foundTime.value)) throw new Error('A date and time cannot be in the future.');
+    if (foundDate.value < occDate.value) throw new Error('It cannot be found before it happened.');
+    if (!causeSel.value) throw new Error('Choose the cause.');
+    if (description.value.trim().length < 3) throw new Error('Describe what happened.');
+    if (!dispSel.value) throw new Error('Say what happened to the product.');
+    if (dispSel.value === 'Other' && !dispOther.value.trim()) throw new Error('Describe the disposal route.');
+    if (!pw.value) throw new Error('Enter your password to sign.');
+    Object.assign(payload, { password: pw.value, stage: stageSel.value, lostKind: kindSel.value, qty: Number(qty.value),
+      occurredAt: occDate.value + (occTime.value ? 'T' + occTime.value : ''), foundAt: foundDate.value + (foundTime.value ? 'T' + foundTime.value : ''),
+      causeId: Number(causeSel.value), description: description.value.trim(), disposalRoute: dispSel.value, mayAffectOther: mayAffect.checked });
+    if (dispSel.value === 'Other') payload.disposalOther = dispOther.value.trim();
+    if (correctsSel.value) payload.correctsId = Number(correctsSel.value);
+    const r = await api('POST', '/losses', payload);
+    try { State.ref = await api('GET', '/refdata'); } catch (e) { /* the tab count catches up on the next load */ }
+    toast('Loss report ' + r.loss.reportNo + ' filed' + (r.requiredNote ? '. ' + r.requiredNote : ''));
+    if (opts.onCreated) await opts.onCreated(r.loss);
+    else { render(); openLossReport(r.loss.id); }
+  }, 'Sign and file the report', { wide: true });
+}
+
+// "Finish this run as a loss": pick a loss report of this run (or file one now), then send the usual finalize request with `lossReportId`.
+async function finishAsLossDialog(runId, lot, payload) {
+  const sel = el('select', {});
+  async function load(pre) {
+    const open = ((await api('GET', '/losses?runId=' + runId)).losses || []).filter(x => x.status !== 'closed');
+    sel.replaceChildren(el('option', { value: '' }, open.length ? 'Choose the loss report…' : 'No open loss report for this run yet'),
+      ...open.map(x => el('option', { value: String(x.id) }, x.reportNo + ' · ' + lossKindName(x) + ' · ' + lossQtyText(x) + ' · ' + (x.causeName || ''))));
+    if (pre != null) sel.value = String(pre);
+  }
+  await load(null);
+  const body = el('div', {},
+    el('div', { class: 'summary-line' }, sl('Run', mono(lot))),
+    el('ul', { style: 'margin:6px 0 10px 18px;font-size:13px' },
+      el('li', {}, 'The run is finished with no product: nothing is packaged, no finished-goods lot is made and the other required fields are not checked (what was still blank is recorded).'),
+      el('li', {}, 'It gets no production-log review or release and is left out of the Yield & Usage statistics. Quality decides on the loss report.'),
+      el('li', {}, 'This cannot be undone.')),
+    field(reqLabel('Loss report of this run'), sel),
+    el('div', { style: 'margin-top:6px' }, el('button', { type: 'button', class: 'secondary', onclick: () => newLossReport({ runId, onCreated: async l => { await load(l.id); } }) }, 'File a new loss report for this run…')),
+    el('div', { class: 'help', style: 'margin-top:6px' }, 'The loss report must be for this run. The report is signed when it is filed.'));
+  modal('Finish run ' + lot + ' as a loss', body, async () => {
+    if (!sel.value) throw new Error('Choose the loss report, or file a new one first.');
+    if (!confirm('Finish run ' + lot + ' with no product?\n\nThis cannot be undone.')) throw new Error('Not finished: the run is still in progress.');
+    await api('POST', '/production/drafts/' + runId + '/finalize', Object.assign({}, payload, { lossReportId: Number(sel.value) }));
+    toast('Run ' + lot + ' finished as a loss');
+    closeAllModals(); render();
+  }, 'Finish run as a loss');
+}
+
+/* Quality Control tab: losses by month, by cause and by stage (counts and quantities; kg and L are never added together). */
+async function lossStatsCard() {
+  let rows = [];
+  try { rows = (await api('GET', '/losses/stats')).rows || []; } catch (e) { return null; }
+  const card = el('div', { class: 'card' }, el('h3', {}, 'Losses'),
+    el('div', { class: 'help', style: 'margin-bottom:8px' }, 'Loss reports by the month the loss happened: number of reports, and the quantity lost (feedstock in kg, product in L).'));
+  if (!rows.length) { card.append(el('div', { class: 'empty' }, 'No losses have been reported yet.')); return card; }
+  const months = [...new Set(rows.map(r => r.month))].sort();
+  const agg = pred => { const c = { count: 0, qty: {} }; rows.filter(pred).forEach(r => { c.count += r.count; c.qty[r.unit] = (c.qty[r.unit] || 0) + r.qty; }); return c; };
+  const cell = c => !c.count ? el('span', { class: 'muted' }, '—')
+    : el('span', {}, String(c.count), el('small', { class: 'muted' }, ' · ' + Object.entries(c.qty).sort().map(([u, q]) => lossNum(q) + ' ' + u).join(' + ')));
+  const build = (title, key) => {
+    const val = r => r[key] || '(none)';
+    const names = [...new Set(rows.map(val))].sort((a, b) => a.localeCompare(b));
+    const data = names.map(n => [n, ...months.map(m => cell(agg(r => val(r) === n && r.month === m))), el('b', {}, cell(agg(r => val(r) === n)))]);
+    data.push([el('b', {}, 'Total'), ...months.map(m => el('b', {}, cell(agg(r => r.month === m)))), el('b', {}, cell(agg(() => true)))]);
+    return el('div', { class: 'loss-stats' }, el('h4', { style: 'margin:10px 0 4px' }, title),
+      table([title.replace(/^By /, '').replace(/^./, c => c.toUpperCase()), ...months, 'Total'], data, [false, ...months.map(() => true), true]));
+  };
+  card.append(build('By cause', 'cause'), build('By stage', 'stage'));
+  return card;
+}
+
+/* Admin: the list of loss causes people choose from. Never deleted (reports keep the name they were filed with): a cause is switched off instead. */
+async function drawAdminLossCauses(v) {
+  const { causes } = await api('GET', '/loss-causes');
+  v.append(el('div', { class: 'page-head', style: 'margin-top:28px' }, el('h2', {}, 'Loss causes'),
+    el('div', { class: 'actions' }, el('button', { onclick: () => editLossCause(null, () => render()) }, '+ Add cause'))));
+  v.append(el('div', { class: 'help', style: 'margin:-6px 0 8px' }, 'The causes offered when a loss is reported. A cause that has been used is never deleted: switch it off and it is no longer offered, while earlier reports keep it. Every change is logged.'));
+  v.append(table(['Cause', 'Order', 'Reports', 'Status', ''],
+    causes.map(c => [c.name, c.sortOrder, c.reports, c.active ? badge('on_hand', 'Active') : badge('disposed', 'Inactive'), rowActions([['Edit', () => editLossCause(c, () => render())]])]),
+    [false, true, true, false, false]));
+}
+function editLossCause(c, after) {
+  const name = el('input', { value: c ? c.name : '', placeholder: 'e.g. Power failure' });
+  const order = el('input', { type: 'number', step: '1', value: c ? c.sortOrder : '' });
+  const act = el('input', { type: 'checkbox' }); act.checked = c ? !!c.active : true;
+  const actRow = el('label', { class: 'perm-item' + (act.checked ? ' on' : '') }, act, el('span', { class: 'perm-text' }, el('b', {}, 'In use'), el('small', {}, 'Untick to stop offering this cause when a loss is reported. Earlier reports keep it.')));
+  act.addEventListener('change', () => actRow.classList.toggle('on', act.checked));
+  modal(c ? 'Edit loss cause — ' + c.name : 'Add loss cause', el('div', {}, field(reqLabel('Name'), name), c ? field('Sort order (smaller first)', order) : null, c ? el('div', { class: 'perm-list' }, actRow) : null),
+    async () => {
+      if (!name.value.trim()) throw new Error('Name is required.');
+      if (c) await api('PUT', '/loss-causes/' + c.id, { name: name.value.trim(), active: act.checked, sortOrder: order.value === '' ? undefined : Number(order.value) });
+      else await api('POST', '/loss-causes', { name: name.value.trim() });
+      State.ref = await api('GET', '/refdata'); toast('Saved'); after();
+    }, 'Save');
+}
+
 /* ---------------- Finished goods ---------------- */
 async function pageFG(v) {
   v.append(el('div', { class: 'page-head' }, el('h2', {}, 'Finished Goods'),
@@ -5379,6 +5876,7 @@ async function pageFG(v) {
         merged ? rowActions([[open ? 'Hide lots' : 'Show lots', () => { open ? expanded.delete(f.key) : expanded.add(f.key); draw(); }]]) : rowActions([
           f.status !== 'sold' ? ['Move', () => moveFG(f)] : null,
           ['Label', () => printLabels([fgLabel(f)])],
+          ['Report loss', () => newLossReport({ fgLotId: f.id })],
           f.skuAssigned === false && f.status === 'on_hand' && f.qty > 0 ? ['Assign SKU', () => assignSkuModal(f)] : null,
           ['Edit', () => editFG(f)]
         ])]);
@@ -5386,6 +5884,7 @@ async function pageFG(v) {
         rows.push([rowCheck(m, selected, updateBulk), el('span', { class: 'muted' }, '↳ ', mono(m.lot)), fgSkuText(m), m.packageSize, fmt(fgUnits(m)), num(fmt(fgLitres(m), 0)), ...common(m), fgStatusWithWhy(m), rowActions([
           m.status !== 'sold' ? ['Move', () => moveFG(m)] : null,
           ['Label', () => printLabels([fgLabel(m)])],
+          ['Report loss', () => newLossReport({ fgLotId: m.id })],
           m.skuAssigned === false && m.status === 'on_hand' && m.qty > 0 ? ['Assign SKU', () => assignSkuModal(m)] : null,
           ['Edit', () => editFG(m)]
         ])]);
@@ -7724,6 +8223,20 @@ const CALCULATIONS = [
     settings: ['yield_report_min_runs'],
   },
   {
+    title: 'Loss report: when a report is required',
+    formula: 'A report is required when  quantity lost > threshold,  with the threshold in kg for feedstock and in L for in-process or finished product.  Threshold 0 = every loss is reported.',
+    description: 'Decides whether a loss has to be reported. A loss at or below the threshold is not required to be reported, but it can still be filed and is never refused; its report says “not required”. The threshold in force is stored on the report when it is opened, so changing the setting later does not change an earlier report. A loss report never moves stock: the tote, the lot or the run is written off through the usual screens.',
+    location: 'Losses tab → New loss report (the note under the quantity) and the “Not required” note in the list',
+    settings: ['loss_report_min_feedstock_kg', 'loss_report_min_product_l'],
+  },
+  {
+    title: 'Loss report: repeated cause',
+    formula: 'Repeat = (number of loss reports with the same cause and the same stage in the last  N days, counting this one) ≥ M.  M = 0 switches the rule off.',
+    description: 'When the same cause is reported at the same stage this many times within the window, the report that makes it so cannot be closed by the Quality Manager without a corrective action (text, owner and due date). The close window says which cause, stage and how many reports it counted.',
+    location: 'Losses tab → a report → Quality close-out',
+    settings: ['loss_repeat_count', 'loss_repeat_days'],
+  },
+  {
     title: 'CIP duration',
     formula: 'Duration (min) = CIP end time − CIP start time',
     description: 'How long a Clean In Place took, shown as hours/minutes once both times are entered.',
@@ -7786,6 +8299,7 @@ const SETTING_GROUPS = [
   { title: 'Quality Control charts & reports', note: 'Control-limit rules and the Yield & Usage report.', keys: [
     'qc_chart_sigma', 'qc_chart_min_n_provisional', 'qc_chart_min_n_established', 'qc_chart_run_length', 'qc_chart_trend_length', 'yield_report_min_runs'] },
   { title: 'Release & sign-off', note: 'Who may review and release a run.', keys: ['release_separate_signers', 'review_not_by_finalizer', 'conditional_release_enabled'] },
+  { title: 'Loss reports', note: 'When a loss has to be reported, and when a repeated cause needs a corrective action.', keys: ['loss_report_min_feedstock_kg', 'loss_report_min_product_l', 'loss_repeat_count', 'loss_repeat_days'] },
   { title: 'Samples, lots & inventory', note: 'Retention and expiry.', keys: ['sample_retention_months', 'lot_expiry_warning_days'] },
   { title: 'Receiving: reading invoices', note: 'Whether scans and photos of invoices are read, the daily limit and the arithmetic check.', keys: ['invoice_ai_enabled', 'invoice_read_daily_limit', 'invoice_check_tolerance_pct'] },
   { title: 'Run summary card display', note: 'Which figures show on a finished run’s summary card (1 shows, 0 hides).', keys: [
@@ -9497,6 +10011,7 @@ async function pageAdmin(v) {
   await drawAdminRequisitionContact(v);
   await drawAdminCoaSpecs(v);
   await drawAdminDestinations(v);
+  await drawAdminLossCauses(v);
   await drawAdminGradeRules(v);
 }
 // KW-100: where product is sold, and whether heavy-metals results are needed before it ships there. A customer points at one (Customers > Edit); product that is only
