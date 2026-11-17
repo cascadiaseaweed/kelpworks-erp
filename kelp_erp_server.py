@@ -267,6 +267,9 @@ SETTINGS_DEFAULTS = [
      "After a document is read, quantity x unit price is compared with the line amount, and the lines + freight + tax with the invoice total. A difference larger than this (and 5 cents) shows a warning; nothing is changed."),
     ("upload_user_daily_mb", 300, "Uploads: most one person may upload in 24 hours (MB; 0 = no limit)",
      "Documents and photos together. A person who reaches it is told to try again later; an administrator can raise it."),
+    ("archive_sync_warn_hours", 36, "Backups: warn when nothing has been copied off the server for this many hours (0 = no warning)",
+     "The office PC's sync copies the nightly backup off the server disk every night. When the sync has not contacted the server, or no backup has been copied off it, for longer than this, "
+     "Admin > Records archive & backups turns red and administrators see a banner. 36 allows one missed night."),
     ("release_separate_signers", 0, "Release: reviewer and releaser must be different people (1 = yes)",
      "When 1, the person who signed a run's production-log review cannot also sign its Quality release."),
     ("conditional_release_enabled", 0, "Release: allow units to be released for shipment before the heavy-metals results (1 = yes)",
@@ -7454,13 +7457,70 @@ def backup_scheduler(stop):
             logger.error("The nightly backup check failed.", exc_info=True)
 
 
+ARCHIVE_CONTACT_REFRESH_SECONDS = 60          # the sync script makes many requests in a row: its "last contact" time is rewritten at most this often
+
+
+def _flag_time(value):
+    """The UTC time at the start of a flag value ('2026-11-17T10:00:00Z ...'), or None."""
+    try:
+        return datetime.datetime.fromisoformat(str(value).split(" ")[0].rstrip("Z"))
+    except (ValueError, TypeError):
+        return None
+
+
+def note_archive_contact(conn):
+    """The sync script (archive key) just made a request: remember when (KW-72). Committed at once: it is called before any request transaction starts."""
+    row = conn.execute("SELECT value FROM app_flags WHERE key='archive_last_contact'").fetchone()
+    last = _flag_time(row["value"]) if row else None
+    if last and (utcnow() - last).total_seconds() < ARCHIVE_CONTACT_REFRESH_SECONDS:
+        return
+    conn.execute("INSERT OR REPLACE INTO app_flags (key,value) VALUES ('archive_last_contact', ?)", (now_iso(),))
+    conn.commit()
+
+
+def note_offbox_backup(conn, name, who):
+    """A nightly backup was downloaded IN FULL (the sync script, or an administrator by hand): it is now copied off the server (KW-72)."""
+    conn.execute("INSERT OR REPLACE INTO app_flags (key,value) VALUES ('archive_last_offbox', ?)", (json.dumps({"at": now_iso(), "name": name, "by": who}),))
+    conn.commit()
+
+
+def _hours_text(hours):
+    return "%d days" % round(hours / 24.0) if hours >= 48 else "%d hours" % round(hours)
+
+
+def archive_sync_info(conn):
+    """KW-72: when the records sync last contacted the server (any request with the archive key) and when the newest nightly backup was last copied off it (a complete
+    download), and whether either is older than `archive_sync_warn_hours`. Never seen counts as too old. It applies only where a copy is expected: the nightly backup is on or the
+    archive key is set (a development server has neither), and the setting is not 0. -> {warn, problems[], lastContact, lastOffsite{at,name,by}, warnHours, applies}"""
+    hours = float(get_setting_value(conn, "archive_sync_warn_hours", 36) or 0)
+    row = conn.execute("SELECT value FROM app_flags WHERE key='archive_last_contact'").fetchone()
+    contact = row["value"] if row else None
+    row = conn.execute("SELECT value FROM app_flags WHERE key='archive_last_offbox'").fetchone()
+    try:
+        off = json.loads(row["value"]) if row and row["value"] else None
+    except ValueError:
+        off = None
+    now = utcnow()
+    age = lambda t: None if t is None else (now - t).total_seconds() / 3600.0
+    c_age, b_age = age(_flag_time(contact)), age(_flag_time((off or {}).get("at")))
+    applies = bool(NIGHTLY_BACKUP or len(ARCHIVE_KEY) >= ARCHIVE_KEY_MIN) and hours > 0
+    problems = []
+    if applies and (c_age is None or c_age > hours):
+        problems.append("No records sync has ever contacted this server." if c_age is None else "The records sync last contacted this server %s ago." % _hours_text(c_age))
+    if applies and (b_age is None or b_age > hours):
+        problems.append("No backup has ever been copied off this server." if b_age is None
+                        else "The newest backup copied off this server was %s ago (%s)." % (_hours_text(b_age), off.get("name", "?")))
+    return {"applies": applies, "warn": bool(problems), "problems": problems, "warnHours": hours, "lastContact": contact, "lastOffsite": off,
+            "advice": "Check the scheduled task on the office PC that runs the sync (its sync.log shows the last runs) and that the computer was awake. Until a backup is copied off, only the newest few exist on the server disk."}
+
+
 def archive_status(conn):
     flag = lambda k: (conn.execute("SELECT value FROM app_flags WHERE key=?", (k,)).fetchone() or {"value": None})["value"]
     backups = [{k: v for k, v in b.items() if k != "path"} for b in list_backups()]
     return {"nightlyBackup": NIGHTLY_BACKUP, "backupHourUtc": BACKUP_HOUR_UTC, "backupKeep": BACKUP_KEEP,
             "archiveKeyConfigured": len(ARCHIVE_KEY) >= ARCHIVE_KEY_MIN, "archiveKeyTooShort": 0 < len(ARCHIVE_KEY) < ARCHIVE_KEY_MIN,
             "lastBackup": flag("last_backup"), "lastBackupError": flag("last_backup_error"), "backups": backups,
-            "images": image_archive_status(conn),
+            "images": image_archive_status(conn), "sync": archive_sync_info(conn),
             "runsToArchive": conn.execute("SELECT COUNT(*) c FROM production_runs WHERE status='completed'").fetchone()["c"],
             "deliveriesToArchive": conn.execute("SELECT COUNT(DISTINCT receipt_id) c FROM receipt_attachments").fetchone()["c"]}
 
@@ -8874,6 +8934,10 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(429, "Too many failed attempts. Try again in %d seconds." % wait)
             if len(ARCHIVE_KEY) >= ARCHIVE_KEY_MIN and hmac.compare_digest(key.encode("utf-8"), ARCHIVE_KEY.encode("utf-8")):
                 login_succeeded(ip, "archive-key")
+                try:
+                    note_archive_contact(conn)                                       # KW-72: the sync script is alive
+                except sqlite3.Error:
+                    conn.rollback()                                                    # never refuse the sync because this note could not be written
                 return "archive key"
             login_failed(ip, "archive-key")
             raise ApiError(403, "The archive key is not accepted")
@@ -8885,8 +8949,10 @@ class Handler(BaseHTTPRequestHandler):
         conn = db()
         try:
             try:
-                self._archive_auth(conn)
+                who = self._archive_auth(conn)
                 qs = parse_qs(urlparse(self.path).query)
+                if path == "/api/archive/sync":
+                    return self._send_json(archive_sync_info(conn))
                 if path == "/api/archive/manifest":
                     out = archive_manifest(conn)
                     conn.commit()                                     # a run archived for the first time is given its folder
@@ -8898,7 +8964,7 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/api/archive/file":
                     return self._archive_send_file(conn, qs)
                 if path == "/api/archive/backup":
-                    return self._archive_send_backup(qs)
+                    return self._archive_send_backup(qs, conn, who)
             except ApiError as e:
                 return self._send_json({"error": e.message}, e.status)
             return self._send_json({"error": "Unknown archive endpoint"}, 404)
@@ -8926,7 +8992,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _archive_send_backup(self, qs):
+    def _archive_send_backup(self, qs, conn, who):
         name = qs.get("name", [""])[0]
         match = next((b for b in list_backups() if b["name"] == name), None)          # only a name from the listing, never a path from the caller
         if not match:
@@ -8938,6 +9004,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         with open(match["path"], "rb") as f:
             shutil.copyfileobj(f, self.wfile, 1 << 20)
+        if match["kind"] == "nightly":                                             # sent in full (a dropped connection raised above): it is now off the server (KW-72)
+            try:
+                note_offbox_backup(conn, name, who)
+            except sqlite3.Error:
+                conn.rollback()
 
     def _archive_confirm(self):
         """POST /api/archive/confirm {files: [{path, src, runId, sha256}]} (archive key or an administrator): the sync script says these pictures are safely in the library."""

@@ -638,6 +638,9 @@ tr.hold-row td { background: var(--bg-fcefd6); }
 }
 
 /* Amend run: banners for a finalized (locked) or amended production log */
+.sync-banner { background: var(--bg-fbe3df); color: var(--danger); border: 1px solid var(--danger); font-size: 13px; padding: 8px 16px; line-height: 1.4; }
+.sync-banner.inline { border-radius: 8px; margin: 8px 0; }
+.sync-banner a { color: inherit; font-weight: 600; text-decoration: underline; }
 .amend-banner { border: 1px solid var(--bd-f0c98a); background: var(--bg-fff8ec); border-radius: 8px; padding: 8px 12px; margin: 8px 0; font-size: 13px; color: var(--fg-6b4600); }
 .amend-banner .actions { margin-top: 6px; display: flex; gap: 8px; flex-wrap: wrap; }
 .lock-banner { border: 1px solid var(--line); background: var(--bg-f3f7f6); border-radius: 8px; padding: 8px 12px; margin: 8px 0; font-size: 13px; color: var(--accent-text); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }

@@ -315,8 +315,29 @@ async function boot() {
   } catch (err) { logout(); }
 }
 
+/* ---------------- Backups not copied off the server (KW-72) ---------------- */
+// Administrators see a red banner when the office PC's sync has not copied a backup off the server for longer than the setting archive_sync_warn_hours. It is read when a page is
+// drawn (at most every 5 minutes) and never in the background, so it does not count as activity for the idle timeout.
+const SyncWarn = { at: 0, busy: false };
+async function syncWarnCheck(force) {
+  if (!State.user || State.user.role !== 'admin' || SyncWarn.busy) return;
+  if (!force && Date.now() - SyncWarn.at < 5 * 60 * 1000) return;
+  SyncWarn.busy = true;
+  try {
+    const s = await api('GET', '/archive/sync');
+    SyncWarn.at = Date.now();
+    let b = document.getElementById('syncBanner');
+    if (!b) { b = el('div', { id: 'syncBanner', class: 'sync-banner hidden', role: 'alert' }); const top = document.querySelector('#app .topbar'); if (top) top.after(b); }
+    b.innerHTML = '';
+    if (s.warn) b.append(el('b', {}, 'Backups are not being copied off the server. '), s.problems.join(' '), ' ',
+      el('a', { href: '#', onclick: e => { e.preventDefault(); State.tab = 'admin'; selectTab('admin'); } }, 'Open Admin › Records archive & backups'));
+    b.classList.toggle('hidden', !s.warn);
+  } catch (e) { /* the banner is only a courtesy: a failed read shows nothing */ } finally { SyncWarn.busy = false; }
+}
+
 /* ---------------- Router ---------------- */
 function render() {
+  syncWarnCheck();
   const v = $('#view'); v.innerHTML = '';
   const docTab = document.querySelector('#tabs button[data-tab="documents"]');       // the number of changes waiting in the SharePoint folders, for administrators
   if (docTab) docTab.textContent = 'Documents' + (State.user && State.user.role === 'admin' && State.ref && State.ref.libraryPending ? ' (' + State.ref.libraryPending + ')' : '');
@@ -7451,6 +7472,13 @@ const CALCULATIONS = [
     settings: [],
   },
   {
+    title: 'Backups not copied off the server: warning',
+    formula: 'Warn when (now − the last time the records sync contacted the server) > archive_sync_warn_hours, or (now − the last time a complete nightly backup was downloaded) > archive_sync_warn_hours.  A sync or a copy that has never been seen counts as too old.',
+    description: 'The nightly backup stays on the server disk, where only the newest few fit; the office PC copies it off every night. If that stops, Admin → Records archive & backups turns red and administrators see a banner until a backup is copied. The default (36 hours) allows one missed night. It is not active on a server that makes no nightly backup and has no sync key, or when the setting is 0.',
+    location: 'Admin → Records archive & backups; the banner at the top of every page for administrators',
+    settings: ['archive_sync_warn_hours'],
+  },
+  {
     title: 'Inventory lots: stock left in a lot, and stock not in a lot',
     formula: 'Left in a lot = quantity received − everything assigned to it (assigned when stock is used: not-expired lots first by earliest expiry, no expiry last, expired lots after, never a lot on hold; a refund returns to the lot it came from);  Not in a lot = max(0, item on hand − Σ left in its lots).  Expiring soon = expiry date within the warning period and stock left.',
     description: 'Lets a recall be traced from a supplier lot to the runs, products and customers it reached. Stock counted or received before lots were recorded is “not in a lot” and cannot be traced to a supplier lot.',
@@ -7765,7 +7793,7 @@ const SETTING_GROUPS = [
     'run_card_show_product', 'run_card_show_farms', 'run_card_show_ibcs', 'run_card_show_feedstock_weight', 'run_card_show_packaged', 'run_card_show_conv_process', 'run_card_show_conv_harvest'] },
   { title: 'Documents (SOPs, safety data sheets & suppliers)', note: 'Review intervals, supplier review and document warnings, and the SharePoint folder check.', keys: ['sds_review_years', 'sds_review_warning_days', 'library_scan_stale_days', 'supplier_review_interval_months', 'supplier_doc_warning_days'] },
   { title: 'Users, sessions & uploads', note: 'Sign-out, presence and upload limits.', keys: ['idle_timeout_minutes', 'presence_timeout_seconds', 'upload_user_daily_mb'] },
-  { title: 'Files, photos & archive', note: 'Moving photos to SharePoint.', keys: ['image_archive_days', 'image_purge_enabled'] },
+  { title: 'Files, photos & archive', note: 'Moving photos to SharePoint.', keys: ['image_archive_days', 'image_purge_enabled', 'archive_sync_warn_hours'] },
   { title: 'Historical run entry', note: 'Entering past runs.', keys: ['historical_entry_enabled'] },
 ];
 const OTHER_SETTINGS = 'Other settings';
@@ -10267,12 +10295,18 @@ async function adminArchiveSection(v) {
     el('div', { class: 'actions' }, el('button', { class: 'secondary', onclick: backUpNow, title: 'Write today’s full backup to the server disk now (replaces today’s file)' }, 'Back up now'))));
   let st;
   try { st = await api('GET', '/archive/status'); } catch (e) { v.append(el('div', { class: 'empty card' }, 'Could not read the archive status: ' + e.message)); return; }
-  const last = st.lastBackup ? st.lastBackup.split(' ') : null;
+  const last = st.lastBackup ? st.lastBackup.split(' ') : null, sy = st.sync || {};
   v.append(el('div', { class: 'summary-line' },
     sl('Nightly backup', st.nightlyBackup ? 'on, after ' + String(st.backupHourUtc).padStart(2, '0') + ':00 UTC (newest ' + st.backupKeep + ' kept here)' : 'off on this server'),
     sl('Last backup', last ? fmtWhen(last[0]) + ' · ' + (last[2] ? fmtBytes(+last[2]) : '') : 'none yet'),
     sl('Sync key', st.archiveKeyConfigured ? 'set' : (st.archiveKeyTooShort ? 'too short (ignored)' : 'not set')),
+    sl('Last sync contact', sy.lastContact ? fmtWhen(sy.lastContact) : 'never'),
+    sl('Newest backup copied off the server', sy.lastOffsite ? fmtWhen(sy.lastOffsite.at) + ' · ' + sy.lastOffsite.name : 'never'),
     sl('Finalized runs in the archive', String(st.runsToArchive))));
+  if (sy.warn) v.append(el('div', { class: 'sync-banner inline', role: 'alert' }, el('b', {}, 'Backups are not being copied off the server. '), sy.problems.join(' '), el('div', { class: 'help', style: 'margin-top:4px;color:inherit' }, sy.advice,
+    ' The warning limit is the setting “Backups: warn when nothing has been copied off the server” (', fmt(sy.warnHours), ' hours) on the Calculations page.')));
+  else if (!sy.applies) v.append(el('div', { class: 'help' }, 'Off-server copy monitoring is not active here: the nightly backup is off and no sync key is set (or the warning limit is 0).'));
+  syncWarnCheck(true);
   if (st.lastBackupError) v.append(el('div', { class: 'help', style: 'color:var(--danger,#b00020)' }, 'Last backup problem: ' + st.lastBackupError));
   photoArchiveCard(v, st.images);
   if (!st.backups.length) v.append(el('div', { class: 'empty card' }, 'No backups on this server yet.'));
