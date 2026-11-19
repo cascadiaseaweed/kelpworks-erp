@@ -72,3 +72,6 @@ c6c56ba  2026-11-05  Feedstock CSV import: reading dates for pH / ORP / TDS and 
 c0253fb  2026-11-05  Quality Control charts for lab results with no CoA specification (additional analyses) (KW-96) (PR 134) merged to main and live
 830ca52  2026-11-13  Historical run import tool: bypassed extraction, run with no output, pass with no recorded tank, sampling-record values; Lots 10-13 loaded (KW-98) (PR 136) merged to main and live
 e65699a  2026-11-17  Conditional release signed on the shipment before the heavy-metals results, by destination; own lot per SKU, units sold in Finished Goods (KW-100) (PR 138) merged to main and live
+2590dc2  2026-11-17  Administrators are warned when no backup has been copied off the server: last contact of the records sync and last copy, Admin banner (KW-72) (PR 140) merged to main and live
+2982dbe  2026-11-17  Loss reports: confirmed by a Production Manager, closed by a Quality Manager, thresholds and repeat rule, runs finished as a loss (KW-99) (PR 141) merged to main and live
+61c54a8  2026-11-19  Draft production run remembers its header, tote selection and feedstock entries (autosave), idle sign-out saves them, expired session prompts a sign-in (KW-101) (PR 142) merged to main and live
