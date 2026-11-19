@@ -15705,6 +15705,8 @@ class Handler(BaseHTTPRequestHandler):
             return out
         if len(seg) == 5 and seg[2] == "drafts" and seg[3].isdigit() and seg[4] == "finalize" and method == "POST":
             return self.finalize_draft(conn, int(seg[3]), user)
+        if len(seg) == 5 and seg[2] == "drafts" and seg[3].isdigit() and seg[4] == "autosave" and method == "PUT":
+            return self.autosave_draft(conn, int(seg[3]), user)
         if len(seg) == 4 and seg[2].isdigit() and seg[3] == "sample-labels" and method == "GET":
             # the run's logged sample points with their label settings and collection times -- works for a draft and a finalized run
             r = conn.execute("SELECT * FROM production_runs WHERE id=?", (int(seg[2]),)).fetchone()
@@ -17564,15 +17566,7 @@ class Handler(BaseHTTPRequestHandler):
         is pulled out of the selection entirely before it's persisted."""
         d = self._body_json()
         sku = (d.get("sku") or "").strip() or None
-        species = None
-        target_tds = None
-        if sku:
-            sku_row = conn.execute("SELECT * FROM fg_skus WHERE code=?", (sku,)).fetchone()
-            if sku_row:
-                target_tds = sku_row["tds_target"]
-                sku_species = [r["species_code"] for r in conn.execute(
-                    "SELECT species_code FROM fg_sku_species WHERE sku_code=?", (sku,))]
-                species = sku_species[0] if len(sku_species) == 1 else None
+        species, target_tds = self._sku_species_target(conn, sku)
         citric = num(d.get("citricKg"))
         sorbate = num(d.get("sorbateKg"))
         location = (d.get("location") or "").strip() or None
@@ -17645,6 +17639,93 @@ class Handler(BaseHTTPRequestHandler):
         return {"run": run_public(conn.execute(
             "SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()),
             "rejectedToteIds": rejected_ids}
+
+    @staticmethod
+    def _sku_species_target(conn, sku):
+        """(species code or None, target TDS or None) of a SKU: what a run stores next to its SKU."""
+        species = None
+        target_tds = None
+        if sku:
+            sku_row = conn.execute("SELECT * FROM fg_skus WHERE code=?", (sku,)).fetchone()
+            if sku_row:
+                target_tds = sku_row["tds_target"]
+                sku_species = [r["species_code"] for r in conn.execute(
+                    "SELECT species_code FROM fg_sku_species WHERE sku_code=?", (sku,))]
+                species = sku_species[0] if len(sku_species) == 1 else None
+        return species, target_tds
+
+    MAX_AUTOSAVE_BYTES = 1000000
+
+    def autosave_draft(self, conn, rid, user):
+        """KW-101: PUT /api/production/drafts/<id>/autosave. The browser sends the run header, the tote selection and every tote's feedstock card a few seconds after the
+        person last changed them, and before a section is saved or the session ends, so what was typed is not lost when the window goes away. It REMEMBERS the entries
+        and nothing else: no tote is locked to the run or rejected, no Feedstock Stability log line is written, no stock moves (that stays with the tote card's own Save,
+        Save & close and Finalize, `save_draft` / `_apply_tote_characterization`). The entries go in `draft_data`, which Resume reads. A blank date keeps the stored one
+        (nothing is defaulted to today); a tote this draft has locked is never dropped from the selection by a stale browser window."""
+        run = conn.execute("SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()
+        if not run:
+            raise ApiError(404, "Draft not found")
+        if run["status"] != "draft":
+            raise ApiError(409, "This run has already been finalized", "not_a_draft")
+        d = self._body_json()
+        sets, vals = [], []
+        if "sku" in d:
+            sku = (d.get("sku") or "").strip() or None
+            species, target_tds = self._sku_species_target(conn, sku)
+            sets += ["sku_code=?", "species_code=?", "target_tds=?"]
+            vals += [sku, species, target_tds]
+        run_date = (d.get("runDate") or "").strip()
+        if run_date:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", run_date):
+                raise ApiError(400, "The run date is not a valid date")
+            if run["is_historical"] and run_date > today_iso():
+                raise ApiError(400, "A historical run cannot be dated in the future")
+            sets.append("run_date=?")
+            vals.append(run_date)
+        for key, col in (("location", "location"), ("operators", "operators")):
+            if key in d:
+                sets.append(col + "=?")
+                vals.append((d.get(key) or "").strip() or None)
+        if "notes" in d:
+            sets.append("notes=?")
+            vals.append(d.get("notes"))
+        try:
+            tote_ids = [int(x) for x in (d.get("toteIds") or [])]
+        except (TypeError, ValueError):
+            raise ApiError(400, "The tote selection is not valid")
+        details = d.get("feedstockDetails") or {}
+        if not isinstance(details, dict) or any(not isinstance(v, dict) for v in details.values()):
+            raise ApiError(400, "The feedstock entries are not valid")
+        if tote_ids:
+            found = {r["id"] for r in conn.execute(
+                "SELECT id FROM tote_lots WHERE id IN (%s)" % ",".join("?" * len(tote_ids)), tote_ids)}
+            if set(tote_ids) - found:
+                raise ApiError(400, "A selected tote no longer exists")
+        for r in conn.execute("SELECT id FROM tote_lots WHERE run_id=? AND status='wip'", (rid,)):
+            if r["id"] not in tote_ids:
+                tote_ids.append(r["id"])
+        keep = {str(t) for t in tote_ids}
+        details = {str(k): v for k, v in details.items() if str(k) in keep}
+        try:
+            dd = json.loads(run["draft_data"] or "{}")
+        except ValueError:
+            dd = {}
+        if not isinstance(dd, dict):
+            dd = {}
+        # a stale window that does not carry a tote's entries must not erase what is already remembered for it
+        old = dd.get("feedstockDetails") or {}
+        for k in keep:
+            if k not in details and isinstance(old.get(k), dict):
+                details[k] = old[k]
+        dd["toteIds"] = tote_ids
+        dd["feedstockDetails"] = details
+        blob = json.dumps(dd)
+        if len(blob) > self.MAX_AUTOSAVE_BYTES:
+            raise ApiError(413, "Too much feedstock text to save in one draft")
+        sets.append("draft_data=?")
+        vals.append(blob)
+        conn.execute("UPDATE production_runs SET " + ", ".join(sets) + " WHERE id=?", vals + [rid])
+        return {"ok": True, "savedAt": now_iso(), "toteIds": tote_ids}
 
     HISTORICAL_LOT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,38}$")
 
