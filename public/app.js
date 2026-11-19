@@ -5,16 +5,59 @@ const TOKEN_KEY = 'kelp_erp_token';
 const State = { token: localStorage.getItem(TOKEN_KEY) || null, user: null, ref: null, tab: 'dashboard', env: { env: 'production', restoreEnabled: false } };
 
 /* ---------------- API ---------------- */
-async function api(method, path, body) {
+async function api(method, path, body, extra) {
   const opts = { method, headers: {} };
   if (State.token) opts.headers['Authorization'] = 'Bearer ' + State.token;
   if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
   const res = await fetch('/api' + path, opts);
   let data = {};
   try { data = await res.json(); } catch (e) {}
+  // keepSession (KW-101, the draft autosave): an expired session does NOT sign the person out and wipe the window; the caller says so and offers reSignIn() instead
+  if (res.status === 401 && extra && extra.keepSession) { const err = new Error(data.error || 'Session expired'); err.code = 'session_expired'; throw err; }
   if (res.status === 401) { if (State.token) logout(data.code === 'idle_timeout' ? data.error : null); throw new Error(data.error || 'Session expired'); }     // (already signed out: a late request must not wipe the sign-in message)
   if (!res.ok) { const err = new Error(data.error || ('HTTP ' + res.status)); err.code = data.code; if (data.duplicates) err.duplicates = data.duplicates; if (data.problems) { err.problems = data.problems; err.problemCount = data.problemCount; } throw err; }
   return data;
+}
+
+/* Sign in again without leaving the window (KW-101). When the session ended while a production run was open, the draft autosave says so and offers this instead of
+   signing the person out and closing the window: the entries still on the screen are saved as soon as the new session starts. Only the SAME person can sign in here.
+   Resolves true when signed in, false when the person chose Not now. One dialog at a time. */
+let reSignInPromise = null;
+function reSignIn() {
+  if (reSignInPromise) return reSignInPromise;
+  const who = State.user || State.lastUser;       // (a background request may already have signed the browser out, which clears State.user)
+  reSignInPromise = new Promise(resolve => {
+    const pw = el('input', { type: 'password', autocomplete: 'current-password', style: 'width:100%' });
+    const err = el('div', { class: 'error' });
+    const go = el('button', {}, 'Sign in');
+    const later = el('button', { class: 'secondary' }, 'Not now');
+    const bg = el('div', { class: 'modal-bg', style: 'z-index:90' }, el('div', { class: 'modal' }, el('h3', {}, 'You were signed out'),
+      el('div', {}, 'Your session ended. What you have entered is still on this screen: sign in as ' + (who ? who.name : 'yourself') + ' to save it.'),
+      field('Password', pw), err, el('div', { class: 'modal-actions' }, later, go)));
+    const done = ok => { bg.remove(); resolve(ok); };
+    async function attempt() {
+      err.textContent = ''; go.disabled = true;
+      try {
+        const res = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: who && who.email, password: pw.value }) });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'Sign-in failed');
+        if (who && data.user && data.user.id !== who.id) throw new Error('That is a different account. Sign in as ' + who.name + '.');
+        State.token = data.token; localStorage.setItem(TOKEN_KEY, data.token);
+        State.user = data.user || who;
+        show('app');                                                                  // a background request may already have shown the sign-in page behind this window
+        for (const [k, o] of (Presence.lost || [])) if (o.bg.isConnected) Presence.open.set(k, o);   // the run windows still open count as open again
+        Presence.lost = null;
+        refreshDlToken(); presenceStart(); idleStart();
+        done(true);
+      } catch (e) { err.textContent = e.message; go.disabled = false; pw.select(); }
+    }
+    go.addEventListener('click', attempt);
+    pw.addEventListener('keydown', e => { if (e.key === 'Enter') attempt(); });
+    later.addEventListener('click', () => done(false));
+    $('#modalRoot').append(bg);
+    setTimeout(() => pw.focus(), 0);
+  }).finally(() => { reSignInPromise = null; });
+  return reSignInPromise;
 }
 
 /* A link that opens a file in the browser carries a SHORT-LIVED download token (15 minutes, files only), never the session token. It is refreshed in the
@@ -209,7 +252,10 @@ async function idleSignOut(minutes) {
     for (const bg of document.querySelectorAll('#modalRoot .modal-bg')) {
       if (Idle.warn && bg === Idle.warn.bg) continue;
       if (!bg.querySelector('button.section-save')) continue;
+      let flushed = true;                       // (KW-101) a run window also saves its header and feedstock entries, which no section Save covers
+      if (typeof bg.kwFlush === 'function') { try { flushed = (await bg.kwFlush()) === true; } catch (e) { flushed = false; } }
       const failed = await pressSectionSaves(bg);
+      if (!flushed) failed.push('the run details and feedstock entries could not be saved');
       const title = (bg.querySelector('h3') || {}).textContent || 'a window';
       (failed.length ? problems : saved).push(title);
     }
@@ -270,7 +316,10 @@ async function toggleTheme() {
 }
 document.getElementById('themeToggle').addEventListener('click', toggleTheme);
 function logout(message) {
-  presenceLeave(); presenceStop(); idleStop();
+  presenceLeave();
+  Presence.lost = new Map([...Presence.open].filter(([, o]) => o.bg.isConnected));        // (KW-101) windows still open: restored if the same person signs in again from the autosave prompt
+  presenceStop(); idleStop();
+  if (State.user) State.lastUser = State.user;
   State.token = null; State.user = null; localStorage.removeItem(TOKEN_KEY); show('login');
   $('#loginError').textContent = message || '';        // e.g. "You were signed out after 30 minutes without activity ..."
 }
@@ -3560,8 +3609,10 @@ function buildFeedstockCard(opts) {
   }));
   odourMultiSelect.el.addEventListener('change', notifyChange);
   decisionSel.addEventListener('change', () => { reasonField.classList.toggle('hidden', decisionSel.value !== 'rejected'); notifyChange(); });
-  [loadedAt, weightInp, volumeInp, intensitySel, notesInp, tdsInp]
+  [loadedAt, weightInp, volumeInp, intensitySel, notesInp, tdsInp, reasonInp]
     .forEach(inp => inp.addEventListener('change', notifyChange));
+  // (KW-101) a value still being typed is reported too, not only once the box loses focus: the draft autosave (and the idle timeout's save) must see what is on the screen
+  [phInp, orpInp, weightInp, volumeInp, notesInp, reasonInp].forEach(inp => inp.addEventListener('input', notifyChange));
 
   function photoSlot(slotKey, label) {
     const img = el('img', { title: 'Click to view full size', style: 'cursor:zoom-in' });
@@ -4377,10 +4428,58 @@ async function openRun(draftSummary, opts) {
   let feedstockState = Object.assign({}, draft?.feedstockDetails || {});
   const operatorsSelect = buildOperatorsSelect(draft?.operators || '');
 
+  // ---- Draft autosave (KW-101) ----
+  // The run header, the tote selection and every tote card's entries are remembered on the server a few seconds after the last change (and before a section is saved,
+  // when the window closes, when the tab is hidden and when the idle timeout signs the person out), so a time-out or a dead tablet no longer loses what was typed.
+  // It only REMEMBERS: totes are locked to the run, rejected and logged by the tote card's own Save, Save & close and Finalize, never by the autosave.
+  // It starts once the draft exists (the first section Save or Save & close): a brand-new run is not created behind the person's back.
+  const AUTOSAVE_DELAY_MS = 3000;
+  const autosaveNote = el('div', { class: 'help autosave-note', role: 'status' });
+  let autosaveTimer = null, autosaveBusy = null, lastSavedJson = null, feedstockBuilding = false;
+  function setAutosaveNote(text, bad) { autosaveNote.textContent = text; autosaveNote.classList.toggle('bad', !!bad); }
+  function scheduleAutosave() {
+    if (!draftId) return;
+    clearTimeout(autosaveTimer);
+    autosaveTimer = setTimeout(() => autosaveNow({ interactive: true }), AUTOSAVE_DELAY_MS);
+  }
+  // Resolves true (saved, or nothing changed), false (could not be saved: shown in the note) or 'expired' (the session ended; with `interactive` the person is
+  // offered a sign-in first and the save is tried again).
+  async function autosaveNow(o) {
+    o = o || {};
+    clearTimeout(autosaveTimer); autosaveTimer = null;
+    if (!draftId) return true;
+    while (autosaveBusy) { try { await autosaveBusy; } catch (e) { /* its own caller reports it */ } }
+    const payload = buildPayload(), json = JSON.stringify(payload);
+    if (json === lastSavedJson) return true;
+    autosaveBusy = (async () => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          await api('PUT', '/production/drafts/' + draftId + '/autosave', payload, { keepSession: true });
+          lastSavedJson = json; setAutosaveNote('Draft saved ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', false);
+          return true;
+        } catch (e) {
+          if (e.code === 'session_expired') {
+            setAutosaveNote('Not saved: you were signed out. Sign in to keep what you entered.', true);
+            if (o.interactive && attempt === 0 && await reSignIn()) continue;
+            return 'expired';
+          }
+          setAutosaveNote('Not saved: ' + e.message, true);
+          return false;
+        }
+      }
+      return 'expired';
+    })();
+    try { return await autosaveBusy; } finally { autosaveBusy = null; }
+  }
+
   // A section that needs a real run id (photos, stages, repeatable lists) calls
   // this first — for a brand-new run it silently saves a draft to get one.
+  // Once the draft exists every such call first saves the header and feedstock entries too (a section's own Save never did).
   async function ensureRunId() {
-    if (draftId) return draftId;
+    if (draftId) {
+      if ((await autosaveNow({ interactive: true })) === 'expired') throw new Error('You were signed out, so this could not be saved. Sign in again.');
+      return draftId;
+    }
     await saveDraft(true);
     return draftId;
   }
@@ -4492,6 +4591,7 @@ async function openRun(draftSummary, opts) {
     if (gen !== feedstockRenderGen) return;
     feedstockHost.innerHTML = '';
     if (!chosen.length) { feedstockHost.append(el('div', { class: 'help' }, 'Select totes above to characterize the feedstock.')); return; }
+    feedstockBuilding = true;                    // a card reports its starting values while it is built: that is not a change to save
     for (const t of chosen) {
       feedstockHost.append(buildFeedstockCard({
         sopSpot: 'production.feedstock.characterization',
@@ -4499,7 +4599,7 @@ async function openRun(draftSummary, opts) {
         label: t.lot + (t.site ? '  ·  ' + t.site : ''),
         initial: feedstockState[t.id],
         mode: 'draft',
-        onChange: vals => { feedstockState[t.id] = vals; },
+        onChange: vals => { feedstockState[t.id] = vals; if (!feedstockBuilding) scheduleAutosave(); },
         // Locks this tote's characterization in immediately instead of only
         // bundling it into the next draft save/finalize, and updates its
         // Feedstock Inventory record the same way either way. An accepted
@@ -4539,6 +4639,7 @@ async function openRun(draftSummary, opts) {
         photoUrl: attId => attDownloadUrl(draftId, attId, false)
       }));
     }
+    feedstockBuilding = false;
   }
 
   const stages = draft?.stages || {};
@@ -4647,7 +4748,7 @@ async function openRun(draftSummary, opts) {
   const body = el('div', {},
     draft ? el('div', { class: 'summary-line', style: 'margin-bottom:10px' },
       sl('Run code', mono(draft.processingLot)), sl('SKU', skuName(draft.sku))) : null,
-    progressHost, reqLegend(),
+    progressHost, autosaveNote, reqLegend(),
     el('details', { class: 'accordion', 'data-sop-spot': 'production.initiation' }, el('summary', {}, 'Initiation'),
       el('div', { class: 'accordion-body' },
         el('div', { class: 'form-row' },
@@ -4690,6 +4791,20 @@ async function openRun(draftSummary, opts) {
   ['click', 'change'].forEach(ev => body.addEventListener(ev, () => {
     clearTimeout(progressTimer); progressTimer = setTimeout(refreshProgress, 1200);
   }));
+  // Any edit in the run window (header, tote ticks, tote cards) checks, a few seconds later, whether the header / feedstock entries differ from what was last saved.
+  ['input', 'change', 'click'].forEach(ev => body.addEventListener(ev, scheduleAutosave));
+  if (draftId) { setAutosaveNote('Entries in this run are saved automatically as you work.', false); lastSavedJson = JSON.stringify(buildPayload()); }     // (what was loaded is what is stored)
+  // A hidden tab (a tablet put to sleep, another app in front) and a window that is closed save what is pending too; neither asks for a sign-in.
+  const autosaveOnHide = () => {
+    if (!body.isConnected) { document.removeEventListener('visibilitychange', autosaveOnHide); return; }
+    if (document.hidden) autosaveNow({ interactive: false }).catch(() => {});
+  };
+  document.addEventListener('visibilitychange', autosaveOnHide);
+  new MutationObserver((recs, obs) => {
+    if (body.isConnected) return;
+    obs.disconnect(); document.removeEventListener('visibilitychange', autosaveOnHide);
+    autosaveNow({ interactive: false }).catch(() => {});
+  }).observe(document.getElementById('modalRoot'), { childList: true });
 
   function buildPayload() {
     return {
@@ -4706,6 +4821,8 @@ async function openRun(draftSummary, opts) {
       ? await api('PUT', '/production/drafts/' + draftId, payload)
       : await api('POST', '/production/drafts', payload);
     draftId = r.run.id;
+    lastSavedJson = JSON.stringify(payload);       // (KW-101) the autosave has nothing more to send until something else changes
+    if (!autosaveNote.textContent) setAutosaveNote('Entries in this run are saved automatically as you work.', false);
     // "Save & close" is the prominent, most-used save action, so it also
     // commits the Packaging table's net container changes (empty body --
     // this only triggers the commit side effect, leaving packagedAt/QC/
@@ -4785,6 +4902,9 @@ async function openRun(draftSummary, opts) {
   }
   modal(draft ? 'Production run — ' + draft.processingLot : 'New production run', body, finalizeRun, 'Finalize run',
     { extraLabel: 'Save & close', onExtra: saveAndClose, wide: true, closeX: true, onClose: () => render() });
+  // (KW-101) the idle timeout calls this before it signs the person out, so the header and feedstock entries are saved with the sections
+  const runWindow = body.closest('.modal-bg');
+  if (runWindow) runWindow.kwFlush = () => autosaveNow({ interactive: false });
   if (opts && opts.section) jumpToSection(body, opts.section);
 }
 

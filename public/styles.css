@@ -954,3 +954,6 @@ html[data-theme="dark"] .modal iframe { color-scheme: light; }
 .loss-datetime input[type=time] { flex: 1 1 40%; }
 .loss-stats td small { white-space: nowrap; }
 .loss-finish-box { margin-top: 14px; }
+/* KW-101: the draft autosave status line in the production run window */
+.autosave-note { margin: 2px 0 6px; min-height: 14px; }
+.autosave-note.bad { color: var(--danger); font-weight: 600; font-size: 12px; }
