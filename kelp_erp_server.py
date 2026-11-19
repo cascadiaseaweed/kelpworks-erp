@@ -5197,7 +5197,8 @@ def migrate(conn):
         if col not in cols:
             conn.execute("ALTER TABLE tote_lots ADD COLUMN %s %s" % (col, decl))
     tscols = {r["name"] for r in conn.execute("PRAGMA table_info(tote_stability_log)")}
-    for col, decl in [("run_id", "INTEGER"), ("attachment_id", "INTEGER"), ("reading_date", "TEXT")]:     # reading_date: the day a reading was taken (NULL = the day it was logged)
+    for col, decl in [("run_id", "INTEGER"), ("attachment_id", "INTEGER"), ("reading_date", "TEXT"),     # reading_date: the day a reading was taken (NULL = the day it was logged)
+                      ("old_attachment_id", "INTEGER"), ("old_run_id", "INTEGER")]:                     # KW-102: the picture a photo line replaced / removed (and the run that held it), so its link can be shown
         if col not in tscols:
             conn.execute("ALTER TABLE tote_stability_log ADD COLUMN %s %s" % (col, decl))
     ccols = {r["name"] for r in conn.execute("PRAGMA table_info(consumables)")}
@@ -10549,20 +10550,33 @@ class Handler(BaseHTTPRequestHandler):
                                                   "odour": od.get("Odour"), "odour_intensity": od.get("Odour intensity")})
         return grade, why
 
+    @staticmethod
+    def _picture_exists(conn, tote_id, run_id, att_id):
+        """True while the picture a history line points to is still stored (a run's copy that was replaced or removed in the draft is deleted; a tote's own picture is kept)."""
+        if not att_id:
+            return False
+        if run_id:
+            return conn.execute("SELECT 1 FROM run_attachments WHERE id=? AND run_id=?", (att_id, run_id)).fetchone() is not None
+        return conn.execute("SELECT 1 FROM tote_attachments WHERE id=? AND tote_lot_id=?", (att_id, tote_id)).fetchone() is not None
+
     def _stability_log(self, conn, tote_id):
         return [dict(field=r["field"], oldValue=r["old_value"], newValue=r["new_value"],
                      note=r["note"], by=r["user_name"], at=r["created_at"], readingDate=r["reading_date"],
-                     runId=r["run_id"], attachmentId=r["attachment_id"])
+                     runId=r["run_id"], attachmentId=r["attachment_id"],
+                     # KW-102: links to the picture of a photo line, and to the one it replaced, only while the file is still there
+                     available=self._picture_exists(conn, tote_id, r["run_id"], r["attachment_id"]),
+                     oldAttachmentId=r["old_attachment_id"], oldRunId=r["old_run_id"],
+                     oldAvailable=self._picture_exists(conn, tote_id, r["old_run_id"], r["old_attachment_id"]))
                 for r in conn.execute(
                     "SELECT * FROM tote_stability_log WHERE tote_lot_id=? ORDER BY id DESC",
                     (tote_id,))]
 
-    def _log_stability(self, conn, tote_id, user, field, old, new, note=None, run_id=None, attachment_id=None, reading_date=None):
+    def _log_stability(self, conn, tote_id, user, field, old, new, note=None, run_id=None, attachment_id=None, reading_date=None, old_attachment_id=None, old_run_id=None):
         conn.execute(
             "INSERT INTO tote_stability_log (tote_lot_id,user_name,field,old_value,new_value,note,"
-            "created_at,run_id,attachment_id,reading_date) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "created_at,run_id,attachment_id,reading_date,old_attachment_id,old_run_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (tote_id, user["name"] if user else None, field, _fmtval(old), _fmtval(new), note, now_iso(),
-             run_id, attachment_id, reading_date))
+             run_id, attachment_id, reading_date, old_attachment_id, old_run_id))
 
     @staticmethod
     def _reading_date(d, *keys):
@@ -16064,7 +16078,8 @@ class Handler(BaseHTTPRequestHandler):
             if (tote_id, label) not in logged:
                 logged.add((tote_id, label))
                 self._log_stability(conn, tote_id, user, label, att["filename"], "(replaced)" if new_id else "(removed)",
-                                    "Photo %s in production run %s" % ("replaced" if new_id else "removed", run["processing_lot"]), run_id=run["id"])
+                                    "Photo %s in production run %s" % ("replaced" if new_id else "removed", run["processing_lot"]), run_id=run["id"],
+                                    old_attachment_id=aid, old_run_id=run["id"])
         if any(r[2] is None for r in refs):
             conn.execute("UPDATE production_runs SET draft_data=? WHERE id=?", (json.dumps(dd), run["id"]))
         conn.execute("DELETE FROM run_attachments WHERE id=?", (aid,))
@@ -16382,22 +16397,27 @@ class Handler(BaseHTTPRequestHandler):
             # the same picture only when the id AND where it is kept match: a tote's picture and a run's copy of it can carry the same number (they are numbered in separate tables, KW-102)
             if last_photo and last_photo["attachment_id"] == att_id and (last_photo["run_id"] or None) == (run_id or None):
                 continue
-            # From = the picture this one replaces: the file name of the previous photo line, or the one a replace / removal line says was taken away
-            was = None
+            # From = the picture this one replaces (its file name, and where it is kept so the history can link to it): the previous photo line, or the one a replace line says was taken away
+            was, was_att, was_run, announced = None, None, None, False
             if last_photo:
                 if last_photo["attachment_id"]:
-                    was = last_photo["new_value"]
+                    was, was_att, was_run = last_photo["new_value"], last_photo["attachment_id"], last_photo["run_id"]
                 elif last_photo["new_value"] == "(replaced)":
-                    was = last_photo["old_value"]
+                    was, was_att, was_run, announced = last_photo["old_value"], last_photo["old_attachment_id"], last_photo["old_run_id"], True
             if run_id:
                 att = conn.execute("SELECT filename FROM run_attachments WHERE id=? AND run_id=?",
                                    (att_id, run_id)).fetchone()
             else:
                 att = conn.execute("SELECT filename FROM tote_attachments WHERE id=? AND tote_lot_id=?",
                                    (att_id, tote_lot_id)).fetchone()
+            # the same two lines wherever the picture is changed (Feedstock Inventory or a production run): "(replaced)" for the picture that was there (a run's draft already wrote it
+            # when it deleted its own copy), then the new picture with a link to it and, in From, the one it replaced
+            if was and not announced:
+                self._log_stability(conn, tote_lot_id, user, label, was, "(replaced)", "Photo replaced - " + (note or ""), run_id=run_id,
+                                    old_attachment_id=was_att, old_run_id=was_run)
             self._log_stability(conn, tote_lot_id, user, label, was,
                                att["filename"] if att else "Photo", note,
-                               run_id=run_id, attachment_id=att_id)
+                               run_id=run_id, attachment_id=att_id, old_attachment_id=was_att, old_run_id=was_run)
         return historical
 
     def _apply_ph_orp_override(self, conn, tote, fd):

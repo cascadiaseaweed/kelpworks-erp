@@ -161,6 +161,56 @@ def test_a_replacement_is_logged_even_when_it_has_the_same_number_as_the_totes_p
         assert photo_lines(fresh, t, rid) == [("Surface photo", "surf.png", "surface-new.png")]
 
 
+def surface_history(admin, t):
+    """The tote's Surface photo history, oldest first, as the screen reads it."""
+    return [e for e in reversed(admin.get("/api/totes/%d/ph" % t).json["stabilityLog"]) if e["field"] == "Surface photo"]
+
+
+def test_a_replacement_is_logged_the_same_two_ways_in_feedstock_inventory_and_in_a_run(srv, admin):
+    # in Feedstock Inventory: the picture that was there, then the new one (a link to it, and From = what it replaced, a link while that file is kept)
+    a, = harvest_totes(admin, 1)
+    first = tote_photo(admin, a, "surface", IMG_A, "first.png")
+    second = tote_photo(admin, a, "surface", IMG_C, "second.png")
+    inv = surface_history(admin, a)
+    assert [(e["oldValue"] or None, e["newValue"]) for e in inv] == [(None, "first.png"), ("first.png", "(replaced)"), ("first.png", "second.png")]
+    assert inv[0]["attachmentId"] == first and inv[0]["available"] is True
+    assert inv[1]["oldAttachmentId"] == first and inv[1]["oldAvailable"] is True and inv[1]["attachmentId"] is None
+    assert inv[2]["attachmentId"] == second and inv[2]["available"] is True and inv[2]["oldAttachmentId"] == first and inv[2]["oldAvailable"] is True
+    # in a production run: the same pattern, here with a picture the run replaces
+    b, = harvest_totes(admin, 1)
+    s = tote_photo(admin, b, "surface", IMG_A, "orig.png")
+    rid = new_draft(admin)
+    new = admin.post("/api/production/%d/feedstock-photo" % rid, {"slot": "surface", "filename": "run-new.png", "contentType": "image/png", "dataB64": b64(IMG_B)}).json["attachmentId"]
+    assert lock_in(admin, rid, b, surfacePhotoId=new).status == 200
+    run = surface_history(admin, b)
+    assert [(e["oldValue"] or None, e["newValue"]) for e in run] == [(None, "orig.png"), ("orig.png", "(replaced)"), ("orig.png", "run-new.png")]
+    assert run[2]["attachmentId"] == new and run[2]["available"] is True and run[2]["runId"] == rid
+    assert run[2]["oldAttachmentId"] == s and run[2]["oldAvailable"] is True                                        # the tote's original is kept, so From links to it
+
+
+def test_a_copy_a_run_deletes_keeps_its_name_but_loses_its_link(srv, admin):
+    t, = harvest_totes(admin, 1)
+    s = tote_photo(admin, t, "surface", IMG_A, "orig.png")
+    rid = new_draft(admin)
+    copy = lock_in(admin, rid, t, surfacePhotoFrom="tote:%d" % s).json["photoIds"]["surfacePhotoId"]
+    up = admin.post("/api/production/%d/feedstock-photo" % rid, {"slot": "surface", "filename": "again.png", "contentType": "image/png", "dataB64": b64(IMG_C), "replaces": copy})
+    assert up.status == 200, up.text
+    gone = [e for e in surface_history(admin, t) if e["newValue"] == "(replaced)" and e["runId"] == rid][0]
+    assert gone["oldValue"] == "orig.png" and gone["oldAttachmentId"] == copy and gone["oldAvailable"] is False         # the run's copy was deleted: a name, no link
+
+
+def test_the_photo_buttons_say_what_they_do_and_the_camera_button_opens_the_camera():
+    assert "'Upload photo'" in APP_JS and "'📷 Take photo'" in APP_JS and "uploadBtn.textContent = has ? 'Replace'" not in APP_JS
+    assert "function takePhotoFile()" in APP_JS and "navigator.mediaDevices.getUserMedia" in APP_JS and "facingMode: { ideal: 'environment' }" in APP_JS
+    assert APP_JS.count("const shot = await takePhotoFile();") == 2                                                 # the feedstock card's slots and the Documents window
+    assert "if (shot === undefined) cameraInput.click()" in APP_JS                                                  # the file input with capture is only the fallback
+
+
+def test_a_picture_uploaded_after_the_tote_was_added_is_offered_when_the_card_is_drawn_again():
+    assert "const recheck = chosen.filter(t => feedstockState[t.id] && !needsPrefill.includes(t)" in APP_JS
+    assert "cur[fromKey] !== st[seenKey]" in APP_JS and "surfacePhotoSeen" in APP_JS                                 # a picture is offered once; one the person removed is not put back, a newer one is
+
+
 def test_a_picture_replaced_in_feedstock_inventory_shows_the_previous_one_in_from(srv, admin):
     t, = harvest_totes(admin, 1)
     tote_photo(admin, t, "surface", IMG_A, "first.png")

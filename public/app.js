@@ -843,13 +843,16 @@ function stabilityLogTable(log, toteId) {
         // a production run (runId set) or from Feedstock Inventory's own
         // Detail card (no run, just this tote's own attachments) -- links
         // straight to the image instead of showing an inert filename.
-        let toCell;
-        if (r.attachmentId && r.runId) toCell = el('a', { href: attDownloadUrl(r.runId, r.attachmentId, false), target: '_blank', rel: 'noopener' }, r.newValue || 'View photo');
-        else if (r.attachmentId && toteId) toCell = el('a', { href: toteAttDownloadUrl(toteId, r.attachmentId, false), target: '_blank', rel: 'noopener' }, r.newValue || 'View photo');
+        // (KW-102) a link only while the picture is still stored: the new picture (To) and the one it replaced (From); a copy a run deleted keeps its file name as plain text
+        let toCell, fromCell = r.oldValue ?? '—';
+        if (r.attachmentId && r.available !== false && r.runId) toCell = el('a', { href: attDownloadUrl(r.runId, r.attachmentId, false), target: '_blank', rel: 'noopener' }, r.newValue || 'View photo');
+        else if (r.attachmentId && r.available !== false && toteId) toCell = el('a', { href: toteAttDownloadUrl(toteId, r.attachmentId, false), target: '_blank', rel: 'noopener' }, r.newValue || 'View photo');
         else toCell = el('b', {}, r.newValue ?? '—');
+        if (r.oldAttachmentId && r.oldAvailable && (r.oldRunId || toteId))
+          fromCell = el('a', { href: r.oldRunId ? attDownloadUrl(r.oldRunId, r.oldAttachmentId, false) : toteAttDownloadUrl(toteId, r.oldAttachmentId, false), target: '_blank', rel: 'noopener' }, r.oldValue || 'View photo');
         return el('tr', {},
           el('td', { class: 'muted' }, fmtWhen(r.at)), el('td', { class: 'muted' }, r.readingDate || '—'), el('td', {}, r.field),
-          el('td', { class: 'muted' }, r.oldValue ?? '—'), el('td', {}, toCell),
+          el('td', { class: 'muted' }, fromCell), el('td', {}, toCell),
           el('td', { class: 'muted' }, r.note || '—'), el('td', {}, r.by || '—'));
       }))));
 }
@@ -1613,6 +1616,38 @@ function attDownloadUrl(rid, aid, dl) {
   return '/api/production/' + rid + '/attachments/' + aid + '/download?' +
     (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(dlToken());
 }
+/* Take a picture with the device's camera (KW-102). Opens a live view with a Take photo button (rear camera where there is one) and resolves with the picture as a File, or null when the
+   person cancels. Where the browser has no camera API or the person refuses the camera it resolves undefined, and the caller falls back to the file input with capture="environment". */
+function takePhotoFile() {
+  return new Promise(async resolve => {
+    if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) { resolve(undefined); return; }
+    let stream;
+    try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false }); }
+    catch (e) { resolve(undefined); return; }
+    const video = el('video', { autoplay: '', playsinline: '', muted: '', style: 'width:100%;max-height:60vh;background:#000;border-radius:8px' });
+    video.muted = true; video.srcObject = stream;
+    const err = el('div', { class: 'error' });
+    const snap = el('button', { type: 'button' }, 'Take photo'), cancel = el('button', { type: 'button', class: 'secondary' }, 'Cancel');
+    const bg = el('div', { class: 'modal-bg', style: 'z-index:95' }, el('div', { class: 'modal' }, el('h3', {}, 'Take photo'), video, err, el('div', { class: 'modal-actions' }, cancel, snap)));
+    const watch = new MutationObserver(() => { if (!bg.isConnected) { stop(); watch.disconnect(); resolve(null); } });       // closed from elsewhere (sign-out, another window)
+    function stop() { stream.getTracks().forEach(t => t.stop()); }
+    function done(file) { watch.disconnect(); stop(); bg.remove(); resolve(file); }
+    cancel.addEventListener('click', () => done(null));
+    snap.addEventListener('click', () => {
+      if (!video.videoWidth) { err.textContent = 'The camera is not ready yet. Wait a moment and try again.'; return; }
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+      canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob(blob => {
+        if (!blob) { err.textContent = 'The picture could not be taken. Try again.'; return; }
+        const t = new Date(), p = n => String(n).padStart(2, '0');
+        done(new File([blob], 'photo-' + t.getFullYear() + p(t.getMonth() + 1) + p(t.getDate()) + '-' + p(t.getHours()) + p(t.getMinutes()) + p(t.getSeconds()) + '.jpg', { type: 'image/jpeg' }));
+      }, 'image/jpeg', 0.9);
+    });
+    $('#modalRoot').append(bg);
+    watch.observe($('#modalRoot'), { childList: true });
+  });
+}
 // (KW-102) a picture offered from a tote's own record ('tote:<id>') or from the tote's earlier run ('run:<run id>:<id>'): its download link
 function photoSourceUrl(toteId, marker) { const p = String(marker).split(':'); return p[0] === 'run' ? attDownloadUrl(+p[1], +p[2], false) : toteAttDownloadUrl(toteId, +p[1], false); }
 function toteAttDownloadUrl(tid, aid, dl) {
@@ -1725,7 +1760,10 @@ async function openAttachments(run) {
   // capture="environment" hands off straight to the rear camera on phones/tablets
   // instead of the general photo/file picker; desktop browsers just ignore it.
   const cameraInput = el('input', { type: 'file', accept: 'image/*', capture: 'environment', style: 'display:none' });
-  const cameraBtn = el('button', { class: 'secondary', type: 'button', onclick: () => cameraInput.click() }, '📷 Take photo');
+  const cameraBtn = el('button', { class: 'secondary', type: 'button', onclick: async () => {           // the camera itself (KW-102), the capture input only where the browser has no camera API
+    const shot = await takePhotoFile();
+    if (shot === undefined) cameraInput.click(); else if (shot) handleFiles([shot]);
+  } }, '📷 Take photo');
   async function refresh() { drawList((await api('GET', '/production/' + run.id + '/attachments')).attachments); }
   function drawList(atts) {
     listHost.innerHTML = '';
@@ -3600,7 +3638,8 @@ function buildFeedstockCard(opts) {
       notes: notesInp.value.trim() || null,
       surfacePhotoId: v.surfacePhotoId, striationPhotoId: v.striationPhotoId,
       // (KW-102) a tote's picture shown on a run's card before the run has its own copy: the server copies it when the entries are locked in
-      ...(opts.fromUrl ? { surfacePhotoFrom: v.surfacePhotoId ? null : (v.surfacePhotoFrom || null), striationPhotoFrom: v.striationPhotoId ? null : (v.striationPhotoFrom || null) } : {})
+      ...(opts.fromUrl ? { surfacePhotoFrom: v.surfacePhotoId ? null : (v.surfacePhotoFrom || null), striationPhotoFrom: v.striationPhotoId ? null : (v.striationPhotoFrom || null),
+        surfacePhotoSeen: v.surfacePhotoSeen || null, striationPhotoSeen: v.striationPhotoSeen || null } : {})          // …Seen: the picture last offered for the slot (a run card does not offer it again once removed)
     };
   }
   function notifyChange() { if (opts.onChange) opts.onChange(currentValues()); }
@@ -3657,7 +3696,7 @@ function buildFeedstockCard(opts) {
     fileInput.addEventListener('change', () => { handle(fileInput.files[0]); fileInput.value = ''; });
     cameraInput.addEventListener('change', () => { handle(cameraInput.files[0]); cameraInput.value = ''; });
     const photoKey = slotKey === 'surfacePhotoId' ? 'surfacePhoto' : 'striationPhoto';
-    const uploadBtn = el('button', { type: 'button', class: 'secondary', onclick: () => fileInput.click() }, 'Upload');
+    const uploadBtn = el('button', { type: 'button', class: 'secondary', onclick: () => fileInput.click() }, 'Upload photo');        // always "Upload photo": choose a file (it replaces the picture shown, if any)
     // Remove is offered only where the caller allows it (a run still being logged); a finalized run's photos are part of its signed log (KW-02)
     const removeBtn = opts.removePhoto ? el('button', { type: 'button', class: 'secondary', onclick: async () => {
       if (!v[slotKey] && v[fromKey]) {          // (KW-102) only the tote's picture is shown, the run has no copy yet: stop offering it for this run; nothing is deleted
@@ -3670,7 +3709,7 @@ function buildFeedstockCard(opts) {
         v[slotKey] = null; img.removeAttribute('src'); img.style.display = 'none'; status.textContent = ''; refreshBtns(); notifyChange();
       } catch (e) { status.textContent = e.message; }
     } }, 'Remove') : null;
-    function refreshBtns() { const has = !!(v[slotKey] || v[fromKey]); uploadBtn.textContent = has ? 'Replace' : 'Upload'; if (removeBtn) removeBtn.style.display = has ? '' : 'none'; }
+    function refreshBtns() { const has = !!(v[slotKey] || v[fromKey]); if (removeBtn) removeBtn.style.display = has ? '' : 'none'; }
     refreshBtns();
     // (KW-102) after the server copied the tote's picture into the run, the card swaps its source marker for the run's own photo without being rebuilt
     slotRefresh[slotKey] = () => { const u = shownUrl(); if (u) { img.src = u; img.style.display = ''; } else { img.removeAttribute('src'); img.style.display = 'none'; } refreshBtns(); };
@@ -3678,7 +3717,10 @@ function buildFeedstockCard(opts) {
       el('div', { class: 'help' }, opts.markRequired && isReq('feedstock', photoKey) ? reqLabel(label) : label), img, fileInput, cameraInput,
       el('div', { style: 'display:flex;gap:6px;margin-top:4px;flex-wrap:wrap' },
         uploadBtn,
-        el('button', { type: 'button', class: 'secondary', onclick: () => cameraInput.click() }, '📷 Photo'),
+        el('button', { type: 'button', class: 'secondary', onclick: async () => {           // the camera itself, not a file chooser; the capture input only where the browser has no camera API
+          const shot = await takePhotoFile();
+          if (shot === undefined) cameraInput.click(); else if (shot) handle(shot);
+        } }, '📷 Take photo'),
         removeBtn),
       status);
   }
@@ -4632,7 +4674,26 @@ async function openRun(draftSummary, opts) {
       if (gen !== feedstockRenderGen) return; // a newer render started meanwhile
       needsPrefill.forEach((t, i) => {
         const r = fetched[i];
-        if (r && r.latestCharacterization && !feedstockState[t.id]) feedstockState[t.id] = r.latestCharacterization;
+        if (r && r.latestCharacterization && !feedstockState[t.id]) {
+          feedstockState[t.id] = r.latestCharacterization;
+          // remember which pictures were offered, so one the person drops is not offered again (below)
+          if (r.latestCharacterization.surfacePhotoFrom) feedstockState[t.id].surfacePhotoSeen = r.latestCharacterization.surfacePhotoFrom;
+          if (r.latestCharacterization.striationPhotoFrom) feedstockState[t.id].striationPhotoSeen = r.latestCharacterization.striationPhotoFrom;
+        }
+      });
+    }
+    // (KW-102) A tote that is already on the run (an earlier visit, a saved draft) is asked again for its pictures when a slot has none: one uploaded in Feedstock Inventory AFTER the tote
+    // was added shows up. A picture is offered once: what the card last offered is remembered (…Seen), so a picture the person removed from the run is not put back, while a NEWER one is.
+    const recheck = chosen.filter(t => feedstockState[t.id] && !needsPrefill.includes(t) && (!feedstockState[t.id].surfacePhotoId || !feedstockState[t.id].striationPhotoId));
+    if (recheck.length) {
+      const looked = await Promise.all(recheck.map(t => api('GET', '/totes/' + t.id + '/ph?forRun=1').catch(() => null)));
+      if (gen !== feedstockRenderGen) return;
+      recheck.forEach((t, i) => {
+        const cur = looked[i] && looked[i].latestCharacterization, st = feedstockState[t.id];
+        if (!cur || !st) return;
+        for (const [slotKey, fromKey, seenKey] of [['surfacePhotoId', 'surfacePhotoFrom', 'surfacePhotoSeen'], ['striationPhotoId', 'striationPhotoFrom', 'striationPhotoSeen']]) {
+          if (!st[slotKey] && cur[fromKey] && cur[fromKey] !== st[seenKey]) { st[fromKey] = cur[fromKey]; st[seenKey] = cur[fromKey]; }
+        }
       });
     }
     if (gen !== feedstockRenderGen) return;
