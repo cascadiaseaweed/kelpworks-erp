@@ -166,37 +166,61 @@ def surface_history(admin, t):
     return [e for e in reversed(admin.get("/api/totes/%d/ph" % t).json["stabilityLog"]) if e["field"] == "Surface photo"]
 
 
-def test_a_replacement_is_logged_the_same_two_ways_in_feedstock_inventory_and_in_a_run(srv, admin):
-    # in Feedstock Inventory: the picture that was there, then the new one (a link to it, and From = what it replaced, a link while that file is kept)
+def shape(rows):
+    return [(e["oldValue"] or None, e["newValue"]) for e in rows]
+
+
+def test_a_replacement_is_one_row_in_feedstock_inventory_and_in_a_run(srv, admin):
+    # in Feedstock Inventory: ONE row for the new picture (To, a link) with the one it replaced (From, a link while that file is kept)
     a, = harvest_totes(admin, 1)
     first = tote_photo(admin, a, "surface", IMG_A, "first.png")
     second = tote_photo(admin, a, "surface", IMG_C, "second.png")
     inv = surface_history(admin, a)
-    assert [(e["oldValue"] or None, e["newValue"]) for e in inv] == [(None, "first.png"), ("first.png", "(replaced)"), ("first.png", "second.png")]
+    assert shape(inv) == [(None, "first.png"), ("first.png", "second.png")]                                         # no separate "(replaced)" row
     assert inv[0]["attachmentId"] == first and inv[0]["available"] is True
-    assert inv[1]["oldAttachmentId"] == first and inv[1]["oldAvailable"] is True and inv[1]["attachmentId"] is None
-    assert inv[2]["attachmentId"] == second and inv[2]["available"] is True and inv[2]["oldAttachmentId"] == first and inv[2]["oldAvailable"] is True
-    # in a production run: the same pattern, here with a picture the run replaces
+    assert inv[1]["attachmentId"] == second and inv[1]["available"] is True and inv[1]["oldAttachmentId"] == first and inv[1]["oldAvailable"] is True
+    # in a production run, when the card is saved: the same single row
     b, = harvest_totes(admin, 1)
     s = tote_photo(admin, b, "surface", IMG_A, "orig.png")
     rid = new_draft(admin)
     new = admin.post("/api/production/%d/feedstock-photo" % rid, {"slot": "surface", "filename": "run-new.png", "contentType": "image/png", "dataB64": b64(IMG_B)}).json["attachmentId"]
     assert lock_in(admin, rid, b, surfacePhotoId=new).status == 200
     run = surface_history(admin, b)
-    assert [(e["oldValue"] or None, e["newValue"]) for e in run] == [(None, "orig.png"), ("orig.png", "(replaced)"), ("orig.png", "run-new.png")]
-    assert run[2]["attachmentId"] == new and run[2]["available"] is True and run[2]["runId"] == rid
-    assert run[2]["oldAttachmentId"] == s and run[2]["oldAvailable"] is True                                        # the tote's original is kept, so From links to it
+    assert shape(run) == [(None, "orig.png"), ("orig.png", "run-new.png")]
+    assert run[1]["attachmentId"] == new and run[1]["available"] is True and run[1]["runId"] == rid
+    assert run[1]["oldAttachmentId"] == s and run[1]["oldAvailable"] is True                                        # the tote's original is kept, so From links to it
 
 
-def test_a_copy_a_run_deletes_keeps_its_name_but_loses_its_link(srv, admin):
+def test_replacing_a_picture_in_a_draft_run_writes_its_one_row_at_once(srv, admin):
     t, = harvest_totes(admin, 1)
     s = tote_photo(admin, t, "surface", IMG_A, "orig.png")
     rid = new_draft(admin)
     copy = lock_in(admin, rid, t, surfacePhotoFrom="tote:%d" % s).json["photoIds"]["surfacePhotoId"]
+    assert shape(surface_history(admin, t)) == [(None, "orig.png")]                                                 # copying the tote's picture is not a change
     up = admin.post("/api/production/%d/feedstock-photo" % rid, {"slot": "surface", "filename": "again.png", "contentType": "image/png", "dataB64": b64(IMG_C), "replaces": copy})
     assert up.status == 200, up.text
-    gone = [e for e in surface_history(admin, t) if e["newValue"] == "(replaced)" and e["runId"] == rid][0]
-    assert gone["oldValue"] == "orig.png" and gone["oldAttachmentId"] == copy and gone["oldAvailable"] is False         # the run's copy was deleted: a name, no link
+    rows = surface_history(admin, t)
+    assert shape(rows) == [(None, "orig.png"), ("orig.png", "again.png")]                                            # one row, before the card is even saved: From = the run's copy, To = the new picture
+    last = rows[-1]
+    assert last["attachmentId"] == up.json["attachmentId"] and last["available"] is True and last["runId"] == rid
+    assert last["oldAttachmentId"] == s and last["oldRunId"] is None and last["oldAvailable"] is True                # the run's copy was deleted, but it was a copy of the tote's picture: From links to that one
+    assert lock_in(admin, rid, t, surfacePhotoId=up.json["attachmentId"]).status == 200                              # saving the card afterwards adds nothing
+    assert shape(surface_history(admin, t)) == [(None, "orig.png"), ("orig.png", "again.png")]
+    assert admin.delete("/api/production/%d/feedstock-photo/%d" % (rid, up.json["attachmentId"])).status == 200      # removing it is its own row
+    assert shape(surface_history(admin, t))[-1] == ("again.png", "(removed)")
+
+
+def test_a_picture_taken_straight_in_the_run_has_no_link_once_it_is_replaced_but_keeps_its_name(srv, admin):
+    t, = harvest_totes(admin, 1)                                                                                    # a tote with no picture of its own
+    rid = new_draft(admin)
+    first = admin.post("/api/production/%d/feedstock-photo" % rid, {"slot": "surface", "filename": "taken-here.png", "contentType": "image/png", "dataB64": b64(IMG_B)}).json["attachmentId"]
+    assert lock_in(admin, rid, t, surfacePhotoId=first).status == 200
+    second = admin.post("/api/production/%d/feedstock-photo" % rid, {"slot": "surface", "filename": "taken-again.png", "contentType": "image/png", "dataB64": b64(IMG_C), "replaces": first})
+    assert second.status == 200, second.text
+    rows = surface_history(admin, t)
+    assert shape(rows) == [(None, "taken-here.png"), ("taken-here.png", "taken-again.png")]                         # one row for the replacement
+    assert rows[1]["attachmentId"] == second.json["attachmentId"] and rows[1]["available"] is True                  # To is a link
+    assert rows[1]["oldAttachmentId"] == first and rows[1]["oldRunId"] == rid and rows[1]["oldAvailable"] is False  # From: the run's copy is gone and has no twin: the name only
 
 
 def test_the_photo_buttons_say_what_they_do_and_the_camera_button_opens_the_camera():

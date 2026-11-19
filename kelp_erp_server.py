@@ -16077,9 +16077,19 @@ class Handler(BaseHTTPRequestHandler):
                 (dd.get("feedstockDetails") or {}).get(str(tote_id), {})[key] = new_id
             if (tote_id, label) not in logged:
                 logged.add((tote_id, label))
-                self._log_stability(conn, tote_id, user, label, att["filename"], "(replaced)" if new_id else "(removed)",
-                                    "Photo %s in production run %s" % ("replaced" if new_id else "removed", run["processing_lot"]), run_id=run["id"],
-                                    old_attachment_id=aid, old_run_id=run["id"])
+                # the run's copy is deleted below; when it was a copy of the tote's own picture (same name and size) the history points at that one, which is kept, so From still links to the picture
+                twin = conn.execute("SELECT id FROM tote_attachments WHERE tote_lot_id=? AND filename=? AND size=? ORDER BY id DESC LIMIT 1", (tote_id, att["filename"], att["size"])).fetchone()
+                old_att, old_run = (twin["id"], None) if twin else (aid, run["id"])
+                if new_id:
+                    # a replacement is ONE row: From = the picture taken away, To = the new picture (a link)
+                    new_att = conn.execute("SELECT filename FROM run_attachments WHERE id=? AND run_id=?", (new_id, run["id"])).fetchone()
+                    self._log_stability(conn, tote_id, user, label, att["filename"], new_att["filename"] if new_att else "Photo",
+                                        "Photo replaced in production run %s" % run["processing_lot"], run_id=run["id"], attachment_id=new_id,
+                                        old_attachment_id=old_att, old_run_id=old_run)
+                else:
+                    self._log_stability(conn, tote_id, user, label, att["filename"], "(removed)",
+                                        "Photo removed in production run %s" % run["processing_lot"], run_id=run["id"],
+                                        old_attachment_id=old_att, old_run_id=old_run)
         if any(r[2] is None for r in refs):
             conn.execute("UPDATE production_runs SET draft_data=? WHERE id=?", (json.dumps(dd), run["id"]))
         conn.execute("DELETE FROM run_attachments WHERE id=?", (aid,))
@@ -16398,23 +16408,19 @@ class Handler(BaseHTTPRequestHandler):
             if last_photo and last_photo["attachment_id"] == att_id and (last_photo["run_id"] or None) == (run_id or None):
                 continue
             # From = the picture this one replaces (its file name, and where it is kept so the history can link to it): the previous photo line, or the one a replace line says was taken away
-            was, was_att, was_run, announced = None, None, None, False
+            was, was_att, was_run = None, None, None
             if last_photo:
                 if last_photo["attachment_id"]:
                     was, was_att, was_run = last_photo["new_value"], last_photo["attachment_id"], last_photo["run_id"]
-                elif last_photo["new_value"] == "(replaced)":
-                    was, was_att, was_run, announced = last_photo["old_value"], last_photo["old_attachment_id"], last_photo["old_run_id"], True
+                elif last_photo["new_value"] == "(replaced)":          # (a line written by an earlier release: the picture it names is the one this replaces)
+                    was, was_att, was_run = last_photo["old_value"], last_photo["old_attachment_id"], last_photo["old_run_id"]
             if run_id:
                 att = conn.execute("SELECT filename FROM run_attachments WHERE id=? AND run_id=?",
                                    (att_id, run_id)).fetchone()
             else:
                 att = conn.execute("SELECT filename FROM tote_attachments WHERE id=? AND tote_lot_id=?",
                                    (att_id, tote_lot_id)).fetchone()
-            # the same two lines wherever the picture is changed (Feedstock Inventory or a production run): "(replaced)" for the picture that was there (a run's draft already wrote it
-            # when it deleted its own copy), then the new picture with a link to it and, in From, the one it replaced
-            if was and not announced:
-                self._log_stability(conn, tote_lot_id, user, label, was, "(replaced)", "Photo replaced - " + (note or ""), run_id=run_id,
-                                    old_attachment_id=was_att, old_run_id=was_run)
+            # ONE row wherever the picture is changed (Feedstock Inventory or a production run): the new picture (To, a link) and the one it replaced (From, a link while that file is kept)
             self._log_stability(conn, tote_lot_id, user, label, was,
                                att["filename"] if att else "Photo", note,
                                run_id=run_id, attachment_id=att_id, old_attachment_id=was_att, old_run_id=was_run)
