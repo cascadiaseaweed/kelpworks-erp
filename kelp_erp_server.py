@@ -16312,19 +16312,22 @@ class Handler(BaseHTTPRequestHandler):
         """Lock-in step (the card's Save, Save & close, Finalize): where a slot has no run photo but carries a source marker, copy the tote's picture into the run and put the new id in
         the slot. `fd` is changed IN PLACE (ids set, markers removed) so the draft copy and the Stability log lines that follow see the run's copy. A source that is gone is dropped."""
         held = conn.execute("SELECT surface_photo, striation_photo FROM run_inputs WHERE run_id=? AND tote_lot_id=?", (run_id, tote_lot_id)).fetchone()
+        adopted = []
         for slot_key, from_key, col in (("surfacePhotoId", "surfacePhotoFrom", "surface_photo"), ("striationPhotoId", "striationPhotoFrom", "striation_photo")):
             marker = fd.pop(from_key, None)
             if not marker or fd.get(slot_key):
                 continue
             if held and held[col]:                      # the run already holds its copy (an earlier lock-in): a client that still sends the marker gets that copy, never a second one
                 fd[slot_key] = int(held[col]) if str(held[col]).isdigit() else held[col]
+                adopted.append(slot_key)
                 continue
             src = self._photo_source_row(conn, tote_lot_id, marker)
             if src:
                 fd[slot_key] = self._copy_photo_to_run(conn, run_id, src, user)
-        return fd
+                adopted.append(slot_key)
+        return adopted                                  # the slots filled with a copy of a picture the tote's history already shows: no new history line for them (it is not a change)
 
-    def _log_characterization_fields(self, conn, tote_lot_id, user, fd, note, run_id=None, reading_date=None):
+    def _log_characterization_fields(self, conn, tote_lot_id, user, fd, note, run_id=None, reading_date=None, skip_photo_slots=()):
         """Write a Feedstock Stability log row only for fields that actually
         changed since they were last captured -- re-saving a card with the
         same values (e.g. touching just one field) shouldn't spam the log
@@ -16364,21 +16367,32 @@ class Handler(BaseHTTPRequestHandler):
         for slot_key, label in (("surfacePhotoId", "Surface photo"),
                                  ("striationPhotoId", "Settling/striation photo")):
             att_id = fd.get(slot_key)
-            if not att_id:
+            if not att_id or slot_key in skip_photo_slots:
                 continue
+            if run_id:                                   # the run input already holds this very picture (an earlier lock-in, KW-102 copies included): nothing changed
+                held = conn.execute("SELECT surface_photo, striation_photo FROM run_inputs WHERE run_id=? AND tote_lot_id=?", (run_id, tote_lot_id)).fetchone()
+                if held and str(held["surface_photo" if slot_key == "surfacePhotoId" else "striation_photo"] or "") == str(att_id):
+                    continue
             last_photo = conn.execute(
-                "SELECT attachment_id, run_id FROM tote_stability_log WHERE tote_lot_id=? AND field=?"
+                "SELECT attachment_id, run_id, old_value, new_value FROM tote_stability_log WHERE tote_lot_id=? AND field=?"
                 " ORDER BY id DESC LIMIT 1", (tote_lot_id, label)).fetchone()
             # the same picture only when the id AND where it is kept match: a tote's picture and a run's copy of it can carry the same number (they are numbered in separate tables, KW-102)
             if last_photo and last_photo["attachment_id"] == att_id and (last_photo["run_id"] or None) == (run_id or None):
                 continue
+            # From = the picture this one replaces: the file name of the previous photo line, or the one a replace / removal line says was taken away
+            was = None
+            if last_photo:
+                if last_photo["attachment_id"]:
+                    was = last_photo["new_value"]
+                elif last_photo["new_value"] == "(replaced)":
+                    was = last_photo["old_value"]
             if run_id:
                 att = conn.execute("SELECT filename FROM run_attachments WHERE id=? AND run_id=?",
                                    (att_id, run_id)).fetchone()
             else:
                 att = conn.execute("SELECT filename FROM tote_attachments WHERE id=? AND tote_lot_id=?",
                                    (att_id, tote_lot_id)).fetchone()
-            self._log_stability(conn, tote_lot_id, user, label, None,
+            self._log_stability(conn, tote_lot_id, user, label, was,
                                att["filename"] if att else "Photo", note,
                                run_id=run_id, attachment_id=att_id)
         return historical
@@ -16486,8 +16500,8 @@ class Handler(BaseHTTPRequestHandler):
         # Accepted: log any captured fields, create/update this tote's
         # run_inputs row (same shape as finalize), and lock it to this run.
         note = "Characterized during production run %s" % processing_lot
-        self._adopt_tote_photos(conn, run_id, tote_lot_id, fd, user)             # KW-102: the tote's pictures shown on the card become the run's own copies
-        self._log_characterization_fields(conn, tote_lot_id, user, fd, note, run_id=run_id)
+        copied = self._adopt_tote_photos(conn, run_id, tote_lot_id, fd, user)             # KW-102: the tote's pictures shown on the card become the run's own copies
+        self._log_characterization_fields(conn, tote_lot_id, user, fd, note, run_id=run_id, skip_photo_slots=copied)       # (an unchanged picture is not a change: no history line for it)
         if existing_input:
             input_id = existing_input["id"]
         else:

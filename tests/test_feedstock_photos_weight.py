@@ -47,7 +47,9 @@ def new_draft(client):
 
 def card(**extra):
     """What the run card sends: the usual entries, no run photo yet, and the sources of the tote's pictures."""
-    return dict(feedstock_detail(), surfacePhotoId=None, striationPhotoId=None, **extra)
+    body = dict(feedstock_detail(), surfacePhotoId=None, striationPhotoId=None)
+    body.update(extra)
+    return body
 
 
 def lock_in(client, rid, tote, **extra):
@@ -96,27 +98,53 @@ def test_locking_in_copies_the_pictures_into_the_run_and_leaves_the_totes_alone(
     assert admin.get("/api/production/%d/attachments/%d/download" % (rid, ids["striationPhotoId"])).body == IMG_B
     assert sql(srv, "SELECT id, stored_name FROM tote_attachments WHERE tote_lot_id=? ORDER BY id", (t,)) == mine      # the tote's own pictures are untouched
     assert admin.get("/api/totes/%d/attachments/%d/download" % (t, s)).body == IMG_A
-    assert sql(srv, "SELECT run_id, attachment_id FROM tote_stability_log WHERE tote_lot_id=? AND field='Surface photo' ORDER BY id DESC LIMIT 1", (t,)) == [(rid, ids["surfacePhotoId"])]
+    assert photo_lines(srv, t, rid) == []                                                                           # an unchanged picture is not a change: no history line for the copy
     again = lock_in(admin, rid, t, surfacePhotoFrom="tote:%d" % s, striationPhotoFrom="tote:%d" % g)                # a client that still sends the marker never makes a second copy
     assert again.status == 200 and again.json["photoIds"] == ids
     assert len(run_photos(srv, rid)) == 2
 
 
-def test_the_copy_is_logged_even_when_it_has_the_same_number_as_the_totes_picture():
-    """A tote's picture and the run's copy are numbered in separate tables, so the first of each is number 1 on a fresh server: the tote's history must still get its line for the copy."""
+def photo_lines(srv, tote, rid):
+    """The history lines the run wrote about this tote's pictures: (field, From, To) of the lines with this run's number."""
+    return sql(srv, "SELECT field, old_value, new_value FROM tote_stability_log WHERE tote_lot_id=? AND run_id=? AND field IN ('Surface photo', 'Settling/striation photo') AND attachment_id IS NOT NULL ORDER BY id", (tote, rid))
+
+
+def test_replacing_only_the_surface_photo_logs_only_that_picture_and_shows_what_it_replaced(srv, admin):
+    t, = harvest_totes(admin, 1)
+    s = tote_photo(admin, t, "surface", IMG_A, "surf.png")
+    g = tote_photo(admin, t, "striation", IMG_B, "stri.png")
+    rid = new_draft(admin)
+    up = admin.post("/api/production/%d/feedstock-photo" % rid, {"slot": "surface", "filename": "surface-new.png", "contentType": "image/png", "dataB64": b64(IMG_C)})
+    assert up.status == 200, up.text
+    new = up.json["attachmentId"]
+    r = lock_in(admin, rid, t, surfacePhotoId=new, striationPhotoFrom="tote:%d" % g)                               # the card: a new surface picture, the settling picture left as it was
+    assert r.status == 200 and r.json["photoIds"]["surfacePhotoId"] == new and isinstance(r.json["photoIds"]["striationPhotoId"], int), r.text
+    assert photo_lines(srv, t, rid) == [("Surface photo", "surf.png", "surface-new.png")]                           # one line, and From names the picture it replaced
+    again = lock_in(admin, rid, t, surfacePhotoId=new, striationPhotoId=r.json["photoIds"]["striationPhotoId"])      # saving the card again changes nothing
+    assert again.status == 200 and photo_lines(srv, t, rid) == [("Surface photo", "surf.png", "surface-new.png")]
+    assert admin.get("/api/totes/%d/attachments/%d/download" % (t, s)).body == IMG_A                                # the tote's own pictures are untouched
+    assert admin.get("/api/totes/%d/attachments/%d/download" % (t, g)).body == IMG_B
+
+
+def test_a_replacement_is_logged_even_when_it_has_the_same_number_as_the_totes_picture():
+    """A tote's picture and a run's photo are numbered in separate tables, so the first of each is number 1 on a fresh server: the history must still get its line."""
     with Server() as fresh:
         c = fresh.admin_client()
         t, = harvest_totes(c, 1)
         s = tote_photo(c, t, "surface", IMG_A, "surf.png")
         rid = new_draft(c)
-        r = lock_in(c, rid, t, surfacePhotoFrom="tote:%d" % s)
-        assert r.status == 200, r.text
-        copy = r.json["photoIds"]["surfacePhotoId"]
-        assert s == copy == 1
-        assert sql(fresh, "SELECT run_id, attachment_id FROM tote_stability_log WHERE tote_lot_id=? AND field='Surface photo' ORDER BY id DESC LIMIT 1", (t,)) == [(rid, copy)]
-        again = lock_in(c, rid, t, surfacePhotoFrom="tote:%d" % s)                                                    # saving again adds no second line for the same copy
-        assert again.status == 200
-        assert sql(fresh, "SELECT COUNT(*) FROM tote_stability_log WHERE tote_lot_id=? AND field='Surface photo' AND run_id=?", (t, rid)) == [(1,)]
+        new = c.post("/api/production/%d/feedstock-photo" % rid, {"slot": "surface", "filename": "surface-new.png", "contentType": "image/png", "dataB64": b64(IMG_C)}).json["attachmentId"]
+        assert s == new == 1
+        assert lock_in(c, rid, t, surfacePhotoId=new).status == 200
+        assert photo_lines(fresh, t, rid) == [("Surface photo", "surf.png", "surface-new.png")]
+
+
+def test_a_picture_replaced_in_feedstock_inventory_shows_the_previous_one_in_from(srv, admin):
+    t, = harvest_totes(admin, 1)
+    tote_photo(admin, t, "surface", IMG_A, "first.png")
+    tote_photo(admin, t, "surface", IMG_C, "second.png")
+    lines = sql(srv, "SELECT old_value, new_value FROM tote_stability_log WHERE tote_lot_id=? AND field='Surface photo' AND attachment_id IS NOT NULL ORDER BY id", (t,))
+    assert [(old or None, new) for old, new in lines] == [(None, "first.png"), ("first.png", "second.png")]
 
 
 def test_save_and_close_copies_them_too_and_the_draft_keeps_the_runs_ids_not_the_markers(srv, admin):
