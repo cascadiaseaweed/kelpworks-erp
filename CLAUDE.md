@@ -179,7 +179,7 @@ for `main` so a red run blocks the merge.
 - **Yield & Usage** (`route_yield_usage`, `/api/yield-usage` + `/xlsx`, the "Yield & Usage"
   tab) is a read-only report over completed runs: two conversion rates -- process
   (output L / measured `run_inputs.weight_kg`) and harvest (output L / stored
-  `input_kg`, the batch-average tote weight) -- plus per-run consumption read from the
+  `input_kg`, the sum of each accepted tote's average harvest weight kept on the run, KW-103) -- plus per-run consumption read from the
   consumable ledger (`ref` = processing lot; reagents / packaging / sample containers /
   FG labels). Group-by is a set of checkboxes (`groupBy=a,b` over `YU_DIMS`: sku, species,
   farm, stabilization, harvest_month, processing_month); species/farm/harvest date come from
@@ -267,6 +267,23 @@ for `main` so a red run blocks the merge.
   or Save & close), so a brand-new run is not created behind the person's back. A "Draft saved 14:02" / "Not saved: ..." line sits at the top of the window. **An expired session does not wipe the window**: `api(..., { keepSession: true })`
   throws `session_expired` instead of `logout()`, and `reSignIn()` (a small password prompt for the SAME person, resolves true / false) restores the screen, presence and idle timers; `logout()` keeps `State.lastUser` and
   `Presence.lost` for that. Unsaved typing inside the OTHER sections (Extraction, Pasteurization ...) is still saved only by that section's Save / the idle timeout / Save & close.
+- **Run feedstock card: the tote's pictures and the two weights** (KW-102 / KW-103; tests in `tests/test_feedstock_photos_weight.py`, `tests/test_harvest_weight_rule.py`).
+  *Pre-fill* (`GET /api/totes/<id>/ph?forRun=1`, the only caller is a production run's card; Feedstock Inventory's own window is unchanged): `_latest_characterization(for_run=True)` leaves out `weightKg` and `densityKgL`
+  (`RUN_CARD_NO_PREFILL`: the tote's "Weight (kg)" log lines also hold the HARVEST average set by Set values / the import / an edit, and the card's Weight is the MEASURED weight, blank until typed) and offers the tote's
+  newest Surface / Settling-striation picture as a SOURCE marker (`surfacePhotoFrom` / `striationPhotoFrom` = `tote:<id>` or `run:<run id>:<id>`, `_latest_tote_photo_source`: newest Stability line for the label, a
+  "(removed)" line ends the search, a line whose file is gone is skipped). **The run keeps its OWN COPY**: `_adopt_tote_photos` copies the file into `run_attachments` (purpose `feedstock_photo`, `_copy_photo_to_run`: the storage
+  room is checked, the daily upload quota is not, a copy is not a person's upload) when the entries are LOCKED IN (`_apply_tote_characterization`: the card's Save and Save & close, and `_finalize_run`), never by the autosave
+  (it only remembers the marker in `draft_data`); it changes `fd` in place, answers with `photoIds` (card Save: `save_feedstock_input`; Save & close: `save_draft`), never copies twice (the run input's own photo wins), and drops a
+  marker that is not this tote's or whose file is gone. Replace / remove in the run only touch the run's copy (KW-02); the tote's picture is never changed; discarding the draft removes the copies. Browser: `buildFeedstockCard`
+  `opts.fromUrl` shows the source until the copy exists, `cardEl.kwApplyPhotos` swaps in the copy without rebuilding the card, Remove on a marker-only photo just stops offering it.
+  *Average harvest weight per run* (KW-103): `run_inputs.avg_harvest_weight_kg` is the run's own copy of each tote's average harvest weight (card field "Average harvest weight (kg)", `opts.showAvgHarvest`, separate from the
+  measured "Weight (kg)"). **A tote cannot be added to a run until `tote_lots.avg_weight_kg` is above 0** (`_require_harvest_weight`, 400 `harvest_weight_missing`, in the card's Save, Save & close and `_finalize_run`; the picker
+  shows such totes un-tickable; a tote already locked to this draft and historical drafts are exempt; check-in may still leave the weight blank). The value starts from the tote's average when the entries are locked in
+  (`_apply_avg_harvest_weight`, `fill_harvest_default`; never on an amendment) and a given value (above 0, up to `MAX_HARVEST_WEIGHT_KG` 5000, else 400 `bad_harvest_weight`) is also written to the tote with a Feedstock Stability line
+  "Average harvest weight (kg)" (note "Changed in production run ..."). **`production_runs.input_kg` = the sum of the accepted totes' values** (`_recompute_run_input_kg`; a run input with no value counts the tote's average, so a run
+  finalized before does not move): at finalize and after `PUT /api/production/<id>/inputs/<id>` changes a value on a finalized run (needs an open amendment and `can_amend_log`, like every log edit), so the Yield & Usage harvest rate
+  follows and the revision shows the value and `inputKg`. The key `avgHarvestWeightKg` is in `_run_inputs_public` ONLY when set, so no existing signed log changes and `RELEASE_SNAPSHOT_VERSION` is not bumped (same precedent as the
+  dilution item ids). It is a required field (`REQUIRED_FEEDSTOCK_HARVEST`) only for drafts and runs finalized with `production_runs.harvest_weight_rule = 1` (stamped at finalize, 0 for historical runs), like KW-59 / KW-63.
 - **Feedstock photos: view, replace, remove** (KW-02; tests in `tests/test_photo_remove.py`). A photo taken for a feedstock characterization card is a `run_attachments` row with `purpose = 'feedstock_photo'` (set by the card's
   upload; the run's `run_inputs.surface_photo / striation_photo` and the draft's saved `feedstockDetails` point to it). While the run is a DRAFT: the card shows the photo (click = full size in a new tab), "Replace" uploads a new one
   with `replaces=<old id>` (the old row is deleted, its places point to the new photo, the file is deleted after the commit) and "Remove" (`DELETE /api/production/<id>/feedstock-photo/<attachment id>`) clears every reference

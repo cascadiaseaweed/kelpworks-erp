@@ -470,7 +470,7 @@ const STAB_COLUMNS = [
   { key: 'stabWeeks', label: 'Stabilization period (weeks)', value: t => stabilizationWeeks(t), numeric: true, center: true, wrapHead: true,
     cell: t => { const w = stabilizationWeeks(t); return w == null ? '—' : String(w); } },
   { key: 'receivedDate', label: 'Received date', value: t => t.receivedDate || '', cell: t => t.receivedDate || '—', hidden: true },
-  { key: 'avgKg', label: 'Avg kg', value: t => t.avgWeightKg, numeric: true, cell: t => fmt(t.avgWeightKg, 1), hidden: true },
+  { key: 'avgKg', label: 'Avg harvest kg', value: t => t.avgWeightKg, numeric: true, cell: t => fmt(t.avgWeightKg, 1), hidden: true },
   { key: 'ph', label: 'pH', value: t => t.ph, numeric: true, center: true, cell: t => phCell(t) },
   { key: 'orp', label: 'ORP (mV)', value: t => t.orp, numeric: true, center: true, cell: t => orpCell(t) },
   { key: 'tds', label: 'Feedstock TDS (%)', value: t => t.tdsPct, numeric: true, center: true, wrapHead: true, hidden: true, cell: t => t.tdsPct == null ? el('span', { class: 'muted' }, '—') : String(t.tdsPct) },
@@ -481,7 +481,7 @@ const STAB_COLUMNS = [
   { key: 'status', label: 'Status', value: t => statusLabel(t.status), options: () => Object.values(STATUS_LABELS),
     cell: t => badge(t.status, statusLabel(t.status)) },
 ];
-// Which columns are shown is a per-browser preference. Stabilization method, Received date, Avg kg and Last updated
+// Which columns are shown is a per-browser preference. Stabilization method, Received date, Avg harvest kg and Last updated
 // start hidden (they live in each row's ⓘ details window) and can be switched on from "Columns".
 const STAB_COLS_KEY = 'kelp.stabCols';
 function loadStabCols() {
@@ -512,7 +512,7 @@ function showToteDetails(t) {
   const rows = [
     ['Lot number', mono(t.lot)], ['Site', siteName(t.site)], ['Species', speciesName(t.species)],
     ['Grind', t.grind || 'Coarse'], ['Stabilization method', t.stabilizationMethod || '—'],
-    ['Storage unit', t.storageUnit || '—'], ['Avg weight', t.avgWeightKg != null ? fmt(t.avgWeightKg, 1) + ' kg' : '—'],
+    ['Storage unit', t.storageUnit || '—'], ['Average harvest weight', t.avgWeightKg != null ? fmt(t.avgWeightKg, 1) + ' kg' : '—'],
     ['Volume', t.volumeL != null ? fmt(t.volumeL, 0) + ' L' : '—'],
     ['Harvest date', t.harvestDate || '—'],
     ['Stabilization period', stabilizationWeeks(t) != null ? stabilizationWeeks(t) + ' week' + (stabilizationWeeks(t) === 1 ? '' : 's') : '—'],
@@ -790,7 +790,7 @@ function bulkSetTotes(ids) {
   const body = el('div', {},
     el('div', { class: 'summary-line' }, sl('Totes', ids.length + ' selected')),
     el('div', { class: 'help' }, 'Fill in only what you want to set — anything left blank is not changed.'),
-    field('Average weight per tote (kg)', el('input', { type: 'number', id: 'bs_kg', step: 'any', min: '0', max: '5000', placeholder: 'e.g. 180.5' })),
+    field('Average harvest weight per tote (kg)', el('input', { type: 'number', id: 'bs_kg', step: 'any', min: '0', max: '5000', placeholder: 'e.g. 180.5' })),
     el('div', { class: 'form-row' },
       field('Grind', el('select', { id: 'bs_grind' }, el('option', { value: keep }, '— no change —'), el('option', {}, 'Coarse'), el('option', {}, 'Fine'), el('option', {}, 'Whole'))),
       field('Stabilization method', el('select', { id: 'bs_stab' }, el('option', { value: keep }, '— no change —'), el('option', {}, 'Citric acid'), el('option', {}, 'Fresh')))),
@@ -800,7 +800,7 @@ function bulkSetTotes(ids) {
   modal('Set values for ' + ids.length + ' tote' + (ids.length === 1 ? '' : 's'), body, async () => {
     const kg = body.querySelector('#bs_kg').value.trim(), grind = body.querySelector('#bs_grind').value, stab = body.querySelector('#bs_stab').value;
     if (kg === '' && !grind && !stab) throw new Error('Enter a weight, or choose a grind or stabilization method.');
-    if (kg !== '' && !(+kg > 0)) throw new Error('The average weight must be above 0.');
+    if (kg !== '' && !(+kg > 0)) throw new Error('The average harvest weight must be above 0.');
     const r = await api('POST', '/totes/set-bulk', { ids, avgWeightKg: kg === '' ? null : +kg, grind: grind || null, stabilizationMethod: stab || null, note: body.querySelector('#bs_note').value || null });
     toast('Updated ' + r.updated + ' tote' + (r.updated === 1 ? '' : 's') + (r.unchanged ? ' (' + r.unchanged + ' already had these values)' : '')); render();
   }, 'Set values');
@@ -1032,7 +1032,7 @@ async function openHarvest() {
   const c_count = body.querySelector('#h_count'), c_kg = body.querySelector('#h_kg');
   const upd = () => {
     const n = +c_count.value || 0, kg = +c_kg.value || 0;
-    body.querySelector('#h_preview').textContent = n > 0 ? `Creates ${n} storage unit(s); average weight ${n ? (kg / n).toFixed(2) : 0} kg each.` : '';
+    body.querySelector('#h_preview').textContent = n > 0 ? `Creates ${n} storage unit(s); average harvest weight ${n ? (kg / n).toFixed(2) : 0} kg each.` : '';
   };
   c_count.addEventListener('input', upd); c_kg.addEventListener('input', upd); upd();
   onStabChange();
@@ -1190,7 +1190,7 @@ async function pageProduction(v) {
 // The key production figures shown on a run's summary card, all derived from the run's
 // own log: feedstock farms, IBCs (totes) consumed, weights, volume out, final QC, extraction
 // efficiency and the two conversion rates (process = measured weights, harvest = stored
-// batch-average weight -- the same definitions as the Yield & Usage report).
+// average harvest weight -- the same definitions as the Yield & Usage report).
 function runSummaryStats(run) {
   const inputs = (run.inputs || []).filter(i => i.decision !== 'rejected');
   const siteCodes = inputs.length ? inputs.map(i => i.site) : (run.inputTotes || []).map(l => String(l).split('-')[0]);
@@ -1235,10 +1235,10 @@ function runSummaryGrid(run) {
     ['farms', 'Feedstock farms', x.farms.join(', ') || dash],
     ['ibcs', 'IBCs consumed', x.toteCount ? fmt(x.toteCount) : dash],
     ['feedstock_weight', 'Total feedstock weight', x.measuredKg != null ? [fmt(x.measuredKg, 1) + ' kg', el('small', {}, 'measured')]
-      : (run.inputKg ? [fmt(run.inputKg, 1) + ' kg', el('small', {}, 'batch-average')] : dash)],
+      : (run.inputKg ? [fmt(run.inputKg, 1) + ' kg', el('small', {}, 'harvest average')] : dash)],
     ['packaged', 'Packaged', fgList],
     ['conv_process', 'Conversion rate, process', x.processRate != null ? [fmt(x.processRate, 1) + ' L/kg', el('small', {}, 'measured weight')] : dash],
-    ['conv_harvest', 'Conversion rate, harvest', x.harvestRate != null ? [fmt(x.harvestRate, 1) + ' L/kg', el('small', {}, 'batch-average weight')] : dash],
+    ['conv_harvest', 'Conversion rate, harvest', x.harvestRate != null ? [fmt(x.harvestRate, 1) + ' L/kg', el('small', {}, 'harvest average weight')] : dash],
   ].filter(k => Number(settingValue('run_card_show_' + k[0], 1)) !== 0);
   const head = kpis.filter(k => RUN_CARD_HEADLINE.includes(k[0]));
   const rest = kpis.filter(k => !head.includes(k));
@@ -3546,8 +3546,12 @@ function buildFeedstockCard(opts) {
   if (v.orp != null) orpInp.value = formatQcValue(v.orp, 0);
   // Calculated from REF_ORP_classification.pdf — never typed by hand.
   const orpRangeNote = el('span', { class: 'help' }, v.orpRange || classifyOrp(v.orp) || 'Enter ORP to classify');
-  const weightInp = el('input', { inputmode: 'decimal', placeholder: 'kg' }); attachNumericMask(weightInp, 1);
+  const weightInp = el('input', { inputmode: 'decimal', placeholder: opts.showAvgHarvest ? 'measured, kg' : 'kg' }); attachNumericMask(weightInp, 1);
   if (v.weightKg != null) weightInp.value = formatQcValue(v.weightKg, 1);
+  // KW-103 (a production run's card only): this tote's AVERAGE HARVEST weight as kept on the run -- separate from the measured weight above. It starts from the tote's recorded
+  // average, can be corrected in a draft or by an amendment, and a change is also made on the tote itself.
+  const avgInp = el('input', { inputmode: 'decimal', placeholder: 'kg' }); attachNumericMask(avgInp, 1);
+  if (v.avgHarvestWeightKg != null) avgInp.value = formatQcValue(v.avgHarvestWeightKg, 1);
   const volumeInp = el('input', { inputmode: 'decimal', placeholder: 'L' }); attachNumericMask(volumeInp, 1);
   if (v.volumeL != null) volumeInp.value = formatQcValue(v.volumeL, 1);
   function calcDensity() {
@@ -3582,6 +3586,7 @@ function buildFeedstockCard(opts) {
       phMeasuredAt: v.phMeasuredAt,
       orp: orpInp.value.trim() === '' ? null : qcParseValue(orpInp.value),
       orpRange: classifyOrp(orpInp.value.trim() === '' ? null : qcParseValue(orpInp.value)),
+      ...(opts.showAvgHarvest ? { avgHarvestWeightKg: avgInp.value.trim() === '' ? null : qcParseValue(avgInp.value) } : {}),
       weightKg: weightInp.value.trim() === '' ? null : qcParseValue(weightInp.value),
       volumeL: volumeInp.value.trim() === '' ? null : qcParseValue(volumeInp.value),
       densityKgL: calcDensity(),
@@ -3590,7 +3595,9 @@ function buildFeedstockCard(opts) {
       decision: decisionSel.value || null,
       rejectionReason: reasonInp.value.trim() || null,
       notes: notesInp.value.trim() || null,
-      surfacePhotoId: v.surfacePhotoId, striationPhotoId: v.striationPhotoId
+      surfacePhotoId: v.surfacePhotoId, striationPhotoId: v.striationPhotoId,
+      // (KW-102) a tote's picture shown on a run's card before the run has its own copy: the server copies it when the entries are locked in
+      ...(opts.fromUrl ? { surfacePhotoFrom: v.surfacePhotoId ? null : (v.surfacePhotoFrom || null), striationPhotoFrom: v.striationPhotoId ? null : (v.striationPhotoFrom || null) } : {})
     };
   }
   function notifyChange() { if (opts.onChange) opts.onChange(currentValues()); }
@@ -3609,15 +3616,19 @@ function buildFeedstockCard(opts) {
   }));
   odourMultiSelect.el.addEventListener('change', notifyChange);
   decisionSel.addEventListener('change', () => { reasonField.classList.toggle('hidden', decisionSel.value !== 'rejected'); notifyChange(); });
-  [loadedAt, weightInp, volumeInp, intensitySel, notesInp, tdsInp, reasonInp]
+  [loadedAt, weightInp, avgInp, volumeInp, intensitySel, notesInp, tdsInp, reasonInp]
     .forEach(inp => inp.addEventListener('change', notifyChange));
   // (KW-101) a value still being typed is reported too, not only once the box loses focus: the draft autosave (and the idle timeout's save) must see what is on the screen
-  [phInp, orpInp, weightInp, volumeInp, notesInp, reasonInp].forEach(inp => inp.addEventListener('input', notifyChange));
+  [phInp, orpInp, weightInp, avgInp, volumeInp, notesInp, reasonInp].forEach(inp => inp.addEventListener('input', notifyChange));
 
+  const slotRefresh = {};
   function photoSlot(slotKey, label) {
+    const fromKey = slotKey === 'surfacePhotoId' ? 'surfacePhotoFrom' : 'striationPhotoFrom';
+    // the picture to show: the run's own photo, else (KW-102) the tote's, offered through opts.fromUrl until the server copies it into the run
+    const shownUrl = () => v[slotKey] && opts.photoUrl ? opts.photoUrl(v[slotKey]) : (!v[slotKey] && v[fromKey] && opts.fromUrl ? opts.fromUrl(v[fromKey]) : null);
     const img = el('img', { title: 'Click to view full size', style: 'cursor:zoom-in' });
-    if (v[slotKey] && opts.photoUrl) img.src = opts.photoUrl(v[slotKey]); else img.style.display = 'none';
-    img.addEventListener('click', () => { if (v[slotKey] && opts.photoUrl) window.open(opts.photoUrl(v[slotKey]), '_blank', 'noopener'); });      // KW-02: full size in its own tab
+    if (shownUrl()) img.src = shownUrl(); else img.style.display = 'none';
+    img.addEventListener('click', () => { const u = shownUrl(); if (u) window.open(u, '_blank', 'noopener'); });      // KW-02: full size in its own tab
     const fileInput = el('input', { type: 'file', accept: 'image/*', style: 'display:none' });
     // capture="environment" hands off to the rear camera on phones/tablets.
     const cameraInput = el('input', { type: 'file', accept: 'image/*', capture: 'environment', style: 'display:none' });
@@ -3632,6 +3643,7 @@ function buildFeedstockCard(opts) {
         try {
           const b64 = String(reader.result).split(',')[1];
           v[slotKey] = await opts.uploadPhoto(slotKey === 'surfacePhotoId' ? 'surface' : 'striation', file, b64, v[slotKey]);      // the old photo (if any) is replaced, not left behind
+          v[fromKey] = null;                                                                                                         // (KW-102) a picture taken here replaces the tote's picture offered for this slot
           status.textContent = '';
           refreshBtns();
           notifyChange();
@@ -3645,6 +3657,9 @@ function buildFeedstockCard(opts) {
     const uploadBtn = el('button', { type: 'button', class: 'secondary', onclick: () => fileInput.click() }, 'Upload');
     // Remove is offered only where the caller allows it (a run still being logged); a finalized run's photos are part of its signed log (KW-02)
     const removeBtn = opts.removePhoto ? el('button', { type: 'button', class: 'secondary', onclick: async () => {
+      if (!v[slotKey] && v[fromKey]) {          // (KW-102) only the tote's picture is shown, the run has no copy yet: stop offering it for this run; nothing is deleted
+        v[fromKey] = null; img.removeAttribute('src'); img.style.display = 'none'; refreshBtns(); notifyChange(); return;
+      }
       if (!v[slotKey] || !confirm('Remove this photo? The file is deleted.')) return;
       status.textContent = 'Removing…';
       try {
@@ -3652,8 +3667,10 @@ function buildFeedstockCard(opts) {
         v[slotKey] = null; img.removeAttribute('src'); img.style.display = 'none'; status.textContent = ''; refreshBtns(); notifyChange();
       } catch (e) { status.textContent = e.message; }
     } }, 'Remove') : null;
-    function refreshBtns() { uploadBtn.textContent = v[slotKey] ? 'Replace' : 'Upload'; if (removeBtn) removeBtn.style.display = v[slotKey] ? '' : 'none'; }
+    function refreshBtns() { const has = !!(v[slotKey] || v[fromKey]); uploadBtn.textContent = has ? 'Replace' : 'Upload'; if (removeBtn) removeBtn.style.display = has ? '' : 'none'; }
     refreshBtns();
+    // (KW-102) after the server copied the tote's picture into the run, the card swaps its source marker for the run's own photo without being rebuilt
+    slotRefresh[slotKey] = () => { const u = shownUrl(); if (u) { img.src = u; img.style.display = ''; } else { img.removeAttribute('src'); img.style.display = 'none'; } refreshBtns(); };
     return el('div', { class: 'photo-slot', style: 'flex:1 1 160px' },
       el('div', { class: 'help' }, opts.markRequired && isReq('feedstock', photoKey) ? reqLabel(label) : label), img, fileInput, cameraInput,
       el('div', { style: 'display:flex;gap:6px;margin-top:4px;flex-wrap:wrap' },
@@ -3675,6 +3692,9 @@ function buildFeedstockCard(opts) {
     ['ph', fl('ph', 'pH', el('div', {}, phInp, phMeasuredNote))],
     ['orp', fl('orp', 'ORP (mV)', orpInp)],
     ['orpRange', field('ORP meter range (calculated)', orpRangeNote)],
+    ...(opts.showAvgHarvest ? [['avgHarvestWeightKg', (opts.mode === 'draft' || v.avgHarvestWeightKg != null) && isReq('feedstock', 'avgHarvestWeightKg') && opts.markRequired
+      ? field(reqLabel('Average harvest weight (kg)'), el('div', {}, avgInp, el('span', { class: 'help' }, 'Harvest average per tote. A change here also changes the tote’s recorded average.')))
+      : field('Average harvest weight (kg)', el('div', {}, avgInp, el('span', { class: 'help' }, 'Harvest average per tote. A change here also changes the tote’s recorded average.')))]] : []),
     ['weightKg', fl('weightKg', 'Weight (kg)', weightInp)],
     ['volumeL', fl('volumeL', 'Volume (L)', volumeInp)],
     ['densityKgL', field('Density (calculated)', densityNote)],
@@ -3706,9 +3726,17 @@ function buildFeedstockCard(opts) {
   // its own outer button (no per-field Save here) always has a current
   // snapshot to send, even if the user never touches this card at all.
   if (opts.onChange) notifyChange();
-  return el('details', { class: 'accordion feedstock-tote', ...(opts.sopSpot ? { 'data-sop-spot': opts.sopSpot } : {}) },
+  const cardEl = el('details', { class: 'accordion feedstock-tote', ...(opts.sopSpot ? { 'data-sop-spot': opts.sopSpot } : {}) },
     el('summary', {}, opts.label + (v.decision === 'rejected' ? '  ⚠ Rejected' : '')),
     el('div', { class: 'accordion-body' }, ...bodyEls));
+  // (KW-102) the caller hands over the ids of the run's own copies of the tote's pictures once the server has made them
+  cardEl.kwApplyPhotos = ids => {
+    for (const [slotKey, fromKey] of [['surfacePhotoId', 'surfacePhotoFrom'], ['striationPhotoId', 'striationPhotoFrom']]) {
+      if (ids && ids[slotKey] && !v[slotKey]) { v[slotKey] = ids[slotKey]; v[fromKey] = null; if (slotRefresh[slotKey]) slotRefresh[slotKey](); }
+      else if (v[fromKey] && ids && !ids[slotKey]) { v[fromKey] = null; if (slotRefresh[slotKey]) slotRefresh[slotKey](); }      // the tote's picture was gone: nothing was copied
+    }
+  };
+  return cardEl;
 }
 
 // Dilution & Preservation -> "Dilution", "Preservatives" and "pH Balancing". Dilution records
@@ -4510,7 +4538,7 @@ async function openRun(draftSummary, opts) {
     pickFilteredCount = rows.length;
     pickHost.innerHTML = '';
     const headRow = el('tr', {}, el('th', { class: 'checkcol' }, ''), el('th', {}, 'Lot'), el('th', {}, 'Site'),
-      el('th', { class: 'num' }, 'Avg kg'), el('th', {}, 'pH'), el('th', {}, 'Grade'), el('th', {}, 'Location'));
+      el('th', { class: 'num' }, 'Avg harvest kg'), el('th', {}, 'pH'), el('th', {}, 'Grade'), el('th', {}, 'Location'));
     const siteOpts = siteFilterNames(totes.map(t => t.site));
     const gradeOpts = [...new Set(totes.map(t => t.grade).filter(Boolean))].sort();
     const gradeFilterSel = el('select', {}, el('option', { value: '' }, 'All'), ...gradeOpts.map(o => el('option', { value: o }, o)));
@@ -4556,7 +4584,12 @@ async function openRun(draftSummary, opts) {
         }
       });
       cb.checked = selected.has(t.id);
-      tb.append(el('tr', {}, el('td', { class: 'checkcol' }, cb), el('td', { class: 'mono' }, t.lot), el('td', {}, siteName(t.site)), el('td', { class: 'num' }, fmt(t.avgWeightKg, 1)), el('td', {}, t.ph ?? '—'), el('td', {}, gradeBadge(t)), el('td', {}, t.location || '—')));
+      // (KW-103) a tote with no average harvest weight cannot be added to a run until it is recorded in Feedstock Inventory; one already in this run (a draft from before the rule) and
+      // a historical run are not held to it
+      const noWeight = !(t.avgWeightKg > 0) && !selected.has(t.id) && t.status !== 'wip' && !(draft && draft.historical);
+      if (noWeight) { cb.disabled = true; cb.title = 'No average harvest weight is recorded for this tote. Record it in Feedstock Inventory (select the tote, Set values for selected) before adding it to a run.'; }
+      tb.append(el('tr', noWeight ? { class: 'no-harvest-weight', title: cb.title } : {}, el('td', { class: 'checkcol' }, cb), el('td', { class: 'mono' }, t.lot), el('td', {}, siteName(t.site)),
+        el('td', { class: 'num' }, noWeight ? el('span', { class: 'muted' }, 'not recorded') : fmt(t.avgWeightKg, 1)), el('td', {}, t.ph ?? '—'), el('td', {}, gradeBadge(t)), el('td', {}, t.location || '—')));
     }
     if (!rows.length) tb.append(el('tr', {}, el('td', { colspan: 7, class: 'empty' }, 'No in-stock totes match these filters.')));
     tbl.append(tb); pickHost.append(tbl); recompute();
@@ -4571,17 +4604,30 @@ async function openRun(draftSummary, opts) {
   // Rebuilt only when tote selection changes (not on every keystroke elsewhere
   // in the modal) so in-progress typing inside a tote's card is never wiped.
   let feedstockRenderGen = 0;
+  const cardEls = {};                                  // tote id -> its card element (KW-102: told the ids of the run's photo copies once the server has made them)
+  // The server copies a tote's pictures into the run when the card's entries are locked in (the card's Save, Save & close, Finalize) and answers with the ids of the copies.
+  function applyPhotoIds(toteId, ids) {
+    const st = feedstockState[toteId];
+    if (!ids || !st) return;
+    for (const [slotKey, fromKey] of [['surfacePhotoId', 'surfacePhotoFrom'], ['striationPhotoId', 'striationPhotoFrom']]) {
+      if (ids[slotKey]) { st[slotKey] = ids[slotKey]; st[fromKey] = null; } else if (st[fromKey]) st[fromKey] = null;
+    }
+    if (cardEls[toteId] && cardEls[toteId].kwApplyPhotos) cardEls[toteId].kwApplyPhotos(ids);
+    scheduleAutosave();                                // the draft remembers the run's photo ids instead of the source markers
+  }
+  // a picture offered from the tote ('tote:<id>') or from the tote's earlier run ('run:<run id>:<id>'): its download link
+  const photoSourceUrl = (toteId, marker) => { const p = String(marker).split(':'); return p[0] === 'run' ? attDownloadUrl(+p[1], +p[2], false) : toteAttDownloadUrl(toteId, +p[1], false); };
   async function renderFeedstockCards() {
     const gen = ++feedstockRenderGen;
     const chosen = totes.filter(t => selected.has(t.id));
     // A tote with no in-memory characterization yet this session (never
     // edited/saved here) is pre-filled from its most recently captured
     // values, if any, so re-selecting an already-characterized tote doesn't
-    // start every field blank.
+    // start every field blank. (KW-102: forRun = no weight / density, and the tote's pictures offered as sources.)
     const needsPrefill = chosen.filter(t => !feedstockState[t.id]);
     if (needsPrefill.length) {
       const fetched = await Promise.all(needsPrefill.map(t =>
-        api('GET', '/totes/' + t.id + '/ph').catch(() => null)));
+        api('GET', '/totes/' + t.id + '/ph?forRun=1').catch(() => null)));
       if (gen !== feedstockRenderGen) return; // a newer render started meanwhile
       needsPrefill.forEach((t, i) => {
         const r = fetched[i];
@@ -4593,12 +4639,16 @@ async function openRun(draftSummary, opts) {
     if (!chosen.length) { feedstockHost.append(el('div', { class: 'help' }, 'Select totes above to characterize the feedstock.')); return; }
     feedstockBuilding = true;                    // a card reports its starting values while it is built: that is not a change to save
     for (const t of chosen) {
-      feedstockHost.append(buildFeedstockCard({
+      const card = buildFeedstockCard({
         sopSpot: 'production.feedstock.characterization',
         markRequired: true,
         label: t.lot + (t.site ? '  ·  ' + t.site : ''),
-        initial: feedstockState[t.id],
+        // (KW-103) the run's Average harvest weight starts from the tote's recorded average
+        initial: feedstockState[t.id] && feedstockState[t.id].avgHarvestWeightKg != null ? feedstockState[t.id]
+          : Object.assign({}, feedstockState[t.id], t.avgWeightKg > 0 ? { avgHarvestWeightKg: t.avgWeightKg } : {}),
+        showAvgHarvest: true,
         mode: 'draft',
+        fromUrl: marker => photoSourceUrl(t.id, marker),
         onChange: vals => { feedstockState[t.id] = vals; if (!feedstockBuilding) scheduleAutosave(); },
         // Locks this tote's characterization in immediately instead of only
         // bundling it into the next draft save/finalize, and updates its
@@ -4626,6 +4676,7 @@ async function openRun(draftSummary, opts) {
             // Just hide this tote's now-stale picker row -- other cards'
             // in-progress edits shouldn't be disturbed by this save.
             if (idx !== -1) totes[idx] = Object.assign({}, totes[idx], { status: 'wip' });
+            applyPhotoIds(t.id, r.photoIds);               // (KW-102) the run's own copies of the tote's pictures
             filterTotes();
           }
         },
@@ -4637,7 +4688,9 @@ async function openRun(draftSummary, opts) {
         },
         removePhoto: async (slot, attId) => { const rid = await ensureRunId(); await api('DELETE', '/production/' + rid + '/feedstock-photo/' + attId); },
         photoUrl: attId => attDownloadUrl(draftId, attId, false)
-      }));
+      });
+      cardEls[t.id] = card;
+      feedstockHost.append(card);
     }
     feedstockBuilding = false;
   }
@@ -4821,6 +4874,7 @@ async function openRun(draftSummary, opts) {
       ? await api('PUT', '/production/drafts/' + draftId, payload)
       : await api('POST', '/production/drafts', payload);
     draftId = r.run.id;
+    for (const [tid, ids] of Object.entries(r.photoIds || {})) applyPhotoIds(+tid, ids);       // (KW-102) the run's own copies of the totes' pictures
     lastSavedJson = JSON.stringify(payload);       // (KW-101) the autosave has nothing more to send until something else changes
     if (!autosaveNote.textContent) setAutosaveNote('Entries in this run are saved automatically as you work.', false);
     // "Save & close" is the prominent, most-used save action, so it also
@@ -4923,6 +4977,7 @@ async function openProcessLog(run, section) {
       markRequired: true,
       label: inp.toteLot + (inp.site ? '  ·  ' + inp.site : ''),
       initial: Object.assign({}, inp, { surfacePhotoId: inp.surfacePhoto, striationPhotoId: inp.striationPhoto }),      // (the card reads the photo ids under these names: without this a saved photo never showed here)
+      showAvgHarvest: true,                                                                                              // KW-103: corrected here under an amendment; a run finalized before shows it blank until a value is entered
       mode: 'completed',
       onSave: async vals => { await api('PUT', '/production/' + run.id + '/inputs/' + inp.id, vals); },
       uploadPhoto: async (slot, file, b64) => {
@@ -7899,7 +7954,7 @@ function exportReportCsv(d) {
 
 /* ---------------- Yield & Usage ---------------- */
 // Read-only view over completed runs: observed conversion rates (process =
-// output L / measured input kg, harvest = output L / stored batch-average
+// output L / measured input kg, harvest = output L / stored harvest-average
 // input kg) and what each run consumed, grouped by any ticked combination of product / species / farm / ... --
 // the observation layer a BOM is later promoted from. Excluded runs never
 // count toward the stats (Edit run -> "Exclude from yield & usage analysis").
@@ -7930,7 +7985,7 @@ const YU_FLAGS = { mixed: 'Mixed source', missing_measured_weight: 'No measured 
 const YU_BASES = {
   perKLOutput: { label: 'per 1,000 L output' },
   perTonneProcess: { label: 'per 1,000 kg process input (measured)' },
-  perTonneHarvest: { label: 'per 1,000 kg harvest input (batch-average)' },
+  perTonneHarvest: { label: 'per 1,000 kg harvest input (average harvest weights)' },
 };
 const YU_DIMS = [['sku', 'Product'], ['species', 'Species'], ['farm', 'Farm'], ['stabilization', 'Stabilization method'],
   ['harvest_month', 'Harvest month'], ['processing_month', 'Processing month']];
@@ -7973,7 +8028,7 @@ async function pageYield(v) {
       } }, '⬇ Excel'))));
   v.append(el('div', { class: 'help', style: 'margin-bottom:10px' },
     'Observed conversion rates and consumption from completed runs -- the basis for a BOM. Process rate = output L / measured input kg; '
-    + 'harvest rate = output L / stored batch-average input kg. Usage comes from the consumable ledger; runs finalized before reagent deduction have no usage data.'),
+    + 'harvest rate = output L / the run’s input kg (the sum of each accepted tote’s average harvest weight). Usage comes from the consumable ledger; runs finalized before reagent deduction have no usage data.'),
     el('div', { class: 'form-row-3', style: 'margin-bottom:6px' }, field('From', fromInp), field('To', toInp), field('Group by (tick any combination)', groupBox)),
     el('div', { class: 'form-row-3', style: 'margin-bottom:10px' },
       field('Usage shown', basisSel),
@@ -8000,7 +8055,7 @@ async function pageYield(v) {
           sl('Process input (' + (g.processRate ? g.processRate.n : 0) + ' runs measured)', fmt(g.processKg, 0) + ' kg'),
           sl('Output', fmt(g.outputL, 0) + ' L')),
         table(['Conversion rate (L / kg)', 'Runs', 'Median', 'Min', 'Max', 'Pooled'],
-          [rate('Process (measured weight)', g.processRate), rate('Harvest (batch-average weight)', g.harvestRate)],
+          [rate('Process (measured weight)', g.processRate), rate('Harvest (average harvest weight)', g.harvestRate)],
           [false, true, true, true, true, true]),
         ...(g.usage.length ? yuUsageSections(g, s.basis, stat)
           : [el('div', { class: 'qc-check-section-title' }, 'Usage'),
@@ -8241,7 +8296,7 @@ const CALCULATIONS = [
     title: 'Pre-processing: output IBC weight',
     formula: 'Output IBC weight (kg) = (Estimated weight + Dilution water added) × (that IBC fill ÷ Total packed)',
     description: 'Each output IBC lot is stored in Feedstock Inventory with its share of the blend mass as its weight, so downstream yield figures use the blend mass.',
-    location: 'Pre-Processing → batch → Pack-out; Feedstock Inventory → Avg kg',
+    location: 'Pre-Processing → batch → Pack-out; Feedstock Inventory → Avg harvest kg',
     settings: [],
   },
   {
@@ -8322,8 +8377,15 @@ const CALCULATIONS = [
     settings: [],
   },
   {
+    title: 'Run input (kg) and average harvest weight (KW-103)',
+    formula: 'Run input (kg) = Σ over the accepted totes of the run’s Average harvest weight (kg) for that tote   ·   a tote with no value of its own on the run (a run finalized before the field existed) counts its recorded average harvest weight',
+    description: 'Each tote on a run keeps its own Average harvest weight (kg), separate from the measured Weight (kg) of the feedstock card. It starts from the tote’s recorded average (Feedstock Inventory: Avg harvest kg, set at check-in, with Set values for selected, or by the import) and a tote cannot be added to a run until that average is recorded (historical runs are exempt). A change in a draft, or on a finalized run under an amendment, also changes the tote’s own recorded average (logged in its Feedstock Stability log) and recalculates the run’s input, so the harvest conversion rate follows. A rejected tote adds nothing.',
+    location: 'Production → Feedstock card (Average harvest weight), applied when a tote is locked into a run, when the run is finalized and when a value is amended',
+    settings: [],
+  },
+  {
     title: 'Process / Harvest conversion rate (Yield & Usage)',
-    formula: 'Process rate (L/kg) = Output (L) / Σ measured tote weights (kg)   ·   Harvest rate (L/kg) = Output (L) / stored input (kg, batch-average tote weight)   ·   Pooled = Σ output / Σ input over the group’s runs',
+    formula: 'Process rate (L/kg) = Output (L) / Σ measured tote weights (kg)   ·   Harvest rate (L/kg) = Output (L) / stored input (kg, the sum of the run’s Average harvest weight per accepted tote)   ·   Pooled = Σ output / Σ input over the group’s runs',
     description: 'Per completed, non-excluded run, with median / min / max across the group. A run missing a measured weight on any accepted tote has no process rate (no fallback). Groups with fewer runs than the minimum are tagged "Low sample".',
     location: 'Yield & Usage tab',
     settings: ['yield_report_min_runs'],
@@ -9624,7 +9686,7 @@ async function openPreprocBatch(id, section) {
     });
     pickHost.append(el('div', { class: 'tablewrap', style: 'max-height:260px;overflow:auto' }, el('table', {},
       el('thead', {}, el('tr', {}, el('th', { class: 'checkcol' }, ''), ...['Lot', 'Site', 'Species', 'Harvest date'].map(h => el('th', {}, h)),
-        el('th', { class: 'num' }, 'Avg kg'), el('th', { class: 'num' }, 'pH'), el('th', {}, 'Location'))), tb)));
+        el('th', { class: 'num' }, 'Avg harvest kg'), el('th', { class: 'num' }, 'pH'), el('th', {}, 'Location'))), tb)));
   }
   [qInp, spSel, siteSel].forEach(c => c.addEventListener(c === qInp ? 'input' : 'change', drawPick));
   const addBtn = el('button', { type: 'button', onclick: async () => {
