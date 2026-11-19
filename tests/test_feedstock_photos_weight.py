@@ -3,12 +3,14 @@ average. The tote's newest Surface / Settling-striation picture is offered as a 
 (the card's Save, Save & close, Finalize), so the autosave stays side-effect free and no draft is created behind anyone's back."""
 import base64
 import os
+from pathlib import Path
 
 import pytest
 
 from factories import feedstock_detail, harvest_totes, sql, stage_payloads
 from harness import Server
 
+APP_JS = (Path(__file__).resolve().parent.parent / "public" / "app.js").read_text(encoding="utf-8")
 IMG_A = b"\x89PNG-surface-" + b"A" * 2048
 IMG_B = b"\x89PNG-striation-" + b"B" * 2048
 IMG_C = b"\x89PNG-replacement-" + b"C" * 2048
@@ -78,6 +80,26 @@ def test_the_run_card_is_offered_the_totes_pictures_but_never_a_weight_or_densit
     assert for_run["surfacePhotoFrom"] == "tote:%d" % s and for_run["striationPhotoFrom"] == "tote:%d" % g
     none, = harvest_totes(admin, 1)
     assert "surfacePhotoFrom" not in admin.get("/api/totes/%d/ph?forRun=1" % none).json["latestCharacterization"]      # no picture, nothing offered
+
+
+def test_feedstock_inventorys_update_window_is_offered_the_totes_pictures_and_everything_else(srv, admin):
+    t, = harvest_totes(admin, 1)
+    s = tote_photo(admin, t, "surface", IMG_A, "surf.png")
+    g = tote_photo(admin, t, "striation", IMG_B, "stri.png")
+    assert admin.post("/api/totes/set-bulk", {"ids": [t], "avgWeightKg": 187.5, "note": "weighed"}).status == 200
+    shown = admin.get("/api/totes/%d/ph?photos=1" % t).json["latestCharacterization"]
+    assert shown["surfacePhotoFrom"] == "tote:%d" % s and shown["striationPhotoFrom"] == "tote:%d" % g
+    assert shown["weightKg"] == 187.5                                                                              # the Update window keeps everything it always showed (the run card is the one that drops weight)
+    assert "surfacePhotoFrom" not in admin.get("/api/totes/%d/ph" % t).json["latestCharacterization"]              # and a plain read is unchanged
+    # saving the window without choosing a new picture writes no photo line and changes nothing
+    before = sql(srv, "SELECT COUNT(*) FROM tote_stability_log WHERE tote_lot_id=? AND field IN ('Surface photo', 'Settling/striation photo')", (t,))
+    assert admin.post("/api/totes/%d/characterize" % t, {"decision": "accepted", "surfacePhotoFrom": shown["surfacePhotoFrom"], "striationPhotoFrom": shown["striationPhotoFrom"]}).status == 200
+    assert sql(srv, "SELECT COUNT(*) FROM tote_stability_log WHERE tote_lot_id=? AND field IN ('Surface photo', 'Settling/striation photo')", (t,)) == before
+
+
+def test_the_update_window_and_the_run_card_both_show_the_totes_pictures():
+    assert APP_JS.count("fromUrl: marker => photoSourceUrl(t.id, marker)") == 2                                   # the run card and the Update window
+    assert "'/ph?photos=1'" in APP_JS and "'/ph?forRun=1'" in APP_JS
 
 
 def test_locking_in_copies_the_pictures_into_the_run_and_leaves_the_totes_alone(srv, admin):

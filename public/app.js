@@ -862,7 +862,7 @@ async function showHistory(t) {
 }
 async function updateCondition(t) {
   if (!(await presenceEnter('tote:' + t.id, 'tote ' + t.lot))) return;
-  const data = await api('GET', '/totes/' + t.id + '/ph');
+  const data = await api('GET', '/totes/' + t.id + '/ph?photos=1');          // (the tote's newest pictures are shown in the Details card's photo slots)
   function summaryLines(d) {
     return [sl('Tote', t.lot),
       sl('Current pH', d.ph == null ? '—' : d.ph + (d.phUpdated ? '  (' + d.phUpdated + ')' : '')),
@@ -891,6 +891,7 @@ async function updateCondition(t) {
     // everything else) rather than starting blank every time.
     initial: data.latestCharacterization,
     mode: 'draft',
+    fromUrl: marker => photoSourceUrl(t.id, marker),            // the tote's existing pictures; a new one replaces it (and the history line says what it replaced)
     onChange: vals => { detailVals = vals; },
     uploadPhoto: async (slot, file, b64) => {
       const r = await api('POST', '/totes/' + t.id + '/photo',
@@ -1612,6 +1613,8 @@ function attDownloadUrl(rid, aid, dl) {
   return '/api/production/' + rid + '/attachments/' + aid + '/download?' +
     (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(dlToken());
 }
+// (KW-102) a picture offered from a tote's own record ('tote:<id>') or from the tote's earlier run ('run:<run id>:<id>'): its download link
+function photoSourceUrl(toteId, marker) { const p = String(marker).split(':'); return p[0] === 'run' ? attDownloadUrl(+p[1], +p[2], false) : toteAttDownloadUrl(toteId, +p[1], false); }
 function toteAttDownloadUrl(tid, aid, dl) {
   return '/api/totes/' + tid + '/attachments/' + aid + '/download?' +
     (dl ? 'dl=1&' : '') + 'token=' + encodeURIComponent(dlToken());
@@ -4615,8 +4618,6 @@ async function openRun(draftSummary, opts) {
     if (cardEls[toteId] && cardEls[toteId].kwApplyPhotos) cardEls[toteId].kwApplyPhotos(ids);
     scheduleAutosave();                                // the draft remembers the run's photo ids instead of the source markers
   }
-  // a picture offered from the tote ('tote:<id>') or from the tote's earlier run ('run:<run id>:<id>'): its download link
-  const photoSourceUrl = (toteId, marker) => { const p = String(marker).split(':'); return p[0] === 'run' ? attDownloadUrl(+p[1], +p[2], false) : toteAttDownloadUrl(toteId, +p[1], false); };
   async function renderFeedstockCards() {
     const gen = ++feedstockRenderGen;
     const chosen = totes.filter(t => selected.has(t.id));

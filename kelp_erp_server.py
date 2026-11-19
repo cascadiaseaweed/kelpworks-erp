@@ -10416,7 +10416,8 @@ class Handler(BaseHTTPRequestHandler):
                             "receivedDate": it["received_date"], "harvestDate": it["checkin_date"],
                             "lastUpdated": self._tote_with_last_updated(conn, it)["lastUpdated"],
                             "latestCharacterization": self._latest_characterization(
-                                conn, tid, it, for_run=parse_qs(urlparse(self.path).query).get("forRun", [""])[0] in ("1", "true"))}
+                                conn, tid, it, for_run=parse_qs(urlparse(self.path).query).get("forRun", [""])[0] in ("1", "true"),
+                                photos=parse_qs(urlparse(self.path).query).get("photos", [""])[0] in ("1", "true"))}
                 if method == "POST":
                     d = self._body_json()
                     ph = numn(d.get("ph")) if d.get("ph") not in (None, "") else None
@@ -16227,7 +16228,7 @@ class Handler(BaseHTTPRequestHandler):
     # "Weight (kg)" log lines also hold the harvest average set by Set values / the import / an edit; the density is calculated from the weight.
     RUN_CARD_NO_PREFILL = ("weightKg", "densityKgL")
 
-    def _latest_characterization(self, conn, tote_lot_id, tote, for_run=False):
+    def _latest_characterization(self, conn, tote_lot_id, tote, for_run=False, photos=False):
         """Best-known current value for each Feedstock characterization
         field, to pre-fill a fresh card with -- pH/ORP come from the tote's
         own current reading; every other field has no persisted 'current'
@@ -16236,10 +16237,12 @@ class Handler(BaseHTTPRequestHandler):
         left out: a new characterization always starts as a fresh accepted
         inspection, never a carry-over of a past rejection.
         `for_run` (a production run's card, KW-102): no weight / density (see RUN_CARD_NO_PREFILL), and the tote's newest Surface / Settling-striation photo
-        is offered as a SOURCE (`surfacePhotoFrom` / `striationPhotoFrom`: 'tote:<id>' or 'run:<run id>:<id>'); the run copies it when the entries are locked in."""
+        is offered as a SOURCE (`surfacePhotoFrom` / `striationPhotoFrom`: 'tote:<id>' or 'run:<run id>:<id>'); the run copies it when the entries are locked in.
+        `photos` offers the same sources WITHOUT leaving anything out: Feedstock Inventory's Update window shows the tote's existing pictures in its slots (nothing is copied or logged
+        unless a new picture replaces one)."""
         kind_for = {key: kind for _, key, kind in self.INPUT_FIELDS}
         out = {"ph": tote["ph"], "orp": tote["orp"], "tdsPct": tote["tds_pct"]}
-        if for_run:
+        if for_run or photos:
             for key, label in (("surfacePhotoFrom", "Surface photo"), ("striationPhotoFrom", "Settling/striation photo")):
                 src = self._latest_tote_photo_source(conn, tote_lot_id, label)
                 if src:
