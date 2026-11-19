@@ -2,6 +2,7 @@
 
 What counts: the sync script (archive key) making ANY request = contact; a nightly backup downloaded IN FULL, by the script or by an administrator = copied off the server. Never seen is too old."""
 import datetime
+import time
 
 import pytest
 
@@ -30,6 +31,17 @@ def info(admin):
     r = admin.get("/api/archive/sync")
     assert r.status == 200, r.text
     return r.json
+
+
+def info_after_copy(admin, done=lambda i: i["lastOffsite"] and not i["warn"], seconds=10):
+    """The server notes a copy only AFTER the last byte of the download has been sent, so the client can be back with its next request first (under load, in the parallel CI run): wait for the note.
+    (A later test that sets its own flags must not be overwritten by a note that arrives late, either.)"""
+    deadline = time.time() + seconds
+    while True:
+        i = info(admin)
+        if done(i) or time.time() > deadline:
+            return i
+        time.sleep(0.1)
 
 
 def hours_ago(h):
@@ -68,7 +80,7 @@ def test_a_fresh_contact_and_copy_clear_the_warning(srv, admin):
     assert i["lastContact"] and i["warn"] and len(i["problems"]) == 1                    # in touch, but nothing copied yet
     got = srv.client().get("/api/archive/backup?name=" + name, headers={"X-Archive-Key": KEY})
     assert got.status == 200 and got.body[:2] == b"PK"
-    i = info(admin)
+    i = info_after_copy(admin)
     assert i["warn"] is False and i["problems"] == [] and i["lastOffsite"]["name"] == name and i["lastOffsite"]["by"] == "archive key"
 
 
@@ -89,7 +101,7 @@ def test_a_sync_clears_a_stale_warning(srv, admin):
     name = make_backup(admin)
     assert keyed(srv, "/api/archive/backups").status == 200
     assert srv.client().get("/api/archive/backup?name=" + name, headers={"X-Archive-Key": KEY}).status == 200
-    assert info(admin)["warn"] is False
+    assert info_after_copy(admin)["warn"] is False
 
 
 def test_an_administrator_downloading_a_backup_by_hand_counts_as_a_copy(srv, admin):
@@ -98,7 +110,7 @@ def test_an_administrator_downloading_a_backup_by_hand_counts_as_a_copy(srv, adm
     token = admin.download_token()
     r = srv.client().get("/api/archive/backup?name=" + name + "&token=" + token)
     assert r.status == 200
-    i = info(admin)
+    i = info_after_copy(admin)
     assert i["warn"] is False and i["lastOffsite"]["by"] != "archive key"
 
 
