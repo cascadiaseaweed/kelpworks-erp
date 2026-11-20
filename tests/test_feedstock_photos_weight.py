@@ -226,7 +226,7 @@ def test_a_picture_taken_straight_in_the_run_has_no_link_once_it_is_replaced_but
 def test_the_photo_buttons_say_what_they_do_and_the_camera_button_opens_the_camera():
     assert "'Upload photo'" in APP_JS and "'📷 Take photo'" in APP_JS and "uploadBtn.textContent = has ? 'Replace'" not in APP_JS
     assert "function takePhotoFile()" in APP_JS and "navigator.mediaDevices.getUserMedia" in APP_JS and "facingMode: { ideal: 'environment' }" in APP_JS
-    assert APP_JS.count("const shot = await takePhotoFile();") == 2                                                 # the feedstock card's slots and the Documents window
+    assert APP_JS.count("const shot = await takePhotoFile();") == 3                                                 # the feedstock card's slots, the Documents window and the Notes form (KW-104)
     assert "if (shot === undefined) cameraInput.click()" in APP_JS                                                  # the file input with capture is only the fallback
 
 

@@ -1,6 +1,6 @@
-"""KW-63: Separation's Liquid Out gets the weight of the recovered liquid (kg), the calculated volume (L) = weight / rho_liquid (g/mL) from the Filtrate characterization, and an optional
-estimate whose % difference from the calculation is flagged like the 6A/6B variance. The server stores the calculated numbers whenever the section is saved, so a density corrected later moves
-the volume with it. The screens are pinned at the bottom."""
+"""KW-63: Separation's Liquid Out gets the weight of the recovered liquid (kg) and the calculated volume (L) = weight / rho_liquid (g/mL) from the Filtrate characterization. The server stores
+the calculated numbers whenever the section is saved, so a density corrected later moves the volume with it. KW-104 took the optional estimate (and its % difference check) off the screen and
+dropped its flag setting; the server still reads and keeps an estimate that an earlier run stored (the tests below pin that), and a blank weight starts at 0. The screens are pinned at the bottom."""
 import pathlib
 
 import pytest
@@ -50,7 +50,7 @@ def test_without_both_a_weight_and_a_positive_density_there_is_no_volume(admin, 
     assert "liquidVolumeL" not in s and "liquidVariancePct" not in s
 
 
-def test_an_estimate_gives_a_stored_percentage_difference_from_the_calculation(admin):
+def test_an_estimate_stored_by_an_earlier_run_still_gives_its_stored_percentage_difference(admin):
     rid = draft(admin)
     s = put(admin, rid, liquidWeightKg=102.0, liquidRhoLiquidGMl=1.02, liquidEstVolumeL=80.0)
     assert s["liquidEstVolumeL"] == 80.0 and s["liquidVariancePct"] == pytest.approx((100.0 - 80.0) / 80.0 * 100)                   # (calculated - estimate) / estimate
@@ -62,9 +62,18 @@ def test_an_estimate_gives_a_stored_percentage_difference_from_the_calculation(a
     assert "liquidVariancePct" not in s
 
 
-def test_the_flag_threshold_is_a_setting(admin):
-    s = admin.get("/api/refdata").json["settings"]["separation_liquid_variance_flag_pct"]
-    assert s["value"] == 5 and s["default"] == 5 and "recovered liquid" in s["description"]
+def test_the_flag_setting_is_gone_and_its_leftover_row_is_dropped_once(admin):
+    import kelp_erp_server as K
+    assert "separation_liquid_variance_flag_pct" not in {k for k, _v, _l, _d in K.SETTINGS_DEFAULTS}
+    assert "separation_liquid_variance_flag_pct" not in admin.get("/api/refdata").json["settings"]
+    # a database from before this change still has the row: the first start with this code drops it, once, and says so in the change log (a server of its own: it is restarted)
+    with Server() as own:
+        sql(own, "INSERT INTO settings (key,value,label,description,updated_at) VALUES ('separation_liquid_variance_flag_pct',5,'x','x','2026-01-01T00:00:00Z')")
+        sql(own, "DELETE FROM app_flags WHERE key='migrated_remove_separation_variance_setting_kw104'")
+        own.restart()
+        assert "separation_liquid_variance_flag_pct" not in own.admin_client().get("/api/refdata").json["settings"]
+        rows = sql(own, "SELECT field,new_value,changed_by FROM config_log WHERE key='separation_liquid_variance_flag_pct'")
+        assert [tuple(r) for r in rows] == [("Setting removed (no longer used)", "removed", "System")]
 
 
 def test_the_new_keys_read_well_in_an_amendment_diff():
@@ -88,8 +97,13 @@ def test_the_summary_pdf_shows_the_recovered_liquid_and_a_unit_that_was_not_used
 
 def test_the_screens():
     flat = " ".join((PUBLIC / "app.js").read_text(encoding="utf-8").split())
-    assert "recoveredLiquidBox" in flat and "Total weight of recovered liquid (kg)" in flat and "Estimated recovered liquid volume (L) (optional)" in flat
-    assert "Total recovered liquid volume (L)" in flat and "Needs ρliquid" in flat
-    assert "w / rho" in flat and "(vol - est) / est * 100" in flat                                            # the live calculation is the server's
-    assert "settingValue('separation_liquid_variance_flag_pct', 5)" in flat
-    assert "separation_liquid_variance_flag_pct" in flat and "'Separation: total recovered liquid volume'" in flat
+    assert "recoveredLiquidBox" in flat and "Total weight of recovered liquid (kg)" in flat
+    assert "Total recovered liquid volume (L)" in flat and "w / rho" in flat                                    # the live calculation is the server's
+    # KW-104: the message names where the density is; the estimate, its difference line and its setting are gone from the screen and the Calculations page
+    assert "Needs density of liquid (ρliquid), found in QC Check – Filtrate characterization" in flat
+    assert "Needs ρliquid" not in flat and "enter it in the Filtrate characterization above" not in flat
+    assert "Estimated recovered liquid volume" not in flat and "Calculated vs estimate" not in flat and "liquidEstInp" not in flat
+    assert "(vol - est) / est * 100" not in flat and "separation_liquid_variance_flag_pct" not in flat
+    assert "'Separation: total recovered liquid volume'" in flat and "recovered liquid volume vs estimate" not in flat
+    # KW-104: a blank weight starts at 0 -- only for a run held to the newer rules, and a saved weight is never replaced
+    assert "if (values.liquidWeightKg != null) liquidWtInp.value = formatQcValue(values.liquidWeightKg, 2); else if (v2) liquidWtInp.value = '0';" in flat
