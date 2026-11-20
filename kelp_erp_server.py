@@ -354,6 +354,10 @@ REQUIRED_FEEDSTOCK = [
     ("volumeL", "Volume (L)"),
     ("decision", "Accept / reject decision"), ("surfacePhoto", "Surface photo"), ("striationPhoto", "Settling / striation photo"),
 ]
+# KW-103: the run's own Average harvest weight (kg) of each tote is required for every run still being logged and every run finalized after it was introduced
+# (production_runs.harvest_weight_rule = 1, stamped at finalize); runs finalized before are not asked for it (their progress and amendments are unchanged).
+REQUIRED_FEEDSTOCK_HARVEST = [("avgHarvestWeightKg", "Average harvest weight (kg)")]
+MAX_HARVEST_WEIGHT_KG = 5000                                       # the same limit as a tote's weight at check-in
 _QC_ALL = [
     ("qcPh", "QC Check: pH"), ("tdsPct", "QC Check: TDS (%)"), ("brixPct", "QC Check: Brix (%)"),
     ("mannitolPct", "QC Check: Mannitol (%)"), ("tsLiquidPct", "QC Check: TSliquid (%)"),
@@ -463,7 +467,7 @@ PROGRESS_SECTIONS = [
 
 def required_keys_by_stage():
     """stage -> [keys] the SPA marks with an asterisk (plus the two table rules)."""
-    out = {"feedstock": [k for k, _l in REQUIRED_FEEDSTOCK], "packagingEntries": True, "packagingSampleRows": True}
+    out = {"feedstock": [k for k, _l in REQUIRED_FEEDSTOCK + REQUIRED_FEEDSTOCK_HARVEST], "packagingEntries": True, "packagingSampleRows": True}
     for sec in PROGRESS_SECTIONS:
         for entry in sec.get("fields", []):
             stage, key = entry[0], entry[1]
@@ -1226,6 +1230,7 @@ CREATE TABLE IF NOT EXISTS run_inputs (
     odour            TEXT,      -- comma-joined; multiple odours may be selected
     odour_other      TEXT,
     odour_intensity  TEXT,      -- Mild | Medium | Strong
+    avg_harvest_weight_kg REAL, -- KW-103: this tote's average harvest weight as recorded for this run (input kg = their sum)
     weight_kg        REAL,      -- this tote's weight as measured for this run
     volume_l         REAL,      -- this tote's volume as measured for this run
     density_kg_l     REAL,      -- calculated: weight_kg / volume_l
@@ -5192,7 +5197,8 @@ def migrate(conn):
         if col not in cols:
             conn.execute("ALTER TABLE tote_lots ADD COLUMN %s %s" % (col, decl))
     tscols = {r["name"] for r in conn.execute("PRAGMA table_info(tote_stability_log)")}
-    for col, decl in [("run_id", "INTEGER"), ("attachment_id", "INTEGER"), ("reading_date", "TEXT")]:     # reading_date: the day a reading was taken (NULL = the day it was logged)
+    for col, decl in [("run_id", "INTEGER"), ("attachment_id", "INTEGER"), ("reading_date", "TEXT"),     # reading_date: the day a reading was taken (NULL = the day it was logged)
+                      ("old_attachment_id", "INTEGER"), ("old_run_id", "INTEGER")]:                     # KW-102: the picture a photo line replaced / removed (and the run that held it), so its link can be shown
         if col not in tscols:
             conn.execute("ALTER TABLE tote_stability_log ADD COLUMN %s %s" % (col, decl))
     ccols = {r["name"] for r in conn.execute("PRAGMA table_info(consumables)")}
@@ -5298,6 +5304,7 @@ def migrate(conn):
         ("separation_liquid_weight_kg", "REAL"), ("separation_liquid_volume_l", "REAL"), ("separation_liquid_est_volume_l", "REAL"),
         ("separation_liquid_variance_pct", "REAL"),
         ("separation_rules_v2", "INTEGER NOT NULL DEFAULT 0"),                     # KW-63: 1 = finalized when both moisture readings and the recovered liquid weight were required
+        ("harvest_weight_rule", "INTEGER NOT NULL DEFAULT 0"),                     # KW-103: 1 = finalized when every tote needed an average harvest weight, kept per run (run_inputs.avg_harvest_weight_kg)
         ("pasteurization_product_setpoint_c", "REAL"), ("pasteurization_boiler_setpoint_c", "REAL"),
         ("pasteurization_total_volume_l", "REAL"), ("pasteurization_started_at", "TEXT"),
         ("pasteurization_pre_sample_collected_at", "TEXT"), ("pasteurization_post_sample_collected_at", "TEXT"),
@@ -5495,6 +5502,7 @@ def migrate(conn):
         ("weight_kg", "REAL"), ("volume_l", "REAL"), ("density_kg_l", "REAL"),
         ("decision", "TEXT NOT NULL DEFAULT 'accepted'"), ("rejection_reason", "TEXT"),
         ("notes", "TEXT"),
+        ("avg_harvest_weight_kg", "REAL"),      # KW-103: the run's own copy of this tote's average harvest weight (a run's input kg is the sum of these); NULL on runs finalized before
     ]:
         if col not in ricols:
             conn.execute("ALTER TABLE run_inputs ADD COLUMN %s %s" % (col, decl))
@@ -10287,7 +10295,7 @@ class Handler(BaseHTTPRequestHandler):
             if d.get("avgWeightKg") not in (None, ""):
                 w = numn(d.get("avgWeightKg"))
                 if w is None or w <= 0 or w > 5000:
-                    raise ApiError(400, "Average weight must be a number above 0 and up to 5000 kg")
+                    raise ApiError(400, "Average harvest weight must be a number above 0 and up to 5000 kg")
                 new["avg_weight_kg"] = w
             if (d.get("grind") or "").strip():
                 g = d["grind"].strip().capitalize()
@@ -10408,7 +10416,9 @@ class Handler(BaseHTTPRequestHandler):
                             "orp": it["orp"], "orpUpdated": it["orp_updated"], "tdsPct": it["tds_pct"], "tdsUpdated": it["tds_updated"],
                             "receivedDate": it["received_date"], "harvestDate": it["checkin_date"],
                             "lastUpdated": self._tote_with_last_updated(conn, it)["lastUpdated"],
-                            "latestCharacterization": self._latest_characterization(conn, tid, it)}
+                            "latestCharacterization": self._latest_characterization(
+                                conn, tid, it, for_run=parse_qs(urlparse(self.path).query).get("forRun", [""])[0] in ("1", "true"),
+                                photos=parse_qs(urlparse(self.path).query).get("photos", [""])[0] in ("1", "true"))}
                 if method == "POST":
                     d = self._body_json()
                     ph = numn(d.get("ph")) if d.get("ph") not in (None, "") else None
@@ -10540,20 +10550,33 @@ class Handler(BaseHTTPRequestHandler):
                                                   "odour": od.get("Odour"), "odour_intensity": od.get("Odour intensity")})
         return grade, why
 
+    @staticmethod
+    def _picture_exists(conn, tote_id, run_id, att_id):
+        """True while the picture a history line points to is still stored (a run's copy that was replaced or removed in the draft is deleted; a tote's own picture is kept)."""
+        if not att_id:
+            return False
+        if run_id:
+            return conn.execute("SELECT 1 FROM run_attachments WHERE id=? AND run_id=?", (att_id, run_id)).fetchone() is not None
+        return conn.execute("SELECT 1 FROM tote_attachments WHERE id=? AND tote_lot_id=?", (att_id, tote_id)).fetchone() is not None
+
     def _stability_log(self, conn, tote_id):
         return [dict(field=r["field"], oldValue=r["old_value"], newValue=r["new_value"],
                      note=r["note"], by=r["user_name"], at=r["created_at"], readingDate=r["reading_date"],
-                     runId=r["run_id"], attachmentId=r["attachment_id"])
+                     runId=r["run_id"], attachmentId=r["attachment_id"],
+                     # KW-102: links to the picture of a photo line, and to the one it replaced, only while the file is still there
+                     available=self._picture_exists(conn, tote_id, r["run_id"], r["attachment_id"]),
+                     oldAttachmentId=r["old_attachment_id"], oldRunId=r["old_run_id"],
+                     oldAvailable=self._picture_exists(conn, tote_id, r["old_run_id"], r["old_attachment_id"]))
                 for r in conn.execute(
                     "SELECT * FROM tote_stability_log WHERE tote_lot_id=? ORDER BY id DESC",
                     (tote_id,))]
 
-    def _log_stability(self, conn, tote_id, user, field, old, new, note=None, run_id=None, attachment_id=None, reading_date=None):
+    def _log_stability(self, conn, tote_id, user, field, old, new, note=None, run_id=None, attachment_id=None, reading_date=None, old_attachment_id=None, old_run_id=None):
         conn.execute(
             "INSERT INTO tote_stability_log (tote_lot_id,user_name,field,old_value,new_value,note,"
-            "created_at,run_id,attachment_id,reading_date) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "created_at,run_id,attachment_id,reading_date,old_attachment_id,old_run_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (tote_id, user["name"] if user else None, field, _fmtval(old), _fmtval(new), note, now_iso(),
-             run_id, attachment_id, reading_date))
+             run_id, attachment_id, reading_date, old_attachment_id, old_run_id))
 
     @staticmethod
     def _reading_date(d, *keys):
@@ -14705,7 +14728,8 @@ class Handler(BaseHTTPRequestHandler):
         rid = r["id"]
         stages = dict(run_public(r)["stages"])
         stages["_meta"] = {"orpRequired": r["status"] == "draft" or bool(r["orp_required"]),      # KW-59 (read by the _orp_needed predicate only)
-                           "separationV2": r["status"] == "draft" or bool(r["separation_rules_v2"])}     # KW-63 (read by the _sep_* predicates only)
+                           "separationV2": r["status"] == "draft" or bool(r["separation_rules_v2"]),     # KW-63 (read by the _sep_* predicates only)
+                           "harvestWeight": r["status"] == "draft" or bool(r["harvest_weight_rule"])}      # KW-103 (the feedstock section below)
         sections = []
         for sec in PROGRESS_SECTIONS:
             items = []   # (label, filled?)
@@ -14727,7 +14751,7 @@ class Handler(BaseHTTPRequestHandler):
                     row = rows.get(tid) or {}
                     lot = conn.execute("SELECT lot_number FROM tote_lots WHERE id=?", (tid,)).fetchone()
                     name = lot["lot_number"] if lot else str(tid)
-                    for key, label in REQUIRED_FEEDSTOCK:
+                    for key, label in REQUIRED_FEEDSTOCK + (REQUIRED_FEEDSTOCK_HARVEST if stages["_meta"]["harvestWeight"] else []):
                         items.append(("%s: %s" % (name, label), _has_value(row.get(key))))
             else:
                 for entry in sec["fields"]:
@@ -16053,8 +16077,19 @@ class Handler(BaseHTTPRequestHandler):
                 (dd.get("feedstockDetails") or {}).get(str(tote_id), {})[key] = new_id
             if (tote_id, label) not in logged:
                 logged.add((tote_id, label))
-                self._log_stability(conn, tote_id, user, label, att["filename"], "(replaced)" if new_id else "(removed)",
-                                    "Photo %s in production run %s" % ("replaced" if new_id else "removed", run["processing_lot"]), run_id=run["id"])
+                # the run's copy is deleted below; when it was a copy of the tote's own picture (same name and size) the history points at that one, which is kept, so From still links to the picture
+                twin = conn.execute("SELECT id FROM tote_attachments WHERE tote_lot_id=? AND filename=? AND size=? ORDER BY id DESC LIMIT 1", (tote_id, att["filename"], att["size"])).fetchone()
+                old_att, old_run = (twin["id"], None) if twin else (aid, run["id"])
+                if new_id:
+                    # a replacement is ONE row: From = the picture taken away, To = the new picture (a link)
+                    new_att = conn.execute("SELECT filename FROM run_attachments WHERE id=? AND run_id=?", (new_id, run["id"])).fetchone()
+                    self._log_stability(conn, tote_id, user, label, att["filename"], new_att["filename"] if new_att else "Photo",
+                                        "Photo replaced in production run %s" % run["processing_lot"], run_id=run["id"], attachment_id=new_id,
+                                        old_attachment_id=old_att, old_run_id=old_run)
+                else:
+                    self._log_stability(conn, tote_id, user, label, att["filename"], "(removed)",
+                                        "Photo removed in production run %s" % run["processing_lot"], run_id=run["id"],
+                                        old_attachment_id=old_att, old_run_id=old_run)
         if any(r[2] is None for r in refs):
             conn.execute("UPDATE production_runs SET draft_data=? WHERE id=?", (json.dumps(dd), run["id"]))
         conn.execute("DELETE FROM run_attachments WHERE id=?", (aid,))
@@ -16094,7 +16129,8 @@ class Handler(BaseHTTPRequestHandler):
                 "SELECT ri.*, t.lot_number, t.site_code, t.species_code FROM run_inputs ri "
                 "JOIN tote_lots t ON t.id=ri.tote_lot_id WHERE ri.run_id=? ORDER BY t.lot_number",
                 (run_id,)):
-            out.append({
+            extra = {"avgHarvestWeightKg": r["avg_harvest_weight_kg"]} if r["avg_harvest_weight_kg"] is not None else {}      # KW-103: shown only when set, so the signed log of a run finalized before does not change
+            out.append(dict(extra, **{
                 "id": r["id"], "toteLotId": r["tote_lot_id"], "toteLot": r["lot_number"],
                 "site": r["site_code"], "species": r["species_code"],
                 "loadedAt": r["loaded_at"], "surfacePhoto": r["surface_photo"],
@@ -16106,14 +16142,59 @@ class Handler(BaseHTTPRequestHandler):
                 "odourIntensity": r["odour_intensity"],
                 "decision": r["decision"] if r["decision_set"] else None,
                 "rejectionReason": r["rejection_reason"], "notes": r["notes"],
-            })
+            }))
         return out
 
-    def _apply_feedstock_detail(self, conn, input_id, fd, tote_lot_id=None):
+    def _recompute_run_input_kg(self, conn, run_id):
+        """KW-103: a run's input kg = the sum of the accepted totes' Average harvest weight kept on the run. A run input with no value of its own (a run finalized before the field
+        existed) counts the tote's recorded average, which is what the run was built from, so its input kg does not move until someone amends a value."""
+        kg = conn.execute(
+            "SELECT COALESCE(SUM(COALESCE(ri.avg_harvest_weight_kg, t.avg_weight_kg, 0)),0) k FROM run_inputs ri JOIN tote_lots t ON t.id=ri.tote_lot_id "
+            "WHERE ri.run_id=? AND ri.decision != 'rejected'", (run_id,)).fetchone()["k"]
+        kg = round(kg, 2)
+        conn.execute("UPDATE production_runs SET input_kg=? WHERE id=?", (kg, run_id))
+        return kg
+
+    def _apply_avg_harvest_weight(self, conn, input_id, fd, tote_lot_id, user, fill_default):
+        """KW-103: the run's own Average harvest weight (kg) for one tote. A value given (a number above 0, up to MAX_HARVEST_WEIGHT_KG) is stored on the run input; where it differs from
+        the tote's recorded average the tote's average is changed too, with a line in its Feedstock Stability log, so Feedstock Inventory and the run agree. With no value given and
+        `fill_default` (the lock-in steps, never an amendment) a run input that has none starts from the tote's recorded average."""
+        row = conn.execute("SELECT ri.avg_harvest_weight_kg v, ri.run_id, t.avg_weight_kg tw, t.lot_number FROM run_inputs ri JOIN tote_lots t ON t.id=ri.tote_lot_id WHERE ri.id=?", (input_id,)).fetchone()
+        if not row:
+            return
+        given = (fd or {}).get("avgHarvestWeightKg")
+        if given in (None, ""):
+            if fill_default and row["v"] is None and row["tw"]:
+                conn.execute("UPDATE run_inputs SET avg_harvest_weight_kg=? WHERE id=?", (row["tw"], input_id))
+            return
+        w = numn(given)
+        if w is None or not (0 < w <= MAX_HARVEST_WEIGHT_KG):
+            raise ApiError(400, "The average harvest weight of %s must be a number above 0 and up to %d kg" % (row["lot_number"], MAX_HARVEST_WEIGHT_KG), "bad_harvest_weight")
+        conn.execute("UPDATE run_inputs SET avg_harvest_weight_kg=? WHERE id=?", (w, input_id))
+        if row["tw"] != w:
+            lot = conn.execute("SELECT processing_lot FROM production_runs WHERE id=?", (row["run_id"],)).fetchone()
+            self._log_stability(conn, tote_lot_id, user, "Average harvest weight (kg)", row["tw"], w,
+                                "Changed in production run %s" % (lot["processing_lot"] if lot else row["run_id"]), run_id=row["run_id"])
+            conn.execute("UPDATE tote_lots SET avg_weight_kg=? WHERE id=?", (w, tote_lot_id))
+
+    @staticmethod
+    def _require_harvest_weight(conn, tote, run_id, historical=False):
+        """KW-103: a tote cannot be added to a production run until its average harvest weight is recorded (Feedstock Inventory: Set values for selected, the import, or Check-in).
+        A tote this draft already locked keeps working (a draft from before the rule); historical runs are exempt (their weights may be unknown)."""
+        if tote["status"] == "wip" and tote["run_id"] == run_id:
+            return
+        if historical or (tote["avg_weight_kg"] or 0) > 0:
+            return
+        raise ApiError(400, "Tote %s has no average harvest weight recorded, so it cannot be added to a production run yet. Record it in Feedstock Inventory "
+                            "(select the tote, then Set values for selected) first." % tote["lot_number"], "harvest_weight_missing")
+
+    def _apply_feedstock_detail(self, conn, input_id, fd, tote_lot_id=None, user=None, fill_harvest_default=False):
         """Apply staged draft characterization (+ already-uploaded photo attachment
         ids) onto a run_inputs row. If the decision is (or becomes) 'rejected',
         also relocate the tote to QAQC Hold — it's excluded from production
         selection and run calculations from that point on."""
+        if tote_lot_id:
+            self._apply_avg_harvest_weight(conn, input_id, fd, tote_lot_id, user, fill_harvest_default)         # KW-103
         if not fd:
             return
         updates = {}
@@ -16150,7 +16231,9 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(409, "The accepted / rejected decision cannot be changed once the run is finalized: it decides which totes "
                                 "were processed and the run's input weight. Other characterization details can still be amended.",
                            "decision_locked")
-        self._apply_feedstock_detail(conn, input_id, d, row["tote_lot_id"])
+        self._apply_feedstock_detail(conn, input_id, d, row["tote_lot_id"], user)
+        if d.get("avgHarvestWeightKg") not in (None, "") and self._run_is_completed(conn, run_id):
+            self._recompute_run_input_kg(conn, run_id)                    # KW-103: an amended value moves the run's input kg (and so the harvest conversion rate)
         return {"inputs": self._run_inputs_public(conn, run_id)}
 
     # Field labels for the Feedstock Stability log, shared by every path that
@@ -16166,18 +16249,33 @@ class Handler(BaseHTTPRequestHandler):
         ("notes", "Notes"), ("tdsPct", "Feedstock TDS (%)"),
     ]
 
-    def _latest_characterization(self, conn, tote_lot_id, tote):
+    # KW-102: what a production run's card must NOT start from. Weight (kg) there is the MEASURED weight (blank until a person enters it), but the tote's
+    # "Weight (kg)" log lines also hold the harvest average set by Set values / the import / an edit; the density is calculated from the weight.
+    RUN_CARD_NO_PREFILL = ("weightKg", "densityKgL")
+
+    def _latest_characterization(self, conn, tote_lot_id, tote, for_run=False, photos=False):
         """Best-known current value for each Feedstock characterization
         field, to pre-fill a fresh card with -- pH/ORP come from the tote's
         own current reading; every other field has no persisted 'current'
         column, so it's pulled from its own most recent Feedstock Stability
         log entry, if any. Decision and rejection reason are deliberately
         left out: a new characterization always starts as a fresh accepted
-        inspection, never a carry-over of a past rejection."""
+        inspection, never a carry-over of a past rejection.
+        `for_run` (a production run's card, KW-102): no weight / density (see RUN_CARD_NO_PREFILL), and the tote's newest Surface / Settling-striation photo
+        is offered as a SOURCE (`surfacePhotoFrom` / `striationPhotoFrom`: 'tote:<id>' or 'run:<run id>:<id>'); the run copies it when the entries are locked in.
+        `photos` offers the same sources WITHOUT leaving anything out: Feedstock Inventory's Update window shows the tote's existing pictures in its slots (nothing is copied or logged
+        unless a new picture replaces one)."""
         kind_for = {key: kind for _, key, kind in self.INPUT_FIELDS}
         out = {"ph": tote["ph"], "orp": tote["orp"], "tdsPct": tote["tds_pct"]}
+        if for_run or photos:
+            for key, label in (("surfacePhotoFrom", "Surface photo"), ("striationPhotoFrom", "Settling/striation photo")):
+                src = self._latest_tote_photo_source(conn, tote_lot_id, label)
+                if src:
+                    out[key] = src
         for key, label in self.CHARACTERIZATION_LABELS:
             if key in out or key == "rejectionReason":
+                continue
+            if for_run and key in self.RUN_CARD_NO_PREFILL:
                 continue
             last = conn.execute(
                 "SELECT new_value FROM tote_stability_log WHERE tote_lot_id=? AND field=?"
@@ -16188,7 +16286,76 @@ class Handler(BaseHTTPRequestHandler):
             out[key] = val
         return out
 
-    def _log_characterization_fields(self, conn, tote_lot_id, user, fd, note, run_id=None, reading_date=None):
+    # ---- KW-102: a tote's photos carried into a production run ------------------------------------------------------------------------------------------ #
+    def _latest_tote_photo_source(self, conn, tote_lot_id, label):
+        """The tote's current Surface / Settling-striation photo as a source marker, or None. Newest Feedstock Stability line for the label first: a removal ends the search
+        (the photo was taken away on purpose); a line without a usable photo (replaced, file gone, taken off the disk) is skipped."""
+        for r in conn.execute("SELECT run_id, attachment_id, new_value FROM tote_stability_log WHERE tote_lot_id=? AND field=? ORDER BY id DESC", (tote_lot_id, label)):
+            if r["new_value"] == "(removed)":
+                return None
+            if not r["attachment_id"]:
+                continue
+            if r["run_id"]:
+                a = conn.execute("SELECT stored_name, purged_at FROM run_attachments WHERE id=? AND run_id=?", (r["attachment_id"], r["run_id"])).fetchone()
+                marker = "run:%d:%d" % (r["run_id"], r["attachment_id"])
+            else:
+                a = conn.execute("SELECT stored_name, purged_at FROM tote_attachments WHERE id=? AND tote_lot_id=?", (r["attachment_id"], tote_lot_id)).fetchone()
+                marker = "tote:%d" % r["attachment_id"]
+            if a and not a["purged_at"] and os.path.isfile(os.path.join(UPLOAD_DIR, a["stored_name"])):
+                return marker
+        return None
+
+    def _photo_source_row(self, conn, tote_lot_id, marker):
+        """The stored picture a source marker names, only if it belongs to THIS tote; None when it is gone."""
+        parts = str(marker or "").split(":")
+        try:
+            if parts[0] == "tote" and len(parts) == 2:
+                a = conn.execute("SELECT * FROM tote_attachments WHERE id=? AND tote_lot_id=?", (int(parts[1]), tote_lot_id)).fetchone()
+            elif parts[0] == "run" and len(parts) == 3:
+                a = conn.execute("SELECT a.* FROM run_attachments a WHERE a.id=? AND a.run_id=? AND EXISTS ("
+                                 "SELECT 1 FROM tote_stability_log l WHERE l.tote_lot_id=? AND l.run_id=a.run_id AND l.attachment_id=a.id)",
+                                 (int(parts[2]), int(parts[1]), tote_lot_id)).fetchone()
+            else:
+                return None
+        except ValueError:
+            return None
+        if not a or a["purged_at"] or not os.path.isfile(os.path.join(UPLOAD_DIR, a["stored_name"])):
+            return None
+        return a
+
+    def _copy_photo_to_run(self, conn, run_id, src, user):
+        """The run keeps its OWN copy of the tote's picture (its own file and run_attachments row), so changing or removing the picture in the run never touches the tote's, and a
+        later change to the tote's picture never changes a finalized run. A copy is not a person's upload: it counts for the storage room, not for the daily upload quota."""
+        with open(os.path.join(UPLOAD_DIR, src["stored_name"]), "rb") as f:
+            raw = f.read()
+        check_upload_filename(src["filename"])
+        self._check_storage_room(conn, len(raw))
+        stored = self._write_upload(UPLOAD_DIR, raw, os.path.splitext(src["filename"])[1][:12])
+        cur = conn.cursor()
+        cur.execute("INSERT INTO run_attachments (run_id,filename,content_type,size,stored_name,uploaded_by,uploaded_at,purpose) VALUES (?,?,?,?,?,?,?,?)",
+                    (run_id, src["filename"], served_type(src["filename"])[0], len(raw), stored, user["name"] if user else None, now_iso(), "feedstock_photo"))
+        return cur.lastrowid
+
+    def _adopt_tote_photos(self, conn, run_id, tote_lot_id, fd, user):
+        """Lock-in step (the card's Save, Save & close, Finalize): where a slot has no run photo but carries a source marker, copy the tote's picture into the run and put the new id in
+        the slot. `fd` is changed IN PLACE (ids set, markers removed) so the draft copy and the Stability log lines that follow see the run's copy. A source that is gone is dropped."""
+        held = conn.execute("SELECT surface_photo, striation_photo FROM run_inputs WHERE run_id=? AND tote_lot_id=?", (run_id, tote_lot_id)).fetchone()
+        adopted = []
+        for slot_key, from_key, col in (("surfacePhotoId", "surfacePhotoFrom", "surface_photo"), ("striationPhotoId", "striationPhotoFrom", "striation_photo")):
+            marker = fd.pop(from_key, None)
+            if not marker or fd.get(slot_key):
+                continue
+            if held and held[col]:                      # the run already holds its copy (an earlier lock-in): a client that still sends the marker gets that copy, never a second one
+                fd[slot_key] = int(held[col]) if str(held[col]).isdigit() else held[col]
+                adopted.append(slot_key)
+                continue
+            src = self._photo_source_row(conn, tote_lot_id, marker)
+            if src:
+                fd[slot_key] = self._copy_photo_to_run(conn, run_id, src, user)
+                adopted.append(slot_key)
+        return adopted                                  # the slots filled with a copy of a picture the tote's history already shows: no new history line for them (it is not a change)
+
+    def _log_characterization_fields(self, conn, tote_lot_id, user, fd, note, run_id=None, reading_date=None, skip_photo_slots=()):
         """Write a Feedstock Stability log row only for fields that actually
         changed since they were last captured -- re-saving a card with the
         same values (e.g. touching just one field) shouldn't spam the log
@@ -16228,22 +16395,35 @@ class Handler(BaseHTTPRequestHandler):
         for slot_key, label in (("surfacePhotoId", "Surface photo"),
                                  ("striationPhotoId", "Settling/striation photo")):
             att_id = fd.get(slot_key)
-            if not att_id:
+            if not att_id or slot_key in skip_photo_slots:
                 continue
+            if run_id:                                   # the run input already holds this very picture (an earlier lock-in, KW-102 copies included): nothing changed
+                held = conn.execute("SELECT surface_photo, striation_photo FROM run_inputs WHERE run_id=? AND tote_lot_id=?", (run_id, tote_lot_id)).fetchone()
+                if held and str(held["surface_photo" if slot_key == "surfacePhotoId" else "striation_photo"] or "") == str(att_id):
+                    continue
             last_photo = conn.execute(
-                "SELECT attachment_id FROM tote_stability_log WHERE tote_lot_id=? AND field=?"
+                "SELECT attachment_id, run_id, old_value, new_value FROM tote_stability_log WHERE tote_lot_id=? AND field=?"
                 " ORDER BY id DESC LIMIT 1", (tote_lot_id, label)).fetchone()
-            if last_photo and last_photo["attachment_id"] == att_id:
+            # the same picture only when the id AND where it is kept match: a tote's picture and a run's copy of it can carry the same number (they are numbered in separate tables, KW-102)
+            if last_photo and last_photo["attachment_id"] == att_id and (last_photo["run_id"] or None) == (run_id or None):
                 continue
+            # From = the picture this one replaces (its file name, and where it is kept so the history can link to it): the previous photo line, or the one a replace line says was taken away
+            was, was_att, was_run = None, None, None
+            if last_photo:
+                if last_photo["attachment_id"]:
+                    was, was_att, was_run = last_photo["new_value"], last_photo["attachment_id"], last_photo["run_id"]
+                elif last_photo["new_value"] == "(replaced)":          # (a line written by an earlier release: the picture it names is the one this replaces)
+                    was, was_att, was_run = last_photo["old_value"], last_photo["old_attachment_id"], last_photo["old_run_id"]
             if run_id:
                 att = conn.execute("SELECT filename FROM run_attachments WHERE id=? AND run_id=?",
                                    (att_id, run_id)).fetchone()
             else:
                 att = conn.execute("SELECT filename FROM tote_attachments WHERE id=? AND tote_lot_id=?",
                                    (att_id, tote_lot_id)).fetchone()
-            self._log_stability(conn, tote_lot_id, user, label, None,
+            # ONE row wherever the picture is changed (Feedstock Inventory or a production run): the new picture (To, a link) and the one it replaced (From, a link while that file is kept)
+            self._log_stability(conn, tote_lot_id, user, label, was,
                                att["filename"] if att else "Photo", note,
-                               run_id=run_id, attachment_id=att_id)
+                               run_id=run_id, attachment_id=att_id, old_attachment_id=was_att, old_run_id=was_run)
         return historical
 
     def _apply_ph_orp_override(self, conn, tote, fd):
@@ -16320,6 +16500,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._tote_available_for_run(conn, tote, run_id):
             raise ApiError(409, "Tote %s is not available for this run (status: %s%s)" % (
                 tote["lot_number"], tote["status"], ", locked to another run or batch" if tote["status"] == "wip" else ""))
+        run_row = conn.execute("SELECT is_historical FROM production_runs WHERE id=?", (run_id,)).fetchone()
+        self._require_harvest_weight(conn, tote, run_id, bool(run_row and run_row["is_historical"]))             # KW-103
         fd = fd or {}
         decision = fd.get("decision") or "accepted"
         existing_input = conn.execute(
@@ -16347,14 +16529,15 @@ class Handler(BaseHTTPRequestHandler):
         # Accepted: log any captured fields, create/update this tote's
         # run_inputs row (same shape as finalize), and lock it to this run.
         note = "Characterized during production run %s" % processing_lot
-        self._log_characterization_fields(conn, tote_lot_id, user, fd, note, run_id=run_id)
+        copied = self._adopt_tote_photos(conn, run_id, tote_lot_id, fd, user)             # KW-102: the tote's pictures shown on the card become the run's own copies
+        self._log_characterization_fields(conn, tote_lot_id, user, fd, note, run_id=run_id, skip_photo_slots=copied)       # (an unchanged picture is not a change: no history line for it)
         if existing_input:
             input_id = existing_input["id"]
         else:
             cur = conn.cursor()
             cur.execute("INSERT INTO run_inputs (run_id,tote_lot_id) VALUES (?,?)", (run_id, tote_lot_id))
             input_id = cur.lastrowid
-        self._apply_feedstock_detail(conn, input_id, fd, tote_lot_id)
+        self._apply_feedstock_detail(conn, input_id, fd, tote_lot_id, user, True)
         ph, ph_updated, orp, orp_updated = self._apply_ph_orp_override(conn, tote, fd)
         if tote["status"] != "wip":
             self._log_stability(conn, tote_lot_id, user, "Status", tote["status"], "wip", note, run_id=run_id)
@@ -16375,7 +16558,7 @@ class Handler(BaseHTTPRequestHandler):
         if d.get("decision") not in ("accepted", "rejected"):
             raise ApiError(400, "A decision (accepted/rejected) is required")
         rejected = self._apply_tote_characterization(conn, run_id, tote_lot_id, d, user, run["processing_lot"])
-        return {"rejected": rejected}
+        return {"rejected": rejected, "photoIds": {k: d.get(k) for k in ("surfacePhotoId", "striationPhotoId")}}
 
     def release_feedstock_tote(self, conn, run_id, tote_lot_id, user):
         """Un-selecting a tote from an in-progress run's Feedstock section
@@ -17358,6 +17541,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(400, "Tote %s is not available (status: %s)" % (r["lot_number"], r["status"]))
             if r["status"] == "wip" and r["run_id"] != (existing["id"] if existing else None):
                 raise ApiError(409, "Tote %s is locked to another run or batch" % r["lot_number"])
+            self._require_harvest_weight(conn, r, existing["id"] if existing else None, hist)             # KW-103
         if existing:
             # a tote this draft locked as WIP that is missing from the request would stay locked to a finished run for good
             left_out = [t["lot_number"] for t in conn.execute(
@@ -17461,9 +17645,13 @@ class Handler(BaseHTTPRequestHandler):
                 cur.execute("INSERT INTO run_inputs (run_id,tote_lot_id) VALUES (?,?)", (run_id, r["id"]))
                 input_id = cur.lastrowid
             fd = feedstock_details.get(str(r["id"])) or feedstock_details.get(r["id"])
-            self._apply_feedstock_detail(conn, input_id, fd, r["id"])
+            if fd and r["id"] in accepted_ids:
+                self._adopt_tote_photos(conn, run_id, r["id"], fd, user)             # KW-102: a tote whose card was never saved on its own still gets the run's copy of its pictures
+            self._apply_feedstock_detail(conn, input_id, fd, r["id"], user, True)
             if r["id"] in accepted_ids:
                 cur.execute("UPDATE tote_lots SET status='consumed', run_id=? WHERE id=?", (run_id, r["id"]))
+        cur.execute("UPDATE production_runs SET harvest_weight_rule=? WHERE id=?", (0 if hist else 1, run_id))        # KW-103: a run finalized from now on is held to the rule (each tote's average harvest weight kept on the run)
+        input_kg = self._recompute_run_input_kg(conn, run_id)                    # KW-103: the run's input kg is the sum of those values
 
         # Deduct consumables.
         uname = user["name"] if user else None
@@ -17638,7 +17826,9 @@ class Handler(BaseHTTPRequestHandler):
         conn.execute("UPDATE production_runs SET draft_data=? WHERE id=?", (draft_data, rid))
         return {"run": run_public(conn.execute(
             "SELECT * FROM production_runs WHERE id=?", (rid,)).fetchone()),
-            "rejectedToteIds": rejected_ids}
+            "rejectedToteIds": rejected_ids,
+            # KW-102: the ids of the run's own photo copies, so the open cards can swap their source markers for them
+            "photoIds": {str(k): {s: (v or {}).get(s) for s in ("surfacePhotoId", "striationPhotoId")} for k, v in feedstock_details.items()}}
 
     @staticmethod
     def _sku_species_target(conn, sku):
@@ -18688,7 +18878,7 @@ class Handler(BaseHTTPRequestHandler):
     def route_yield_usage(self, query, conn):
         """Read-only report over completed production runs: two conversion
         rates (process = output L / measured input kg; harvest = output L /
-        stored batch-average input kg) and what each run consumed (from the
+        stored input kg: the sum of each accepted tote's average harvest weight) and what each run consumed (from the
         consumable ledger, ref = processing lot), grouped by SKU x feedstock
         source. Excluded runs never count toward group stats."""
         frm = query.get("from", [""])[0]

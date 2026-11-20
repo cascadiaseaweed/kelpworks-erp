@@ -957,3 +957,6 @@ html[data-theme="dark"] .modal iframe { color-scheme: light; }
 /* KW-101: the draft autosave status line in the production run window */
 .autosave-note { margin: 2px 0 6px; min-height: 14px; }
 .autosave-note.bad { color: var(--danger); font-weight: 600; font-size: 12px; }
+/* KW-103: a tote with no average harvest weight cannot be added to a run: its row in the picker is greyed out */
+.tote-pick tr.no-harvest-weight { opacity: .55; }
+.tote-pick tr.no-harvest-weight input[type=checkbox] { cursor: not-allowed; }
