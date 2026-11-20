@@ -169,8 +169,6 @@ SETTINGS_DEFAULTS = [
      "How long someone who has closed their browser (or lost power) still shows as having a run, batch or tote open. Browsers announce themselves about every third of this time; it only drives the 'someone else has this open' warning."),
     ("idle_timeout_minutes", 30, "Idle timeout (minutes)",
      "A signed-in person who has not used the screen for this long is signed out; the run and batch sections they have open are saved first. 0 turns it off. Takes effect for everyone within a minute, no deploy needed."),
-    ("separation_liquid_variance_flag_pct", 5, "Separation recovered-liquid volume check flag (%)",
-     "Flags a Separation when the calculated recovered liquid volume (weight / liquid density) differs from the optional estimate by more than this percentage."),
     ("run_card_show_volume_out", 1, "Run summary card: show Product volume out",
      "1 shows product volume out on a finished run's summary card, 0 hides it (big number at the top)."),
     ("run_card_show_final_ph", 1, "Run summary card: show Final pH",
@@ -5642,6 +5640,15 @@ def migrate(conn):
     # instead of a water-to-add amount -- no formula reads it anymore, so
     # drop the row rather than leave a stale constant in the admin table.
     conn.execute("DELETE FROM settings WHERE key='homog_dilution_density_kg_per_l'")
+    # KW-104: the optional recovered-liquid estimate (and its % difference check) was taken off the Separation screen, so its flag setting is no longer used by anything:
+    # the row is dropped once, with a line in the change log, so the Calculations page has no dead setting. What earlier runs stored (the estimate, the difference) stays.
+    def drop_separation_variance_setting():
+        old = conn.execute("SELECT value FROM settings WHERE key='separation_liquid_variance_flag_pct'").fetchone()
+        if old:
+            conn.execute("INSERT INTO config_log (area,key,field,old_value,new_value,changed_by,changed_at) VALUES ('setting','separation_liquid_variance_flag_pct',"
+                         "'Setting removed (no longer used)',?,?,?,?)", (str(old["value"]), "removed", "System", now_iso()))
+        conn.execute("DELETE FROM settings WHERE key='separation_liquid_variance_flag_pct'")
+    run_once(conn, "remove_separation_variance_setting_kw104", drop_separation_variance_setting)
     # package_size_*_l were replaced by container types living in consumables
     # (admin can now add/rename/remove them like any other consumable, with
     # real on-hand/reorder/cost tracking) when FG-lot creation at finalize
@@ -16555,8 +16562,10 @@ class Handler(BaseHTTPRequestHandler):
         if not run:
             raise ApiError(404, "Draft not found")
         d = self._body_json()
-        if d.get("decision") not in ("accepted", "rejected"):
-            raise ApiError(400, "A decision (accepted/rejected) is required")
+        # KW-104: "Commit tote to run" does what Save & close does for the tote: with no decision yet it is locked to the run (WIP); run_inputs.decision_set stays 0, so Finalize
+        # still demands an explicit Accepted / Rejected. A value that is neither is a mistake.
+        if d.get("decision") not in (None, "", "accepted", "rejected"):
+            raise ApiError(400, "The decision must be accepted or rejected")
         rejected = self._apply_tote_characterization(conn, run_id, tote_lot_id, d, user, run["processing_lot"])
         return {"rejected": rejected, "photoIds": {k: d.get(k) for k in ("surfacePhotoId", "striationPhotoId")}}
 

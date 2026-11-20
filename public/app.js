@@ -2686,7 +2686,22 @@ function buildQualityCheckBox(subtitle, values, opts) {
     }
     return payload;
   }
-  return { box, getPayload };
+  // KW-104: fill the BLANK liquid readings from another section's values (Separation's Filtrate characterization takes them from Extraction). It never overwrites a value that is on
+  // screen or one the person typed or cleared, and returns how many it filled. It saves nothing: the section's own Save does.
+  const fillable = { qcPh: [qcPhInp, 1], tdsPct: [tdsInp, 1], brixPct: [brixInp, 1], mannitolPct: [mannitolInp, 1], tsLiquidPct: [tsLiquidInp, 1], rhoLiquidGMl: [rhoLiquidInp, 3] };
+  const edited = new Set();
+  for (const [k, [inp]] of Object.entries(fillable)) inp.addEventListener('input', () => edited.add(k));
+  function fill(source, keys) {
+    let n = 0;
+    for (const k of keys) {
+      const [inp, decimals] = fillable[k] || [];
+      if (!inp || edited.has(k) || inp.value.trim() !== '' || !source || source[k] == null) continue;
+      inp.value = formatQcValue(source[k], decimals); n++;
+    }
+    if (n) box.dispatchEvent(new Event('input', { bubbles: true }));
+    return n;
+  }
+  return { box, getPayload, fill };
 }
 // Extraction: "Start Conditions" groups the stage's existing process
 // parameters (compact, with a couple of fields given sensible defaults/
@@ -2803,6 +2818,7 @@ function buildExtractionSection(getRunId, values, onSaved) {
       el('div', { style: 'margin-top:6px' }, saveBtn, status)));
   section.addEventListener('toggle', () => { if (section.open && bypassOn()) drawRelinked(); });      // pick up Homogenization changes made since
   refreshBypass();
+  section.kwQc = () => ({ bypassed: bypassOn(), values: qcCheck.getPayload() });          // KW-104: Separation's Filtrate characterization starts from these
   return section;
 }
 // Separation: "Start Conditions" groups the stage's process parameters
@@ -2813,7 +2829,15 @@ function buildExtractionSection(getRunId, values, onSaved) {
 // title/single-Save formatting as Extraction.
 // KW-63: `rules2` = this run is held to the newer rules (both moisture readings, each unless that unit was not used, and the weight of the recovered liquid); false for a run finalized
 // before them, which keeps the KW-18 rule (at least one of the two).
-function buildSeparationSection(getRunId, values, samplePoints, processingLot, onSaved, rules2) {
+// KW-104: where Separation's Filtrate characterization takes its starting values from: Extraction's QC Check, or -- when extraction was bypassed -- the Homogenization lot characterization
+// (the same link as KW-16). Reads what is on screen in those sections now; null when neither is available.
+function separationQcSource(extractionSection, homogenizationSection) {
+  const ex = extractionSection && extractionSection.kwQc ? extractionSection.kwQc() : null;
+  if (ex && !ex.bypassed) return { label: 'Extraction', values: ex.values };
+  const hom = ex && ex.bypassed && homogenizationSection && homogenizationSection.kwQc ? homogenizationSection.kwQc() : null;
+  return hom ? { label: 'Homogenization (extraction was bypassed)', values: hom } : null;
+}
+function buildSeparationSection(getRunId, values, samplePoints, processingLot, onSaved, rules2, getQcSource) {
   values = values || {};
   const v2 = rules2 !== false;
   const ownNum = inp => inp.value.trim() === '' ? null : qcParseValue(inp.value);
@@ -2882,39 +2906,44 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot, o
   // before this section is saved (Save then makes it the stored value)
   liquidQc.box.addEventListener('input', () => { values.liveLiquidTdsPct = liquidQc.getPayload().tdsPct; if (onSaved) onSaved(); });
 
-  // KW-63: the measured mass balance of the liquid: weight of the recovered liquid (kg); its volume (L) = weight / rho_liquid (g/mL) from the Filtrate characterization above
-  // (1 g/mL = 1 kg/L, so kg / (g/mL) = L); an optional estimate cross-checks it. The server calculates and stores the same numbers when the section is saved.
+  // KW-63: the measured mass balance of the liquid: weight of the recovered liquid (kg); its volume (L) = weight / rho_liquid (g/mL) from the Filtrate characterization below
+  // (1 g/mL = 1 kg/L, so kg / (g/mL) = L). The server calculates and stores the same number when the section is saved.
+  // KW-104: a blank weight starts at 0 (a run held to the newer rules only; a saved weight is never touched) and the optional estimate / variance check is gone
+  // (what earlier runs stored stays in their data).
   const liquidWtInp = el('input', { inputmode: 'decimal', placeholder: 'kg' }); attachNumericMask(liquidWtInp, 2);
   if (values.liquidWeightKg != null) liquidWtInp.value = formatQcValue(values.liquidWeightKg, 2);
-  const liquidEstInp = el('input', { inputmode: 'decimal', placeholder: 'L (optional)' }); attachNumericMask(liquidEstInp, 1);
-  if (values.liquidEstVolumeL != null) liquidEstInp.value = formatQcValue(values.liquidEstVolumeL, 1);
-  const liquidVolT = el('span', { class: 'help' }), liquidVarT = el('span', { class: 'help' });
+  else if (v2) liquidWtInp.value = '0';
+  const liquidVolT = el('span', { class: 'help' });
   const liquidTile = (span, text, cls) => { span.className = text != null ? (cls || 'qc-check-result-value') : 'help'; span.textContent = text != null ? text : '—'; };
   const liquidRow = (label, node) => el('div', { class: 'qc-check-result' }, el('span', { class: 'qc-check-result-label' }, label), node);
   function refreshRecoveredLiquid() {
-    const w = ownNum(liquidWtInp), rho = liquidQc.getPayload().rhoLiquidGMl, est = ownNum(liquidEstInp);
+    const w = ownNum(liquidWtInp), rho = liquidQc.getPayload().rhoLiquidGMl;
     const vol = (w != null && rho != null && rho > 0) ? w / rho : null;
     if (vol != null) liquidTile(liquidVolT, fmt(vol, 1) + ' L');
-    else if (w != null) liquidTile(liquidVolT, 'Needs ρliquid (enter it in the Filtrate characterization above)', 'help var-flag');
+    else if (w != null) liquidTile(liquidVolT, 'Needs density of liquid (ρliquid), found in QC Check – Filtrate characterization', 'help var-flag');
     else liquidTile(liquidVolT, null);
-    const vp = (vol != null && est != null && est > 0) ? (vol - est) / est * 100 : null;
-    if (vp != null) {
-      const flag = settingValue('separation_liquid_variance_flag_pct', 5), over = Math.abs(vp) > flag;
-      liquidVarT.className = 'qc-check-result-value' + (over ? ' var-flag' : '');
-      liquidVarT.textContent = (vp > 0 ? '+' : '') + vp.toFixed(1) + '%' + (over ? '  ⚠ exceeds ' + flag + '%' : '  ✓ within ' + flag + '%');
-    } else liquidTile(liquidVarT, null);
   }
   const recoveredLiquidBox = el('div', { class: 'qc-check-box', 'data-sop-spot': 'production.separation.recovered_liquid' },       // the plain (grey) box of a Process Check, not the purple QC Check
     el('div', { class: 'qc-check-title' }, 'Process Check'),
     el('div', { class: 'qc-check-subtitle' }, 'Recovered liquid'),
     v2 ? rfield('separation', 'liquidWeightKg', 'Total weight of recovered liquid (kg)', liquidWtInp) : field('Total weight of recovered liquid (kg)', liquidWtInp),
     liquidRow('Total recovered liquid volume (L)', liquidVolT),
-    field('Estimated recovered liquid volume (L) (optional)', liquidEstInp),
-    liquidRow('Calculated vs estimate', liquidVarT),
-    el('div', { class: 'help' }, 'Volume = weight ÷ ρliquid (g/mL) from the Filtrate characterization above. The estimate is optional; it checks the calculation.'));
-  [liquidWtInp, liquidEstInp].forEach(i => i.addEventListener('input', refreshRecoveredLiquid));
+    el('div', { class: 'help' }, 'Volume = weight ÷ ρliquid (g/mL) from the Filtrate characterization below.'));
+  liquidWtInp.addEventListener('input', refreshRecoveredLiquid);
   liquidQc.box.addEventListener('input', refreshRecoveredLiquid);
   refreshRecoveredLiquid();
+
+  // KW-104: the Filtrate characterization starts from Extraction's QC Check (pH, TDS, Brix, Mannitol, density) -- never TSliquid, which is entered here. Only blank,
+  // untouched fields are filled; the values are saved with this section's own Save.
+  const prefillNote = el('div', { class: 'help hidden' });
+  const PREFILL_KEYS = ['qcPh', 'tdsPct', 'brixPct', 'mannitolPct', 'rhoLiquidGMl'];
+  function prefillFromExtraction() {
+    const src = v2 && getQcSource ? getQcSource() : null;
+    if (!src || !src.values || !liquidQc.fill(src.values, PREFILL_KEYS)) return;
+    prefillNote.textContent = 'Pre-filled from ' + src.label + ' (change any value that differs). TSliquid (%) is entered here.';
+    prefillNote.classList.remove('hidden');
+  }
+  prefillFromExtraction();
 
   const status = el('span', { class: 'help' });
   const saveBtn = el('button', { type: 'button', class: 'secondary section-save', onclick: save }, 'Save');
@@ -2930,7 +2959,7 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot, o
         wetSolidsWtKg: wetSolidsWtInp.value.trim() === '' ? null : qcParseValue(wetSolidsWtInp.value),
         pctMoisture: cent.on() || moistureInp.value.trim() === '' ? null : qcParseValue(moistureInp.value),
         pctMoistureScrew: screw.on() || moistureScrewInp.value.trim() === '' ? null : qcParseValue(moistureScrewInp.value),
-        liquidWeightKg: ownNum(liquidWtInp), liquidEstVolumeL: ownNum(liquidEstInp),
+        liquidWeightKg: ownNum(liquidWtInp),
         liquidQcPh: liquidPayload.qcPh, liquidTdsPct: liquidPayload.tdsPct,
         liquidBrixPct: liquidPayload.brixPct, liquidMannitolPct: liquidPayload.mannitolPct,
         liquidTsLiquidPct: liquidPayload.tsLiquidPct, liquidRhoLiquidGMl: liquidPayload.rhoLiquidGMl,
@@ -2950,7 +2979,7 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot, o
     } catch (e) { status.textContent = e.message; }
     saveBtn.disabled = false;
   }
-  return el('details', { class: 'accordion', 'data-sop-spot': 'production.separation' }, el('summary', {}, 'Separation'),
+  const sectionEl = el('details', { class: 'accordion', 'data-sop-spot': 'production.separation' }, el('summary', {}, 'Separation'),
     el('div', { class: 'accordion-body' },
       el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Start Conditions'),
       el('div', { class: 'form-row' }, rfield('separation', 'startedAt', 'Started at', startedAt)),
@@ -2963,15 +2992,19 @@ function buildSeparationSection(getRunId, values, samplePoints, processingLot, o
       el('div', { class: 'qc-check-section-title' }, 'Liquid Out'),
       recoveredLiquidBox,                        // KW-63: above the Filtrate characterization (its density is entered right below)
       liquidQc.box,
+      prefillNote,
       solidsSamplePointBox,                      // KW-17: the sample can be solid, liquid or slurry, so it comes after both Solids Out and Liquid Out
       el('div', { style: 'margin-top:6px' }, saveBtn, status)));
+  sectionEl.kwPrefill = prefillFromExtraction;                                // Extraction / Homogenization call this when they are saved
+  sectionEl.addEventListener('toggle', () => { if (sectionEl.open) prefillFromExtraction(); });
+  return sectionEl;
 }
 // Homogenization: "Homogenization In" groups the input fields (start time,
 // water/slurry inputs, its Process Check) and "Homogenization Out" groups
 // the output fields (dilution target, QC Check, Sample Point) -- one
 // accordion with section-title-divided groups and a single shared Save
 // button, same formatting as Extraction's Start Conditions/Extraction Out.
-function buildHomogenizationSection(getRunId, values, samplePoints, processingLot) {
+function buildHomogenizationSection(getRunId, values, samplePoints, processingLot, onSaved) {
   values = values || {};
   const startedAt = el('input', { type: 'datetime-local', value: values.startedAt || '' });
   const rinsingInp = el('input', { inputmode: 'decimal', placeholder: 'Measured using garden hose' }); attachNumericMask(rinsingInp, 2);
@@ -3116,11 +3149,12 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
       }, ...blocks.filter(b => b.used()).map(b => b.payload()),
       qcCheck.getPayload(), { sampleCollectedAt: collectedInp.value || null }));
       status.textContent = 'Saved.';
+      if (onSaved) onSaved();                                             // KW-104: a bypassed run's Separation starts from these values
     } catch (e) { status.textContent = e.message; }
     saveBtn.disabled = false;
   }
   refreshTanks();
-  return el('details', { class: 'accordion', 'data-sop-spot': 'production.homogenization' }, el('summary', {}, 'Homogenization'),
+  const sectionEl = el('details', { class: 'accordion', 'data-sop-spot': 'production.homogenization' }, el('summary', {}, 'Homogenization'),
     el('div', { class: 'accordion-body' },
       el('div', { class: 'qc-check-section-title', style: 'margin-top:0' }, 'Homogenization In'),
       el('div', { class: 'form-row' }, rfield('homogenization', 'startedAt', 'Started at', startedAt),
@@ -3137,6 +3171,8 @@ function buildHomogenizationSection(getRunId, values, samplePoints, processingLo
       qcCheckBox,
       samplePointBox,
       el('div', { style: 'margin-top:6px' }, saveBtn, status)));
+  sectionEl.kwQc = () => qcCheck.getPayload();
+  return sectionEl;
 }
 
 // Notes (KW-01): what happened that the numbers do not say (a machine failure, a process change), each tagged with the log section it belongs to and optionally with
@@ -3165,29 +3201,51 @@ function buildNotesSection(getRunId, editable) {
   function noteForm(n, onDone) {                       // add (n = null) or edit
     const sel = el('select', {}, ...NOTE_SECTIONS_UI.map(([k, l]) => el('option', { value: k }, l))); sel.value = n ? n.section : 'general';
     const txt = el('textarea', { rows: '3', maxlength: '4000', placeholder: 'What happened? (machine failure, process change, anything the reviewer should know)' }, n ? n.body : '');
-    const pics = el('input', { type: 'file', accept: 'image/*', multiple: 'multiple' });
-    const err = el('div', { class: 'error' });
+    // KW-104: pictures are added with the same two buttons as a feedstock photo (Upload photo / Take photo); they are kept here with a preview and saved with the note
+    const staged = [];                                 // [{ file, url }] chosen but not saved yet
+    const thumbs = el('div', { class: 'note-images' });
+    const drawStaged = () => thumbs.replaceChildren(...staged.map(s => el('span', { class: 'note-thumb' }, el('img', { src: s.url, alt: s.file.name }),
+      el('button', { type: 'button', class: 'secondary', onclick: () => { URL.revokeObjectURL(s.url); staged.splice(staged.indexOf(s), 1); drawStaged(); } }, 'Remove'))));
+    const addFiles = files => { for (const f of files) staged.push({ file: f, url: URL.createObjectURL(f) }); drawStaged(); };
+    const chooser = el('input', { type: 'file', accept: 'image/*', multiple: 'multiple', style: 'display:none' });
+    const camInput = el('input', { type: 'file', accept: 'image/*', capture: 'environment', style: 'display:none' });         // only where the browser has no camera API
+    chooser.addEventListener('change', () => { addFiles([...chooser.files]); chooser.value = ''; });
+    camInput.addEventListener('change', () => { addFiles([...camInput.files]); camInput.value = ''; });
+    const photoRow = el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap' },
+      el('button', { type: 'button', class: 'secondary', onclick: () => chooser.click() }, 'Upload photo'),
+      el('button', { type: 'button', class: 'secondary', onclick: async () => {
+        const shot = await takePhotoFile();
+        if (shot === undefined) camInput.click(); else if (shot) addFiles([shot]);
+      } }, '📷 Take photo'), chooser, camInput);
     const removeBoxes = n ? n.images.map(i => ({ i, cb: el('input', { type: 'checkbox' }) })) : [];
-    const save = el('button', { type: 'button' }, n ? 'Save note' : 'Add note');
+    const msg = el('span', { class: 'help' });          // the button's next sibling: pressSectionSaves reads it ('Saved.' or why not)
+    const save = el('button', { type: 'button', class: 'secondary section-save' }, n ? 'Save note' : 'Save');
+    let pendingId = null;                              // a new note that was created but whose pictures failed: a second try adds to it instead of making another
     save.addEventListener('click', async () => {
-      err.textContent = ''; save.disabled = true;
+      msg.className = 'help'; msg.textContent = ''; save.disabled = true;
       try {
+        if (!n && !txt.value.trim() && !staged.length) { msg.textContent = 'Saved.'; return; }          // nothing typed: nothing to save (the run is not created for it)
         rid = await getRunId();
-        let id = n && n.id;
-        if (n) await api('PUT', '/production/' + rid + '/notes/' + n.id, { section: sel.value, body: txt.value });
+        let id = (n && n.id) || pendingId;
+        if (id) await api('PUT', '/production/' + rid + '/notes/' + id, { section: sel.value, body: txt.value });
         else id = (await api('POST', '/production/' + rid + '/notes', { section: sel.value, body: txt.value })).id;
+        if (!n) pendingId = id;
         for (const r of removeBoxes) if (r.cb.checked) await api('DELETE', '/production/' + rid + '/notes/' + id + '/images/' + r.i.id);
-        await addPictures(id, [...pics.files]);
-        await reload(); if (onDone) onDone();
-      } catch (e) { err.textContent = e.message; await reload().catch(() => {}); }
-      save.disabled = false;
+        await addPictures(id, staged.map(s => s.file));
+        staged.forEach(s => URL.revokeObjectURL(s.url)); staged.length = 0; drawStaged();
+        if (!n) { txt.value = ''; pendingId = null; }
+        await reload();
+        msg.textContent = 'Saved.';
+        if (onDone) onDone();
+      } catch (e) { msg.className = 'error'; msg.textContent = e.message; await reload().catch(() => {}); }
+      finally { save.disabled = false; }
     });
     return el('div', { class: 'note-form' },
       el('div', { class: 'form-row' }, field('Log section', sel)),
       field('Note', txt),
       removeBoxes.length ? el('div', { class: 'help' }, 'Remove pictures: ', ...removeBoxes.map(r => el('label', { style: 'margin-right:10px' }, r.cb, ' ' + r.i.filename))) : null,
-      field(n ? 'Add pictures' : 'Pictures (optional)', pics), err,
-      el('div', { style: 'margin-top:6px;display:flex;gap:8px' }, save, n ? el('button', { type: 'button', class: 'secondary', onclick: () => { onDone(); } }, 'Cancel') : null));
+      field(n ? 'Add pictures' : 'Pictures (optional)', el('div', {}, photoRow, thumbs)),
+      el('div', { style: 'margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap' }, save, msg, n ? el('button', { type: 'button', class: 'secondary', onclick: () => { onDone(); } }, 'Cancel') : null));
   }
   function noteCard(n) {
     const card = el('div', { class: 'note-card' });
@@ -3756,14 +3814,15 @@ function buildFeedstockCard(opts) {
 
   if (opts.onSave) {
     const status = el('span', { class: 'help' });
+    // KW-104: in a production run in progress this button commits the tote to the run (it goes to WIP, as Save & close does); the result or the refusal is said plainly
     const saveBtn = el('button', {
       type: 'button', class: 'secondary', onclick: async () => {
-        status.textContent = ''; saveBtn.disabled = true;
-        try { await opts.onSave(currentValues()); status.textContent = 'Saved.'; }
-        catch (e) { status.textContent = e.message; }
+        status.className = 'help'; status.textContent = ''; saveBtn.disabled = true;
+        try { const r = await opts.onSave(currentValues()); status.textContent = (r && r.message) || 'Saved.'; }
+        catch (e) { status.className = opts.commitToRun ? 'error' : 'help'; status.textContent = e.message; }
         saveBtn.disabled = false;
       }
-    }, 'Save');
+    }, opts.commitToRun ? 'Commit tote to run' : 'Save');
     bodyEls.push(el('div', { style: 'margin-top:10px' }, saveBtn, status));
   }
   // Seed the caller's onChange with the initial (possibly prefilled) values
@@ -4710,6 +4769,7 @@ async function openRun(draftSummary, opts) {
           : Object.assign({}, feedstockState[t.id], t.avgWeightKg > 0 ? { avgHarvestWeightKg: t.avgWeightKg } : {}),
         showAvgHarvest: true,
         mode: 'draft',
+        commitToRun: true,                           // KW-104
         fromUrl: marker => photoSourceUrl(t.id, marker),
         onChange: vals => { feedstockState[t.id] = vals; if (!feedstockBuilding) scheduleAutosave(); },
         // Locks this tote's characterization in immediately instead of only
@@ -4740,6 +4800,7 @@ async function openRun(draftSummary, opts) {
             if (idx !== -1) totes[idx] = Object.assign({}, totes[idx], { status: 'wip' });
             applyPhotoIds(t.id, r.photoIds);               // (KW-102) the run's own copies of the tote's pictures
             filterTotes();
+            return { message: 'Tote ' + t.lot + ' is now WIP and locked to this run.' };
           }
         },
         uploadPhoto: async (slot, file, b64, replaces) => {
@@ -4758,17 +4819,19 @@ async function openRun(draftSummary, opts) {
   }
 
   const stages = draft?.stages || {};
+  let separationSectionRef;                       // KW-104: Extraction / Homogenization tell Separation to pre-fill its Filtrate characterization
   const homogenizationSection =
-    buildHomogenizationSection(ensureRunId, stages.homogenization, draft?.samplePoints || [], draft?.processingLot);
+    buildHomogenizationSection(ensureRunId, stages.homogenization, draft?.samplePoints || [], draft?.processingLot, () => separationSectionRef?.kwPrefill());
   // Extraction's Save needs to tell Pasteurization to refresh its mirrored
   // TDS display right away -- pasteurizationSection doesn't exist yet at
   // this point, so the callback looks it up lazily (it's only actually
   // invoked later, after Save is clicked, by which time it's assigned below).
   let pasteurizationSectionRef;
-  const extractionSection = buildExtractionSection(ensureRunId, stages.extraction);
+  const extractionSection = buildExtractionSection(ensureRunId, stages.extraction, () => separationSectionRef?.kwPrefill());
   const separationSection =
     buildSeparationSection(ensureRunId, stages.separation, draft?.samplePoints || [], draft?.processingLot,
-      () => pasteurizationSectionRef?.refreshTds(), true);
+      () => pasteurizationSectionRef?.refreshTds(), true, () => separationQcSource(extractionSection, homogenizationSection));
+  separationSectionRef = separationSection;
   // TDS/pH/Ksorbate targets follow the currently-selected SKU (which can
   // still change in this draft), so they're refreshed alongside the spec
   // panel below.
@@ -5054,15 +5117,17 @@ async function openProcessLog(run, section) {
   if (!run.inputs || !run.inputs.length) feedstockHost.append(el('div', { class: 'help' }, 'No feedstock characterization recorded.'));
 
   const getRunId = async () => run.id;
+  let separationSectionRef;                       // KW-104 (see openRun)
   const homogenizationSection =
-    buildHomogenizationSection(getRunId, stages.homogenization, run.samplePoints || [], run.processingLot);
+    buildHomogenizationSection(getRunId, stages.homogenization, run.samplePoints || [], run.processingLot, () => separationSectionRef?.kwPrefill());
   // See openRun's identical comment: extractionSection's Save needs to poke
   // pasteurizationSection, which isn't built yet at this point.
   let pasteurizationSectionRef;
-  const extractionSection = buildExtractionSection(getRunId, stages.extraction);
+  const extractionSection = buildExtractionSection(getRunId, stages.extraction, () => separationSectionRef?.kwPrefill());
   const separationSection =
     buildSeparationSection(getRunId, stages.separation, run.samplePoints || [], run.processingLot,
-      () => pasteurizationSectionRef?.refreshTds(), !(run.progress && run.progress.separationV2 === false));
+      () => pasteurizationSectionRef?.refreshTds(), !(run.progress && run.progress.separationV2 === false), () => separationQcSource(extractionSection, homogenizationSection));
+  separationSectionRef = separationSection;
   // SKU is fixed once a run is finalized, so TDS/pH/Ksorbate targets need no
   // refresh wiring here.
   const pasteurizationSection = buildPasteurizationSection(
@@ -8511,16 +8576,9 @@ const CALCULATIONS = [
   {
     title: 'Separation: total recovered liquid volume',
     formula: 'Volume (L) = Total weight of recovered liquid (kg) \u00f7 \u03c1liquid (g/mL)',
-    description: 'The volume of the liquid recovered in Separation, from its weight and the filtrate density measured in the Filtrate characterization (1 g/mL = 1 kg/L). It stays blank until both the weight and the density are entered. Shown live while typing and stored when the section is saved (and again if the density is corrected later).',
+    description: 'The volume of the liquid recovered in Separation, from its weight and the filtrate density measured in the Filtrate characterization (1 g/mL = 1 kg/L). A new run starts the weight at 0; the volume stays blank until the density is entered. Shown live while typing and stored when the section is saved (and again if the density is corrected later).',
     location: 'Production \u2192 Separation \u2192 Recovered liquid',
     settings: [],
-  },
-  {
-    title: 'Separation: recovered liquid volume vs estimate',
-    formula: 'Difference (%) = (Calculated volume \u2212 Estimated volume) \u00f7 Estimated volume \u00d7 100',
-    description: 'Cross-checks the calculated recovered liquid volume against the optional estimate entered by the operator; the difference is flagged when it is larger than the limit (same sign convention as the 6A / 6B final-volume variance). Shown only when an estimate is entered.',
-    location: 'Production \u2192 Separation \u2192 Recovered liquid',
-    settings: ['separation_liquid_variance_flag_pct'],
   },
   {
     title: 'Ksorbate / Nabenzoate (w/v)',
@@ -8538,7 +8596,7 @@ const SETTING_GROUPS = [
     'pasteurization_default_product_setpoint_c', 'pasteurization_default_boiler_setpoint_c', 'ksorbate_stock_concentration_default_pct', 'nabenzoate_stock_concentration_default_pct',
     'preproc_target_solids_pct', 'preproc_target_ph'] },
   { title: 'Equipment & capacities', note: 'Tank working volumes.', keys: ['homog_tank_capacity_each_l', 'dilution_tank_capacity_each_l'] },
-  { title: 'Quality limits & tolerances', note: 'Thresholds that flag a reading or a volume.', keys: ['orp_spoiled_below', 'orp_spoilage_underway_below', 'orp_watch_closely_below', 'dilution_variance_flag_pct', 'separation_liquid_variance_flag_pct'] },
+  { title: 'Quality limits & tolerances', note: 'Thresholds that flag a reading or a volume.', keys: ['orp_spoiled_below', 'orp_spoilage_underway_below', 'orp_watch_closely_below', 'dilution_variance_flag_pct'] },
   { title: 'Certificate of Analysis & lab results', note: 'Heavy-metal loading and lab report rules.', keys: ['coa_application_rate_kg_ha', 'coa_application_periods', 'lab_result_require_report'] },
   { title: 'Quality Control charts & reports', note: 'Control-limit rules and the Yield & Usage report.', keys: [
     'qc_chart_sigma', 'qc_chart_min_n_provisional', 'qc_chart_min_n_established', 'qc_chart_run_length', 'qc_chart_trend_length', 'yield_report_min_runs'] },

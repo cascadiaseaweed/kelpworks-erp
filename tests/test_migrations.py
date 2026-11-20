@@ -131,7 +131,9 @@ def snapshot(path):
             removable = conn.execute(
                 "SELECT COUNT(*) FROM consumables WHERE label_sku_code IN ('SACC-LKE','MACRO-LKE')"
                 " AND id NOT IN (SELECT consumable_id FROM consumable_txns) AND id NOT IN (SELECT consumable_id FROM run_label_commits)").fetchone()[0]
-        return {"tables": tables, "counts": counts, "keys": keys, "fk": fk, "removable": {"consumables": removable}, "integrity": conn.execute("PRAGMA integrity_check").fetchone()[0]}
+        # a setting a migration drops ON PURPOSE (KW-104: the recovered-liquid estimate flag, no longer used by anything)
+        gone_settings = conn.execute("SELECT COUNT(*) FROM settings WHERE key IN ('separation_liquid_variance_flag_pct')").fetchone()[0] if "settings" in tables else 0
+        return {"tables": tables, "counts": counts, "keys": keys, "fk": fk, "removable": {"consumables": removable, "settings": gone_settings}, "integrity": conn.execute("PRAGMA integrity_check").fetchone()[0]}
     finally:
         conn.close()
 
