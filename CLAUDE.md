@@ -832,7 +832,7 @@ for `main` so a red run blocks the merge.
 
 - Tiny DOM helper `el(tag, attrs, ...children)`; `table(headers, rows, numCols,
   rowClick?)`; `modal(title, body, onSubmit, submitLabel, opts?)`
-  (**backdrop click does not close** — only Cancel/submit). `api(method, path,
+  (**backdrop click does not close**; Cancel, the X in the top right (KW-105) or submit close it). `api(method, path,
   body)` wraps fetch with the bearer token.
 - **"Today" in a date input is the browser's LOCAL day**: use `todayStr()` / `localDateStr(date)` (app.js), never `new Date().toISOString().slice(0, 10)` (the UTC day, already tomorrow on a Pacific
   evening; the server refuses a received / run / reading date after its own `today_iso()`). Render's server runs in UTC, which is never behind a Pacific browser, so the local default is always accepted
@@ -844,6 +844,17 @@ for `main` so a red run blocks the merge.
   `styles.css`), an entry in the `render()` map, and a `pageX(v)` function.
   There is no Labels tab: labels print from each row's Label button (`printLabels`).
 - **Wrapping in tables** (KW-97; tests in `tests/test_layout_kw97.py`). Every `th` / `td` is `white-space: nowrap`, so a long text inside a cell never wraps by itself: it widens the table (a horizontal scroll) or, if the element has a `max-width`, runs out of its box into the next column. A status badge is one line (`.badge`); the explanation under it (`.hold-why`, the KW-94 hold cause) is the part that wraps (`white-space: normal`, up to 340px). A table with long text cells (the Lab results window) goes through `wrapTextTable(wrap, nameCol, labCol, keep)` (`.wrap-text`: text cells wrap with `overflow-wrap: break-word`, the `keep` columns stay on one line). A name box that belongs under its select (Add lab report > Other test / laboratory) is `.stack-input` (own line, full width; the test name is a 2-line textarea so a long metal name shows in full). Check a new table with a long value at a narrow width before shipping it.
+- **Shared screen behaviour** (KW-105; tests in `tests/test_kw105_feedstock_ui.py`, source checks -- there is no Node on the PC, so the behaviour is checked in the browser preview).
+  *Windows*: every `modal()` has an X in its top right (`opts.closeX !== false`; off only for the forced first-password window, `noBackdropClose`). It does what the window's own dismiss button does: **Cancel** where there is one, otherwise the window's
+  **Close / Done** button (`submitBtn.click()`, which may refresh the page behind it), plus `opts.onClose`; a window opened above another (`opts.above`) closes alone; the dark background still does not close anything, and neither does Escape.
+  The camera window (`takePhotoFile`) has one wired to its Cancel; the forced dialogs (signed out, "Still there?", re-sign-in) have none. `opts.xwide` (`.modal.xwide`, 1100px) is the width of the Feedstock Stability log window; its Note cell wraps (`td.note-wrap`).
+  *Wide tables*: every `.tablewrap` gets its horizontal scroll bar pinned to the bottom of the SCREEN (or of the dialog it is in): `sbarSweep` / `sbarEnsure` (app.js, started by one MutationObserver, coalesced into one animation frame so there is no
+  flash) add a twin `div.tablewrap-sbar` right after the table (`position: sticky; bottom: 0`), keep its `scrollLeft` equal to the table's (both ways), size it to the table's scroll range and hide it while nothing overflows; the table's own horizontal bar is
+  hidden (`.has-sbar`, via `::-webkit-scrollbar { height: 0 }`; Firefox, which cannot hide only the horizontal bar, keeps both). A table whose parent is a flex / grid container is left alone (an extra child would change that layout). Build a table as a
+  plain `.tablewrap` (the `table()` helper does) and it is covered; do NOT add a second pinned-bar mechanism. *Column choosers*: a `details.col-menu` closes on a press anywhere outside it (one global `pointerdown` listener) and on Escape.
+  *Feedstock Inventory*: every column heading wraps (`.wrap-wide .tablewrap.sticky-actions thead tr:first-child th { white-space: normal }`; data cells stay nowrap, KW-97); a filter box keeps focus and caret through `drawStab`'s rebuild (`data-key`) and the
+  table keeps its scroll position; the view (filters, sort, the table's and the page's scroll position) is `State.stabView`, so it survives a save (which calls `render()`) and `selectTab` clears it (choosing the tab starts fresh); the chosen columns are
+  still the per-browser `kelp.stabCols`.
 - **Dark theme** (KW-43; tests in `tests/test_theme.py`): each person's own choice, `users.theme` (`light` | `dark`, NULL = light; returned as `theme` by `/api/me` and the sign-in answer, set by `PUT /api/me/theme`), mirrored in
   `localStorage` so the page and the sign-in screen are drawn in it at once (`applyTheme` / `toggleTheme`, the moon / sun button in the top bar); the page is `<html data-theme="dark">`. `styles.css` states every
   hard-coded light surface / border / dark-text colour as a variable (`--bg-xxxxxx`, `--bd-xxxxxx`, `--fg-xxxxxx`: the light value in `:root`, the dark one in the `html[data-theme="dark"]` block, a test fails if one is missing) and the

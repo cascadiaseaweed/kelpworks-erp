@@ -311,6 +311,7 @@ th.sortable:hover { background: var(--bg-e2ece9); }
 .modal-bg { position: fixed; inset: 0; background: rgba(12,43,39,.5); display:flex; align-items:flex-start; justify-content:center; padding: 40px 16px; z-index: 50; overflow:auto; }
 .modal { position: relative; background: var(--card); border-radius: 16px; padding: 22px; width: 100%; max-width: 620px; box-shadow: 0 24px 60px rgba(0,0,0,.3); }
 .modal.wide { max-width: 960px; }
+.modal.xwide { max-width: 1100px; }          /* KW-105: the Feedstock Stability log window */
 .modal h3 { margin: 0 24px 14px 0; color: var(--accent-text); }
 .modal-close-x {
   position: absolute; top: 14px; right: 14px; background: none; border: none;
@@ -723,10 +724,9 @@ tr.hold-row td { background: var(--bg-fcefd6); }
 .stock-note { color: var(--danger, var(--fg-b3261e)); font-size: 12.5px; line-height: 1.4; margin-top: 4px; }
 .stock-note.hidden { display: none; }
 
-/* Feedstock Inventory: centred pH / ORP columns, and a header that may wrap (Stabilization Period (Weeks)) */
+/* Feedstock Inventory: centred pH / ORP columns */
 th.ctr, td.ctr { text-align: center; font-variant-numeric: tabular-nums; }
 .wrap-wide .tablewrap.sticky-actions th.ctr, .wrap-wide .tablewrap.sticky-actions td.ctr { text-align: center; }
-th.wraphead { white-space: normal; min-width: 104px; max-width: 120px; }
 
 /* Multi-select column filters (Feedstock Inventory) */
 button.ms-filter { display: flex; align-items: center; justify-content: space-between; gap: 6px; width: 100%; min-width: 64px; max-width: 120px; height: 34px; box-sizing: border-box;
@@ -749,6 +749,24 @@ button.ms-filter:hover { filter: none; border-color: var(--teal); }
 .wrap-wide .tablewrap.sticky-actions thead tr:first-child th:last-child { z-index: 5; }
 .wrap-wide .tablewrap.sticky-actions .filter-row th:last-child { z-index: 4; }
 th.actions-head { cursor: default; }
+
+/* KW-105: a wide table's horizontal scroll bar is pinned to the bottom of the screen. app.js (stickyScrollbars) puts a twin bar right after each .tablewrap; it is sticky to the bottom of the screen (or of the
+   dialog it is in) while the table's own foot is out of sight and sits under the table otherwise. The table's own horizontal bar is hidden so there is only one (the vertical bar of a table that also scrolls
+   up and down stays: `auto` hands the bar styling back to the ::-webkit-scrollbar rules). A browser without ::-webkit-scrollbar (Firefox) keeps both bars. */
+.tablewrap.has-sbar { scrollbar-width: auto; scrollbar-color: auto; }
+.tablewrap.has-sbar::-webkit-scrollbar { height: 0; width: 11px; }
+.tablewrap-sbar { position: sticky; bottom: 0; z-index: 8; overflow-x: auto; overflow-y: hidden; height: 15px; margin: 2px 0 0; background: var(--bg-eef3f2); border-radius: 8px;
+  scrollbar-width: thin; scrollbar-color: var(--teal) var(--bg-eef3f2); box-shadow: 0 -3px 8px -4px rgba(0,0,0,.18); }
+.tablewrap-sbar::-webkit-scrollbar { height: 11px; }
+.tablewrap-sbar::-webkit-scrollbar-track { background: var(--bg-eef3f2); }
+.tablewrap-sbar::-webkit-scrollbar-thumb { background: var(--teal); border-radius: 6px; border: 2px solid var(--bd-eef3f2); }
+.tablewrap-sbar::-webkit-scrollbar-thumb:hover { background: var(--teal-dark); }
+.tablewrap-sbar-in { height: 1px; }
+@media print { .tablewrap-sbar { display: none; } }
+/* KW-105: every Feedstock Inventory column heading wraps at its spaces (th.sortable is nowrap, so this is the more specific rule); the data cells stay on one line (KW-97) */
+.wrap-wide .tablewrap.sticky-actions thead tr:first-child th { white-space: normal; overflow-wrap: normal; }
+/* KW-105: a long note in a Feedstock Stability log row wraps (the window is wider, so the seven columns read without sideways scrolling) */
+td.note-wrap { white-space: normal; min-width: 220px; overflow-wrap: anywhere; }
 
 /* Grouped table (e.g. FG labels under a heading per SKU) */
 tr.group-row td { background: var(--bg-e3efec); color: var(--accent-text); padding: 9px 12px; font-size: 13.5px; border-top: 1px solid var(--line); }

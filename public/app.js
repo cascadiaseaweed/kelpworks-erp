@@ -340,6 +340,7 @@ $('#changePw').addEventListener('click', () => changePasswordModal(false));
 $('#tabs').addEventListener('click', e => { const b = e.target.closest('button'); if (b) selectTab(b.dataset.tab); });
 function selectTab(tab) {
   closeSidePanel();
+  State.stabView = null;          // KW-105: choosing a tab starts the Feedstock Inventory view fresh; only a save keeps it
   State.tab = tab;
   $('#tabs').querySelectorAll('button[data-tab]').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   render();
@@ -387,6 +388,9 @@ async function syncWarnCheck(force) {
 /* ---------------- Router ---------------- */
 function render() {
   syncWarnCheck();
+  // KW-105: a re-render of the Feedstock Inventory page (after a save) puts the page back where it was (see pageStabilized)
+  if (State.tab === 'stabilized' && State.renderedTab === 'stabilized' && State.stabView) State.stabView.pageY = window.scrollY;
+  State.renderedTab = State.tab;
   const v = $('#view'); v.innerHTML = '';
   const docTab = document.querySelector('#tabs button[data-tab="documents"]');       // the number of changes waiting in the SharePoint folders, for administrators
   if (docTab) docTab.textContent = 'Documents' + (State.user && State.user.role === 'admin' && State.ref && State.ref.libraryPending ? ' (' + State.ref.libraryPending + ')' : '');
@@ -467,13 +471,13 @@ const STAB_COLUMNS = [
   { key: 'stabMethod', label: 'Stabilization method', value: t => t.stabilizationMethod || '',
     options: () => ['Citric acid', 'Fresh'], cell: t => t.stabilizationMethod || '—', hidden: true },
   { key: 'harvestDate', label: 'Harvest date', value: t => t.harvestDate || '', cell: t => t.harvestDate || '—' },
-  { key: 'stabWeeks', label: 'Stabilization period (weeks)', value: t => stabilizationWeeks(t), numeric: true, center: true, wrapHead: true,
+  { key: 'stabWeeks', label: 'Stabilization period (weeks)', value: t => stabilizationWeeks(t), numeric: true, center: true,
     cell: t => { const w = stabilizationWeeks(t); return w == null ? '—' : String(w); } },
   { key: 'receivedDate', label: 'Received date', value: t => t.receivedDate || '', cell: t => t.receivedDate || '—', hidden: true },
   { key: 'avgKg', label: 'Avg harvest kg', value: t => t.avgWeightKg, numeric: true, cell: t => fmt(t.avgWeightKg, 1), hidden: true },
   { key: 'ph', label: 'pH', value: t => t.ph, numeric: true, center: true, cell: t => phCell(t) },
   { key: 'orp', label: 'ORP (mV)', value: t => t.orp, numeric: true, center: true, cell: t => orpCell(t) },
-  { key: 'tds', label: 'Feedstock TDS (%)', value: t => t.tdsPct, numeric: true, center: true, wrapHead: true, hidden: true, cell: t => t.tdsPct == null ? el('span', { class: 'muted' }, '—') : String(t.tdsPct) },
+  { key: 'tds', label: 'Feedstock TDS (%)', value: t => t.tdsPct, numeric: true, center: true, hidden: true, cell: t => t.tdsPct == null ? el('span', { class: 'muted' }, '—') : String(t.tdsPct) },
   { key: 'grade', label: 'Grade', value: t => t.grade || '', center: true, options: () => [...new Set((stabCache || []).map(t => t.grade).filter(Boolean))].sort(), cell: t => gradeBadge(t) },
   { key: 'lastUpdated', label: 'Last updated', value: t => t.lastUpdated ? fmtWhen(t.lastUpdated) : '',
     cell: t => t.lastUpdated ? fmtWhen(t.lastUpdated) : '—', hidden: true },
@@ -546,8 +550,11 @@ async function pageStabilized(v) {
   v.append(bar, bulkBar, host);
   const selected = new Set();
   // Consumed and disposed totes are hidden by default (their status is un-ticked); tick them in the Status filter to include them.
-  const filters = { status: Object.entries(STATUS_LABELS).filter(([k]) => k !== 'consumed' && k !== 'disposed').map(([, label]) => label) };
-  let sortKey = null, sortDir = 1;
+  // KW-105: the view (filters, sort, scroll) is kept in State.stabView, so a save -- which redraws the whole page -- keeps it; choosing the tab again clears it (selectTab).
+  const view = State.stabView || (State.stabView = { filters: { status: Object.entries(STATUS_LABELS).filter(([k]) => k !== 'consumed' && k !== 'disposed').map(([, label]) => label) },
+    sortKey: null, sortDir: 1, tableTop: 0, tableLeft: 0, pageY: null });
+  const filters = view.filters;
+  let sortKey = view.sortKey, sortDir = view.sortDir;
   let visibleSelectable = [];
   let shownCols = loadStabCols();
   const cols = () => STAB_COLUMNS.filter(c => shownCols.has(c.key));
@@ -624,6 +631,7 @@ async function pageStabilized(v) {
     placeMultiFilter();
   }
   function drawStab() {
+    view.sortKey = sortKey; view.sortDir = sortDir;
     let rows = stabCache.filter(t => cols().every(c => {
       if (c.options) {      // dropdown filters are multi-select: a row matches if its value is any of the ticked ones
         const sel = filters[c.key];
@@ -647,6 +655,10 @@ async function pageStabilized(v) {
     [...selected].forEach(id => { if (!visibleSelectable.some(t => t.id === id)) selected.delete(id); });
     const kgInStock = rows.filter(x => x.status === 'in_stock').reduce((a, b) => a + (b.avgWeightKg || 0), 0);
     countEl.textContent = rows.length + ' totes shown · ' + fmt(kgInStock, 0) + ' kg in stock';
+    // KW-105: the whole table is rebuilt on every keystroke, so remember the filter box being typed in (and its caret) and where the table was scrolled, and put both back
+    const typing = document.activeElement, keepFocus = typing && typing.tagName === 'INPUT' && typing.dataset && typing.dataset.key && host.contains(typing)
+      ? { key: typing.dataset.key, from: typing.selectionStart, to: typing.selectionEnd } : null;
+    const oldWrap = host.querySelector('.tablewrap'), keepScroll = oldWrap ? { l: oldWrap.scrollLeft, t: oldWrap.scrollTop } : { l: view.tableLeft, t: view.tableTop };
     host.innerHTML = '';
 
     const allCb = el('input', { type: 'checkbox', title: 'Select all shown', onchange: () => {
@@ -659,7 +671,7 @@ async function pageStabilized(v) {
       ...cols().map(c => {
         const arrow = sortKey === c.key ? (sortDir === 1 ? ' ▲' : ' ▼') : '';
         return el('th', {
-          class: (c.center ? 'ctr ' : (c.numeric ? 'num ' : '')) + (c.wrapHead ? 'wraphead ' : '') + 'sortable', title: 'Click to sort',
+          class: (c.center ? 'ctr ' : (c.numeric ? 'num ' : '')) + 'sortable', title: 'Click to sort',
           onclick: () => { sortKey === c.key ? (sortDir = -sortDir) : (sortKey = c.key, sortDir = 1); drawStab(); }
         }, c.label + arrow);
       }), el('th', { class: 'actions-head' }, 'Actions'));
@@ -679,7 +691,7 @@ async function pageStabilized(v) {
               return left.length && left.length <= 2 ? 'All except ' + left.join(', ') : chosen.length + ' selected';
             })()), el('span', { class: 'ms-caret' }, '▾')));
         } else {
-          const inp = el('input', { placeholder: 'Filter…', value: filters[c.key] || '' });
+          const inp = el('input', { placeholder: 'Filter…', value: filters[c.key] || '', 'data-key': c.key });
           inp.addEventListener('input', () => { filters[c.key] = inp.value; drawStab(); });
           cell.append(inp);
         }
@@ -711,6 +723,12 @@ async function pageStabilized(v) {
     const wrapEl = el('div', { class: 'tablewrap sticky-actions' },
       el('table', {}, el('thead', {}, headRow, filterRow), tbody));
     host.append(wrapEl);
+    wrapEl.scrollLeft = keepScroll.l; wrapEl.scrollTop = keepScroll.t;
+    wrapEl.addEventListener('scroll', () => { view.tableLeft = wrapEl.scrollLeft; view.tableTop = wrapEl.scrollTop; }, { passive: true });
+    if (keepFocus) {
+      const inp = host.querySelector('input[data-key="' + keepFocus.key + '"]');
+      if (inp) { inp.focus({ preventScroll: true }); try { inp.setSelectionRange(keepFocus.from, keepFocus.to); } catch (e) { /* not a text box */ } }
+    }
     // the filter row freezes directly under the column headings: offset it by the heading row's height
     const pinFilters = () => wrapEl.style.setProperty('--stab-head-h', headRow.getBoundingClientRect().height + 'px');
     pinFilters();
@@ -719,6 +737,7 @@ async function pageStabilized(v) {
     placeMultiFilter();
   }
   drawStab();
+  if (view.pageY != null) { window.scrollTo(0, view.pageY); view.pageY = null; }          // KW-105: back where the page was before the save
 }
 function rowCheck(item, selected, onChange) {
   if (item.status === 'consumed' || item.status === 'sold' || item.status === 'disposed') return '';
@@ -853,7 +872,7 @@ function stabilityLogTable(log, toteId) {
         return el('tr', {},
           el('td', { class: 'muted' }, fmtWhen(r.at)), el('td', { class: 'muted' }, r.readingDate || '—'), el('td', {}, r.field),
           el('td', { class: 'muted' }, fromCell), el('td', {}, toCell),
-          el('td', { class: 'muted' }, r.note || '—'), el('td', {}, r.by || '—'));
+          el('td', { class: 'muted note-wrap' }, r.note || '—'), el('td', {}, r.by || '—'));
       }))));
 }
 async function showHistory(t) {
@@ -861,7 +880,7 @@ async function showHistory(t) {
   const body = el('div', {},
     el('div', { class: 'summary-line' }, sl('Tote', t.lot)),
     stabilityLogTable(data.stabilityLog, t.id));
-  modal('Feedstock Stability log — ' + t.lot, body, async () => {}, 'Close', { noCancel: true });
+  modal('Feedstock Stability log — ' + t.lot, body, async () => {}, 'Close', { noCancel: true, xwide: true });
 }
 async function updateCondition(t) {
   if (!(await presenceEnter('tote:' + t.id, 'tote ' + t.lot))) return;
@@ -1628,7 +1647,8 @@ function takePhotoFile() {
     video.muted = true; video.srcObject = stream;
     const err = el('div', { class: 'error' });
     const snap = el('button', { type: 'button' }, 'Take photo'), cancel = el('button', { type: 'button', class: 'secondary' }, 'Cancel');
-    const bg = el('div', { class: 'modal-bg', style: 'z-index:95' }, el('div', { class: 'modal' }, el('h3', {}, 'Take photo'), video, err, el('div', { class: 'modal-actions' }, cancel, snap)));
+    const bg = el('div', { class: 'modal-bg', style: 'z-index:95' }, el('div', { class: 'modal' },
+      el('button', { type: 'button', class: 'modal-close-x', 'aria-label': 'Close', title: 'Close', onclick: () => cancel.click() }, '×'), el('h3', {}, 'Take photo'), video, err, el('div', { class: 'modal-actions' }, cancel, snap)));
     const watch = new MutationObserver(() => { if (!bg.isConnected) { stop(); watch.disconnect(); resolve(null); } });       // closed from elsewhere (sign-out, another window)
     function stop() { stream.getTracks().forEach(t => t.stop()); }
     function done(file) { watch.disconnect(); stop(); bg.remove(); resolve(file); }
@@ -10236,8 +10256,12 @@ function modal(title, body, onSubmit, submitLabel = 'Save', opts = {}) {
   }
   actions.append(submitBtn);
   const sopSpot = opts.sopSpot || (SOP_WINDOW_SPOTS.find(([p]) => String(title).startsWith(p)) || [])[1];
-  const card = el('div', { class: 'modal' + (opts.wide ? ' wide' : ''), ...(sopSpot ? { 'data-sop-spot': sopSpot } : {}) },
-    opts.closeX ? el('button', { type: 'button', class: 'modal-close-x', 'aria-label': 'Close', title: 'Close', onclick: () => { close(); if (opts.onClose) opts.onClose(); } }, '×') : null,
+  // KW-105: every window has an X in its top right corner (not the one that must be answered: the forced first password, `noBackdropClose`). It does what the window's own dismiss button does: Cancel where there is one,
+  // otherwise the window's Close / Done button (which may refresh the page behind it). A window opened above another closes alone; a click on the dark background still does nothing.
+  const showX = opts.closeX !== false && !opts.noBackdropClose;
+  const dismiss = () => { if (opts.noCancel && !opts.closeX) { submitBtn.click(); return; } close(); if (opts.onClose) opts.onClose(); };
+  const card = el('div', { class: 'modal' + (opts.wide ? ' wide' : '') + (opts.xwide ? ' xwide' : ''), ...(sopSpot ? { 'data-sop-spot': sopSpot } : {}) },
+    showX ? el('button', { type: 'button', class: 'modal-close-x', 'aria-label': 'Close', title: 'Close', onclick: dismiss }, '×') : null,
     el('h3', {}, title), body, errBox, actions);
   // Backdrop clicks do NOT close the dialog — only Cancel or completing the
   // action does, so a stray click off the popup can't discard your input.
@@ -10255,6 +10279,49 @@ function modal(title, body, onSubmit, submitLabel = 'Save', opts = {}) {
   });
   $('#modalRoot').append(bg);
 }
+/* ---------------- Shared table / chooser behaviour (KW-105) ---------------- */
+// A "Columns" chooser (<details class="col-menu">) closes on a press anywhere outside it (mouse or touch) and on Escape; a press on its own summary still toggles it and a tick inside it still works.
+document.addEventListener('pointerdown', e => { document.querySelectorAll('details.col-menu[open]').forEach(d => { if (!d.contains(e.target)) d.open = false; }); }, true);
+document.addEventListener('keydown', e => { if (e.key === 'Escape') document.querySelectorAll('details.col-menu[open]').forEach(d => { d.open = false; }); }, true);
+
+// The horizontal scroll bar of a wide table sits at the bottom of the SCREEN, not at the foot of the table (which can be far below the fold). Every `.tablewrap` gets a twin bar (`.tablewrap-sbar`, a sibling
+// right after it) that is `position: sticky; bottom: 0`: it floats at the bottom of the screen (or of the window, inside a dialog) while the table's own foot is out of sight and sits directly under the table
+// when that is on screen. The table's own bar is hidden (`.has-sbar`), the two scroll positions are kept the same, and the twin is hidden while nothing overflows. Tables are redrawn all the time, so a
+// MutationObserver (coalesced into one frame, so there is no flash of the native bar) attaches the twin to new tables and removes the ones whose table is gone. A table whose parent is a flex / grid
+// container is left alone (an extra child would change that layout): it keeps its own bar.
+const SBAR = { pending: false, ro: window.ResizeObserver ? new ResizeObserver(entries => entries.forEach(en => { const w = en.target._sbarWrap || en.target; sbarSync(w); })) : null };
+function sbarSync(wrap) {
+  const bar = wrap._sbar; if (!bar) return;
+  const over = wrap.scrollWidth > wrap.clientWidth + 1;
+  bar.style.display = over ? '' : 'none';
+  if (!over) return;
+  bar.firstChild.style.width = wrap.scrollWidth + 'px';
+  bar.style.width = wrap.clientWidth + 'px';          // the same scroll range as the table (a vertical bar of the table is not part of it)
+  if (Math.abs(bar.scrollLeft - wrap.scrollLeft) > 1) bar.scrollLeft = wrap.scrollLeft;
+}
+function sbarEnsure(wrap) {
+  const parentDisplay = wrap.parentElement ? getComputedStyle(wrap.parentElement).display : '';
+  if (/flex|grid/.test(parentDisplay)) return;
+  if (!wrap._sbarInit) {
+    wrap._sbarInit = true; wrap._sbarWrap = wrap; wrap.classList.add('has-sbar');
+    wrap.addEventListener('scroll', () => { const b = wrap._sbar; if (b && Math.abs(b.scrollLeft - wrap.scrollLeft) > 1) b.scrollLeft = wrap.scrollLeft; }, { passive: true });
+    if (SBAR.ro) { SBAR.ro.observe(wrap); if (wrap.firstElementChild) { wrap.firstElementChild._sbarWrap = wrap; SBAR.ro.observe(wrap.firstElementChild); } }
+  }
+  if (!wrap._sbar || wrap.nextElementSibling !== wrap._sbar) {
+    if (wrap._sbar) wrap._sbar.remove();
+    const bar = el('div', { class: 'tablewrap-sbar', 'aria-hidden': 'true' }, el('div', { class: 'tablewrap-sbar-in' }));
+    bar._wrap = wrap;
+    bar.addEventListener('scroll', () => { if (Math.abs(wrap.scrollLeft - bar.scrollLeft) > 1) wrap.scrollLeft = bar.scrollLeft; }, { passive: true });
+    wrap.after(bar); wrap._sbar = bar;
+  }
+  sbarSync(wrap);
+}
+function sbarSweep() {
+  document.querySelectorAll('.tablewrap-sbar').forEach(bar => { if (!bar._wrap || !bar._wrap.isConnected || bar._wrap.nextElementSibling !== bar) bar.remove(); });
+  document.querySelectorAll('.tablewrap').forEach(sbarEnsure);
+}
+new MutationObserver(() => { if (SBAR.pending) return; SBAR.pending = true; requestAnimationFrame(() => { SBAR.pending = false; sbarSweep(); }); }).observe(document.body, { childList: true, subtree: true });
+
 function changePasswordModal(forced) {
   const body = el('div', {},
     forced ? el('div', { class: 'summary-line' }, 'For security, please set a new password before continuing.') : null,
