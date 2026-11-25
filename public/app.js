@@ -1267,7 +1267,12 @@ function drawFinalizedRuns(pane, runs, lossSum, view) {
   const list = el('div', {}), count = el('span', { class: 'muted' });
   const bar = el('div', { class: 'viewbar prod-bar' });
   const uniq = get => [...new Set(runs.flatMap(get).filter(Boolean))];
-  const onFilter = () => { view.shown = PROD_PAGE; drawList(); clearBtn.classList.toggle('hidden', !prodFiltered()); };
+  const onFilter = () => { view.shown = PROD_PAGE; drawList(); updateChipCounts(); clearBtn.classList.toggle('hidden', !prodFiltered()); };
+  // the number on a chip counts what is on the screen: of the runs the filters (and any ticked chips) leave in the list -- every page of it, not only the 20 drawn -- how many pass that chip's test
+  function updateChipCounts() {
+    const base = runs.filter(r => prodMatches(r, view, lossSum));
+    bar.querySelectorAll('.prod-chip').forEach(b => { b.textContent = b._label + ' (' + base.filter(r => b._test(r, lossSum)).length + ')'; });
+  }
   const prodFiltered = () => !!(view.q || view.sku || view.from || view.to || view.species || view.farm || view.chips.length);
   const sel = (key, label, opts) => {
     const s = el('select', { 'aria-label': label }, el('option', { value: '' }, label), ...opts.map(([val, text]) => el('option', { value: val }, text)));
@@ -1279,8 +1284,8 @@ function drawFinalizedRuns(pane, runs, lossSum, view) {
     const q = el('input', { type: 'search', placeholder: 'Search lot, product, operators, farm…', 'aria-label': 'Search runs', value: view.q });
     q.addEventListener('input', () => { view.q = q.value; onFilter(); });
     const chips = PROD_CHIPS.map(([key, label, test]) => {
-      const n = runs.filter(r => test(r, lossSum)).length;
-      const b = el('button', { type: 'button', class: 'vb-opt prod-chip' + (view.chips.includes(key) ? ' on' : ''), 'aria-pressed': view.chips.includes(key) ? 'true' : 'false' }, label + ' (' + n + ')');
+      const b = el('button', { type: 'button', class: 'vb-opt prod-chip' + (view.chips.includes(key) ? ' on' : ''), 'aria-pressed': view.chips.includes(key) ? 'true' : 'false' }, label);
+      b._label = label; b._test = test;
       b.addEventListener('click', () => {
         view.chips = view.chips.includes(key) ? view.chips.filter(k => k !== key) : [...view.chips, key];
         b.classList.toggle('on', view.chips.includes(key)); b.setAttribute('aria-pressed', view.chips.includes(key) ? 'true' : 'false'); onFilter();
@@ -1297,6 +1302,7 @@ function drawFinalizedRuns(pane, runs, lossSum, view) {
       sel('species', 'All species', uniq(runSpeciesCodes).map(c => [c, speciesName(c)]).sort((a, b) => a[1].localeCompare(b[1]))),
       el('span', { class: 'vb-label' }, 'From'), dateBox('from', 'Run date from'), el('span', { class: 'vb-label' }, 'To'), dateBox('to', 'Run date to'),
       el('span', { class: 'vb-sep' }), ...chips, clearBtn, mode);
+    updateChipCounts();
   }
   function drawList() {
     const hits = runs.filter(run => prodMatches(run, view, lossSum));          // the filters look through EVERY run; only then is the page of 20 cut

@@ -50,6 +50,10 @@ def test_2_the_filter_bar_has_the_fields_and_five_chips_and_filters_before_pagin
     assert "q.split(/\\s+/).every(w => hay.includes(w))" in m                                               # every search word must be found
     draw = block("function drawList() {", 900)
     assert draw.index("runs.filter(run => prodMatches(run, view, lossSum))") < draw.index("hits.slice(0, view.shown)")   # all runs are searched, then the page is cut
+    # the number on a chip counts what is listed now (every filter and ticked chip applied, all pages of the list)
+    counts = block("function updateChipCounts() {", 500)
+    assert "runs.filter(r => prodMatches(r, view, lossSum))" in counts and "chips: []" not in counts and "b._label + ' (' + base.filter(r => b._test(r, lossSum)).length + ')'" in counts
+    assert "drawList(); updateChipCounts();" in JS and JS.count("updateChipCounts();") >= 2          # redrawn after every filter change and when the bar is built
     # the bar is built once (typing redraws the list only), so the search box keeps focus
     assert "q.addEventListener('input', () => { view.q = q.value; onFilter(); });" in JS
     assert "const onFilter = () => { view.shown = PROD_PAGE; drawList();" in JS
