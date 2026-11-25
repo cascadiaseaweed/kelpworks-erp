@@ -341,6 +341,7 @@ $('#tabs').addEventListener('click', e => { const b = e.target.closest('button')
 function selectTab(tab) {
   closeSidePanel();
   State.stabView = null;          // KW-105: choosing a tab starts the Feedstock Inventory view fresh; only a save keeps it
+  State.prodView = null;          // KW-106: and the Production Runs view
   State.tab = tab;
   $('#tabs').querySelectorAll('button[data-tab]').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   render();
@@ -390,6 +391,7 @@ function render() {
   syncWarnCheck();
   // KW-105: a re-render of the Feedstock Inventory page (after a save) puts the page back where it was (see pageStabilized)
   if (State.tab === 'stabilized' && State.renderedTab === 'stabilized' && State.stabView) State.stabView.pageY = window.scrollY;
+  if (State.tab === 'production' && State.renderedTab === 'production' && State.prodView) State.prodView.pageY = window.scrollY;          // KW-106: the same for the Production Runs page
   State.renderedTab = State.tab;
   const v = $('#view'); v.innerHTML = '';
   const docTab = document.querySelector('#tabs button[data-tab="documents"]');       // the number of changes waiting in the SharePoint folders, for administrators
@@ -1167,6 +1169,156 @@ async function openFeedstockImport() {
 }
 
 /* ---------------- Production ---------------- */
+// ---- Production Runs page (KW-106) ----
+// Two parts behind a switch: In progress (the draft runs, full cards as always) and Finalized (a searchable list that is drawn 20 runs at a time, under month headings, as compact rows that open into
+// the full card). The view -- the tab, the filters, which rows are open, how many are shown -- is kept in State.prodView, so a save (which redraws the page) keeps it; choosing the tab again clears it (selectTab).
+const PROD_PAGE = 20;
+const PROD_DETAIL_KEY = 'kelp.prodDetail';             // '1' = Detailed (every run as a full card, as before), else Compact; a per-browser preference
+const prodDetailed = () => { try { return localStorage.getItem(PROD_DETAIL_KEY) === '1'; } catch (e) { return false; } };
+const prodViewFresh = () => ({ tab: null, q: '', sku: '', from: '', to: '', species: '', farm: '', chips: [], open: new Set(), shown: PROD_PAGE, pageY: null });
+// The "needs attention" chips: a run matches a ticked chip when its test holds (ticked chips are "any of these"); the count on a chip is over every finalized run.
+const PROD_CHIPS = [
+  ['review', 'Awaiting review', r => !!(r.release && r.release.state === 'pending_review')],
+  ['amend', 'Under amendment', r => !!r.amendment],
+  ['hold', 'On hold', r => (r.fgLots || []).some(f => f.status === 'hold') || !!(r.release && ['rejected', 'returned'].includes(r.release.state))],
+  ['loss', 'Has a loss report', (r, sum) => !!(r.lossReportId || (sum && sum[String(r.id)] && sum[String(r.id)].count))],
+  ['notes', 'Has notes', r => runNoteItems(r, []).length > 0],
+];
+// the site and species codes of a run's feedstock: from its run inputs, else from the tote lot numbers (SITE-SPECIES-date-no) of an older run
+const runSiteCodes = run => (run.inputs && run.inputs.length ? run.inputs.map(i => i.site) : (run.inputTotes || []).map(l => String(l).split('-')[0])).filter(Boolean);
+const runSpeciesCodes = run => (run.inputs && run.inputs.length ? run.inputs.map(i => i.species) : (run.inputTotes || []).map(l => String(l).split('-')[1])).filter(Boolean);
+function prodMonthLabel(ym) {
+  const m = /^(\d{4})-(\d{2})$/.exec(ym || '');
+  return m ? new Date(+m[1], +m[2] - 1, 1).toLocaleString('en-CA', { month: 'long', year: 'numeric' }) : 'No run date';
+}
+// Does a finalized run pass the filters? Every filter narrows; the ticked chips are "any of these"; the search words must ALL be found.
+function prodMatches(run, v, sum) {
+  if (v.sku && run.sku !== v.sku) return false;
+  if (v.from && (run.runDate || '') < v.from) return false;
+  if (v.to && (run.runDate || '') > v.to) return false;
+  if (v.species && !runSpeciesCodes(run).includes(v.species)) return false;
+  if (v.farm && !runSiteCodes(run).includes(v.farm)) return false;
+  if (v.chips.length && !PROD_CHIPS.some(([k, , test]) => v.chips.includes(k) && test(run, sum))) return false;
+  const q = v.q.trim().toLowerCase();
+  if (q) {
+    const hay = [run.processingLot, run.sku, skuName(run.sku), run.operators, run.runDate, ...runSiteCodes(run).map(siteName), ...runSpeciesCodes(run).map(speciesName)].filter(Boolean).join(' ').toLowerCase();
+    if (!q.split(/\s+/).every(w => hay.includes(w))) return false;
+  }
+  return true;
+}
+// "More" menu on a run card: the same look and the same outside-click closing as the Columns chooser (details.col-menu). items = [[label, handler, title?]]
+function moreMenu(items) {
+  const d = el('details', { class: 'col-menu more-menu' }, el('summary', {}, 'More ▾'),
+    el('div', { class: 'col-menu-panel' }, ...items.filter(Boolean).map(([label, fn, title]) =>
+      el('button', { type: 'button', class: 'more-item', title: title || '', onclick: () => { d.open = false; fn(); } }, label))));
+  return d;
+}
+// One finalized run as a full card (what the page showed for every run before KW-106). Process log, QC and Documents stay on the card; the other actions are under More.
+function runCard(run, lossSum) {
+  return el('div', { class: 'card' },
+    el('div', { class: 'page-head', style: 'margin:0 0 8px' },
+      el('h3', { style: 'margin:0' }, mono(run.processingLot),
+        run.excludeFromStats ? el('span', { class: 'pill', style: 'margin-left:6px', title: run.excludeReason || '' }, 'Excluded from analysis') : null,
+        run.historical ? el('span', { class: 'pill', style: 'margin-left:6px', title: 'Entered retrospectively by ' + (run.historical.enteredBy || '—') + '. ' + (run.historical.release === 'grandfather' ? 'Grandfathered as released. ' : '') + (run.historical.deductInventory ? '' : 'Did not move inventory. ') + (run.historical.note ? 'Log was incomplete at entry.' : '') }, 'Historical') : null,
+        run.release && run.release.state && run.release.state !== 'legacy' ? [' ', releaseBadge(run.release.state)] : null,
+        ' ', lossBadge(lossSum, run.id, run.processingLot), ' ', analysisInfoButton(run), ' ', presenceBadge('run:' + run.id)),
+      el('div', { class: 'actions' },
+        el('button', { class: 'secondary', onclick: () => openProcessLog(run) }, '📋 Process log'),
+        el('button', { class: 'secondary', onclick: () => openQcForRun(run) }, '🧪 QC'),
+        el('button', { class: 'secondary', onclick: () => openAttachments(run) },
+          '📎 Documents' + (run.attachments && run.attachments.length ? ' (' + run.attachments.length + ')' : '')),
+        moreMenu([
+          ['Report a loss', () => newLossReport({ runId: run.id }), 'Report product lost from this run'],
+          canAmendLog() ? (run.amendment ? ['✏️ Continue amendment', () => openRunLog(run.id)] : ['✏️ Amend run', () => openAmendDialog(run)]) : null,
+          ['🧫 Lab results', () => openLabResults(run)],
+          ['Print FG labels', () => printLabels(run.fgLots.map(f => fgLabel(f, run)))],
+          ['Print sample labels', () => openSampleLabels(run)]]))),
+    run.amendment ? amendBanner(run) : null,
+    lossRunBanner(run),
+    runSummaryGrid(run),
+    runNotesPanel(run),
+    stageProgress(run, { onSelect: key => openProcessLog(run, key) }),
+    revisionTracker(run));
+}
+// A finalized run as one compact line; opening it shows the full card (built the first time it is opened). The open rows are remembered in view.open, so they stay open after a save.
+function runRow(run, lossSum, view) {
+  const x = runSummaryStats(run), notes = runNoteItems(run, []).length;
+  const flags = el('span', { class: 'rr-flags', onclick: e => { if (e.target.closest('.loss-badge, button, a')) e.preventDefault(); } },      // a click on a badge's own action must not also open / close the row
+    run.release && run.release.state && run.release.state !== 'legacy' ? releaseBadge(run.release.state) : null,
+    run.excludeFromStats ? el('span', { class: 'pill', title: run.excludeReason || '' }, 'Excluded') : null,
+    run.historical ? el('span', { class: 'pill' }, 'Historical') : null,
+    lossBadge(lossSum, run.id, run.processingLot),
+    notes ? el('span', { class: 'pill', title: notes + ' note(s) on this run' }, '📝 ' + notes) : null,
+    presenceBadge('run:' + run.id));
+  const det = el('details', { class: 'run-row' },
+    el('summary', {}, el('span', { class: 'rr-lot' }, mono(run.processingLot)), el('span', { class: 'rr-date' }, run.runDate || '—'), el('span', { class: 'rr-sku' }, skuName(run.sku)),
+      el('span', { class: 'rr-num' }, x.out ? fmt(x.out, 0) + ' L' : '—'), el('span', { class: 'rr-num' }, x.finalPh != null ? 'pH ' + fmt(x.finalPh, 2) : 'pH —'),
+      el('span', { class: 'rr-num' }, x.finalTds != null ? 'TDS ' + fmt(x.finalTds, 2) + ' %' : 'TDS —'), flags));
+  const body = el('div', { class: 'rr-body' });
+  det.append(body);
+  const build = () => { if (!body.firstChild) body.append(runCard(run, lossSum)); };
+  if (view.open.has(run.id)) { det.open = true; build(); }
+  det.addEventListener('toggle', () => { if (det.open) { view.open.add(run.id); build(); } else view.open.delete(run.id); });
+  return det;
+}
+// The Finalized pane: the filter bar (built once, so typing never loses focus; only the list below it is redrawn), then the runs under month headings.
+function drawFinalizedRuns(pane, runs, lossSum, view) {
+  if (!runs.length) { pane.append(el('div', { class: 'empty card' }, 'No finalized runs yet.')); return; }
+  const list = el('div', {}), count = el('span', { class: 'muted' });
+  const bar = el('div', { class: 'viewbar prod-bar' });
+  const uniq = get => [...new Set(runs.flatMap(get).filter(Boolean))];
+  const onFilter = () => { view.shown = PROD_PAGE; drawList(); clearBtn.classList.toggle('hidden', !prodFiltered()); };
+  const prodFiltered = () => !!(view.q || view.sku || view.from || view.to || view.species || view.farm || view.chips.length);
+  const sel = (key, label, opts) => {
+    const s = el('select', { 'aria-label': label }, el('option', { value: '' }, label), ...opts.map(([val, text]) => el('option', { value: val }, text)));
+    s.value = view[key]; s.addEventListener('change', () => { view[key] = s.value; onFilter(); }); return s;
+  };
+  const dateBox = (key, title) => { const d = el('input', { type: 'date', title, 'aria-label': title, value: view[key] }); d.addEventListener('change', () => { view[key] = d.value; onFilter(); }); return d; };
+  const clearBtn = el('button', { type: 'button', class: 'ghost', onclick: () => { Object.assign(view, { q: '', sku: '', from: '', to: '', species: '', farm: '', chips: [] }); buildBar(); onFilter(); } }, 'Clear filters');
+  function buildBar() {
+    const q = el('input', { type: 'search', placeholder: 'Search lot, product, operators, farm…', 'aria-label': 'Search runs', value: view.q });
+    q.addEventListener('input', () => { view.q = q.value; onFilter(); });
+    const chips = PROD_CHIPS.map(([key, label, test]) => {
+      const n = runs.filter(r => test(r, lossSum)).length;
+      const b = el('button', { type: 'button', class: 'vb-opt prod-chip' + (view.chips.includes(key) ? ' on' : ''), 'aria-pressed': view.chips.includes(key) ? 'true' : 'false' }, label + ' (' + n + ')');
+      b.addEventListener('click', () => {
+        view.chips = view.chips.includes(key) ? view.chips.filter(k => k !== key) : [...view.chips, key];
+        b.classList.toggle('on', view.chips.includes(key)); b.setAttribute('aria-pressed', view.chips.includes(key) ? 'true' : 'false'); onFilter();
+      });
+      return b;
+    });
+    const mode = el('span', { class: 'prod-switch small', title: 'Compact: one line per run. Detailed: every run as a full card.' },
+      ...[['0', 'Compact'], ['1', 'Detailed']].map(([val, label]) => el('button', { type: 'button', class: 'prod-tab' + ((prodDetailed() ? '1' : '0') === val ? ' active' : ''),
+        onclick: e => { try { localStorage.setItem(PROD_DETAIL_KEY, val); } catch (err) { /* not saved: the choice lasts until the page is redrawn */ }
+          e.target.parentElement.querySelectorAll('.prod-tab').forEach(b => b.classList.toggle('active', b === e.target)); drawList(); } }, label)));
+    bar.replaceChildren(q,
+      sel('sku', 'All products', uniq(r => [r.sku]).sort((a, b) => skuName(a).localeCompare(skuName(b))).map(c => [c, skuName(c)])),
+      sel('farm', 'All farms', uniq(runSiteCodes).map(c => [c, siteName(c)]).sort((a, b) => a[1].localeCompare(b[1]))),
+      sel('species', 'All species', uniq(runSpeciesCodes).map(c => [c, speciesName(c)]).sort((a, b) => a[1].localeCompare(b[1]))),
+      el('span', { class: 'vb-label' }, 'From'), dateBox('from', 'Run date from'), el('span', { class: 'vb-label' }, 'To'), dateBox('to', 'Run date to'),
+      el('span', { class: 'vb-sep' }), ...chips, clearBtn, mode);
+  }
+  function drawList() {
+    const hits = runs.filter(run => prodMatches(run, view, lossSum));          // the filters look through EVERY run; only then is the page of 20 cut
+    const detailed = prodDetailed();
+    count.textContent = hits.length === runs.length ? runs.length + ' finalized runs' : hits.length + ' of ' + runs.length + ' runs match';
+    list.replaceChildren();
+    if (!hits.length) { list.append(el('div', { class: 'empty card' }, 'No runs match these filters.')); return; }
+    const shown = hits.slice(0, view.shown);
+    let month = null;
+    for (const run of shown) {
+      const ym = (run.runDate || '').slice(0, 7);
+      if (ym !== month) { month = ym; list.append(el('h3', { class: 'month-head' }, prodMonthLabel(ym))); }
+      list.append(detailed ? runCard(run, lossSum) : runRow(run, lossSum, view));
+    }
+    if (hits.length > shown.length) list.append(el('div', { class: 'prod-more' },
+      el('button', { type: 'button', class: 'secondary', onclick: () => { view.shown += PROD_PAGE; drawList(); } }, 'Show older runs (' + (hits.length - shown.length) + ' more)')));
+  }
+  buildBar();
+  clearBtn.classList.toggle('hidden', !prodFiltered());
+  drawList();
+  pane.append(bar, el('div', { style: 'margin:0 0 8px' }, count), list);
+}
 async function pageProduction(v) {
   v.append(el('div', { class: 'page-head' },
     el('h2', {}, 'Production Runs'),
@@ -1174,41 +1326,22 @@ async function pageProduction(v) {
       State.user.role === 'admin' && settingValue('historical_entry_enabled', 0) ? el('button', { class: 'secondary', onclick: () => openHistoricalRun(), title: 'Enter a run that already happened, with its original lot number and date' }, '+ Historical run') : null,
       el('button', { onclick: () => openNewRun() }, '+ New production run'))));
   const [r, dr, lossSum] = await Promise.all([api('GET', '/production'), api('GET', '/production/drafts'), lossSummary()]);       // KW-99: the loss summary is fetched once per page draw
-  if (dr.drafts.length) {
-    v.append(el('h3', { style: 'margin:0 0 8px' }, 'In progress'));
-    for (const d of dr.drafts) v.append(draftCard(d, lossSum));
-  }
   if (!r.runs.length && !dr.drafts.length) { v.append(el('div', { class: 'empty card' }, 'No production runs yet. Click “New production run” to process stabilized totes into finished goods.')); return; }
-  if (!r.runs.length) return;
-  for (const run of r.runs) {
-    const card = el('div', { class: 'card' },
-      el('div', { class: 'page-head', style: 'margin:0 0 8px' },
-        el('h3', { style: 'margin:0' }, mono(run.processingLot),
-          run.excludeFromStats ? el('span', { class: 'pill', style: 'margin-left:6px', title: run.excludeReason || '' }, 'Excluded from analysis') : null,
-          run.historical ? el('span', { class: 'pill', style: 'margin-left:6px', title: 'Entered retrospectively by ' + (run.historical.enteredBy || '—') + '. ' + (run.historical.release === 'grandfather' ? 'Grandfathered as released. ' : '') + (run.historical.deductInventory ? '' : 'Did not move inventory. ') + (run.historical.note ? 'Log was incomplete at entry.' : '') }, 'Historical') : null,
-          run.release && run.release.state && run.release.state !== 'legacy' ? [' ', releaseBadge(run.release.state)] : null,
-          ' ', lossBadge(lossSum, run.id, run.processingLot), ' ', analysisInfoButton(run), ' ', presenceBadge('run:' + run.id)),
-        el('div', { class: 'actions' },
-          el('button', { class: 'secondary', onclick: () => newLossReport({ runId: run.id }), title: 'Report product lost from this run' }, 'Report a loss'),
-          canAmendLog() ? (run.amendment
-            ? el('button', { onclick: () => openRunLog(run.id) }, '✏️ Continue amendment')
-            : el('button', { onclick: () => openAmendDialog(run) }, '✏️ Amend run')) : null,
-          el('button', { class: 'secondary', onclick: () => openProcessLog(run) }, '📋 Process log'),
-          el('button', { class: 'secondary', onclick: () => openQcForRun(run) },
-            '🧪 QC'),
-          el('button', { class: 'secondary', onclick: () => openAttachments(run) },
-            '📎 Documents' + (run.attachments && run.attachments.length ? ' (' + run.attachments.length + ')' : '')),
-          el('button', { class: 'secondary', onclick: () => openLabResults(run) }, '🧫 Lab results'),
-          el('button', { class: 'secondary', onclick: () => printLabels(run.fgLots.map(f => fgLabel(f, run))) }, 'Print FG labels'),
-          el('button', { class: 'secondary', onclick: () => openSampleLabels(run) }, 'Print sample labels'))),
-      run.amendment ? amendBanner(run) : null,
-      lossRunBanner(run),
-      runSummaryGrid(run),
-      runNotesPanel(run),
-      stageProgress(run, { onSelect: key => openProcessLog(run, key) }),
-      revisionTracker(run));
-    v.append(card);
+  const view = State.prodView || (State.prodView = prodViewFresh());
+  const pane = el('div', {}), tabs = {};
+  const tab = (key, label, n) => (tabs[key] = el('button', { type: 'button', class: 'prod-tab', role: 'tab', onclick: () => { view.tab = key; paint(); } }, label + ' (' + n + ')'));
+  v.append(el('div', { class: 'prod-switch', role: 'tablist' }, tab('drafts', 'In progress', dr.drafts.length), tab('final', 'Finalized', r.runs.length)), pane);
+  function paint() {
+    const now = view.tab || (dr.drafts.length ? 'drafts' : 'final');          // no choice yet: In progress when there is anything in progress, else Finalized
+    Object.entries(tabs).forEach(([k, b]) => { b.classList.toggle('active', k === now); b.setAttribute('aria-selected', k === now ? 'true' : 'false'); });
+    pane.replaceChildren();
+    if (now === 'drafts') {
+      if (!dr.drafts.length) pane.append(el('div', { class: 'empty card' }, 'No runs in progress. Click “New production run” to start one.'));
+      for (const d of dr.drafts) pane.append(draftCard(d, lossSum));
+    } else drawFinalizedRuns(pane, r.runs, lossSum, view);
   }
+  paint();
+  if (view.pageY != null) { window.scrollTo(0, view.pageY); view.pageY = null; }          // back where the page was before a save
 }
 // The key production figures shown on a run's summary card, all derived from the run's
 // own log: feedstock farms, IBCs (totes) consumed, weights, volume out, final QC, extraction
@@ -1521,11 +1654,18 @@ function runNoteItems(run, events) {
 function runNotesPanel(run, events, opts = {}) {
   const items = runNoteItems(run, events);
   if (!items.length) return opts.emptyText ? el('div', { class: 'help', style: 'margin:6px 0' }, opts.emptyText) : null;
-  return el('div', { class: 'notes-panel', style: 'border-left:4px solid var(--amber,#d9a400);background:rgba(217,164,0,.10);padding:8px 12px;margin:8px 0;border-radius:4px' },
-    el('h4', { style: 'margin:0 0 4px' }, 'Notes on this run (' + items.length + ')'),
-    ...items.map(n => el('div', { style: 'margin:3px 0;font-size:13px' },
-      el('b', {}, n.source), n.who || n.at ? el('span', { class: 'muted' }, ' · ' + [n.who, n.at ? fmtWhen(n.at) : ''].filter(Boolean).join(' · ')) : null,
-      el('div', { style: 'white-space:pre-wrap' }, n.text))));
+  // KW-106: a collapsible box -- closed on a run card (the count and the first note's first line show), open under an open amendment or when the caller asks (the Product Release window)
+  const first = (items[0].text.split('\n')[0] || '').trim();
+  return el('details', { class: 'notes-panel', ...(opts.open === true || run.amendment ? { open: '' } : {}) },
+    el('summary', {}, el('b', {}, 'Notes on this run (' + items.length + ')'), el('span', { class: 'muted np-preview' }, ' — ' + (first.length > 110 ? first.slice(0, 110) + '…' : first))),
+    ...items.map(n => {
+      const long = n.text.split('\n').length > 3 || n.text.length > 280;          // a long note shows three lines and a Show more
+      const txt = el('div', { class: 'np-text' + (long ? ' clamped' : '') }, n.text);
+      return el('div', { class: 'np-item' },
+        el('b', {}, n.source), n.who || n.at ? el('span', { class: 'muted' }, ' · ' + [n.who, n.at ? fmtWhen(n.at) : ''].filter(Boolean).join(' · ')) : null,
+        txt,
+        long ? el('button', { type: 'button', class: 'ghost np-more', onclick: e => { e.target.textContent = txt.classList.toggle('clamped') ? 'Show more' : 'Show less'; } }, 'Show more') : null);
+    }));
 }
 function revisionTracker(run) {
   const revs = (run.revisions || []).slice().reverse();   // newest first
@@ -5673,7 +5813,7 @@ async function openReleaseRun(id) {
         signBox('Reopen', 'By signing I confirm the prior review/release no longer stands and a new review is required.', [['reopen', 'Reopen']], 'reopen', { quality: true, button: 'Sign & reopen', commentHint: 'Reason for reopening (required)' }))));
   }
   // the supporting detail, folded away so the lab results and the sign-off are what is in front of the reviewer
-  body.append(fold('Run notes', runNotesPanel(d.run, d.events, { emptyText: 'No notes were written on this run.' })));
+  body.append(fold('Run notes', runNotesPanel(d.run, d.events, { emptyText: 'No notes were written on this run.', open: true })));
   const lotRows = fgDisplayRows(d.lots);
   body.append(fold('Finished goods lots (' + lotRows.length + ')', table(['FG lot', 'Pack', 'Units', 'Litres', 'Status'], lotRows.map(l => [mono(l.lot), l.packageSize, fmt(fgUnits(l)), num(fmt(fgLitres(l), 0)), fgStatusWithWhy(l)]), [false, false, true, true, false])));
   body.append(fold('Materials used and their lots', await materialsCard(id)));

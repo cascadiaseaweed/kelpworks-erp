@@ -768,6 +768,50 @@ th.actions-head { cursor: default; }
 /* KW-105: a long note in a Feedstock Stability log row wraps (the window is wider, so the seven columns read without sideways scrolling) */
 td.note-wrap { white-space: normal; min-width: 220px; overflow-wrap: anywhere; }
 
+/* KW-106: the Production Runs page -- the In progress / Finalized switch, the filter bar, compact rows under month headings, the collapsible notes box and the More menu. Theme variables only (KW-43). */
+.prod-switch { display: inline-flex; margin: 0 0 14px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--bg-ffffff); }
+.prod-switch .prod-tab { background: transparent; color: var(--accent-text); border: 0; border-radius: 0; padding: 8px 18px; font-size: 14px; font-weight: 600; }
+.prod-switch .prod-tab + .prod-tab { border-left: 1px solid var(--line); }
+.prod-switch .prod-tab.active { background: var(--teal); color: #fff; }
+.prod-switch.small { margin: 0; }
+.prod-switch.small .prod-tab { padding: 4px 12px; font-size: 12.5px; }
+.prod-bar input[type=search] { width: 240px; max-width: 100%; padding: 5px 8px; font-size: 13px; }
+.prod-bar .ghost { font-size: 12.5px; padding: 3px 8px; }
+.viewbar button.vb-opt { color: var(--ink); background: var(--bg-ffffff); border: 1px solid var(--line); font-weight: normal; padding: 3px 11px; }
+.viewbar button.vb-opt.on { background: var(--bg-e3efec); border-color: var(--teal); color: var(--accent-text); font-weight: 600; }
+.month-head { margin: 18px 0 8px; font-size: 14px; letter-spacing: .02em; color: var(--accent-text); }
+.run-row { background: var(--card); border: 1px solid var(--line); border-radius: 12px; margin: 0 0 8px; box-shadow: var(--shadow); }
+.run-row > summary { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 16px; padding: 10px 14px; cursor: pointer; list-style: none; font-size: 13.5px; }
+.run-row > summary::-webkit-details-marker { display: none; }
+.run-row > summary::before { content: '▸'; color: var(--muted); width: 12px; flex: none; }
+.run-row[open] > summary::before { content: '▾'; }
+.run-row[open] > summary { border-bottom: 1px solid var(--line); }
+.run-row > summary:hover { background: var(--bg-f6faf9); border-radius: 12px; }
+.rr-lot { font-weight: 600; min-width: 170px; }
+.rr-date { min-width: 84px; color: var(--muted); }
+.rr-sku { flex: 1 1 150px; min-width: 120px; }
+.rr-num { min-width: 76px; font-variant-numeric: tabular-nums; }
+.rr-flags { margin-left: auto; display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.rr-body { padding: 8px 10px 2px; }
+.rr-body > .card { box-shadow: none; border: 0; margin-bottom: 6px; padding: 8px 4px; }
+.prod-more { text-align: center; margin: 14px 0; }
+.notes-panel { border-left: 4px solid var(--warn); background: rgba(217,164,0,.10); padding: 8px 12px; margin: 8px 0; border-radius: 4px; }
+.notes-panel > summary { cursor: pointer; font-size: 13px; list-style: none; }
+.notes-panel > summary::-webkit-details-marker { display: none; }
+.notes-panel > summary::before { content: '▸ '; color: var(--muted); }
+.notes-panel[open] > summary::before { content: '▾ '; }
+.notes-panel[open] .np-preview { display: none; }
+.np-preview { font-weight: normal; font-size: 12.5px; }
+.np-item { margin: 6px 0 3px; font-size: 13px; }
+.np-text { white-space: pre-wrap; }
+.np-text.clamped { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.np-more { font-size: 12px; padding: 0; text-decoration: underline; }
+.more-menu { margin-left: 0; }
+.more-menu .col-menu-panel { z-index: 25; min-width: 190px; gap: 2px; padding: 6px; }
+.more-menu .more-item { background: transparent; color: var(--ink); border: 0; text-align: left; font-weight: 500; font-size: 13px; padding: 6px 8px; border-radius: 6px; }
+.more-menu .more-item:hover { background: var(--bg-e9f4f1); filter: none; }
+@media (max-width: 600px) { .rr-lot, .rr-date, .rr-sku, .rr-num { min-width: 0; } .rr-flags { margin-left: 0; } }
+
 /* Grouped table (e.g. FG labels under a heading per SKU) */
 tr.group-row td { background: var(--bg-e3efec); color: var(--accent-text); padding: 9px 12px; font-size: 13.5px; border-top: 1px solid var(--line); }
 tr.group-row:hover { background: transparent; }
